@@ -2,8 +2,8 @@ import numpy as np
 from roc_mcs.processing.alignment import find_phase, extract_branch
 from roc_mcs.processing.calibration import calibrate_roc_map
 from roc_mcs.io.mcs import load_mcs, find_mcs_files 
-from roc_mcs.plots import plot_roc_map
-
+from roc_mcs.plots import plot_roc_map, save_figure
+from roc_mcs.export import export_roc_map_excel
 def process_mcs(mcs, branch="up"):
     """ Функция обработки одного файла """
     counts = mcs["counts"]
@@ -54,4 +54,36 @@ def run_pipeline(folder, amplitude, reference_amplitude, reference_angle):
         reference_angle=reference_angle,
     )
     fig = plot_roc_map(roc_map)
+    return roc_map, fig
+
+
+def run_experiment(
+    folder,
+    amplitude,
+    reference_amplitude,
+    reference_angle,
+    results_folder=None,
+    save_excel=True,
+    save_figure_flag=True,
+):
+    roc_map = build_roc_map(folder)
+    roc_map = calibrate_roc_map(
+        roc_map,
+        amplitude=amplitude,
+        reference_amplitude=reference_amplitude,
+        reference_angle=reference_angle,
+    )
+
+    fig = plot_roc_map(roc_map)
+
+    if results_folder is not None:
+        if save_figure_flag:
+            save_figure(fig, results_folder, "roc_map.png")
+
+        if save_excel:
+            export_roc_map_excel(
+                roc_map,
+                folder=results_folder,
+                filename="rocking_curve_dynamics.xlsx",
+            )
     return roc_map, fig
