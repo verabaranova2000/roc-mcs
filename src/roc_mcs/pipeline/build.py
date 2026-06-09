@@ -45,20 +45,13 @@ def build_roc_map(folder, branch="up"):
     return roc_map
 
 
-
-# def run_pipeline(folder, angle_scale):
-#     scan = build_roc_map(folder)
-#     scan = calibrate_roc_map(scan, angle_scale)
-#     fig = plot_roc_map(scan)
-#     return scan, fig
-
-def run_pipeline(folder, amplitude, reference_angle, reference_amplitude=400.0):
+def run_pipeline(folder, amplitude, reference_amplitude, reference_angle):
     roc_map = build_roc_map(folder)
     roc_map = calibrate_roc_map(
         roc_map,
-        amplitude=amplitude,        
+        amplitude=amplitude,   
+        reference_amplitude=reference_amplitude,     
         reference_angle=reference_angle,
-        reference_amplitude=reference_amplitude,
     )
     fig = plot_roc_map(roc_map)
     return roc_map, fig
