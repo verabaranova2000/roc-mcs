@@ -5,8 +5,8 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "roc-mcs"
 version = "0.1.0"
-description = "ROC analysis pipeline for MCS files"
-requires-python = ">=3.9"
+description = "Rocking curve analysis for ORTEC MCS measurements"
+requires-python = ">=3.10"
 
 dependencies = [
     "numpy",
