@@ -1,8 +1,8 @@
 import numpy as np
-from src.roc_mcs.processing.alignment import find_phase, extract_branch
-from src.roc_mcs.processing.calibration import calibrate_phase_scan
-from src.roc_mcs.io import load_mcs, find_mcs_files 
-from src.roc_mcs.plots import plot_phase_scan
+from roc_mcs.processing.alignment import find_phase, extract_branch
+from roc_mcs.processing.calibration import calibrate_phase_scan
+from roc_mcs.io import load_mcs, find_mcs_files 
+from roc_mcs.plots import plot_phase_scan
 
 def process_mcs(mcs, branch="up"):
     """ Функция обработки одного файла """
