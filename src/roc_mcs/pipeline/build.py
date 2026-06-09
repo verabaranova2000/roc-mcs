@@ -1,7 +1,7 @@
 import numpy as np
 from roc_mcs.processing.alignment import find_phase, extract_branch
 from roc_mcs.processing.calibration import calibrate_phase_scan
-from roc_mcs.io import load_mcs, find_mcs_files 
+from roc_mcs.io.mcs import load_mcs, find_mcs_files 
 from roc_mcs.plots import plot_phase_scan
 
 def process_mcs(mcs, branch="up"):
