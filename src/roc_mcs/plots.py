@@ -2,10 +2,10 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 
 
-def plot_phase_scan(phase_scan):
-    time_s = phase_scan["time_s"]         # X
-    theta = phase_scan["theta_axis"]      # Y
-    Z = phase_scan["intensity"].T         # Z     shape: (s, time)
+def plot_roc_map(roc_map):
+    time_s = roc_map["time_s"]         # X
+    theta = roc_map["theta_axis"]      # Y
+    Z = roc_map["intensity"].T         # Z     shape: (s, time)
 
     fig, ax = plt.subplots(figsize=(10, 5))
     im = ax.imshow(
@@ -22,7 +22,7 @@ def plot_phase_scan(phase_scan):
         ax.axvline(ti, color="white", linestyle=":", linewidth=0.4, alpha=0.4)
 
     ax.set_xlabel("Time (s)")
-    ax.set_ylabel("Angle (arcsec)" if "theta_axis" in phase_scan else r"$\sin(\omega t + \varphi)$")
+    ax.set_ylabel("Angle (arcsec)" if "theta_axis" in roc_map else r"$\sin(\omega t + \varphi)$")
     ax.set_title("Rocking curve dynamics")
 
     plt.tight_layout()

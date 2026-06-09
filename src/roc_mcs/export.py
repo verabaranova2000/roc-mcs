@@ -1,14 +1,14 @@
 import pandas as pd
 from pathlib import Path
 
-def export_phase_scan_excel(phase_scan, filename="rocking_curve_dynamics.xlsx", folder=None):
+def export_roc_map_excel(roc_map, filename="rocking_curve_dynamics.xlsx", folder=None):
     """
     Экспорт ROC-карт и метаданных эксперимента в Excel.
 
     Parameters
     ----------
-    phase_scan : dict
-        Результат build_phase_scan().
+    roc_map : dict
+        Результат build_roc_map().
     filename : str
         Имя выходного Excel-файла.
     folder : str | Path | None
@@ -24,26 +24,26 @@ def export_phase_scan_excel(phase_scan, filename="rocking_curve_dynamics.xlsx", 
     output_file = folder / filename
 
     # ---------- ось Y ----------
-    if "theta_axis" in phase_scan:
-        axis = phase_scan["theta_axis"]
+    if "theta_axis" in roc_map:
+        axis = roc_map["theta_axis"]
         axis_name = "theta_arcsec"
     else:
-        axis = phase_scan["s_axis"]
+        axis = roc_map["s_axis"]
         axis_name = "sin_axis"
     # ---------- ось X ----------
-    time_s = phase_scan["time_s"]
+    time_s = roc_map["time_s"]
 
     # ---------- ROC ----------
     data = {axis_name: axis}
-    for t, intensity in zip(time_s, phase_scan["intensity"]):
+    for t, intensity in zip(time_s, roc_map["intensity"]):
         data[f"t_{t:.1f}s"] = intensity
     roc_df = pd.DataFrame(data)
     # ---------- Metadata ----------
     meta_df = pd.DataFrame({
-        "file_name": phase_scan["file_name"],
-        "datetime": phase_scan["time"],        
+        "file_name": roc_map["file_name"],
+        "datetime": roc_map["time"],        
         "time_s": time_s,
-        "phi": phase_scan["phi"],
+        "phi": roc_map["phi"],
     })
 
     with pd.ExcelWriter(output_file) as writer:
