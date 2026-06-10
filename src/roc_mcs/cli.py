@@ -19,7 +19,7 @@ def main() -> int:
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--config", type=Path, 
                        help="Path to YAML config file")
-    group.add_argument("folder", type=Path, 
+    group.add_argument("--folder", type=Path, 
                         help="Folder with .mcs files")
     parser.add_argument("--amplitude", type=float,
                         help="Current piezo amplitude, mVpp")
