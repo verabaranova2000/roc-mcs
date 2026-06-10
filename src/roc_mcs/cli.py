@@ -15,11 +15,13 @@ def main() -> int:
         prog="roc-mcs",
         description="Build ROC map from MCS files."
     )
-    parser.add_argument("--config", type=Path, default=None, 
-                        help="Path to YAML config file")    
-    parser.add_argument("folder", type=Path, 
+
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--config", type=Path, 
+                       help="Path to YAML config file")
+    group.add_argument("folder", type=Path, 
                         help="Folder with .mcs files")
-    parser.add_argument("--amplitude", type=float, required=True,
+    parser.add_argument("--amplitude", type=float,
                         help="Current piezo amplitude, mVpp")
     parser.add_argument("--reference-amplitude", type=float, default=400.0,
                         help="Reference amplitude used for calibration, mVpp")
@@ -38,8 +40,9 @@ def main() -> int:
         reference_amplitude = cfg.get("reference_amplitude", 400.0)
         reference_angle = cfg.get("reference_angle", 180.0)
         results_folder = cfg.get("results_folder")
-
     else:
+        if args.amplitude is None:
+            parser.error("--amplitude is required when --config is not used")        
         folder = args.folder
         amplitude = args.amplitude
         reference_amplitude = args.reference_amplitude
