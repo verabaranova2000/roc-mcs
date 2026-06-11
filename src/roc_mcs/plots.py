@@ -35,11 +35,11 @@ def plot_roc_map(roc_map):
     return fig
 
 
-def save_figure(fig, folder, filename="roc.png", dpi=300):
-    folder = Path(folder)
-    folder.mkdir(parents=True, exist_ok=True)
+def save_figure(fig, output_folder, filename="roc.png", dpi=300):
+    output_folder = Path(output_folder)
+    output_folder.mkdir(parents=True, exist_ok=True)
 
-    outpath = folder / filename
+    outpath = output_folder / filename
     fig.savefig(outpath, dpi=dpi, bbox_inches="tight")
 
     print(f"Figure saved: {outpath.resolve()}")

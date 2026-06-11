@@ -1,7 +1,7 @@
 import pandas as pd
 from pathlib import Path
 
-def export_roc_map_excel(roc_map, filename="rocking_curve_dynamics.xlsx", folder=None):
+def export_roc_map_excel(roc_map, output_folder=None, filename="rocking_curve_dynamics.xlsx"):
     """
     Экспорт ROC-карт и метаданных эксперимента в Excel.
 
@@ -11,17 +11,17 @@ def export_roc_map_excel(roc_map, filename="rocking_curve_dynamics.xlsx", folder
         Результат build_roc_map().
     filename : str
         Имя выходного Excel-файла.
-    folder : str | Path | None
+    output_folder : str | Path | None
         Каталог сохранения.
         Если None — используется текущая директория.
     """
 
-    if folder is None:
-        folder = Path.cwd()
+    if output_folder is None:
+        output_folder = Path.cwd()
     else:
-        folder = Path(folder)
-    folder.mkdir(parents=True, exist_ok=True)
-    output_file = folder / filename
+        output_folder = Path(output_folder)
+    output_folder.mkdir(parents=True, exist_ok=True)
+    output_file = output_folder / filename
 
     # ---------- ось Y ----------
     if "theta_axis" in roc_map:

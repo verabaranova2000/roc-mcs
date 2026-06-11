@@ -53,17 +53,20 @@ def main() -> int:
     output_folder = output_folder or (input_folder / "results")
 
     roc_map, fig = run_experiment(
-        folder=input_folder,
+        input_folder=input_folder,
         amplitude=amplitude,
         reference_amplitude=reference_amplitude,
         reference_angle=reference_angle,
     )
 
-    save_figure(fig, output_folder, "roc_map.png")
-
+    save_figure(
+        fig,
+        output_folder=output_folder,
+        filename="roc_map.png",
+    )
     export_roc_map_excel(
         roc_map,
-        folder=output_folder,
+        output_folder=output_folder,
         filename="rocking_curve_dynamics.xlsx",
     )
 
