@@ -1,0 +1,19 @@
+# results.py
+from dataclasses import dataclass
+import numpy as np
+
+from roc_mcs.fitting.params import FitParameter
+
+
+
+
+@dataclass(slots=True)
+class FitResult:
+    model: str
+    parameters: dict[str, FitParameter]
+    metrics: dict[str, float]
+    y_fit_global: np.ndarray | None = None
+    y_fit_local: np.ndarray | None = None
+    covariance: np.ndarray | None = None
+    success: bool = True
+    message: str = ""
