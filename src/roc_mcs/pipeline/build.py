@@ -4,13 +4,14 @@ from roc_mcs.processing.calibration import calibrate_roc_map
 from roc_mcs.io.mcs import load_mcs, find_mcs_files 
 from roc_mcs.plots import plot_roc_map, save_figure
 from roc_mcs.export import export_roc_map_excel
-def process_mcs(mcs, branch="up"):
+
+def process_mcs(mcs, phi, branch="up"):
     """ Функция обработки одного файла """
     counts = mcs["counts"]
     n_channels = mcs["n_channels"]
-    phi, _ = find_phase(counts, n_channels)
+    # phi, _ = find_phase(counts, n_channels)
     s_branch, I_branch = extract_branch(counts, phi, n_channels, branch=branch)
-    return mcs["header"]["file_info"]["datetime"], phi, s_branch, I_branch
+    return mcs["header"]["file_info"]["datetime"], s_branch, I_branch
 
 
 def build_roc_map(folder, branch="up"):
@@ -25,22 +26,33 @@ def build_roc_map(folder, branch="up"):
     }
 
     files = find_mcs_files(folder)
+    if not files:
+        raise ValueError(f"В каталоге не обнаружены файлы .mcs: {folder}")
+
+
+    # --- фаза только по первому файлу ---
+    first_mcs = load_mcs(files[0])
+    counts = first_mcs["counts"]
+    n_channels = first_mcs["n_channels"]
+    phi, _ = find_phase(counts, n_channels)    
+    roc_map["phi"] = float(phi)
+
     for file in files:
         mcs = load_mcs(file)
-        t, phi, s_branch, I_branch = process_mcs(mcs, branch=branch)
+        t, s_branch, I_branch = process_mcs(mcs, phi=phi, branch=branch)
 
         if roc_map["s_axis"] is None:
             roc_map["s_axis"] = s_branch.copy()                            # ось Y
         roc_map["file_name"].append(mcs["file_name"])
         roc_map["time"].append(t)
-        roc_map["phi"].append(phi)
+        #roc_map["phi"].append(phi)
         roc_map["intensity"].append(I_branch)
 
     t = np.asarray(roc_map["time"])
     t0 = t[0]
     roc_map["time_s"] = np.array([(ti - t0).total_seconds() for ti in t])  # ось X 
     roc_map["intensity"] = np.asarray(roc_map["intensity"])             # ось Z
-    roc_map["phi"] = np.asarray(roc_map["phi"])
+    #roc_map["phi"] = np.asarray(roc_map["phi"])
     
     return roc_map
 

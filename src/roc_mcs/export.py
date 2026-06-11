@@ -43,12 +43,21 @@ def export_roc_map_excel(roc_map, output_folder=None, filename="rocking_curve_dy
         "file_name": roc_map["file_name"],
         "datetime": roc_map["time"],        
         "time_s": time_s,
-        "phi": roc_map["phi"],
+        #"phi": roc_map["phi"],
+    })
+    # ---------- Calibration ----------
+    calibration_df = pd.DataFrame({
+        "phi": [roc_map["phi"]],
+        "reference_amplitude": [roc_map.get("calibration", {}).get("reference_amplitude")],
+        "reference_angle": [roc_map.get("calibration", {}).get("reference_angle")],
+        "amplitude": [roc_map.get("calibration", {}).get("amplitude")],
+        "scale": [roc_map["calibration"]["scale"]],
     })
 
     with pd.ExcelWriter(output_file) as writer:
         roc_df.to_excel(writer, sheet_name="ROC", index=False)
         meta_df.to_excel(writer, sheet_name="Metadata", index=False)  
-        
+        calibration_df.to_excel(writer, sheet_name="Calibration", index=False)
+
     print(f"Excel-файл сохранён: {output_file.resolve()}")
     return output_file  
