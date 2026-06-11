@@ -19,7 +19,8 @@ def main() -> int:
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--config", type=Path, 
                        help="Path to YAML config file")
-    group.add_argument("--folder", type=Path, 
+    group.add_argument("--input-folder", 
+                       type=Path, 
                         help="Folder with .mcs files")
     parser.add_argument("--amplitude", type=float,
                         help="Current piezo amplitude, mVpp")
@@ -27,7 +28,7 @@ def main() -> int:
                         help="Reference amplitude used for calibration, mVpp")
     parser.add_argument("--reference-angle", type=float, default=180.0,
                         help="Reference angle used for calibration, arcsec",)
-    parser.add_argument("--results-folder", type=Path, default=None,
+    parser.add_argument("--output-folder", type=Path, default=None,
                         help="Folder for output files")
 
     args = parser.parse_args()
@@ -35,46 +36,38 @@ def main() -> int:
     if args.config is not None:
         cfg = load_config(args.config)
 
-        folder = Path(cfg["input_folder"])
+        input_folder = Path(cfg["input_folder"])
         amplitude = cfg["amplitude"]
         reference_amplitude = cfg.get("reference_amplitude", 400.0)
         reference_angle = cfg.get("reference_angle", 180.0)
-        results_folder = cfg.get("results_folder")
+        output_folder = cfg.get("output_folder")
     else:
         if args.amplitude is None:
             parser.error("--amplitude is required when --config is not used")        
-        folder = args.folder
+        input_folder = args.input_folder
         amplitude = args.amplitude
         reference_amplitude = args.reference_amplitude
         reference_angle = args.reference_angle
-        results_folder = args.results_folder
+        output_folder = args.output_folder
 
-    # results_folder = args.results_folder or (args.folder / "results")
-    results_folder = results_folder or (folder / "results")
+    output_folder = output_folder or (input_folder / "results")
 
     roc_map, fig = run_experiment(
-        folder=folder,
+        folder=input_folder,
         amplitude=amplitude,
         reference_amplitude=reference_amplitude,
         reference_angle=reference_angle,
     )
 
-    # roc_map, fig = run_experiment(
-    #     folder=args.folder,
-    #     amplitude=args.amplitude,
-    #     reference_amplitude=args.reference_amplitude,
-    #     reference_angle=args.reference_angle,
-    # )
-
-    save_figure(fig, results_folder, "roc_map.png")
+    save_figure(fig, output_folder, "roc_map.png")
 
     export_roc_map_excel(
         roc_map,
-        folder=results_folder,
+        folder=output_folder,
         filename="rocking_curve_dynamics.xlsx",
     )
 
-    print(f"Done. Results saved to: {results_folder.resolve()}")
+    print(f"Done. Results saved to: {output_folder.resolve()}")
     return 0
 
 

@@ -46,15 +46,15 @@ def build_roc_map(folder, branch="up"):
 
 
 def run_experiment(
-    folder,
+    input_folder,
     amplitude,
     reference_amplitude,
     reference_angle,
-    results_folder=None,
+    output_folder=None,
     save_excel=True,
     save_figure_flag=True,
 ):
-    roc_map = build_roc_map(folder)
+    roc_map = build_roc_map(input_folder)
     roc_map = calibrate_roc_map(
         roc_map,
         amplitude=amplitude,
@@ -64,14 +64,14 @@ def run_experiment(
 
     fig = plot_roc_map(roc_map)
 
-    if results_folder is not None:
+    if output_folder is not None:
         if save_figure_flag:
-            save_figure(fig, results_folder, "roc_map.png")
+            save_figure(fig, output_folder, "roc_map.png")
 
         if save_excel:
             export_roc_map_excel(
                 roc_map,
-                folder=results_folder,
+                folder=output_folder,
                 filename="rocking_curve_dynamics.xlsx",
             )
     return roc_map, fig
