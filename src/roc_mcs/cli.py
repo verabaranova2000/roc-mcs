@@ -8,7 +8,7 @@ from roc_mcs.io.config import load_config
 from roc_mcs.pipeline.build import run_experiment
 from roc_mcs.export import export_roc_map_excel
 from roc_mcs.plots import save_figure
-from roc_mcs.diagnostics.registry import DIAGNOSTICS
+from roc_mcs.diagnostics.registry import DIAGNOSTICS, parse_diagnostics
 
 
 def main() -> int:
@@ -44,7 +44,7 @@ def main() -> int:
         reference_angle = cfg.get("reference_angle", 180.0)
         output_folder = cfg.get("output_folder")
         diag_cfg = cfg.get("diagnostics", "")
-        diagnostics = [DIAGNOSTICS[name] for name in (diag_cfg.split(",") if diag_cfg else [])]
+        diagnostics = parse_diagnostics(cfg.get("diagnostics", []))
     else:
         if args.amplitude is None:
             parser.error("--amplitude is required when --config is not used")        
@@ -53,7 +53,7 @@ def main() -> int:
         reference_amplitude = args.reference_amplitude
         reference_angle = args.reference_angle
         output_folder = args.output_folder
-        diagnostics = [DIAGNOSTICS[name] for name in args.diagnostics.split(",") if name]
+        diagnostics = parse_diagnostics(args.diagnostics)
 
     output_folder = output_folder or (input_folder / "results")
 
