@@ -57,7 +57,7 @@ def main() -> int:
         reference_amplitude = args.reference_amplitude
         reference_angle = args.reference_angle
         output_folder = args.output_folder
-        diag_names = cfg.get("diagnostics", "")
+        diag_names = [name.strip() for name in args.diagnostics.split(",") if name.strip()]
         print("diag_names =", repr(diag_names))
         diagnostics = [DIAGNOSTICS[name] for name in diag_names]
         print('diagnostics', diagnostics)
