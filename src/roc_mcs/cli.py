@@ -8,6 +8,7 @@ from roc_mcs.io.config import load_config
 from roc_mcs.pipeline.build import run_experiment
 from roc_mcs.export import export_roc_map_excel
 from roc_mcs.plots import save_figure
+from roc_mcs.diagnostics.registry import DIAGNOSTICS
 
 
 def main() -> int:
@@ -30,7 +31,8 @@ def main() -> int:
                         help="Reference angle used for calibration, arcsec",)
     parser.add_argument("--output-folder", type=Path, default=None,
                         help="Folder for output files")
-
+    parser.add_argument("--diagnostics", type=str, default="",
+                        help="Comma-separated list of diagnostics, e.g. phase,branch")
     args = parser.parse_args()
 
     if args.config is not None:
@@ -41,6 +43,8 @@ def main() -> int:
         reference_amplitude = cfg.get("reference_amplitude", 400.0)
         reference_angle = cfg.get("reference_angle", 180.0)
         output_folder = cfg.get("output_folder")
+        diag_cfg = cfg.get("diagnostics", "")
+        diagnostics = [DIAGNOSTICS[name] for name in (diag_cfg.split(",") if diag_cfg else [])]
     else:
         if args.amplitude is None:
             parser.error("--amplitude is required when --config is not used")        
@@ -49,6 +53,7 @@ def main() -> int:
         reference_amplitude = args.reference_amplitude
         reference_angle = args.reference_angle
         output_folder = args.output_folder
+        diagnostics = [DIAGNOSTICS[name] for name in args.diagnostics.split(",") if name]
 
     output_folder = output_folder or (input_folder / "results")
 
@@ -57,18 +62,20 @@ def main() -> int:
         amplitude=amplitude,
         reference_amplitude=reference_amplitude,
         reference_angle=reference_angle,
+        output_folder=output_folder,
+        diagnostics=diagnostics,
     )
 
-    save_figure(
-        fig,
-        output_folder=output_folder,
-        filename="roc_map.png",
-    )
-    export_roc_map_excel(
-        roc_map,
-        output_folder=output_folder,
-        filename="rocking_curve_dynamics.xlsx",
-    )
+    # save_figure(
+    #     fig,
+    #     output_folder=output_folder,
+    #     filename="roc_map.png",
+    # )
+    # export_roc_map_excel(
+    #     roc_map,
+    #     output_folder=output_folder,
+    #     filename="rocking_curve_dynamics.xlsx",
+    # )
 
     print(f"Done. Results saved to: {output_folder.resolve()}")
     return 0

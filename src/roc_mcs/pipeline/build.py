@@ -1,4 +1,6 @@
 import numpy as np
+
+from pathlib import Path
 from roc_mcs.processing.alignment import find_phase, extract_branch
 from roc_mcs.processing.calibration import calibrate_roc_map
 from roc_mcs.io.mcs import load_mcs, find_mcs_files 
@@ -29,12 +31,11 @@ def build_roc_map(folder, branch="up"):
     if not files:
         raise ValueError(f"В каталоге не обнаружены файлы .mcs: {folder}")
 
-
     # --- фаза только по первому файлу ---
     first_mcs = load_mcs(files[0])
     counts = first_mcs["counts"]
     n_channels = first_mcs["n_channels"]
-    phi, _ = find_phase(counts, n_channels)    
+    phi, scores = find_phase(counts, n_channels)    
     roc_map["phi"] = float(phi)
 
     for file in files:
@@ -45,16 +46,22 @@ def build_roc_map(folder, branch="up"):
             roc_map["s_axis"] = s_branch.copy()                            # ось Y
         roc_map["file_name"].append(mcs["file_name"])
         roc_map["time"].append(t)
-        #roc_map["phi"].append(phi)
         roc_map["intensity"].append(I_branch)
 
     t = np.asarray(roc_map["time"])
     t0 = t[0]
     roc_map["time_s"] = np.array([(ti - t0).total_seconds() for ti in t])  # ось X 
     roc_map["intensity"] = np.asarray(roc_map["intensity"])             # ось Z
-    #roc_map["phi"] = np.asarray(roc_map["phi"])
-    
-    return roc_map
+
+    qc_context = {
+        "best_phi": float(phi),
+        "scores": scores,
+        "counts": counts,
+        "n_channels": n_channels,
+        "file_name": first_mcs["file_name"],
+    }
+
+    return roc_map, qc_context
 
 
 def run_experiment(
@@ -65,8 +72,9 @@ def run_experiment(
     output_folder=None,
     save_excel=True,
     save_figure_flag=True,
+    diagnostics=(),
 ):
-    roc_map = build_roc_map(input_folder)
+    roc_map, qc = build_roc_map(input_folder)
     roc_map = calibrate_roc_map(
         roc_map,
         amplitude=amplitude,
@@ -77,13 +85,18 @@ def run_experiment(
     fig = plot_roc_map(roc_map)
 
     if output_folder is not None:
+        output_folder = Path(output_folder)
+        qc_folder = output_folder / "qc"
+        qc_folder.mkdir(parents=True, exist_ok=True)   
+
         if save_figure_flag:
             save_figure(fig, output_folder, "roc_map.png")
 
         if save_excel:
-            export_roc_map_excel(
-                roc_map,
-                folder=output_folder,
-                filename="rocking_curve_dynamics.xlsx",
-            )
+            export_roc_map_excel(roc_map, output_folder, filename="rocking_curve_dynamics.xlsx")
+
+        for diagnostic in diagnostics:
+            diag_fig = diagnostic(qc)
+            save_figure(diag_fig, qc_folder, f"{diagnostic.__name__}.png")        
+
     return roc_map, fig
