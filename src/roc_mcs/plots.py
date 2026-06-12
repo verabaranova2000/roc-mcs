@@ -1,6 +1,6 @@
-from pathlib import Path
 import matplotlib.pyplot as plt
-import numpy as np
+from roc_mcs.utils import resolve_output_folder
+
 
 from roc_mcs.processing.alignment import extract_branch
 
@@ -100,12 +100,10 @@ def plot_phase_diagnostics(qc):
 
 
 
-def save_figure(fig, output_folder, filename="roc.png", dpi=300):
-    output_folder = Path(output_folder)
+def save_figure(fig, output_folder=None, filename="roc.png", dpi=300):
+    output_folder = resolve_output_folder(output_folder)
     output_folder.mkdir(parents=True, exist_ok=True)
 
     outpath = output_folder / filename
     fig.savefig(outpath, dpi=dpi, bbox_inches="tight")
-
-    print(f"Figure saved: {outpath.resolve()}")
     return outpath

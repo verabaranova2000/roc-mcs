@@ -1,5 +1,6 @@
 import pandas as pd
-from pathlib import Path
+from roc_mcs.utils import resolve_output_folder
+
 
 def export_roc_map_excel(roc_map, output_folder=None, filename="rocking_curve_dynamics.xlsx"):
     """
@@ -15,11 +16,7 @@ def export_roc_map_excel(roc_map, output_folder=None, filename="rocking_curve_dy
         Каталог сохранения.
         Если None — используется текущая директория.
     """
-
-    if output_folder is None:
-        output_folder = Path.cwd()
-    else:
-        output_folder = Path(output_folder)
+    output_folder = resolve_output_folder(output_folder)
     output_folder.mkdir(parents=True, exist_ok=True)
     output_file = output_folder / filename
 
@@ -59,5 +56,4 @@ def export_roc_map_excel(roc_map, output_folder=None, filename="rocking_curve_dy
         meta_df.to_excel(writer, sheet_name="Metadata", index=False)  
         calibration_df.to_excel(writer, sheet_name="Calibration", index=False)
 
-    print(f"Excel-файл сохранён: {output_file.resolve()}")
     return output_file  

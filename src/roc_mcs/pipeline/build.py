@@ -1,17 +1,18 @@
 import numpy as np
 
-from pathlib import Path
+
 from roc_mcs.processing.alignment import find_phase, extract_branch
 from roc_mcs.processing.calibration import calibrate_roc_map
 from roc_mcs.io.mcs import load_mcs, find_mcs_files 
 from roc_mcs.plots import plot_roc_map, save_figure
 from roc_mcs.export import export_roc_map_excel
+from roc_mcs.utils import resolve_output_folder
+
 
 def process_mcs(mcs, phi, branch="up"):
     """ Функция обработки одного файла """
     counts = mcs["counts"]
     n_channels = mcs["n_channels"]
-    # phi, _ = find_phase(counts, n_channels)
     s_branch, I_branch = extract_branch(counts, phi, n_channels, branch=branch)
     return mcs["header"]["file_info"]["datetime"], s_branch, I_branch
 
@@ -70,10 +71,12 @@ def run_experiment(
     reference_amplitude,
     reference_angle,
     output_folder=None,
-    save_excel=True,
+    save_excel_flag=True,
     save_figure_flag=True,
     diagnostics=(),
 ):
+    output_folder = resolve_output_folder(output_folder)
+
     roc_map, qc = build_roc_map(input_folder)
     roc_map = calibrate_roc_map(
         roc_map,
@@ -84,19 +87,24 @@ def run_experiment(
 
     fig = plot_roc_map(roc_map)
 
-    if output_folder is not None:
-        output_folder = Path(output_folder)
-        qc_folder = output_folder / "qc"
-        qc_folder.mkdir(parents=True, exist_ok=True)   
+    qc_folder = output_folder / "qc"
+    qc_folder.mkdir(parents=True, exist_ok=True)
 
-        if save_figure_flag:
-            save_figure(fig, output_folder, "roc_map.png")
+    artifacts = []
 
-        if save_excel:
-            export_roc_map_excel(roc_map, output_folder, filename="rocking_curve_dynamics.xlsx")
+    # --- ROC figure ---
+    if save_figure_flag:
+        artifacts.append(
+            save_figure(fig, output_folder, "roc_map.png"))
+    # --- Excel ---
+    if save_excel_flag:
+        artifacts.append(
+            export_roc_map_excel(roc_map, output_folder, "rocking_curve_dynamics.xlsx",))
 
-        for diagnostic in diagnostics:
-            diag_fig = diagnostic(qc)
-            save_figure(diag_fig, qc_folder, f"{diagnostic.__name__}.png")        
+    # --- diagnostics ---
+    for diagnostic in diagnostics:
+        diag_fig = diagnostic(qc)
+        artifacts.append(
+            save_figure(diag_fig, qc_folder, f"{diagnostic.__name__}.png"))
 
-    return roc_map, fig
+    return roc_map, fig,  artifacts

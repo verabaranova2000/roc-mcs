@@ -6,9 +6,8 @@ from pathlib import Path
 
 from roc_mcs.io.config import load_config
 from roc_mcs.pipeline.build import run_experiment
-from roc_mcs.export import export_roc_map_excel
-from roc_mcs.plots import save_figure
-from roc_mcs.diagnostics.registry import DIAGNOSTICS, parse_diagnostics
+from roc_mcs.reporting import print_run_report
+from roc_mcs.diagnostics.registry import DIAGNOSTICS
 
 
 def main() -> int:
@@ -42,7 +41,7 @@ def main() -> int:
         reference_amplitude = cfg.get("reference_amplitude", 400.0)
         reference_angle = cfg.get("reference_angle", 180.0)
         output_folder = cfg.get("output_folder")
-        diag_names = cfg.get("diagnostics", "")
+        diag_names = cfg.get("diagnostics", [])
         diagnostics = [DIAGNOSTICS[name] for name in diag_names]
     else:
         if args.amplitude is None:
@@ -57,27 +56,19 @@ def main() -> int:
 
     output_folder = output_folder or (input_folder / "results")
 
-    roc_map, fig = run_experiment(
+    roc_map, fig, artifacts = run_experiment(
         input_folder=input_folder,
         amplitude=amplitude,
         reference_amplitude=reference_amplitude,
         reference_angle=reference_angle,
         output_folder=output_folder,
+        save_excel_flag=True,
+        save_figure_flag=True,
         diagnostics=diagnostics,
     )
+    print_run_report(output_folder, artifacts)
 
-    # save_figure(
-    #     fig,
-    #     output_folder=output_folder,
-    #     filename="roc_map.png",
-    # )
-    # export_roc_map_excel(
-    #     roc_map,
-    #     output_folder=output_folder,
-    #     filename="rocking_curve_dynamics.xlsx",
-    # )
 
-    print(f"Done. Results saved to: {output_folder.resolve()}")
     return 0
 
 
