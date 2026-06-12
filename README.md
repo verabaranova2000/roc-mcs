@@ -37,12 +37,13 @@ roc-mcs --input-folder <PATH> \
         [--reference-amplitude <REFERENCE_AMPLITUDE_MVPP>] \
         [--reference-angle <REFERENCE_ANGLE_ARCSEC>] \
         [--output-folder <OUTPUT_FOLDER>]
+        [--diagnostics <DIAGNOSTICS>]
 ```
 
 Пример:
 
 ```bash
-roc-mcs --input-folder "D:\experiment" --amplitude 600 --reference-amplitude 400 --reference-angle 180
+roc-mcs --input-folder "D:\experiment" --amplitude 600 --reference-amplitude 400 --reference-angle 180 --diagnostics phase,metrics
 ```
 
 ### 2. Запуск через YAML-конфигурацию
@@ -59,6 +60,9 @@ input_folder: "D:/experiment"
 amplitude: 600
 reference_amplitude: 400
 reference_angle: 180
+
+diagnostics: 
+  - phase
 
 output_folder: null
 ```
@@ -78,6 +82,7 @@ YAML-ключи соответствуют аргументам командно
 | `--reference-amplitude` | Опорная амплитуда пьезоактуатора для калибровки (по умолчанию: 400 mVpp)            |
 | `--reference-angle`     | Угловой диапазон, соответствующий опорной амплитуде (по умолчанию: ±180 arcsec)  |
 | `--output-folder`      | Каталог сохранения результатов. Если не задан (т.е. `null`), результаты сохраняются в `<input-folder>/results` |
+| `--diagnostics`      | Список диагностик для сохранения в подкаталоге `<output-folder>/qc` |
 
 ---
 
@@ -87,5 +92,6 @@ YAML-ключи соответствуют аргументам командно
 После выполнения создаются:
 
 * `roc_map.png` — ROC-карта;
-* `rocking_curve_dynamics.xlsx` — таблица интенсивностей и метаданных эксперимента.
+* `rocking_curve_dynamics.xlsx` — таблица интенсивностей и метаданных эксперимента;
+* `qc/*.png` — диагностические графики, если они были включены.
 

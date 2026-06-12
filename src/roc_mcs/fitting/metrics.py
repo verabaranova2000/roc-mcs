@@ -1,4 +1,3 @@
-# metrics.py
 import numpy as np
 
 def r_factor(y_exp: np.ndarray, y_fit: np.ndarray) -> float:
@@ -48,5 +47,5 @@ def compute_fit_metrics(y_exp: np.ndarray, y_fit: np.ndarray, n_params: int,) ->
         "RMSE": rmse(y_exp, y_fit),
         "NRMSE": nrmse(y_exp, y_fit),
         "chi2_red": poisson_reduced_chi_square(y_exp, y_fit, n_params=n_params,),  # "χ²_red"
-        "eta": cosine_similarity(y_exp, y_fit),   # "η"
+        "cosine_similarity": cosine_similarity(y_exp, y_fit),   # "η"
     }

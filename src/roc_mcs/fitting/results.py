@@ -17,3 +17,11 @@ class FitResult:
     covariance: np.ndarray | None = None
     success: bool = True
     message: str = ""
+
+    @property
+    def y_fit(self):
+        if self.y_fit_local is not None:
+            return self.y_fit_local
+        if self.y_fit_global is not None:
+            return self.y_fit_global
+        return None    
