@@ -43,8 +43,9 @@ def main() -> int:
         reference_amplitude = cfg.get("reference_amplitude", 400.0)
         reference_angle = cfg.get("reference_angle", 180.0)
         output_folder = cfg.get("output_folder")
-        diag_cfg = cfg.get("diagnostics", "")
-        diagnostics = parse_diagnostics(cfg.get("diagnostics", []))
+        diag_names = cfg.get("diagnostics", "")
+        diagnostics = [DIAGNOSTICS[name] for name in diag_names]
+        print('diagnostics', diagnostics)
     else:
         if args.amplitude is None:
             parser.error("--amplitude is required when --config is not used")        
