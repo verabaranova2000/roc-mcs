@@ -1,27 +1,3 @@
-def format_run_report(output_folder, files_created, diagnostics=None):
-    lines = []
-    lines.append("=" * 50)
-    lines.append("Обработка завершена")
-    lines.append("")
-    lines.append("Каталог результатов:")
-    lines.append(f"  {output_folder}")
-    lines.append("")
-    lines.append("Сформированные файлы:")
-
-    for f in files_created:
-        lines.append(f"  • {f}")
-
-    if diagnostics:
-        lines.append("")
-        lines.append("Диагностические графики:")
-        for d in diagnostics:
-            lines.append(f"  • qc/{d}.png")
-
-    lines.append("=" * 50)
-    return "\n".join(lines)
-
-
-
 from pathlib import Path
 
 def print_run_report(output_folder, files):

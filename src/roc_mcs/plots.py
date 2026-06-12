@@ -1,8 +1,9 @@
 import matplotlib.pyplot as plt
+
 from roc_mcs.utils import resolve_output_folder
-
-
 from roc_mcs.processing.alignment import extract_branch
+from roc_mcs.fitting.analysis import MODEL_ANALYSIS
+
 
 def plot_roc_map(roc_map):
     time_s = roc_map["time_s"]         # X
@@ -97,6 +98,39 @@ def plot_phase_diagnostics(qc):
     ax[1].grid(True, alpha=0.25, linewidth=0.6)
     ax[1].legend(frameon=False)
     return fig
+
+
+def plot_model_evolution(df_fit, x="time"):
+    """
+    Графики эволюции параметров модели.
+
+    Parameters
+    ----------
+    df_fit : pandas.DataFrame
+        Таблица результатов подгонки.
+    x : str, default="time"
+        Название столбца, используемого по оси X
+        (например: "time", "index").
+    """
+    model_name = df_fit["model"].iloc[0]
+    spec = MODEL_ANALYSIS.get(model_name, {})
+
+    for group in spec.get("plot_groups", []):
+        n = len(group)
+        fig, axes = plt.subplots(1, n, figsize=(4*n, 3.5), constrained_layout=True,)
+        if n == 1:
+            axes = [axes]
+        for ax, (key, label) in zip(axes, group):
+            if key not in df_fit.columns:
+                ax.set_visible(False)
+                continue
+
+            ax.plot(df_fit[x], df_fit[key], marker="o")
+            ax.set_ylabel(label)
+            ax.set_xlabel(x)
+            ax.grid(True)
+
+        plt.show() 
 
 
 
