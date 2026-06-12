@@ -16,12 +16,11 @@ def main() -> int:
         description="Build ROC map from MCS files."
     )
 
-    group = parser.add_mutually_exclusive_group(required=True)
+    group = parser.add_mutually_exclusive_group()
     group.add_argument("--config", type=Path, 
                        help="Path to YAML config file")
-    group.add_argument("--input-folder", 
-                       type=Path, 
-                        help="Folder with .mcs files")
+    group.add_argument("--input-folder", type=Path,
+                        help="Folder with .mcs files (default: current directory)")
     parser.add_argument("--amplitude", type=float,
                         help="Current piezo amplitude, mVpp")
     parser.add_argument("--reference-amplitude", type=float, default=400.0,
@@ -46,7 +45,7 @@ def main() -> int:
     else:
         if args.amplitude is None:
             parser.error("--amplitude is required when --config is not used")        
-        input_folder = args.input_folder
+        input_folder = args.input_folder or Path.cwd()
         amplitude = args.amplitude
         reference_amplitude = args.reference_amplitude
         reference_angle = args.reference_angle
@@ -67,7 +66,6 @@ def main() -> int:
         diagnostics=diagnostics,
     )
     print_run_report(output_folder, artifacts)
-
 
     return 0
 
