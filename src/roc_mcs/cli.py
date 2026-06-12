@@ -36,20 +36,15 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.config is not None:
-        print("CONFIG MODE")
         cfg = load_config(args.config)
-        print(cfg)
         input_folder = Path(cfg["input_folder"])
         amplitude = cfg["amplitude"]
         reference_amplitude = cfg.get("reference_amplitude", 400.0)
         reference_angle = cfg.get("reference_angle", 180.0)
         output_folder = cfg.get("output_folder")
         diag_names = cfg.get("diagnostics", "")
-        print("diag_names =", repr(diag_names))
         diagnostics = [DIAGNOSTICS[name] for name in diag_names]
-        print('diagnostics', diagnostics)
     else:
-        print("MANUAL MODE")
         if args.amplitude is None:
             parser.error("--amplitude is required when --config is not used")        
         input_folder = args.input_folder
@@ -58,9 +53,7 @@ def main() -> int:
         reference_angle = args.reference_angle
         output_folder = args.output_folder
         diag_names = [name.strip() for name in args.diagnostics.split(",") if name.strip()]
-        print("diag_names =", repr(diag_names))
         diagnostics = [DIAGNOSTICS[name] for name in diag_names]
-        print('diagnostics', diagnostics)
 
     output_folder = output_folder or (input_folder / "results")
 
