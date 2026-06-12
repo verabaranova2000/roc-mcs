@@ -36,14 +36,16 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.config is not None:
+        print("CONFIG MODE")
         cfg = load_config(args.config)
-
+        print(cfg)
         input_folder = Path(cfg["input_folder"])
         amplitude = cfg["amplitude"]
         reference_amplitude = cfg.get("reference_amplitude", 400.0)
         reference_angle = cfg.get("reference_angle", 180.0)
         output_folder = cfg.get("output_folder")
         diag_names = cfg.get("diagnostics", "")
+        print("diag_names =", repr(diag_names))
         diagnostics = [DIAGNOSTICS[name] for name in diag_names]
         print('diagnostics', diagnostics)
     else:
