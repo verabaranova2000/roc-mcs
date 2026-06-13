@@ -34,3 +34,15 @@ def augment_results(results, theta, time=None):
             row["FWHM"] = spec["fwhm"](r, theta)
         rows.append(row)
     return pd.DataFrame(rows)
+
+
+def prepare_fit_table_for_export(df):
+    df = df.copy()
+    drop_columns = ["index", "model", "success", "message"]
+    df = df.drop(columns=[c for c in drop_columns if c in df.columns])
+
+    preferred_order = ["time", "theta0", "FWHM"]
+    ordered_cols = [c for c in preferred_order if c in df.columns]
+    ordered_cols += [c for c in df.columns if c not in ordered_cols]
+    df = df[ordered_cols]
+    return df

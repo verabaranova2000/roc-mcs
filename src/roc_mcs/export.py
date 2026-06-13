@@ -1,6 +1,6 @@
 import pandas as pd
 from roc_mcs.utils import resolve_output_folder
-
+from roc_mcs.fitting.postprocessing import prepare_fit_table_for_export
 
 def export_roc_map_excel(roc_map, output_folder=None, filename="rocking_curve_dynamics.xlsx", fit_tables=None):
     """
@@ -61,5 +61,6 @@ def export_roc_map_excel(roc_map, output_folder=None, filename="rocking_curve_dy
         
         for model_name, df_fit in fit_tables.items():
             sheet_name = f"Fit_{model_name}"[:31]   # ограничение Excel
-            df_fit.to_excel(writer, sheet_name=sheet_name, index=False)
+            export_df = prepare_fit_table_for_export(df_fit)
+            export_df.to_excel(writer, sheet_name=sheet_name, index=False)
     return output_file  
