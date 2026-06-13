@@ -6,7 +6,7 @@ from roc_mcs.processing.calibration import calibrate_roc_map
 from roc_mcs.io.mcs import load_mcs, find_mcs_files 
 from roc_mcs.plots import plot_roc_map, plot_model_evolution, save_figure
 from roc_mcs.export import export_roc_map_excel
-from roc_mcs.utils import resolve_output_folder
+from roc_mcs.utils import resolve_output_folder, ensure_folder
 from roc_mcs.pipeline.fit import fit_roc_map
 from roc_mcs.fitting.postprocessing import augment_results
 
@@ -91,12 +91,9 @@ def run_experiment(
     roc_fig = plot_roc_map(roc_map)
 
     artifacts = []
-    qc_folder = output_folder / "qc"
-    fit_folder = output_folder / "fit"
-
-    qc_folder.mkdir(parents=True, exist_ok=True)
-    fit_folder.mkdir(parents=True, exist_ok=True)
-
+    qc_folder = ensure_folder(output_folder / "qc") if diagnostics else None
+    fit_folder = ensure_folder(output_folder / "fit") if fit_models else None
+    
     fit_tables = {}   
     for model in fit_models:
         results = fit_roc_map(roc_map, model)
