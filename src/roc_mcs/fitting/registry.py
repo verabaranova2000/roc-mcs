@@ -90,3 +90,17 @@ MODEL_SPECS = {
         bounds_fn=split_voigt_bounds,
     )
 }   
+
+
+
+# ======================================
+# Валидация моделей
+# ======================================
+def validate_model(model_name):
+    if model_name not in MODEL_SPECS:
+        available = ", ".join(sorted(MODEL_SPECS))
+
+        raise ValueError(
+            f"Неизвестная модель '{model_name}'. "
+            f"Доступные модели: {available}."
+        )

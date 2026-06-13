@@ -7,6 +7,8 @@ from roc_mcs.io.mcs import load_mcs, find_mcs_files
 from roc_mcs.plots import plot_roc_map, save_figure
 from roc_mcs.export import export_roc_map_excel
 from roc_mcs.utils import resolve_output_folder
+from roc_mcs.pipeline.fit import fit_roc_map
+from roc_mcs.fitting.postprocessing import augment_results
 
 
 def process_mcs(mcs, phi, branch="up"):
@@ -74,6 +76,7 @@ def run_experiment(
     save_excel_flag=True,
     save_figure_flag=True,
     diagnostics=(),
+    fit_models=()
 ):
     output_folder = resolve_output_folder(output_folder)
 
@@ -90,8 +93,16 @@ def run_experiment(
     qc_folder = output_folder / "qc"
     qc_folder.mkdir(parents=True, exist_ok=True)
 
-    artifacts = []
+    fit_tables = {}
+    for model in fit_models:
+        results = fit_roc_map(roc_map, model)
+        fit_tables[model] = augment_results(
+            results,
+            theta=roc_map["theta_axis"],
+            time=roc_map["time_s"],
+        )
 
+    artifacts = []
     # --- ROC figure ---
     if save_figure_flag:
         artifacts.append(
@@ -99,7 +110,8 @@ def run_experiment(
     # --- Excel ---
     if save_excel_flag:
         artifacts.append(
-            export_roc_map_excel(roc_map, output_folder, "rocking_curve_dynamics.xlsx",))
+            export_roc_map_excel(roc_map, output_folder, "rocking_curve_dynamics.xlsx",
+                                 fit_tables=fit_tables,))
 
     # --- diagnostics ---
     for diagnostic in diagnostics:
@@ -107,4 +119,4 @@ def run_experiment(
         artifacts.append(
             save_figure(diag_fig, qc_folder, f"{diagnostic.__name__}.png"))
 
-    return roc_map, fig,  artifacts
+    return roc_map, fig, fit_tables, artifacts

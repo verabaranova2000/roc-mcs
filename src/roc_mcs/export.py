@@ -2,7 +2,7 @@ import pandas as pd
 from roc_mcs.utils import resolve_output_folder
 
 
-def export_roc_map_excel(roc_map, output_folder=None, filename="rocking_curve_dynamics.xlsx"):
+def export_roc_map_excel(roc_map, output_folder=None, filename="rocking_curve_dynamics.xlsx", fit_tables=None):
     """
     Экспорт ROC-карт и метаданных эксперимента в Excel.
 
@@ -19,6 +19,9 @@ def export_roc_map_excel(roc_map, output_folder=None, filename="rocking_curve_dy
     output_folder = resolve_output_folder(output_folder)
     output_folder.mkdir(parents=True, exist_ok=True)
     output_file = output_folder / filename
+
+    if fit_tables is None:
+        fit_tables = {}
 
     # ---------- ось Y ----------
     if "theta_axis" in roc_map:
@@ -55,5 +58,8 @@ def export_roc_map_excel(roc_map, output_folder=None, filename="rocking_curve_dy
         roc_df.to_excel(writer, sheet_name="ROC", index=False)
         meta_df.to_excel(writer, sheet_name="Metadata", index=False)  
         calibration_df.to_excel(writer, sheet_name="Calibration", index=False)
-
+        
+        for model_name, df_fit in fit_tables.items():
+            sheet_name = f"Fit_{model_name}"[:31]   # ограничение Excel
+            df_fit.to_excel(writer, sheet_name=sheet_name, index=False)
     return output_file  

@@ -1,9 +1,10 @@
 from tqdm import tqdm
 
 from roc_mcs.fitting.optimize import FitConfig, fit_curve
-
+from roc_mcs.fitting.registry import validate_model
 
 def fit_roc_map(roc_map, model_name="gauss", show_progress=True):
+    validate_model(model_name)
     theta = roc_map["theta_axis"]
     time = roc_map["time_s"]
     intensity_map = roc_map["intensity"]
