@@ -59,7 +59,7 @@ def main() -> int:
 
     output_folder = output_folder or (input_folder / "results")
 
-    roc_map, fig, artifacts = run_experiment(
+    roc_map, fig, fit_tables, artifacts = run_experiment(
         input_folder=input_folder,
         amplitude=amplitude,
         reference_amplitude=reference_amplitude,
