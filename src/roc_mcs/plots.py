@@ -4,6 +4,18 @@ from roc_mcs.utils import resolve_output_folder
 from roc_mcs.processing.alignment import extract_branch
 from roc_mcs.fitting.analysis import MODEL_ANALYSIS
 
+PLOT_STYLE = {
+    "font.family": "serif",
+    "mathtext.fontset": "stix",
+    "axes.labelsize": 11,
+    "axes.titlesize": 12,
+    "legend.fontsize": 9,
+    "xtick.labelsize": 10,
+    "ytick.labelsize": 10,
+}
+
+plt.rcParams.update(PLOT_STYLE)
+
 
 def plot_roc_map(roc_map):
     time_s = roc_map["time_s"]         # X
@@ -44,15 +56,15 @@ def plot_phase_diagnostics(qc):
     n_channels = qc["n_channels"]
     best_phi = qc["best_phi"]
     scores = qc["scores"]
-    plt.rcParams.update({
-        "font.family": "serif",
-        "mathtext.fontset": "stix",
-        "axes.labelsize": 11,
-        "axes.titlesize": 12,
-        "legend.fontsize": 10,
-        "xtick.labelsize": 10,
-        "ytick.labelsize": 10,
-    })
+    # plt.rcParams.update({
+    #     "font.family": "serif",
+    #     "mathtext.fontset": "stix",
+    #     "axes.labelsize": 11,
+    #     "axes.titlesize": 12,
+    #     "legend.fontsize": 10,
+    #     "xtick.labelsize": 10,
+    #     "ytick.labelsize": 10,
+    # })
     fig, ax = plt.subplots(1, 2, figsize=(13.5, 4.2), constrained_layout=True)
     
     # -------------------------
@@ -100,7 +112,21 @@ def plot_phase_diagnostics(qc):
     return fig
 
 
-def plot_model_evolution(df_fit, x="time"):
+COLORS = {
+    "nature": ("#3C5488", "#B24745"),      # сине-фиолетовый + приглушённый красный
+    "classic": ("#1f3b73", "#8b1e3f"),     # тёмно-синий + бордовый
+    "green": ("#1b5e20", "#8e244d"),       # тёмно-зелёный + бордовый
+    "okabe": ("#0072B2", "#D55E00"),       # синий + киноварь
+    "bw": ("black", "#a11d33"),            # чёрный + тёмно-красный
+}
+
+COLOR_LEFT, COLOR_RIGHT = COLORS["nature"]
+
+
+def plot_model_evolution(df_fit, x="time", max_cols=2, 
+                         figsize_per_panel=(5.4, 3.6), 
+                         y_dual=False):  # y_mode="shared" | "dual"
+                        
     """
     Графики эволюции параметров модели.
 
@@ -109,28 +135,110 @@ def plot_model_evolution(df_fit, x="time"):
     df_fit : pandas.DataFrame
         Таблица результатов подгонки.
     x : str, default="time"
-        Название столбца, используемого по оси X
-        (например: "time", "index").
+        Название столбца, используемого по оси X.
+    max_cols : int, default=2
+        Максимальное число панелей в одном ряду.
+    figsize_per_panel : tuple, default=(5.4, 3.6)
+        Размер одной панели (ширина, высота).
+    y_dual : bool, default=False
+        Если True, для панелей с двумя кривыми используется
+        дополнительная правая ось Y с независимым масштабом.
+        Если False, все кривые отображаются на общей оси Y.
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+        Объект Figure с построенными графиками.
     """
+    if df_fit.empty:
+        raise ValueError("df_fit is empty")
+
     model_name = df_fit["model"].iloc[0]
     spec = MODEL_ANALYSIS.get(model_name, {})
+    groups = spec.get("plot_groups", [])
 
-    for group in spec.get("plot_groups", []):
-        n = len(group)
-        fig, axes = plt.subplots(1, n, figsize=(4*n, 3.5), constrained_layout=True,)
-        if n == 1:
-            axes = [axes]
-        for ax, (key, label) in zip(axes, group):
-            if key not in df_fit.columns:
-                ax.set_visible(False)
-                continue
+    if not groups:
+        raise ValueError(f"No plot_groups defined for model '{model_name}'")
 
-            ax.plot(df_fit[x], df_fit[key], marker="o")
-            ax.set_ylabel(label)
+    # plt.rcParams.update({
+    #     "font.family": "serif",
+    #     "mathtext.fontset": "stix",
+    #     "axes.labelsize": 11,
+    #     "axes.titlesize": 12,
+    #     "legend.fontsize": 9,
+    #     "xtick.labelsize": 10,
+    #     "ytick.labelsize": 10,
+    # })
+
+    n_panels = len(groups)
+    ncols = min(max_cols, n_panels)
+    nrows = math.ceil(n_panels / ncols)
+
+    fig, axes = plt.subplots(nrows, ncols, 
+                             figsize=(figsize_per_panel[0] * ncols, figsize_per_panel[1] * nrows),
+                             constrained_layout=True)
+
+    if n_panels == 1:
+        axes = [axes]
+    else:
+        axes = axes.flatten()
+        
+    for ax, group in zip(axes, groups):
+        plotted_any = False
+        available = [(key, label) for key, label in group if key in df_fit.columns]
+        if not available:
+            ax.set_visible(False)
+            continue
+    
+        # Если ровно 2 кривые — делаем две оси Y
+        if y_dual and len(available) == 2:    # if y_mode == "dual" and len(available) == 2:
+            (key1, label1), (key2, label2) = available
+            ax2 = ax.twinx()
+            l1 = ax.plot(df_fit[x], df_fit[key1], marker="o", 
+                         lw=1.2, ms=3.5, color=COLOR_LEFT, label=label1)
+            l2 = ax2.plot(df_fit[x], df_fit[key2], marker="s", 
+                          lw=1.2, ms=3.5, color=COLOR_RIGHT, label=label2)
+    
+            ax.set_title(f"{label1} / {label2}")
             ax.set_xlabel(x)
-            ax.grid(True)
+            ax.set_ylabel(label1) #, color=COLOR_LEFT)
+            ax.tick_params(axis="y", labelcolor=COLOR_LEFT)
+            ax2.set_ylabel(label2) #,  color=COLOR_RIGHT)
+            ax2.tick_params(axis="y", labelcolor=COLOR_RIGHT)
+    
+            ax.grid(True, alpha=0.25, linewidth=0.6)
+            ax.spines["top"].set_visible(False)
+            ax2.spines["top"].set_visible(False)
+    
+            # общий legend для обеих осей
+            lines = l1 + l2
+            labels = [line.get_label() for line in lines]
+            ax.legend(lines, labels, frameon=False, loc="best")
+    
+        else:
+            for key, label in available:
+                ax.plot(df_fit[x], df_fit[key], marker="o", lw=1.2, ms=3.5, 
+                        color=COLOR_LEFT, label=label)
+                plotted_any = True
+    
+            panel_title = ", ".join(label for _, label in available)
+            ax.set_title(panel_title)
+            ax.set_xlabel(x)
+            ax.set_ylabel(available[0][1] if len(available) == 1 else panel_title) #, color=COLOR_LEFT)
+            ax.tick_params(axis="y", labelcolor=COLOR_LEFT)
+            ax.grid(True, alpha=0.25, linewidth=0.6)
+            ax.spines["top"].set_visible(False)
+            ax.spines["right"].set_visible(False)
+    
+            if len(available) > 1:
+                ax.legend(frameon=False)
+        plotted_any = True
 
-        plt.show() 
+    for ax in axes[n_panels:]:      # скрыть лишние пустые оси
+        ax.set_visible(False)
+    return fig
+
+
 
 
 

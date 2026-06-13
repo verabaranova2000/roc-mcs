@@ -9,7 +9,7 @@ class AnalysisSpec:
     primary_plots: list[str]
 
 
-MODEL_ANALYSIS = {
+MODEL_ANALYSIS_v0 = {
     "lorentz": {
         "fwhm": lambda r, theta: 2 * r.parameters["gamma"].value,
     
@@ -68,6 +68,81 @@ MODEL_ANALYSIS = {
         ],
     },
 }    
+
+
+
+MODEL_ANALYSIS = {
+    "lorentz": {
+        "fwhm": lambda r, theta: 2 * r.parameters["gamma"].value,
+        "derived": {},
+        "plot_groups": [
+            [("theta0", "θ₀"), ("FWHM", "FWHM")],
+            [("S", "S")],
+        ],
+    },
+
+    "gauss": {
+        "fwhm": lambda r, theta: 2 * np.sqrt(2 * np.log(2)) * r.parameters["sigma"].value,
+        "derived": {},
+        "plot_groups": [
+            [("theta0", "θ₀"), ("FWHM", "FWHM")],
+            [("sigma", "σ")],
+            [("S", "S")],
+        ],
+    },
+
+    "gauss_us": {
+        "fwhm": lambda r, theta: 2 * np.sqrt(2 * np.log(2)) * r.parameters["sigma"].value,
+        "derived": {},
+        "plot_groups": [
+            [("theta0", "θ₀"), ("FWHM", "FWHM")],
+            [("sigma", "σ"), ("Delta", "Δ")],
+            [("S", "S")],
+        ],
+    },
+
+    "voigt": {
+        "fwhm": lambda r, theta: (
+            0.5346 * 2 * r.parameters["gamma"].value
+            + np.sqrt(
+                0.2166 * (2 * r.parameters["gamma"].value) ** 2
+                + (2.3548 * r.parameters["sigma"].value) ** 2
+            )
+        ),
+        "derived": {},
+        "plot_groups": [
+            [("theta0", "θ₀"), ("FWHM", "FWHM")],
+            [("sigma", "σ"), ("gamma", "γ")],
+            [("S", "S")],
+        ],
+    },
+
+    "pvoigt": {
+        "fwhm": lambda r, theta: r.parameters["H"].value,
+        "derived": {},
+        "plot_groups": [
+            [("theta0", "θ₀"), ("FWHM", "FWHM")],
+            [("eta", "η")],
+            [("S", "S")],
+        ],
+    },
+
+    "split_voigt": {
+        "fwhm": lambda r, theta: estimate_fwhm(theta, r.y_fit),
+        "derived": {
+            "beta_G_mean": lambda p: 0.5 * (p["beta_Gl"] + p["beta_Gr"]),
+            "beta_C_mean": lambda p: 0.5 * (p["beta_Cl"] + p["beta_Cr"]),
+            "beta_G_asym": lambda p: p["beta_Gr"] - p["beta_Gl"],
+            "beta_C_asym": lambda p: p["beta_Cr"] - p["beta_Cl"],
+        },
+        "plot_groups": [
+            [("theta0", "θ₀"), ("FWHM", "FWHM")],
+            [("beta_G_mean", "β_G mean"), ("beta_C_mean", "β_C mean")],
+            [("beta_G_asym", "β_G asym"), ("beta_C_asym", "β_C asym")],
+            [("S", "S")],
+        ],
+    },
+}
 
 
 # ==================================================

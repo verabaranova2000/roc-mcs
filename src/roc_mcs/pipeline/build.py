@@ -1,10 +1,10 @@
 import numpy as np
-
+import matplotlib.pyplot as plt
 
 from roc_mcs.processing.alignment import find_phase, extract_branch
 from roc_mcs.processing.calibration import calibrate_roc_map
 from roc_mcs.io.mcs import load_mcs, find_mcs_files 
-from roc_mcs.plots import plot_roc_map, save_figure
+from roc_mcs.plots import plot_roc_map, plot_model_evolution, save_figure
 from roc_mcs.export import export_roc_map_excel
 from roc_mcs.utils import resolve_output_folder
 from roc_mcs.pipeline.fit import fit_roc_map
@@ -88,12 +88,16 @@ def run_experiment(
         reference_angle=reference_angle,
     )
 
-    fig = plot_roc_map(roc_map)
+    roc_fig = plot_roc_map(roc_map)
 
+    artifacts = []
     qc_folder = output_folder / "qc"
-    qc_folder.mkdir(parents=True, exist_ok=True)
+    fit_folder = output_folder / "fit"
 
-    fit_tables = {}
+    qc_folder.mkdir(parents=True, exist_ok=True)
+    fit_folder.mkdir(parents=True, exist_ok=True)
+
+    fit_tables = {}   
     for model in fit_models:
         results = fit_roc_map(roc_map, model)
         fit_tables[model] = augment_results(
@@ -102,11 +106,11 @@ def run_experiment(
             time=roc_map["time_s"],
         )
 
-    artifacts = []
     # --- ROC figure ---
     if save_figure_flag:
         artifacts.append(
-            save_figure(fig, output_folder, "roc_map.png"))
+            save_figure(roc_fig, output_folder, "roc_map.png"))
+        plt.close(roc_fig)
     # --- Excel ---
     if save_excel_flag:
         artifacts.append(
@@ -119,4 +123,11 @@ def run_experiment(
         artifacts.append(
             save_figure(diag_fig, qc_folder, f"{diagnostic.__name__}.png"))
 
-    return roc_map, fig, fit_tables, artifacts
+    # --- model evolution figures ---
+    if save_figure_flag:    
+        for model in fit_models:
+            evol_fig = plot_model_evolution(fit_tables[model], y_dual=True)
+            artifacts.append(
+                save_figure(evol_fig, fit_folder, f"model_evolution_{model}.png"))
+            plt.close(evol_fig)
+    return roc_map, roc_fig, fit_tables, artifacts
