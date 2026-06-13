@@ -36,7 +36,8 @@ roc-mcs --input-folder <PATH> \
         --amplitude <AMPLITUDE_MVPP> \
         [--reference-amplitude <REFERENCE_AMPLITUDE_MVPP>] \
         [--reference-angle <REFERENCE_ANGLE_ARCSEC>] \
-        [--output-folder <OUTPUT_FOLDER>]
+        [--output-folder <OUTPUT_FOLDER>] \
+        [--fit-models <FIT_MODELS>] \
         [--diagnostics <DIAGNOSTICS>]
 ```
 
@@ -46,8 +47,9 @@ roc-mcs --amplitude 600 --diagnostics phase
 ```
 
 ```bash
-roc-mcs --input-folder "D:\experiment" --amplitude 600 --reference-amplitude 400 --reference-angle 180 --diagnostics phase,metrics
+roc-mcs --input-folder "D:\experiment" --amplitude 600 --reference-amplitude 400 --reference-angle 180 --fit-models gauss,pvoigt --diagnostics phase,metrics
 ```
+При отсутствии параметра `--input-folder` используется текущий рабочий каталог.
 
 ### 2. Запуск через YAML-конфигурацию
 
@@ -64,6 +66,9 @@ amplitude: 600
 reference_amplitude: 400
 reference_angle: 180
 
+fit_models: 
+  - gauss
+  - pvoigt
 diagnostics: 
   - phase
 
@@ -85,6 +90,7 @@ YAML-ключи соответствуют аргументам командно
 | `--reference-amplitude` | Опорная амплитуда пьезоактуатора для калибровки (по умолчанию: 400 mVpp)            |
 | `--reference-angle`     | Угловой диапазон, соответствующий опорной амплитуде (по умолчанию: ±180 arcsec)  |
 | `--output-folder`      | Каталог сохранения результатов. Если не задан (т.е. `null`), результаты сохраняются в `<input-folder>/results` |
+| `--fit-models`      | Список моделей подгонки ROC-кривых `<output-folder>/qc` |
 | `--diagnostics`      | Список диагностик для сохранения в подкаталоге `<output-folder>/qc` |
 
 ---
@@ -95,6 +101,5 @@ YAML-ключи соответствуют аргументам командно
 После выполнения создаются:
 
 * `roc_map.png` — ROC-карта;
-* `rocking_curve_dynamics.xlsx` — таблица интенсивностей;
+* `rocking_curve_dynamics.xlsx` — ттаблица интенсивностей, метаданных и результатов подгонки;
 * `qc/*.png` — диагностические графики, если они были включены.
-
