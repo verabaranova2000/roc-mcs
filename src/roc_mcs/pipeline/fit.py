@@ -10,7 +10,7 @@ def fit_roc_map(roc_map, model_name="gauss", show_progress=True):
     intensity_map = roc_map["intensity"]
 
     results = []
-    iterator = tqdm(time) if show_progress else time
+    iterator = tqdm(time, desc=f"Model: {model_name:<14}") if show_progress else time
     for i, t in enumerate(iterator):
         I = intensity_map[i, :]
         res = fit_curve(theta, I, FitConfig(model_name=model_name))
