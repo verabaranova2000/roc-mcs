@@ -4,12 +4,12 @@ import matplotlib.pyplot as plt
 from roc_mcs.processing.alignment import find_phase, extract_branch
 from roc_mcs.processing.calibration import calibrate_roc_map
 from roc_mcs.io.mcs import load_mcs, find_mcs_files 
-from roc_mcs.plots import plot_roc_map, plot_model_evolution, save_figure
+from roc_mcs.plots import plot_roc_map, plot_model_evolution, plot_residual_maps, save_figure
 from roc_mcs.export import export_roc_map_excel
 from roc_mcs.utils import resolve_output_folder, ensure_folder
 from roc_mcs.pipeline.fit import fit_roc_map, run_fit_analysis
 from roc_mcs.fitting.postprocessing import augment_results
-
+from roc_mcs.fitting.metrics import compute_map_metrics
 
 def process_mcs(mcs, phi, branch="up"):
     """ Функция обработки одного файла """
@@ -94,11 +94,23 @@ def run_experiment(
     qc_folder = ensure_folder(output_folder / "qc") if diagnostics else None
     fit_folder = ensure_folder(output_folder / "fit") if fit_models else None
     
-    fit_tables = {}   
+    fit_tables = {}
+    diff_maps = {}
+    metrics = {}
     for model in fit_models:
         results = fit_roc_map(roc_map, model)
         fit_tables[model] = augment_results(results, 
                                             theta=roc_map["theta_axis"], time=roc_map["time_s"])
+
+    for model_name in fit_models:
+        results = fit_roc_map(roc_map, model_name=model_name, show_progress=show_progress)
+        df_fit = augment_results(results, theta=roc_map["theta_axis"], time=roc_map["time_s"])
+        fit_tables[model_name] = df_fit
+
+        I_model = np.array([res.y_fit for res in results])
+        diff_maps[model_name] = roc_map["intensity"] - I_model
+        metrics[model_name] = compute_map_metrics(roc_map["intensity"], I_model)
+        
 
     # --- ROC figure ---
     if save_figure_flag:
@@ -124,5 +136,11 @@ def run_experiment(
             artifacts.append(
                 save_figure(evol_fig, fit_folder, f"model_evolution_{model}.png"))
             plt.close(evol_fig)
+
+        theta = roc_map["theta_axis"]
+        time = roc_map["time_s"]        
+        residual_fig = plot_residual_maps(time, theta, diff_maps,  metrics=metrics)
+        artifacts.append(
+            save_figure(residual_fig , fit_folder, f"residual_maps.png"))
     return roc_map, roc_fig, fit_tables, artifacts
 
