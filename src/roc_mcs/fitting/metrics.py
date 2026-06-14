@@ -1,5 +1,9 @@
 import numpy as np
 
+
+# ==================================================
+# curve metrics
+# ==================================================
 def r_factor(y_exp: np.ndarray, y_fit: np.ndarray) -> float:
     return np.sum(np.abs(y_exp - y_fit)) / np.sum(np.abs(y_exp))
 
@@ -36,6 +40,11 @@ def poisson_reduced_chi_square(y_exp: np.ndarray, y_fit: np.ndarray, n_params: i
     y_exp_safe = np.clip(y_exp, 1.0, None)
     return np.sum((y_exp_safe - y_fit) ** 2 / y_exp_safe) / dof
 
+def bias(y_exp: np.ndarray, y_fit: np.ndarray) -> float:
+    return np.mean(y_exp - y_fit)
+
+def mae(y_exp: np.ndarray, y_fit: np.ndarray) -> float:
+    return np.mean(np.abs(y_exp - y_fit))
 
 
 # ==================================================
@@ -48,4 +57,15 @@ def compute_fit_metrics(y_exp: np.ndarray, y_fit: np.ndarray, n_params: int,) ->
         "NRMSE": nrmse(y_exp, y_fit),
         "chi2_red": poisson_reduced_chi_square(y_exp, y_fit, n_params=n_params,),  # "χ²_red"
         "cosine_similarity": cosine_similarity(y_exp, y_fit),   # "η"
+    }
+
+# ==================================================
+# map metrics
+# ==================================================
+
+def compute_map_metrics(y_exp: np.ndarray, y_fit: np.ndarray) -> dict[str, float]:
+    return {
+        "RMSE": rmse(y_exp, y_fit),
+        "MAE": mae(y_exp, y_fit),
+        "BIAS": bias(y_exp, y_fit),
     }

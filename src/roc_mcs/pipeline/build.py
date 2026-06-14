@@ -7,7 +7,7 @@ from roc_mcs.io.mcs import load_mcs, find_mcs_files
 from roc_mcs.plots import plot_roc_map, plot_model_evolution, save_figure
 from roc_mcs.export import export_roc_map_excel
 from roc_mcs.utils import resolve_output_folder, ensure_folder
-from roc_mcs.pipeline.fit import fit_roc_map
+from roc_mcs.pipeline.fit import fit_roc_map, run_fit_analysis
 from roc_mcs.fitting.postprocessing import augment_results
 
 
@@ -94,14 +94,18 @@ def run_experiment(
     qc_folder = ensure_folder(output_folder / "qc") if diagnostics else None
     fit_folder = ensure_folder(output_folder / "fit") if fit_models else None
     
-    fit_tables = {}   
-    for model in fit_models:
-        results = fit_roc_map(roc_map, model)
-        fit_tables[model] = augment_results(
-            results,
-            theta=roc_map["theta_axis"],
-            time=roc_map["time_s"],
-        )
+    # fit_tables = {}   
+    # for model in fit_models:
+    #     results = fit_roc_map(roc_map, model)
+    #     fit_tables[model] = augment_results(results, 
+    #                                         theta=roc_map["theta_axis"], time=roc_map["time_s"])
+    fit_bundle = None
+    if fit_models:
+        fit_bundle = run_fit_analysis(roc_map, fit_models=fit_models, 
+                                      show_progress=True, plot_residuals=True, plot_evolution=True)
+    fit_tables = fit_bundle["fit_tables"] if fit_bundle else {}
+    residual_fig = fit_bundle["residual_fig"] if fit_bundle else None
+
 
     # --- ROC figure ---
     if save_figure_flag:
@@ -120,11 +124,24 @@ def run_experiment(
         artifacts.append(
             save_figure(diag_fig, qc_folder, f"{diagnostic.__name__}.png"))
 
+    # # --- model evolution figures ---
+    # if save_figure_flag:    
+    #     for model in fit_models:
+    #         evol_fig = plot_model_evolution(fit_tables[model], y_dual=True)
+    #         artifacts.append(
+    #             save_figure(evol_fig, fit_folder, f"model_evolution_{model}.png"))           
+    #         plt.close(evol_fig)
+
     # --- model evolution figures ---
-    if save_figure_flag:    
-        for model in fit_models:
-            evol_fig = plot_model_evolution(fit_tables[model], y_dual=True)
+    if save_figure_flag and fit_models:
+        for model_name, evol_fig in fit_bundle["figures"].items():
             artifacts.append(
-                save_figure(evol_fig, fit_folder, f"model_evolution_{model}.png"))
+                save_figure(evol_fig, fit_folder, f"model_evolution_{model_name}.png"))
             plt.close(evol_fig)
+
+        if fit_bundle["residual_fig"] is not None:
+            artifacts.append(
+                save_figure(fit_bundle["residual_fig"], fit_folder, "residual_maps.png"))
+            plt.close(fit_bundle["residual_fig"])            
     return roc_map, roc_fig, fit_tables, artifacts
+

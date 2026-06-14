@@ -1,5 +1,6 @@
 import matplotlib.pyplot as plt
 import math
+import numpy as np
 
 from roc_mcs.utils import resolve_output_folder
 from roc_mcs.processing.alignment import extract_branch
@@ -16,6 +17,20 @@ PLOT_STYLE = {
 }
 
 plt.rcParams.update(PLOT_STYLE)
+
+
+def style_line_axes(ax):
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.tick_params(direction="out", length=3, width=0.8)
+    ax.grid(True, alpha=0.25, linewidth=0.6)
+
+def style_map_axes(ax):
+    for spine in ax.spines.values():
+        spine.set_visible(True)
+        spine.set_linewidth(0.8)
+    ax.grid(False)
+    ax.tick_params(direction="out", length=3, width=0.8)  
 
 
 def plot_roc_map(roc_map):
@@ -46,7 +61,7 @@ def plot_roc_map(roc_map):
     ax.set_xlabel("Time (s)")
     ax.set_ylabel(ylabel)
     ax.set_title("Rocking curve dynamics")
-
+    style_map_axes(ax)
     plt.tight_layout()
     return fig
 
@@ -57,15 +72,6 @@ def plot_phase_diagnostics(qc):
     n_channels = qc["n_channels"]
     best_phi = qc["best_phi"]
     scores = qc["scores"]
-    # plt.rcParams.update({
-    #     "font.family": "serif",
-    #     "mathtext.fontset": "stix",
-    #     "axes.labelsize": 11,
-    #     "axes.titlesize": 12,
-    #     "legend.fontsize": 10,
-    #     "xtick.labelsize": 10,
-    #     "ytick.labelsize": 10,
-    # })
     fig, ax = plt.subplots(1, 2, figsize=(13.5, 4.2), constrained_layout=True)
     
     # -------------------------
@@ -76,7 +82,7 @@ def plot_phase_diagnostics(qc):
     
     ax[0].set_title( r"Зависимость дисперсии остатка от фазового сдвига")
     ax[0].set_xlabel(r"Фазовый сдвиг, $\varphi$")
-    ax[0].set_ylabel(r"Дисперсия остатка $\mathcal{C}(\varphi)=\mathrm{Var}(I-I_{\mathrm{smooth}})$")
+    ax[0].set_ylabel(r"Дисперсия остатка, $\mathcal{C}(\varphi)=\mathrm{Var}(I-I_{\mathrm{smooth}})$")
     
     ymin, ymax = ax[0].get_ylim()
     ax[0].annotate(
@@ -161,16 +167,6 @@ def plot_model_evolution(df_fit, x="time", max_cols=2,
     if not groups:
         raise ValueError(f"No plot_groups defined for model '{model_name}'")
 
-    # plt.rcParams.update({
-    #     "font.family": "serif",
-    #     "mathtext.fontset": "stix",
-    #     "axes.labelsize": 11,
-    #     "axes.titlesize": 12,
-    #     "legend.fontsize": 9,
-    #     "xtick.labelsize": 10,
-    #     "ytick.labelsize": 10,
-    # })
-
     n_panels = len(groups)
     ncols = min(max_cols, n_panels)
     nrows = math.ceil(n_panels / ncols)
@@ -210,7 +206,6 @@ def plot_model_evolution(df_fit, x="time", max_cols=2,
             ax.grid(True, alpha=0.25, linewidth=0.6)
             ax.spines["top"].set_visible(False)
             ax2.spines["top"].set_visible(False)
-    
             # общий legend для обеих осей
             lines = l1 + l2
             labels = [line.get_label() for line in lines]
@@ -230,7 +225,7 @@ def plot_model_evolution(df_fit, x="time", max_cols=2,
             ax.grid(True, alpha=0.25, linewidth=0.6)
             ax.spines["top"].set_visible(False)
             ax.spines["right"].set_visible(False)
-    
+            
             if len(available) > 1:
                 ax.legend(frameon=False)
         plotted_any = True
@@ -240,6 +235,67 @@ def plot_model_evolution(df_fit, x="time", max_cols=2,
     return fig
 
 
+
+def plot_residual_maps(
+    time,
+    theta,
+    diff_maps,
+    metrics=None,
+    title="Residual maps",   # title="Разностные карты",
+    max_cols=2,
+):
+    """
+    Грид разностных ROC-карт.
+    Максимум max_cols графиков в строке.
+    """
+    models = list(diff_maps.keys())
+    n = len(models)
+
+    ncols = min(max_cols, n)
+    nrows = math.ceil(n / ncols)
+
+    fig, axes = plt.subplots(nrows, ncols, figsize=(4.5 * ncols, 3.8 * nrows),
+                             sharex=True, sharey=True, constrained_layout=True)
+    axes = np.atleast_1d(axes).ravel()
+
+    # Общая цветовая шкала
+    all_vals = np.concatenate([diff_maps[m].ravel() for m in models])
+    vmax = np.nanmax(np.abs(all_vals))
+    vmin = -vmax
+    
+    labels = "abcdefghijklmnopqrstuvwxyz"
+
+    for i, (ax, model) in enumerate(zip(axes, models)):
+        im = ax.imshow(diff_maps[model].T,
+                       aspect="auto", origin="lower", cmap="RdBu_r",
+                       vmin=vmin, vmax=vmax,
+                       extent=[time[0], time[-1], theta.min(), theta.max()])
+        if metrics is not None and model in metrics:
+            metric_dict = metrics[model]
+            txt = []
+            for key in ("RMSE", "MAE", "BIAS"):
+                if key in metric_dict:
+                    txt.append(f"{key} = {metric_dict[key]:.4f}")
+            ax.text(
+                0.02, 0.98,
+                "\n".join(txt),
+                transform=ax.transAxes,
+                va="top", ha="left", multialignment="left", fontsize=8, 
+                bbox=dict(facecolor="white", edgecolor="0.8", linewidth=0.5, alpha=0.9, pad=1.5)
+            )       
+        ax.set_title(f"({labels[i]}) {model}", fontsize=11, fontweight="normal")
+        ax.set_xlabel("Time (s)")
+        style_map_axes(ax)
+
+    for ax in axes[n:]:         # скрыть пустые оси
+        ax.set_visible(False)
+    for row in range(nrows):    # подписи только по левому краю
+        axes[row * ncols].set_ylabel(r"$\theta$")      
+
+    cbar = fig.colorbar(im, ax=axes[:n], fraction=0.03, pad=0.02)
+    cbar.set_label("Residual intensity (Exp − Calc)")     # cbar.set_label("Разность интенсивностей (эксп. − расч.)")
+    fig.suptitle(title, fontsize=13, fontweight="bold")
+    return fig
 
 
 
