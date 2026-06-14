@@ -103,7 +103,7 @@ def run_experiment(
                                             theta=roc_map["theta_axis"], time=roc_map["time_s"])
 
     for model_name in fit_models:
-        results = fit_roc_map(roc_map, model_name=model_name, show_progress=show_progress)
+        results = fit_roc_map(roc_map, model_name)
         df_fit = augment_results(results, theta=roc_map["theta_axis"], time=roc_map["time_s"])
         fit_tables[model_name] = df_fit
 
