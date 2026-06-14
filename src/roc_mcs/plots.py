@@ -19,11 +19,11 @@ PLOT_STYLE = {
 plt.rcParams.update(PLOT_STYLE)
 
 
-# def style_line_axes(ax):    # Ломает всё! или нет?...
-#     ax.spines["top"].set_visible(False)
-#     ax.spines["right"].set_visible(False)
-#     ax.tick_params(direction="out", length=3, width=0.8)
-#     ax.grid(True, alpha=0.25, linewidth=0.6)
+def style_line_axes(ax):   
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.tick_params(direction="out", length=3, width=0.8)
+    ax.grid(True, alpha=0.25, linewidth=0.6)
 
 def style_map_axes(ax):
     for spine in ax.spines.values():
