@@ -19,7 +19,7 @@ PLOT_STYLE = {
 plt.rcParams.update(PLOT_STYLE)
 
 
-# def style_line_axes(ax):    # Ломает всё!
+# def style_line_axes(ax):    # Ломает всё! или нет?...
 #     ax.spines["top"].set_visible(False)
 #     ax.spines["right"].set_visible(False)
 #     ax.tick_params(direction="out", length=3, width=0.8)
