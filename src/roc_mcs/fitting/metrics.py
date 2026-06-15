@@ -4,10 +4,20 @@ import numpy as np
 # ==================================================
 # curve metrics
 # ==================================================
+def sse(y_exp: np.ndarray, y_fit: np.ndarray) -> float:
+    """
+    Sum of squared errors.
+    он не нормирован → чувствителен к амплитуде (важно для ROC-кривых с разной интенсивностью)
+    он совпадает с loss-функционалом в curve_fit
+    """
+    return np.sum((y_exp - y_fit) ** 2)
+
 def r_factor(y_exp: np.ndarray, y_fit: np.ndarray) -> float:
+    """ L1-норма (другая геометрия) """
     return np.sum(np.abs(y_exp - y_fit)) / np.sum(np.abs(y_exp))
 
 def rmse(y_exp: np.ndarray, y_fit: np.ndarray) -> float:
+    """ нормированная версия SSE """
     return np.sqrt(np.mean((y_exp - y_fit) ** 2))
 
 def nrmse(y_exp: np.ndarray, y_fit: np.ndarray) -> float:
@@ -18,7 +28,7 @@ def cosine_similarity(y_exp: np.ndarray, y_fit: np.ndarray) -> float:
 
 
 def chi_square(y_exp: np.ndarray, y_fit: np.ndarray, sigma: np.ndarray) -> float:
-    """ Classical chi-square. """
+    """ Classical chi-square. SSE с весами и поправкой на степени свободы """
     return np.sum(((y_exp - y_fit) / sigma) ** 2)
 
 def reduced_chi_square(y_exp: np.ndarray, y_fit: np.ndarray, sigma: np.ndarray, n_params: int) -> float:
@@ -52,6 +62,7 @@ def mae(y_exp: np.ndarray, y_fit: np.ndarray) -> float:
 # ==================================================
 def compute_fit_metrics(y_exp: np.ndarray, y_fit: np.ndarray, n_params: int,) -> dict[str, float]:
     return {
+        "SSE": sse(y_exp, y_fit),
         "R_factor": r_factor(y_exp, y_fit),
         "RMSE": rmse(y_exp, y_fit),
         "NRMSE": nrmse(y_exp, y_fit),
