@@ -32,7 +32,6 @@ from roc_mcs.fitting.models import (
 from roc_mcs.fitting.models import (
     batch_model_lorentz,
     batch_model_gauss,
-    #batch_model_gauss_us,
     batch_model_voigt,
     batch_model_pvoigt,
     batch_model_emg,
@@ -69,7 +68,7 @@ MODEL_SPECS = {
     "gauss_us": ModelSpec(
         name="gauss_us",
         func=model_gauss_us,
-        batch_func=batch_model_gauss_us,
+        batch_func=model_gauss_us,   # ⚠️
         param_names=("S", "theta0", "sigma", "Delta"),
         guess_fn=gauss_us_guess,
         bounds_fn=gauss_us_bounds,
