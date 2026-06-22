@@ -32,7 +32,7 @@ from roc_mcs.fitting.models import (
 from roc_mcs.fitting.models import (
     batch_model_lorentz,
     batch_model_gauss,
-    batch_model_gauss_us,
+    #batch_model_gauss_us,
     batch_model_voigt,
     batch_model_pvoigt,
     batch_model_emg,
