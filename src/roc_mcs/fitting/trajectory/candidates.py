@@ -127,7 +127,7 @@ def generate_time_candidates_nd(
         for col, idx in enumerate(vary_idx):
             X_full[:, idx] = X_vary[:, col]
 
-        scores = score_candidates_batch(theta=theta, intensity=I, batch_func=spec.batch_func, X_full=X_full)
+        scores = score_candidates_batch(theta=theta, intensity=I, batch_model_func=spec.batch_func, X_full=X_full)
         all_time_candidates.append(CandidateCloud(X=X_full, scores=scores))
 
     return all_time_candidates
