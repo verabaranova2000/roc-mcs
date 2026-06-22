@@ -97,14 +97,14 @@ def generate_time_candidates_nd(
     spec = MODEL_SPECS[model_name]
     theta = roc_map["theta_axis"]
     intensity_map = roc_map["intensity"]
-  
-    missing = [k for k in vary_keys if k not in full_keys]
-    if missing:
-        raise KeyError(f"param_keys contain unknown parameters: {missing}")
     
     full_keys = tuple(spec.param_names)
     vary_keys = tuple(param_keys)
     vary_idx = [full_keys.index(k) for k in vary_keys]
+
+    missing = [k for k in vary_keys if k not in full_keys]
+    if missing:
+        raise KeyError(f"param_keys contain unknown parameters: {missing}")    
     
     all_time_candidates = []
     iterator = df_fit.iterrows()
