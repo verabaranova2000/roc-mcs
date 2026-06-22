@@ -29,13 +29,23 @@ from roc_mcs.fitting.models import (
     model_split_voigt
 )
 
+from roc_mcs.fitting.models import (
+    batch_model_lorentz,
+    batch_model_gauss,
+    batch_model_gauss_us,
+    batch_model_voigt,
+    batch_model_pvoigt,
+    batch_model_emg,
+    batch_model_split_voigt
+)
+
 
 @dataclass(frozen=True, slots=True)
 class ModelSpec:
     name: str
     func: Callable
+    batch_func: Callable
     param_names: tuple[str, ...]
-    # param_info: dict[str, dict]
     guess_fn: Callable
     bounds_fn: Callable
 
@@ -43,6 +53,7 @@ MODEL_SPECS = {
     "lorentz": ModelSpec(
         name="lorentz",
         func=model_lorentz,
+        batch_func=batch_model_lorentz,
         param_names=("S", "theta0", "gamma"),
         guess_fn=lorentz_guess,
         bounds_fn=lorentz_bounds,
@@ -50,6 +61,7 @@ MODEL_SPECS = {
     "gauss": ModelSpec(
         name="gauss",
         func=model_gauss,
+        batch_func=batch_model_gauss,
         param_names=("S", "theta0", "sigma"),
         guess_fn=gauss_guess,
         bounds_fn=gauss_bounds,
@@ -57,6 +69,7 @@ MODEL_SPECS = {
     "gauss_us": ModelSpec(
         name="gauss_us",
         func=model_gauss_us,
+        batch_func=batch_model_gauss_us,
         param_names=("S", "theta0", "sigma", "Delta"),
         guess_fn=gauss_us_guess,
         bounds_fn=gauss_us_bounds,
@@ -64,6 +77,7 @@ MODEL_SPECS = {
     "voigt": ModelSpec(
         name="voigt",
         func=model_voigt,
+        batch_func=batch_model_voigt,
         param_names=("S", "theta0", "sigma", "gamma"),
         guess_fn=voigt_guess,
         bounds_fn=voigt_bounds,
@@ -71,6 +85,7 @@ MODEL_SPECS = {
     "pvoigt": ModelSpec(
         name="pvoigt",
         func=model_pvoigt,
+        batch_func=batch_model_pvoigt,
         param_names=("S","theta0","H","eta"),
         guess_fn=pvoigt_guess,
         bounds_fn=pvoigt_bounds,
@@ -78,6 +93,7 @@ MODEL_SPECS = {
     "emg": ModelSpec(
         name="emg",
         func=model_emg,
+        batch_func=batch_model_emg,
         param_names=("S","theta0","sigma","gamma","lam"),
         guess_fn=emg_guess,
         bounds_fn=emg_bounds,
@@ -85,6 +101,7 @@ MODEL_SPECS = {
     "split_voigt": ModelSpec(
         name="split_voigt",
         func=model_split_voigt,
+        batch_func=batch_model_split_voigt,
         param_names=("S", "theta0", "beta_Gl", "beta_Cl", "beta_Gr", "beta_Cr"),
         guess_fn=split_voigt_guess,
         bounds_fn=split_voigt_bounds,
