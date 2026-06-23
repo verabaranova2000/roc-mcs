@@ -3,6 +3,39 @@ from typing import Sequence
 
 from roc_mcs.fitting.trajectory.types import KalmanResult
 
+
+
+def estimate_Q(df, param_keys, alpha=0.01):
+    """
+    Оценка матрицы шума процесса для модели Калмана.
+
+    Диагональные элементы вычисляются по дисперсиям первых
+    разностей выбранных параметров и масштабируются коэффициентом alpha.
+
+    Параметры
+    ----------
+    df : pandas.DataFrame
+        Таблица с временными рядами параметров.
+
+    param_keys : sequence[str]
+        Имена параметров, используемых в модели состояния.
+
+    alpha : float, default=0.01
+        Масштабный коэффициент для матрицы Q.
+
+    Возвращает
+    ----------
+    Q : ndarray, shape (d, d)
+        Диагональная матрица шума процесса.
+    """
+    process_vars = [
+        np.var(np.diff(df[pk]))
+        for pk in param_keys
+    ]
+    return alpha * np.diag(process_vars)
+
+
+
 def kalman_smoother_random_walk(
     zs: np.ndarray,
     Rs: Sequence[np.ndarray],
