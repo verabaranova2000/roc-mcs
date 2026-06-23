@@ -1,5 +1,8 @@
 from dataclasses import dataclass
+from typing import Sequence
 import numpy as np
+import pandas as pd
+
 
 @dataclass
 class CandidateCloud:
@@ -56,3 +59,36 @@ class KalmanResult:
     P_filt: list[np.ndarray]
     x_pred: np.ndarray
     P_pred: list[np.ndarray]    
+
+
+
+
+@dataclass(slots=True)
+class TrajectoryResult:
+    """
+    Результаты ridge/Kalman-постобработки траекторий параметров.
+    """
+    # итоговые данные
+    df_kf: pd.DataFrame
+
+    # промежуточные результаты
+    trajectory: RidgeTrajectory
+    kalman: KalmanResult
+
+    # параметры модели случайного блуждания
+    Q: np.ndarray
+
+
+    # диагностика
+    roughness_before: dict[str, float]
+    roughness_after: dict[str, float]
+
+    # конфигурация анализа
+    model_name: str
+    param_keys: tuple[str, ...]
+
+    rel_spans: float | Sequence[float]
+    ns: int | Sequence[int]
+    rel_keep: float
+    max_keep: int | None
+    q_alpha: float    
