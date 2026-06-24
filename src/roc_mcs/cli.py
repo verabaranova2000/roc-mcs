@@ -33,6 +33,8 @@ def main() -> int:
                         help="Comma-separated list of diagnostics, e.g. phase,branch")
     parser.add_argument("--fit-models", type=str, default="", 
                         help="Comma-separated list of fitting models, e.g. gauss,pvoigt")
+    parser.add_argument("--trajectory-models", type=str, default="",
+                        help="Comma-separated list of trajectory models, e.g. gauss,pvoigt")    
     args = parser.parse_args()
 
     if args.config is not None:
@@ -45,6 +47,7 @@ def main() -> int:
         diag_names = cfg.get("diagnostics", [])
         diagnostics = [DIAGNOSTICS[name] for name in diag_names]
         fit_models = cfg.get("fit_models", [])
+        trajectory_models = cfg.get("trajectory_models", [])
     else:
         if args.amplitude is None:
             parser.error("--amplitude is required when --config is not used")        
@@ -56,10 +59,11 @@ def main() -> int:
         diag_names = [name.strip() for name in args.diagnostics.split(",") if name.strip()]
         diagnostics = [DIAGNOSTICS[name] for name in diag_names]
         fit_models = [name.strip() for name in args.fit_models.split(",") if name.strip()]
-
+        trajectory_models = [name.strip() for name in args.trajectory_models.split(",") if name.strip()]
     output_folder = output_folder or (input_folder / "results")
 
-    roc_map, fig, fit_tables, artifacts = run_experiment(
+
+    roc_map, fig, fit_tables, trajectory_results, artifacts = run_experiment(
         input_folder=input_folder,
         amplitude=amplitude,
         reference_amplitude=reference_amplitude,
@@ -69,6 +73,7 @@ def main() -> int:
         save_figure_flag=True,
         diagnostics=diagnostics,
         fit_models=fit_models,
+        trajectory_models=trajectory_models,
     )
     print_run_report(output_folder, artifacts)
 

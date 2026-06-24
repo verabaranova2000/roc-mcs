@@ -5,6 +5,8 @@ import numpy as np
 from roc_mcs.utils import resolve_output_folder
 from roc_mcs.processing.alignment import extract_branch
 from roc_mcs.fitting.analysis import MODEL_ANALYSIS
+from roc_mcs.fitting.trajectory.builders import build_scalar_trajectory
+from roc_mcs.fitting.trajectory.types import ScalarTrajectory
 
 PLOT_STYLE = {
     "font.family": "serif",
@@ -296,6 +298,73 @@ def plot_residual_maps(
     cbar.set_label("Residual intensity (Exp − Calc)")     # cbar.set_label("Разность интенсивностей (эксп. − расч.)")
     fig.suptitle(title, fontsize=13, fontweight="bold")
     return fig
+
+
+
+
+
+def plot_scalar_trajectory(
+    ax_main,
+    traj: ScalarTrajectory,
+    time,
+    ylabel=None,
+    show_uncertainty=True,
+):
+    if ylabel is None:
+        ylabel = traj.name
+
+    ax_main.errorbar(time, traj.local, yerr=traj.sigma_fit,
+                     fmt=".:", alpha=0.9, capsize=2,
+                     linewidth=2.2, label="local fit", zorder=3)
+    ax_main.errorbar(time, traj.ridge, yerr=traj.sigma_ridge,
+                     fmt="o--", alpha=0.9, capsize=3,
+                     linewidth=1.5, label="ridge observation", zorder=4)
+    ax_main.plot(time, traj.smooth, "-", color="black", lw=2.5,
+                 label="Kalman-RTS", zorder=5)
+    if show_uncertainty:
+        ax_main.fill_between(
+            time,
+            traj.smooth - 2 * traj.sigma_smooth,
+            traj.smooth + 2 * traj.sigma_smooth,
+            color="gray", alpha=0.2,
+            label="Kalman ±2σ", zorder=0,
+        )
+    ax_main.set_ylabel(ylabel)
+    ax_main.grid(True, alpha=0.3)
+    ax_main.legend()
+
+
+def plot_trajectories(traj_analysis, df_fit, results):
+    param_order = traj_analysis.param_keys
+    zs = traj_analysis.trajectory.obs
+    Rs = traj_analysis.trajectory.covs
+    x_smooth = traj_analysis.kalman.x_smooth
+    P_smooth = traj_analysis.kalman.P_smooth
+
+    trajectories = [
+        build_scalar_trajectory(
+            name=key,
+            param_order=param_order,
+            df_fit=df_fit,
+            ridge_observations=zs,
+            smooth_states=x_smooth,
+            fit_results=results,
+            ridge_covariances=Rs,
+            smooth_covariances=P_smooth,
+        ) for key in param_order]
+    trajectories.extend(traj_analysis.derived.values())
+    n = len(trajectories)
+    fig, axes = plt.subplots(n, 1, figsize=(9, 3.5 * n), sharex=True)
+    if n == 1:
+        axes = [axes]
+    for ax, traj in zip(axes, trajectories):
+        plot_scalar_trajectory(ax, traj, df_fit["time"].to_numpy(), ylabel=traj.name)
+
+    axes[-1].set_xlabel("time")
+    plt.tight_layout()
+    return fig
+
+
 
 
 

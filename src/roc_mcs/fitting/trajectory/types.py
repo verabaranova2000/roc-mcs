@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Sequence
 import numpy as np
 import pandas as pd
@@ -61,6 +61,35 @@ class KalmanResult:
     P_pred: list[np.ndarray]    
 
 
+# | слой               | смысл                                |
+# | ------------------ | ------------------------------------ |
+# | `KalmanResult`     | “что посчитал фильтр”                |
+# | `ScalarTrajectory` | “как это интерпретировать физически” |
+
+
+# ==================================================
+# Контейнер для любой скалярной траектории
+# ==================================================
+@dataclass(slots=True)
+class ScalarTrajectory:
+    """
+    Траектория (временной ряд) скалярной величины и её неопределённостей
+    на различных этапах trajectory-analysis.
+    берёт KalmanResult.x_smooth и превращает его в:
+        S, theta0, ..., FWHM (derived)
+    """    
+    name: str
+    local: np.ndarray
+    ridge: np.ndarray
+    smooth: np.ndarray
+    sigma_fit: np.ndarray
+    sigma_ridge: np.ndarray
+    sigma_smooth: np.ndarray
+    idx: int | None = None
+    kind: str = "parameter"   # "parameter" или "derived"
+    unit: str | None = None
+
+
 
 
 @dataclass(slots=True)
@@ -92,3 +121,5 @@ class TrajectoryResult:
     rel_keep: float
     max_keep: int | None
     q_alpha: float    
+
+    derived: dict[str, ScalarTrajectory] = field(default_factory=dict)    

@@ -5,9 +5,11 @@ from roc_mcs.processing.alignment import find_phase, extract_branch
 from roc_mcs.processing.calibration import calibrate_roc_map
 from roc_mcs.io.mcs import load_mcs, find_mcs_files 
 from roc_mcs.plots import plot_roc_map, plot_model_evolution, plot_residual_maps, save_figure
+from roc_mcs.plots import plot_trajectories
 from roc_mcs.export import export_roc_map_excel
 from roc_mcs.utils import resolve_output_folder, ensure_folder
 from roc_mcs.pipeline.fit import fit_roc_map, run_fit_analysis
+from roc_mcs.pipeline.trajectory import run_trajectory_analysis
 from roc_mcs.fitting.postprocessing import augment_results
 from roc_mcs.fitting.metrics import compute_map_metrics
 
@@ -76,8 +78,19 @@ def run_experiment(
     save_excel_flag=True,
     save_figure_flag=True,
     diagnostics=(),
-    fit_models=()
+    fit_models=(),
+    trajectory_models=(),
 ):
+
+    fit_models = tuple(fit_models)
+    trajectory_models = tuple(trajectory_models)
+
+    missing = set(trajectory_models) - set(fit_models)
+    if missing:
+        raise ValueError(
+            f"trajectory_models must be subset of fit_models. Missing fits for: {sorted(missing)}"
+        )
+
     output_folder = resolve_output_folder(output_folder)
 
     roc_map, qc = build_roc_map(input_folder)
@@ -94,7 +107,9 @@ def run_experiment(
     qc_folder = ensure_folder(output_folder / "qc") if diagnostics else None
     fit_folder = ensure_folder(output_folder / "fit") if fit_models else None
     
+    fit_results = {}
     fit_tables = {}
+    trajectory_results = {}
     diff_maps = {}
     metrics = {}
     # for model in fit_models:
@@ -105,12 +120,17 @@ def run_experiment(
     for model_name in fit_models:
         results = fit_roc_map(roc_map, model_name)
         df_fit = augment_results(results, theta=roc_map["theta_axis"], time=roc_map["time_s"])
+        fit_results[model_name] = results
         fit_tables[model_name] = df_fit
 
         I_model = np.array([res.y_fit for res in results])
         diff_maps[model_name] = roc_map["intensity"] - I_model
         metrics[model_name] = compute_map_metrics(roc_map["intensity"], I_model)
         
+        # fit построил таблицу; если модель есть в trajectory_models, запускаем ridge+Kalman
+        if model_name in trajectory_models:
+            traj = run_trajectory_analysis(roc_map=roc_map, df_fit=df_fit, results=results, model_name=model_name)
+            trajectory_results[model_name] = traj  
 
     # --- ROC figure ---
     if save_figure_flag:
@@ -119,9 +139,10 @@ def run_experiment(
         plt.close(roc_fig)
     # --- Excel ---
     if save_excel_flag:
+        trajectory_tables = {model: traj.df_kf for model, traj in trajectory_results.items()}
         artifacts.append(
             export_roc_map_excel(roc_map, output_folder, "rocking_curve_dynamics.xlsx",
-                                 fit_tables=fit_tables,))
+                                 fit_tables=fit_tables, trajectory_tables=trajectory_tables))
 
     # --- diagnostics ---
     for diagnostic in diagnostics:
@@ -136,11 +157,17 @@ def run_experiment(
             artifacts.append(
                 save_figure(evol_fig, fit_folder, f"model_evolution_{model}.png"))
             plt.close(evol_fig)
+        for model in trajectory_models:
+            traj_fig = plot_trajectories(trajectory_results[model], fit_tables[model], fit_results[model],)
+            artifacts.append(
+                save_figure(traj_fig, fit_folder, f"trajectory_{model}.png")
+            )
+            plt.close(traj_fig)
 
         theta = roc_map["theta_axis"]
         time = roc_map["time_s"]        
         residual_fig = plot_residual_maps(time, theta, diff_maps,  metrics=metrics)
         artifacts.append(
             save_figure(residual_fig , fit_folder, f"residual_maps.png"))
-    return roc_map, roc_fig, fit_tables, artifacts
+    return roc_map, roc_fig, fit_tables, trajectory_results, artifacts
 

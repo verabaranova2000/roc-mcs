@@ -2,9 +2,15 @@ import pandas as pd
 from roc_mcs.utils import resolve_output_folder
 from roc_mcs.fitting.postprocessing import prepare_fit_table_for_export
 
-def export_roc_map_excel(roc_map, output_folder=None, filename="rocking_curve_dynamics.xlsx", fit_tables=None):
+def export_roc_map_excel(roc_map, output_folder=None, filename="rocking_curve_dynamics.xlsx", 
+                         fit_tables=None, trajectory_tables=None):
     """
     Экспорт ROC-карт и метаданных эксперимента в Excel.
+
+    Структура:
+        [локальные параметры]
+        [локальные метрики]
+        [Kalman параметры]
 
     Parameters
     ----------
@@ -22,6 +28,9 @@ def export_roc_map_excel(roc_map, output_folder=None, filename="rocking_curve_dy
 
     if fit_tables is None:
         fit_tables = {}
+
+    if trajectory_tables is None:
+        trajectory_tables = {}        
 
     # ---------- ось Y ----------
     if "theta_axis" in roc_map:
@@ -62,5 +71,9 @@ def export_roc_map_excel(roc_map, output_folder=None, filename="rocking_curve_dy
         for model_name, df_fit in fit_tables.items():
             sheet_name = f"Fit_{model_name}"[:31]   # ограничение Excel
             export_df = prepare_fit_table_for_export(df_fit)
-            export_df.to_excel(writer, sheet_name=sheet_name, index=False)
+            if model_name in trajectory_tables:
+                df_kf = trajectory_tables[model_name]
+                kf_cols = [c for c in df_kf.columns if c.endswith("_kf")]
+                export_df = export_df.join(df_kf[kf_cols])               
+            export_df.to_excel(writer, sheet_name=sheet_name, index=False)        
     return output_file  
