@@ -5,6 +5,8 @@ from roc_mcs.fitting.registry import MODEL_SPECS
 from roc_mcs.fitting.trajectory.builders import build_fwhm_trajectory
 from roc_mcs.fitting.trajectory.metrics import  mean_roughness
 from roc_mcs.fitting.trajectory.kalman import estimate_Q, kalman_smoother_random_walk
+from roc_mcs.fitting.trajectory.ridge import extract_ridge_trajectory
+
 
 def run_trajectory_analysis(
     roc_map,
