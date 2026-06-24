@@ -39,6 +39,26 @@ from roc_mcs.fitting.models import (
 )
 
 
+from roc_mcs.fitting.derived import (
+    estimate_fwhm_from_curve,
+    fwhm_lorentz,
+    fwhm_gauss,
+    fwhm_voigt,
+    fwhm_pvoigt,
+    #fwhm_emg,
+    #fwhm_split_voigt
+)
+
+from roc_mcs.fitting.derived import (
+    grad_fwhm_lorentz,
+    grad_fwhm_gauss,
+    grad_fwhm_voigt,
+    grad_fwhm_pvoigt,
+    #fwhm_emg,
+    #fwhm_split_voigt
+)
+
+
 @dataclass(frozen=True, slots=True)
 class ModelSpec:
     name: str
@@ -120,3 +140,51 @@ def validate_model(model_name):
             f"Неизвестная модель '{model_name}'. "
             f"Доступные модели: {available}."
         )
+    
+
+
+
+@dataclass(frozen=True)
+class DerivedSpec:
+    value_func: Callable
+    grad_func: Callable | None = None
+    needs_curve: bool = False
+
+
+DERIVED_SPECS = {
+    "lorentz": {
+        "FWHM": DerivedSpec(
+            value_func=fwhm_lorentz,
+            grad_func=grad_fwhm_lorentz,
+            needs_curve=False,
+        )
+    },
+    "gauss": {
+        "FWHM": DerivedSpec(
+            value_func=fwhm_gauss,
+            grad_func=grad_fwhm_gauss,
+            needs_curve=False,
+        )
+    },   
+    "voigt": {
+        "FWHM": DerivedSpec(
+            value_func=fwhm_voigt,
+            grad_func=grad_fwhm_voigt,
+            needs_curve=False,
+        )
+    },     
+    "pvoigt": {
+        "FWHM": DerivedSpec(
+            value_func=fwhm_pvoigt,
+            grad_func=grad_fwhm_pvoigt,
+            needs_curve=False,
+        )
+    },
+    "split_voigt": {
+        "FWHM": DerivedSpec(
+            value_func=estimate_fwhm_from_curve,
+            grad_func=None,
+            needs_curve=True,
+        )
+    },
+}
