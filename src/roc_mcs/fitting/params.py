@@ -17,10 +17,10 @@ PARAMETER_INFO = {
     
     "lam": {"symbol": "λ", "unit": "arcsec⁻¹"},
 
-    "beta_Gl": {"symbol": "β_Gl", "unit": "arcsec"},
-    "beta_Cl": {"symbol": "β_Cl", "unit": "arcsec"},
-    "beta_Gr": {"symbol": "β_Gr", "unit": "arcsec"},
-    "beta_Cr": {"symbol": "β_Cr", "unit": "arcsec"},    
+    "beta_Gl": {"symbol": "β_Gl", "unit": "arcsec", "lower": 0.0},
+    "beta_Cl": {"symbol": "β_Cl", "unit": "arcsec", "lower": 0.0},
+    "beta_Gr": {"symbol": "β_Gr", "unit": "arcsec", "lower": 0.0},
+    "beta_Cr": {"symbol": "β_Cr", "unit": "arcsec", "lower": 0.0},    
     
     "Delta": {"symbol": "Δ", "unit": "arcsec"},
 }
