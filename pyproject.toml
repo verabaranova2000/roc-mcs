@@ -13,7 +13,9 @@ dependencies = [
     "matplotlib",
     "pandas",
     "openpyxl",
-    "PyYAML"
+    "PyYAML",
+    "tqdm",
+    "scipy"
 ]
 
 [tool.setuptools]
