@@ -2,7 +2,7 @@ import numpy as np
 from typing import Sequence
 
 from roc_mcs.fitting.trajectory.types import KalmanResult
-
+from scipy.linalg import solve_triangular
 
 
 def estimate_Q(df, param_keys, alpha=0.01):
@@ -91,9 +91,18 @@ def kalman_smoother_random_walk(
             x_pred[t] = x_prev
             P_pred[t] = P_prev + Q
 
-        S = P_pred[t] + Rs[t]
-        K = P_pred[t] @ np.linalg.solve(S, P_pred[t].T).T       # вместо np.linalg.inv(S)
+        # S = P_pred[t] + Rs[t]
+        # K = P_pred[t] @ np.linalg.inv(S)       #  np.linalg.solve(S, P_pred[t].T).T  - падает!!!
 
+        # # ✔ Cholesky:
+        # S = P_pred[t] + Rs[t]
+        # S = 0.5 * (S + S.T)
+        # S += 1e-10 * np.eye(S.shape[0])        
+        # L = np.linalg.cholesky(S)
+        # K = solve_triangular(L.T, solve_triangular(L, P_pred[t].T).T)
+        S = P_pred[t] + Rs[t]
+        K = P_pred[t] @ np.linalg.solve(S, np.eye(S.shape[0]))
+        
         y = zs[t] - x_pred[t]
         x_post = x_pred[t] + K @ y
         P_post = (I - K) @ P_pred[t]

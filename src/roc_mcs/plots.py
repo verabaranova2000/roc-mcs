@@ -5,7 +5,7 @@ import numpy as np
 from roc_mcs.utils import resolve_output_folder
 from roc_mcs.processing.alignment import extract_branch
 from roc_mcs.fitting.analysis import MODEL_ANALYSIS
-from roc_mcs.fitting.trajectory.derived import build_scalar_trajectory
+from roc_mcs.fitting.trajectory.builders import build_scalar_trajectory
 from roc_mcs.fitting.trajectory.types import ScalarTrajectory
 
 PLOT_STYLE = {
