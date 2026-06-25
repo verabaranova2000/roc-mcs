@@ -2,7 +2,7 @@ import numpy as np
 from roc_mcs.fitting.trajectory.types import ScalarTrajectory
 from roc_mcs.fitting.params import PARAMETER_INFO
 from roc_mcs.fitting.derived import estimate_fwhm_from_curve
-from roc_mcs.fitting.models import MODEL_SPECS, DERIVED_SPECS
+from roc_mcs.fitting.registry import MODEL_SPECS, DERIVED_SPECS
 
 """
 Структура: 
