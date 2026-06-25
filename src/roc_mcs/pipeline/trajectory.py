@@ -2,7 +2,7 @@ from roc_mcs.fitting.trajectory.types import TrajectoryResult
 from roc_mcs.fitting.trajectory.config import MODEL_TRAJECTORY
 from roc_mcs.fitting.trajectory.candidates import generate_time_candidates_nd
 from roc_mcs.fitting.registry import MODEL_SPECS
-from roc_mcs.fitting.trajectory.builders import build_fwhm_trajectory
+from roc_mcs.fitting.trajectory.derived import build_fwhm_trajectory
 from roc_mcs.fitting.trajectory.metrics import  mean_roughness
 from roc_mcs.fitting.trajectory.kalman import estimate_Q, kalman_smoother_random_walk
 from roc_mcs.fitting.trajectory.ridge import extract_ridge_trajectory
