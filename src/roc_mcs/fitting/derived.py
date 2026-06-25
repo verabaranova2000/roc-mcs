@@ -67,12 +67,33 @@ def grad_fwhm_pvoigt(params: dict[str, float], param_order: Sequence[str]) -> np
 # ==================================================
 def estimate_fwhm_from_curve(theta, intensity):
     """
-    Оценка FWHM по дискретной кривой.
+    Оценка полной ширины на полувысоте (FWHM) по дискретному профилю
+    с линейной интерполяцией точек пересечения уровня 0.5·I_max.
     """
     theta = np.asarray(theta, dtype=float)
     I = np.asarray(intensity, dtype=float)
+
+    if theta.ndim != 1 or I.ndim != 1 or len(theta) != len(I):
+        raise ValueError("theta and intensity must be 1D arrays of the same length")
+
+    imax = int(np.argmax(I))
     half = 0.5 * np.max(I)
-    idx = np.where(I >= half)[0]
-    if len(idx) < 2:
+
+    # левая граница: ищем последний индекс слева, где I < half
+    left_candidates = np.where(I[:imax] < half)[0]
+    if len(left_candidates) == 0:
         return np.nan
-    return float(theta[idx[-1]] - theta[idx[0]])
+    i1 = left_candidates[-1]
+    i2 = i1 + 1
+
+    # правая граница: ищем первый индекс справа, где I < half
+    right_candidates = np.where(I[imax:] < half)[0]
+    if len(right_candidates) == 0:
+        return np.nan
+    j2 = imax + right_candidates[0]
+    j1 = j2 - 1
+
+    # линейная интерполяция пересечения half
+    x_left = theta[i1] + (half - I[i1]) * (theta[i2] - theta[i1]) / (I[i2] - I[i1])
+    x_right = theta[j1] + (half - I[j1]) * (theta[j2] - theta[j1]) / (I[j2] - I[j1])
+    return float(x_right - x_left)

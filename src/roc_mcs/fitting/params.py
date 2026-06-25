@@ -7,13 +7,13 @@ from roc_mcs.fitting.analysis import estimate_fwhm
 # Метаданные
 # ======================================
 PARAMETER_INFO = {
-    "S": {"symbol": "S", "unit": None},
+    "S": {"symbol": "S", "unit": None, "lower": 0.0},
     "theta0": {"symbol": "θ₀", "unit": "arcsec"},
-    "sigma": {"symbol": "σ", "unit": "arcsec"},
+    "sigma": {"symbol": "σ", "unit": "arcsec", "lower": 0.0},
 
-    "gamma": {"symbol": "γ", "unit": "arcsec"},
-    "eta": {"symbol": "η", "unit": None},    
-    "H": {"symbol": "H", "unit": "arcsec"},
+    "gamma": {"symbol": "γ", "unit": "arcsec", "lower": 0.0},
+    "eta": {"symbol": "η", "unit": None, "lower": 0.0, "upper": 1.0},    
+    "H": {"symbol": "H", "unit": "arcsec", "lower": 0.0},
     
     "lam": {"symbol": "λ", "unit": "arcsec⁻¹"},
 
