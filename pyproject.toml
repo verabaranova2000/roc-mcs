@@ -12,7 +12,8 @@ dependencies = [
     "numpy",
     "matplotlib",
     "pandas",
-    "openpyxl"
+    "openpyxl",
+    "PyYAML"
 ]
 
 [tool.setuptools]
