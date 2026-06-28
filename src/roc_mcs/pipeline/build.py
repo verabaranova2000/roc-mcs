@@ -204,9 +204,7 @@ def run_experiment(
         artifact_path = output_folder / "experiment_artifact.pkl"
         with open(artifact_path, "wb") as f:
             pickle.dump(artifact, f)
-        output_files.append(str(artifact_path.relative_to(output_folder)))        
-        # path = Path(output_folder / "experiment_artifact.pkl")
-        # with open(path.with_suffix(".pkl"), "wb") as f:
-        #     pickle.dump(artifact, f)
+        output_files.append(str(artifact_path.relative_to(output_folder)))   # в объекте artifact список тоже обновится
+
 
     return artifact            

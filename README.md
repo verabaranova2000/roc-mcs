@@ -38,7 +38,9 @@ roc-mcs --input-folder <PATH> \
         [--reference-angle <REFERENCE_ANGLE_ARCSEC>] \
         [--output-folder <OUTPUT_FOLDER>] \
         [--fit-models <FIT_MODELS>] \
-        [--diagnostics <DIAGNOSTICS>]
+        [--trajectory-models <TRAJECTORY_MODELS>] \
+        [--diagnostics <DIAGNOSTICS>] \
+        [--save-artifact]
 ```
 
 Примеры:
@@ -69,9 +71,12 @@ reference_angle: 180
 fit_models: 
   - gauss
   - pvoigt
+trajectory_models:
+  - gauss
+  - pvoigt  
 diagnostics: 
   - phase
-
+save_artifact: true  
 output_folder: null
 ```
 
@@ -91,7 +96,9 @@ YAML-ключи соответствуют аргументам командно
 | `--reference-angle`     | Угловой диапазон, соответствующий опорной амплитуде (по умолчанию: ±180 arcsec)  |
 | `--output-folder`      | Каталог сохранения результатов. Если не задан (т.е. `null`), результаты сохраняются в `<input-folder>/results` |
 | `--fit-models`      | Список моделей подгонки ROC-кривых `<output-folder>/qc` |
+| `--trajectory-models` | Подмножество `fit_models`, для которого дополнительно выполняется анализ эволюции параметров (ridge-регрессия и фильтр Калмана) |
 | `--diagnostics`      | Список диагностик для сохранения в подкаталоге `<output-folder>/qc` |
+| `--save-artifact` | Сохранить полный объект эксперимента `experiment_artifact.pkl` для последующего анализа в Python |
 
 ---
 
@@ -103,6 +110,21 @@ YAML-ключи соответствуют аргументам командно
 * `roc_map.png` — ROC-карта;
 * `rocking_curve_dynamics.xlsx` — таблица интенсивностей, метаданных и параметров моделей;
 * `fit/`
-    * `model_evolution_<model>.png` — эволюция параметров моделей;
-  * `residual_maps.png` — разностные ROC-карты для сравнения моделей;    
-* `qc/*.png` — диагностические графики, если они были включены.
+  * `model_evolution_<model>.png` — эволюция параметров моделей;
+  * `residual_maps.png` — разностные ROC-карты для сравнения моделей; 
+  * `trajectory_<model>.png` — эволюция параметров модели во времени (если модель включена в `--trajectory-models` и для неё выполняется Kalman/Ridge анализ).   
+* `qc/*.png` — диагностические графики, если они были включены;
+* `experiment_artifact.pkl` — сериализованный объект ExperimentArtifact с результатами обработки, параметрами моделей и метаданными эксперимента.
+
+---
+
+## Загрузка сохранённого результата
+
+Сохранённый эксперимент можно восстановить в Python:
+
+```python
+import pickle
+
+with open("experiment_artifact.pkl", "rb") as f:
+    artifact_loaded = pickle.load(f)
+```
