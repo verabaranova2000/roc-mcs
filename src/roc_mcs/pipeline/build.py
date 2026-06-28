@@ -1,5 +1,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
+import pickle
+from pathlib import Path
 
 from roc_mcs.processing.alignment import find_phase, extract_branch
 from roc_mcs.processing.calibration import calibrate_roc_map
@@ -12,6 +14,9 @@ from roc_mcs.pipeline.fit import fit_roc_map, run_fit_analysis
 from roc_mcs.pipeline.trajectory import run_trajectory_analysis
 from roc_mcs.fitting.postprocessing import augment_results
 from roc_mcs.fitting.metrics import compute_map_metrics
+from roc_mcs.fitting.results import ExperimentArtifact
+from roc_mcs.diagnostics.registry import DIAGNOSTICS
+from roc_mcs.fitting.registry import MODEL_SPECS
 
 def process_mcs(mcs, phi, branch="up"):
     """ Функция обработки одного файла """
@@ -77,6 +82,7 @@ def run_experiment(
     output_folder=None,
     save_excel_flag=True,
     save_figure_flag=True,
+    save_artifact: bool = False,
     diagnostics=(),
     fit_models=(),
     trajectory_models=(),
@@ -103,7 +109,7 @@ def run_experiment(
 
     roc_fig = plot_roc_map(roc_map)
 
-    artifacts = []
+    output_files = []
     qc_folder = ensure_folder(output_folder / "qc") if diagnostics else None
     fit_folder = ensure_folder(output_folder / "fit") if fit_models else None
     
@@ -112,10 +118,6 @@ def run_experiment(
     trajectory_results = {}
     diff_maps = {}
     metrics = {}
-    # for model in fit_models:
-    #     results = fit_roc_map(roc_map, model)
-    #     fit_tables[model] = augment_results(results, 
-    #                                         theta=roc_map["theta_axis"], time=roc_map["time_s"])
 
     for model_name in fit_models:
         results = fit_roc_map(roc_map, model_name)
@@ -134,32 +136,34 @@ def run_experiment(
 
     # --- ROC figure ---
     if save_figure_flag:
-        artifacts.append(
+        output_files.append(
             save_figure(roc_fig, output_folder, "roc_map.png"))
         plt.close(roc_fig)
     # --- Excel ---
     if save_excel_flag:
         trajectory_tables = {model: traj.df_kf for model, traj in trajectory_results.items()}
-        artifacts.append(
+        output_files.append(
             export_roc_map_excel(roc_map, output_folder, "rocking_curve_dynamics.xlsx",
                                  fit_tables=fit_tables, trajectory_tables=trajectory_tables))
 
     # --- diagnostics ---
+    if diagnostics and isinstance(diagnostics[0], str):
+        diagnostics = [DIAGNOSTICS[name] for name in diagnostics]    
     for diagnostic in diagnostics:
         diag_fig = diagnostic(qc)
-        artifacts.append(
+        output_files.append(
             save_figure(diag_fig, qc_folder, f"{diagnostic.__name__}.png"))
 
     # --- model evolution figures ---
     if save_figure_flag:    
         for model in fit_models:
             evol_fig = plot_model_evolution(fit_tables[model], y_dual=True)
-            artifacts.append(
+            output_files.append(
                 save_figure(evol_fig, fit_folder, f"model_evolution_{model}.png"))
             plt.close(evol_fig)
         for model in trajectory_models:
             traj_fig = plot_trajectories(trajectory_results[model], fit_tables[model], fit_results[model],)
-            artifacts.append(
+            output_files.append(
                 save_figure(traj_fig, fit_folder, f"trajectory_{model}.png")
             )
             plt.close(traj_fig)
@@ -167,7 +171,38 @@ def run_experiment(
         theta = roc_map["theta_axis"]
         time = roc_map["time_s"]        
         residual_fig = plot_residual_maps(time, theta, diff_maps,  metrics=metrics)
-        artifacts.append(
+        output_files.append(
             save_figure(residual_fig , fit_folder, f"residual_maps.png"))
-    return roc_map, roc_fig, fit_tables, trajectory_results, artifacts
+    
+    # --- model metadata used for downstream analysis ---
+    model_config = {
+        model_name: {
+            "fit_parameters": list(MODEL_SPECS[model_name].param_names),
+            "derived_parameters": ["FWHM"],
+            "fit_sheet": f"Fit_{model_name}",
+            "used_for_trajectory": model_name in trajectory_models,
+        } for model_name in fit_models}
+    
+    artifact = ExperimentArtifact(
+        roc_map=roc_map,
+        fit_tables=fit_tables,
+        fit_results=fit_results,
+        trajectory_results=trajectory_results,
+        metrics=metrics,
+        metadata={
+            "input_folder": str(input_folder),
+            "amplitude": amplitude,
+            "reference_amplitude": reference_amplitude,
+            "reference_angle": reference_angle,
+        },
+        model_config=model_config,
+        output_files=output_files
+    )
 
+    # --- save full experiment object (.pkl) ---
+    if save_artifact:
+        path = Path(output_folder / "experiment_artifact.pkl")
+        with open(path.with_suffix(".pkl"), "wb") as f:
+            pickle.dump(artifact, f)
+
+    return artifact            

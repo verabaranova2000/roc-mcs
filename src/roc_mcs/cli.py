@@ -15,7 +15,7 @@ def main() -> int:
         prog="roc-mcs",
         description="Build ROC map from MCS files."
     )
-
+    # === Добавляем аргументы CLI ===
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--config", type=Path, 
                        help="Path to YAML config file")
@@ -35,8 +35,11 @@ def main() -> int:
                         help="Comma-separated list of fitting models, e.g. gauss,pvoigt")
     parser.add_argument("--trajectory-models", type=str, default="",
                         help="Comma-separated list of trajectory models, e.g. gauss,pvoigt")    
+    parser.add_argument("--save-artifact", action="store_true",
+                        help="Save ExperimentArtifact (*.pkl)")
     args = parser.parse_args()
 
+    # === Ветка --config ===
     if args.config is not None:
         cfg = load_config(args.config)
         input_folder = Path(cfg["input_folder"])
@@ -44,10 +47,13 @@ def main() -> int:
         reference_amplitude = cfg.get("reference_amplitude", 400.0)
         reference_angle = cfg.get("reference_angle", 180.0)
         output_folder = cfg.get("output_folder")
-        diag_names = cfg.get("diagnostics", [])
-        diagnostics = [DIAGNOSTICS[name] for name in diag_names]
+        #diag_names = cfg.get("diagnostics", [])
+        #diagnostics = [DIAGNOSTICS[name] for name in diag_names]        
+        diagnostics = cfg.get("diagnostics", [])
         fit_models = cfg.get("fit_models", [])
         trajectory_models = cfg.get("trajectory_models", [])
+        save_artifact = cfg.get("save_artifact", False) or args.save_artifact
+    # === Ветка аргументов командной строки ===
     else:
         if args.amplitude is None:
             parser.error("--amplitude is required when --config is not used")        
@@ -56,14 +62,16 @@ def main() -> int:
         reference_amplitude = args.reference_amplitude
         reference_angle = args.reference_angle
         output_folder = args.output_folder
-        diag_names = [name.strip() for name in args.diagnostics.split(",") if name.strip()]
-        diagnostics = [DIAGNOSTICS[name] for name in diag_names]
+        #diag_names = [name.strip() for name in args.diagnostics.split(",") if name.strip()]
+        #diagnostics = [DIAGNOSTICS[name] for name in diag_names]
+        diagnostics = [name.strip() for name in args.diagnostics.split(",") if name.strip()]
         fit_models = [name.strip() for name in args.fit_models.split(",") if name.strip()]
         trajectory_models = [name.strip() for name in args.trajectory_models.split(",") if name.strip()]
+        save_artifact = args.save_artifact
     output_folder = output_folder or (input_folder / "results")
 
 
-    roc_map, fig, fit_tables, trajectory_results, artifacts = run_experiment(
+    artifact = run_experiment(
         input_folder=input_folder,
         amplitude=amplitude,
         reference_amplitude=reference_amplitude,
@@ -71,11 +79,12 @@ def main() -> int:
         output_folder=output_folder,
         save_excel_flag=True,
         save_figure_flag=True,
+        save_artifact=save_artifact,
         diagnostics=diagnostics,
         fit_models=fit_models,
         trajectory_models=trajectory_models,
     )
-    print_run_report(output_folder, artifacts)
+    print_run_report(output_folder, artifact.output_files)
 
     return 0
 

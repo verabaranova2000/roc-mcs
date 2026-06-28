@@ -25,3 +25,16 @@ class FitResult:
         if self.y_fit_global is not None:
             return self.y_fit_global
         return None    
+    
+
+
+@dataclass(slots=True)
+class ExperimentArtifact:
+    roc_map: dict
+    fit_tables: dict
+    fit_results: dict
+    trajectory_results: dict
+    metrics: dict
+    metadata: dict
+    model_config: dict
+    output_files: list[str] | None = None    

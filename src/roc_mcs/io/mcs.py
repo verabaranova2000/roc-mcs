@@ -12,7 +12,7 @@ def parse_header(file):
 
     # text
     dt_str = raw[20:36].tobytes().decode()
-    dt = datetime.strptime(dt_str, "%H:%M:%S%m%d%Y")
+    dt = datetime.strptime(dt_str, "%H:%M:%S%m%d%Y") # время старта сбора данных с точностью только до секунды
 
     instrument_len = int(raw[64])         # ❗ не доказано
     instrument = raw[65:88].tobytes().decode(errors="ignore").rstrip("\x00")
