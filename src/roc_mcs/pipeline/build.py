@@ -201,8 +201,12 @@ def run_experiment(
 
     # --- save full experiment object (.pkl) ---
     if save_artifact:
-        path = Path(output_folder / "experiment_artifact.pkl")
-        with open(path.with_suffix(".pkl"), "wb") as f:
+        artifact_path = output_folder / "experiment_artifact.pkl"
+        with open(artifact_path, "wb") as f:
             pickle.dump(artifact, f)
+        output_files.append(str(artifact_path.relative_to(output_folder)))        
+        # path = Path(output_folder / "experiment_artifact.pkl")
+        # with open(path.with_suffix(".pkl"), "wb") as f:
+        #     pickle.dump(artifact, f)
 
     return artifact            
