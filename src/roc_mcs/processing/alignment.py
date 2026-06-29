@@ -44,8 +44,8 @@ def find_phase(counts, n_channels, window=15):
 
     scores = np.asarray(scores)
     best_phi = np.argmin(scores)
-    phi = best_phi % (n_channels // 2) # + n_channels // 2  🔴 канонизация (убираем двузначность)
-
+    phi = best_phi % (n_channels // 2) # + n_channels // 2  # 🔴 канонизация (убираем двузначность)
+    # print('[DEBAG find_phase 🔴] best_phi =', best_phi, 'phi =', phi)
     return phi, scores 
 
 
