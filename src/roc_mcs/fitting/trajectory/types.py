@@ -90,16 +90,17 @@ class ScalarTrajectory:
     """  
     name: str
     local: np.ndarray
-    ridge: np.ndarray
-    smooth: np.ndarray
-    sigma_fit: np.ndarray
-    sigma_ridge: np.ndarray
-    sigma_smooth: np.ndarray
-    idx: int | None = None
-    kind: str = "parameter"   # "parameter" или "derived"
+
+    ridge: np.ndarray | None = None
+    smooth: np.ndarray | None = None
+
+    sigma_fit: np.ndarray | None = None
+    sigma_ridge: np.ndarray | None = None
+    sigma_smooth: np.ndarray | None = None
+
+    idx: int | None = None 
+    kind: str = "parameter"  # "parameter" или "derived"
     unit: str | None = None
-
-
 
 
 @dataclass(slots=True)
