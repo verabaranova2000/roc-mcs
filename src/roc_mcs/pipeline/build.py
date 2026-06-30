@@ -2,7 +2,6 @@ import numpy as np
 import matplotlib.pyplot as plt
 import pickle
 import warnings
-from pathlib import Path
 
 from roc_mcs.processing.alignment import find_phase, extract_branch
 from roc_mcs.processing.calibration import calibrate_roc_map
@@ -134,7 +133,23 @@ def build_secondary_curves(control_log, roc_map):
         "Давление, МПа": (x, raw.loc[mask, "pressure_mpa"].to_numpy(float)),
         "Сила": (x, raw.loc[mask, "force"].to_numpy(float)),
     }
-
+def build_secondary_curves(control_log, roc_map):
+    """
+    Подготовка плотных кривых внешнего воздействия
+    для наложения на графики траекторий.
+    """
+    t0 = roc_map["time_elapsed_s"][0]
+    raw = control_log["raw"].copy()
+    mask = raw["elapsed"] >= t0
+    x = raw.loc[mask, "elapsed"].to_numpy(float) - t0
+    return {
+        "Давление, МПа": {"x": x,
+                          "y": raw.loc[mask, "pressure_mpa"].to_numpy(float),
+                          "color": "crimson",},
+        "Сила, Н": {"x": x,
+                    "y": raw.loc[mask, "force"].to_numpy(float),
+                    "color": "darkgreen",},
+    }
 
 
 def run_experiment(
@@ -245,6 +260,7 @@ def run_experiment(
                 time=roc_map["time_s"],
                 trajectories=trajectory_store[model],
                 secondary_curves=secondary_curves,
+                model_name=model,
             )
             output_files.append(save_figure(traj_fig, fit_folder, f"trajectory_{model}.png"))
             plt.close(traj_fig)             

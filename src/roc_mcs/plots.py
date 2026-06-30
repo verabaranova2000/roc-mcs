@@ -351,7 +351,8 @@ def plot_scalar_trajectory(
 
 def plot_trajectories(time,                     # временная ось
                       trajectories,             # список ScalarTrajectory
-                      secondary_curves=None     # сила, давление и прочие внешние кривые
+                      secondary_curves=None,     # сила, давление и прочие внешние кривые
+                      model_name=None,
 ):
     # если передали dict[name -> ScalarTrajectory], берём значения
     if isinstance(trajectories, dict):
@@ -359,7 +360,7 @@ def plot_trajectories(time,                     # временная ось
     
     n = len(trajectories)
     t = np.asarray(time)
-    fig, axes = plt.subplots(n, 1, figsize=(9, 3.5 * n), sharex=True)
+    fig, axes = plt.subplots(n, 1, figsize=(9, 3.5 * n), sharex=True, constrained_layout=True,)
     if n == 1:
         axes = [axes]
     for ax, traj in zip(axes, trajectories):
@@ -367,11 +368,12 @@ def plot_trajectories(time,                     # временная ось
         ax.legend(loc="upper left")
         if secondary_curves is not None:
             ax2 = ax.twinx()   
-            for label, (x, y) in secondary_curves.items():
-                ax2.plot(np.asarray(x), np.asarray(y), "--", linewidth=1.2, alpha=0.5, label=label)
+            for label, curve in secondary_curves.items():
+                ax2.plot(curve["x"],  curve["y"], "--", linewidth=1.2, alpha=0.7, color=curve["color"], label=label)
             ax2.legend(loc="upper right")
     axes[-1].set_xlabel("time")
-    plt.tight_layout()
+    if model_name is not None:
+        fig.suptitle(model_name)
     return fig
 
 
