@@ -37,4 +37,6 @@ class ExperimentArtifact:
     metrics: dict
     metadata: dict
     model_config: dict
+    control_log: dict | None = None    
     output_files: list[str] | None = None    
+  

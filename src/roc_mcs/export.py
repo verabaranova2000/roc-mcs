@@ -2,8 +2,14 @@ import pandas as pd
 from roc_mcs.utils import resolve_output_folder
 from roc_mcs.fitting.postprocessing import prepare_fit_table_for_export
 
-def export_roc_map_excel(roc_map, output_folder=None, filename="rocking_curve_dynamics.xlsx", 
-                         fit_tables=None, trajectory_tables=None):
+def export_roc_map_excel(
+    roc_map,
+    output_folder=None,
+    filename="rocking_curve_dynamics.xlsx",
+    fit_tables=None,
+    trajectory_tables=None,
+    control_log=None,
+):
     """
     Экспорт ROC-карт и метаданных эксперимента в Excel.
 
@@ -51,9 +57,11 @@ def export_roc_map_excel(roc_map, output_folder=None, filename="rocking_curve_dy
     meta_df = pd.DataFrame({
         "file_name": roc_map["file_name"],
         "datetime": roc_map["time"],        
-        "time_s": time_s,
+        "time_s": time_s,                             # точное время стартов сканов; рабочая ось для анализа
+        "time_elapsed_s": roc_map["time_elapsed_s"]   # исходный elapsed из контроллера
         #"phi": roc_map["phi"],
     })
+
     # ---------- Calibration ----------
     calibration_df = pd.DataFrame({
         "phi": [roc_map["phi"]],
@@ -63,11 +71,24 @@ def export_roc_map_excel(roc_map, output_folder=None, filename="rocking_curve_dy
         "scale": [roc_map["calibration"]["scale"]],
     })
 
+    # ---------- Force and Pressure ----------
+    control_df = None
+    if control_log is not None:
+        t0 = roc_map["time_elapsed_s"][0]
+        mask = control_log["time_s"] >= t0
+        control_df = pd.DataFrame({
+            "time_s": control_log["time_s"][mask] - t0,
+            "force": control_log["force"][mask],
+            "pressure_mpa": control_log["pressure_mpa"][mask],
+            "state": control_log["state"][mask],
+        })
+
     with pd.ExcelWriter(output_file) as writer:
         roc_df.to_excel(writer, sheet_name="ROC", index=False)
         meta_df.to_excel(writer, sheet_name="Metadata", index=False)  
         calibration_df.to_excel(writer, sheet_name="Calibration", index=False)
-        
+        if control_df is not None:
+            control_df.to_excel(writer, sheet_name="ForcePressure", index=False)        
         for model_name, df_fit in fit_tables.items():
             sheet_name = f"Fit_{model_name}"[:31]   # ограничение Excel
             export_df = prepare_fit_table_for_export(df_fit)

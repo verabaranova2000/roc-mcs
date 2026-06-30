@@ -5,7 +5,6 @@ import numpy as np
 from roc_mcs.utils import resolve_output_folder
 from roc_mcs.processing.alignment import extract_branch
 from roc_mcs.fitting.analysis import MODEL_ANALYSIS
-from roc_mcs.fitting.trajectory.builders import build_scalar_trajectory
 from roc_mcs.fitting.trajectory.types import ScalarTrajectory
 
 PLOT_STYLE = {
@@ -312,54 +311,65 @@ def plot_scalar_trajectory(
 ):
     if ylabel is None:
         ylabel = traj.name
+    t = np.asarray(time)
 
-    ax_main.errorbar(time, traj.local, yerr=traj.sigma_fit,
+    # ---- Local fit ---    
+    local = np.asarray(traj.local)
+    if local.shape[0] != t.shape[0]:
+        raise ValueError(f"Длина time ({t.shape[0]}) не совпадает с длиной local ({local.shape[0]}) для траектории '{traj.name}'")      
+    ax_main.errorbar(t, local, 
+                     yerr=traj.sigma_fit if traj.sigma_fit is not None else None,
                      fmt=".:", alpha=0.9, capsize=2,
                      linewidth=2.2, label="local fit", zorder=3)
-    ax_main.errorbar(time, traj.ridge, yerr=traj.sigma_ridge,
-                     fmt="o--", alpha=0.9, capsize=3,
-                     linewidth=1.5, label="ridge observation", zorder=4)
-    ax_main.plot(time, traj.smooth, "-", color="black", lw=2.5,
-                 label="Kalman-RTS", zorder=5)
-    if show_uncertainty:
-        ax_main.fill_between(
-            time,
-            traj.smooth - 2 * traj.sigma_smooth,
-            traj.smooth + 2 * traj.sigma_smooth,
-            color="gray", alpha=0.2,
-            label="Kalman ±2σ", zorder=0,
-        )
+    # ---- Ridge ---   
+    if traj.ridge is not None:
+        ridge = np.asarray(traj.ridge)
+        if ridge.shape[0] != t.shape[0]:
+            raise ValueError(f"Длина time ({t.shape[0]}) не совпадает с длиной ridge ({ridge.shape[0]}) для траектории '{traj.name}'")        
+        ax_main.errorbar(t, ridge, 
+                         yerr=traj.sigma_ridge if traj.sigma_ridge is not None else None,
+                         fmt="o--", alpha=0.9, capsize=3,
+                         linewidth=1.5, label="ridge observation", zorder=4)
+    # ---- Smooth ---
+    if traj.smooth is not None:
+        smooth = np.asarray(traj.smooth)
+        if smooth.shape[0] != t.shape[0]:
+            raise ValueError(f"Длина time ({t.shape[0]}) не совпадает с длиной smooth ({smooth.shape[0]}) для траектории '{traj.name}'")   
+        ax_main.plot(t, smooth, "-", color="black", lw=2.5,
+                     label="Kalman-RTS", zorder=5)
+        if show_uncertainty and traj.sigma_smooth is not None:
+            sigma_smooth = np.asarray(traj.sigma_smooth)
+            if sigma_smooth.shape[0] != t.shape[0]:
+                raise ValueError(f"Длина time ({t.shape[0]}) не совпадает с длиной sigma_smooth ({sigma_smooth.shape[0]}) "
+                                 f"для траектории '{traj.name}'")            
+            ax_main.fill_between(t, smooth - 2 * sigma_smooth, smooth + 2 * sigma_smooth,
+                                 color="gray", alpha=0.2, label="Kalman ±2σ", zorder=0)
     ax_main.set_ylabel(ylabel)
     ax_main.grid(True, alpha=0.3)
     ax_main.legend()
 
 
-def plot_trajectories(traj_analysis, df_fit, results):
-    param_order = traj_analysis.param_keys
-    zs = traj_analysis.trajectory.obs
-    Rs = traj_analysis.trajectory.covs
-    x_smooth = traj_analysis.kalman.x_smooth
-    P_smooth = traj_analysis.kalman.P_smooth
-
-    trajectories = [
-        build_scalar_trajectory(
-            name=key,
-            param_order=param_order,
-            df_fit=df_fit,
-            ridge_observations=zs,
-            smooth_states=x_smooth,
-            fit_results=results,
-            ridge_covariances=Rs,
-            smooth_covariances=P_smooth,
-        ) for key in param_order]
-    trajectories.extend(traj_analysis.derived.values())
+def plot_trajectories(time,                     # временная ось
+                      trajectories,             # список ScalarTrajectory
+                      secondary_curves=None     # сила, давление и прочие внешние кривые
+):
+    # если передали dict[name -> ScalarTrajectory], берём значения
+    if isinstance(trajectories, dict):
+        trajectories = list(trajectories.values())
+    
     n = len(trajectories)
+    t = np.asarray(time)
     fig, axes = plt.subplots(n, 1, figsize=(9, 3.5 * n), sharex=True)
     if n == 1:
         axes = [axes]
     for ax, traj in zip(axes, trajectories):
-        plot_scalar_trajectory(ax, traj, df_fit["time"].to_numpy(), ylabel=traj.name)
-
+        plot_scalar_trajectory(ax, traj, t, ylabel=traj.name)
+        ax.legend(loc="upper left")
+        if secondary_curves is not None:
+            ax2 = ax.twinx()   
+            for label, (x, y) in secondary_curves.items():
+                ax2.plot(np.asarray(x), np.asarray(y), "--", linewidth=1.2, alpha=0.5, label=label)
+            ax2.legend(loc="upper right")
     axes[-1].set_xlabel("time")
     plt.tight_layout()
     return fig

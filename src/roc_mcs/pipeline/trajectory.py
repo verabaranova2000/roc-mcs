@@ -1,3 +1,5 @@
+import numpy as np
+
 from roc_mcs.fitting.trajectory.types import TrajectoryResult
 from roc_mcs.fitting.trajectory.config import MODEL_TRAJECTORY
 from roc_mcs.fitting.trajectory.candidates import generate_time_candidates_nd
@@ -6,6 +8,34 @@ from roc_mcs.fitting.trajectory.derived import build_fwhm_trajectory
 from roc_mcs.fitting.trajectory.metrics import  mean_roughness
 from roc_mcs.fitting.trajectory.kalman import estimate_Q, kalman_smoother_random_walk
 from roc_mcs.fitting.trajectory.ridge import extract_ridge_trajectory
+from roc_mcs.fitting.trajectory.types import ScalarTrajectory
+
+# Создать их сразу после локального фиттинга
+def build_local_trajectories(df_fit, results, param_order):
+    trajectories = {}
+    for name in param_order:
+        idx = param_order.index(name)
+        trajectories[name] = ScalarTrajectory(
+            name=name,
+            idx=idx,
+            local=df_fit[name].to_numpy(),
+            sigma_fit=np.array([np.sqrt(max(r.covariance[idx, idx], 0.0)) for r in results]),
+        )
+    return trajectories
+
+
+# Потом отдельная функция для обогащения ridge/Kalman
+def enrich_trajectories_with_kalman(trajectories, traj_result):
+    for name in traj_result.param_keys:
+        tr = trajectories[name]
+        idx = tr.idx
+        tr.ridge = traj_result.trajectory.obs[:, idx]
+        tr.smooth = traj_result.kalman.x_smooth[:, idx]
+        tr.sigma_ridge = np.array([np.sqrt(max(R[idx, idx], 0.0))  for R in traj_result.trajectory.covs])
+        tr.sigma_smooth = np.array([np.sqrt(max(P[idx, idx], 0.0)) for P in traj_result.kalman.P_smooth])
+    for name, derived_traj in traj_result.derived.items():
+        trajectories[name] = derived_traj
+    return trajectories
 
 
 def run_trajectory_analysis(
