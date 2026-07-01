@@ -5,7 +5,7 @@ import warnings
 
 from roc_mcs.processing.alignment import find_phase, extract_branch
 from roc_mcs.processing.calibration import calibrate_roc_map
-from roc_mcs.processing.moments import compute_roc_map_moments
+from roc_mcs.processing.moments import compute_roc_map_moments, enrich_profile_moments_with_control_log
 from roc_mcs.io.mcs import load_mcs, find_mcs_files 
 from roc_mcs.io.control_log import build_control_log
 from roc_mcs.plots import plot_roc_map, plot_residual_maps, save_figure
@@ -131,23 +131,10 @@ def build_secondary_curves(control_log, roc_map):
     mask = raw["elapsed"] >= t0
     x = raw.loc[mask, "elapsed"].to_numpy(float) - t0
     return {
-        "Давление, МПа": (x, raw.loc[mask, "pressure_mpa"].to_numpy(float)),
-        "Сила": (x, raw.loc[mask, "force"].to_numpy(float)),
-    }
-def build_secondary_curves(control_log, roc_map):
-    """
-    Подготовка плотных кривых внешнего воздействия
-    для наложения на графики траекторий.
-    """
-    t0 = roc_map["time_elapsed_s"][0]
-    raw = control_log["raw"].copy()
-    mask = raw["elapsed"] >= t0
-    x = raw.loc[mask, "elapsed"].to_numpy(float) - t0
-    return {
         "Давление, МПа": {"x": x,
                           "y": raw.loc[mask, "pressure_mpa"].to_numpy(float),
                           "color": "crimson",},
-        "Сила, Н": {"x": x,
+        "Сила, кг": {"x": x,
                     "y": raw.loc[mask, "force"].to_numpy(float),
                     "color": "darkgreen",},
     }
@@ -197,7 +184,9 @@ def run_experiment(
     profile_moments = None
     if compute_moments:
         profile_moments = compute_roc_map_moments(roc_map)
-
+        if control_log is not None:
+            profile_moments = enrich_profile_moments_with_control_log(profile_moments, control_log)
+    
     roc_fig = plot_roc_map(roc_map)
 
     output_files = []
@@ -245,7 +234,7 @@ def run_experiment(
         output_files.append(
             export_roc_map_excel(roc_map, output_folder, "rocking_curve_dynamics.xlsx",
                                  fit_tables=fit_tables, 
-                                 moment_table=profile_moments,
+                                 profile_moments=profile_moments,
                                  trajectory_tables=trajectory_tables,
                                  control_log=control_log))
 

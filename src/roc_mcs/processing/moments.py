@@ -138,15 +138,14 @@ def compute_profile_moments(
 
 def compute_roc_map_moments(roc_map) -> pd.DataFrame:
     """
-    Вычисляет моментные характеристики для всех рок-кривых
-    эксперимента.
+    Вычисляет моментные характеристики для всех рок-кривых эксперимента.
     """
     theta = np.asarray(roc_map["theta_axis"], dtype=float)
     intensity_map = np.asarray(roc_map["intensity"], dtype=float)
     time_s = np.asarray(roc_map["time_s"], dtype=float)
 
     rows = []
-    for scan, (t, intensity) in enumerate(zip(time_s, intensity_map)):
+    for scan_id, (t, intensity) in enumerate(zip(time_s, intensity_map), start=1):
         moments = compute_profile_moments(theta=theta, intensity=intensity)
 
         # положение и высота глобального максимума
@@ -155,7 +154,7 @@ def compute_roc_map_moments(roc_map) -> pd.DataFrame:
         peak_intensity = intensity[idx_max]
 
         rows.append({
-            "scan": scan,
+            "scan_id": scan_id,
             "time_s": t,
 
             "peak_theta": float(peak_theta),
@@ -178,9 +177,8 @@ def compute_roc_map_moments(roc_map) -> pd.DataFrame:
         })
     df = pd.DataFrame(rows)
 
-    # удобный порядок столбцов
     column_order = [
-        "scan",
+        "scan_id",
         "time_s",
 
         "peak_theta",
@@ -201,5 +199,64 @@ def compute_roc_map_moments(roc_map) -> pd.DataFrame:
         "fw80_int",
         "fw90_int",
     ]
+    return df[column_order]
+
+
+
+def enrich_profile_moments_with_control_log(
+    profile_moments: pd.DataFrame,
+    control_log: dict,
+) -> pd.DataFrame:
+    """
+    Добавляет к таблице profile moments силу и давление,
+    соответствующие моменту старта каждого скана.
+    """
+    if control_log is None:
+        return profile_moments
+
+    if "scan_points" not in control_log:
+        raise ValueError("control_log не содержит scan_points")
+
+    sp = control_log["scan_points"].copy()
+
+    required_cols = {"scan_id", "force", "pressure_mpa"}
+    missing = required_cols - set(sp.columns)
+    if missing:
+        raise ValueError(f"В scan_points не хватает столбцов: {sorted(missing)}")
+
+    df = profile_moments.copy()
+    df = df.merge(
+        sp[["scan_id", "force", "pressure_mpa"]],
+        on="scan_id",
+        how="inner",
+        validate="one_to_one",
+    )
+
+    if len(df) != len(profile_moments):
+        raise ValueError("Не все scan_id удалось сопоставить между profile_moments и scan_points")
+
+    column_order = [
+        "scan_id",
+        "time_s",
+        "force_kg",
+        "pressure_MPa",
+        "peak_theta",
+        "peak_intensity",
+        "area",
+        "centroid",
+        "centroid_shift",
+        "variance",
+        "sigma",
+        "skewness",
+        "kurtosis",
+        "fw50_int",
+        "fw80_int",
+        "fw90_int",
+    ]
+
+    df = df.rename(columns={
+        "force": "force_kg",
+        "pressure_mpa": "pressure_MPa",
+    })
 
     return df[column_order]
