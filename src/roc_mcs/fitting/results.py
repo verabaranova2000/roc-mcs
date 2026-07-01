@@ -1,6 +1,7 @@
 # results.py
 from dataclasses import dataclass
 import numpy as np
+import pandas as pd
 
 from roc_mcs.fitting.params import FitParameter
 
@@ -37,6 +38,7 @@ class ExperimentArtifact:
     metrics: dict
     metadata: dict
     model_config: dict
+    profile_moments: pd.DataFrame | None = None
     control_log: dict | None = None    
     output_files: list[str] | None = None    
   
