@@ -5,6 +5,7 @@ import warnings
 
 from roc_mcs.processing.alignment import find_phase, extract_branch
 from roc_mcs.processing.calibration import calibrate_roc_map
+from roc_mcs.processing.moments import compute_roc_map_moments
 from roc_mcs.io.mcs import load_mcs, find_mcs_files 
 from roc_mcs.io.control_log import build_control_log
 from roc_mcs.plots import plot_roc_map, plot_residual_maps, save_figure
@@ -162,6 +163,7 @@ def run_experiment(
     save_figure_flag=True,
     save_artifact: bool = False,
     diagnostics=(),
+    compute_moments: bool = True,
     fit_models=(),
     trajectory_models=(),
 ):
@@ -191,6 +193,10 @@ def run_experiment(
         reference_amplitude=reference_amplitude,
         reference_angle=reference_angle,
     )
+
+    profile_moments = None
+    if compute_moments:
+        profile_moments = compute_roc_map_moments(roc_map)
 
     roc_fig = plot_roc_map(roc_map)
 
@@ -239,6 +245,7 @@ def run_experiment(
         output_files.append(
             export_roc_map_excel(roc_map, output_folder, "rocking_curve_dynamics.xlsx",
                                  fit_tables=fit_tables, 
+                                 moment_table=profile_moments,
                                  trajectory_tables=trajectory_tables,
                                  control_log=control_log))
 
@@ -294,6 +301,7 @@ def run_experiment(
             "reference_angle": reference_angle,
         },
         model_config=model_config,
+        profile_moments=profile_moments,
         control_log=control_log,
         output_files=output_files
     )

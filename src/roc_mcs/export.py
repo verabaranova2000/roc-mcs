@@ -6,6 +6,7 @@ def export_roc_map_excel(
     roc_map,
     output_folder=None,
     filename="rocking_curve_dynamics.xlsx",
+    profile_moments=None,
     fit_tables=None,
     trajectory_tables=None,
     control_log=None,
@@ -87,6 +88,8 @@ def export_roc_map_excel(
         roc_df.to_excel(writer, sheet_name="ROC", index=False)
         meta_df.to_excel(writer, sheet_name="Metadata", index=False)  
         calibration_df.to_excel(writer, sheet_name="Calibration", index=False)
+        if profile_moments is not None:
+            profile_moments.to_excel(writer, sheet_name="Moments", index=False)                
         if control_df is not None:
             control_df.to_excel(writer, sheet_name="ForcePressure", index=False)        
         for model_name, df_fit in fit_tables.items():
