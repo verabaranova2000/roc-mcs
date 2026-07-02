@@ -4,7 +4,7 @@ import re
 
 
 def find_periodic_log_file(folder,
-                      pattern="periodic_control_log_*.csv"):
+                      pattern="cycle_control_log_*.csv"):
     """
     Поиск лог-файла управления экспериментом.
     """
@@ -28,7 +28,7 @@ def extract_scan_points(df_log):
     Извлечение моментов запуска MCS-сканов.
     """
     scans = []
-    mask = df_log["state"].str.contains("PERIODIC_SCAN_START", na=False)
+    mask = df_log["state"].str.contains("CYCLE_SCAN_START", na=False)
     for _, row in df_log[mask].iterrows():
         m = re.search( r"SCAN_START_(\d+)", row["state"])
         if m is None:

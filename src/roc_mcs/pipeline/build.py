@@ -9,6 +9,7 @@ from roc_mcs.processing.moments import compute_roc_map_moments, enrich_profile_m
 from roc_mcs.io.mcs import load_mcs, find_mcs_files 
 from roc_mcs.io.control_log import build_control_log
 from roc_mcs.plots import plot_roc_map, plot_residual_maps, save_figure
+from roc_mcs.plots import plot_roc_moment_evolution
 from roc_mcs.plots import plot_trajectories
 from roc_mcs.export import export_roc_map_excel
 from roc_mcs.utils import resolve_output_folder, ensure_folder
@@ -127,9 +128,12 @@ def build_secondary_curves(control_log, roc_map):
     для наложения на графики траекторий.
     """
     t0 = roc_map["time_elapsed_s"][0]
+    t_end = roc_map["time_elapsed_s"][-1]  # или edges[-1], если передашь его
     raw = control_log["raw"].copy()
-    mask = raw["elapsed"] >= t0
+    # mask = raw["elapsed"] >= t0
+    mask = (raw["elapsed"] >= t0) & (raw["elapsed"] <= t_end)
     x = raw.loc[mask, "elapsed"].to_numpy(float) - t0
+    
     return {
         "Давление, МПа": {"x": x,
                           "y": raw.loc[mask, "pressure_mpa"].to_numpy(float),
@@ -186,8 +190,30 @@ def run_experiment(
         profile_moments = compute_roc_map_moments(roc_map)
         if control_log is not None:
             profile_moments = enrich_profile_moments_with_control_log(profile_moments, control_log)
-    
-    roc_fig = plot_roc_map(roc_map)
+
+    secondary_curves = None
+    if control_log is not None:
+        secondary_curves = build_secondary_curves(control_log, roc_map)
+
+    roc_fig = plot_roc_map(roc_map, secondary_curves=secondary_curves)
+
+    # roc_fig = plot_roc_map(roc_map)
+    moment_fig_time = None
+    moment_fig_pressure = None
+    if profile_moments is not None:
+        moment_fig_time = plot_roc_moment_evolution(
+            profile_moments,
+            x_col="time_s",
+            x_label="Time, s",
+            show_shape_stats=True,
+        )
+        if "pressure_MPa" in profile_moments.columns:
+            moment_fig_pressure = plot_roc_moment_evolution(
+                profile_moments,
+                x_col="pressure_MPa",
+                x_label="Pressure, MPa",
+                show_shape_stats=True,
+            )    
 
     output_files = []
     qc_folder = ensure_folder(output_folder / "qc") if diagnostics else None
@@ -224,10 +250,18 @@ def run_experiment(
             trajectories.update(traj.derived)      # вместе с параметрами будет величина FWHM
             trajectory_store[model_name] = trajectories
 
-    # --- ROC figure ---
+
     if save_figure_flag:
+        # --- ROC figure ---
         output_files.append(save_figure(roc_fig, output_folder, "roc_map.png"))
         plt.close(roc_fig)
+        if moment_fig_time is not None:
+            output_files.append(save_figure(moment_fig_time, output_folder, "moment_evolution_time.png"))
+            plt.close(moment_fig_time)
+        if moment_fig_pressure is not None:
+            output_files.append(save_figure(moment_fig_pressure, output_folder, "moment_evolution_pressure.png"))
+            plt.close(moment_fig_pressure)    
+
     # --- Excel ---
     if save_excel_flag:
         trajectory_tables = {model: traj.df_kf for model, traj in trajectory_results.items()}
@@ -248,9 +282,9 @@ def run_experiment(
 
     # --- model evolution figures ---
     if save_figure_flag: 
-        secondary_curves = None
-        if control_log is not None:
-            secondary_curves = build_secondary_curves(control_log, roc_map)
+        # secondary_curves = None
+        # if control_log is not None:
+        #     secondary_curves = build_secondary_curves(control_log, roc_map)
         for model in fit_models:
             traj_fig = plot_trajectories(
                 time=roc_map["time_s"],
