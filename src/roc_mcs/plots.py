@@ -33,13 +33,6 @@ def style_map_axes(ax):
     ax.grid(False)
     ax.tick_params(direction="out", length=3, width=0.8)  
 
-def plot_control_curve(ax, secondary_curves):
-    for label, curve in secondary_curves.items():
-        ax.plot(curve["x"], curve["y"], lw=1.2, alpha=0.8, label=label)
-    # ax.set_ylabel("Load")
-    ax.legend(frameon=False)
-    style_line_axes(ax)
-
 def plot_roc_map(roc_map, secondary_curves=None):    
     time_s = roc_map["time_s"]         # X
     # theta = roc_map["theta_axis"]    # Y
@@ -52,7 +45,6 @@ def plot_roc_map(roc_map, secondary_curves=None):
         y = roc_map["s_axis"]
         ylabel = r"$\sin(\omega t + \varphi)$"
 
-    # fig, ax = plt.subplots(figsize=(10, 5))
     ax_load = None
     if secondary_curves is None:
         fig, ax = plt.subplots(figsize=(10, 5))
@@ -66,8 +58,7 @@ def plot_roc_map(roc_map, secondary_curves=None):
     edges = np.empty(len(time_s) + 1)
     edges[1:-1] = 0.5 * (time_s[:-1] + time_s[1:])
     edges[0] = time_s[0] - 0.5 * dt[0]
-    edges[-1] = time_s[-1] + 0.5 * dt[-1]  
-    half_step = np.median(dt) / 2   
+    edges[-1] = time_s[-1] + 0.5 * dt[-1]   
   
     im = ax.imshow(
         Z,
@@ -76,15 +67,12 @@ def plot_roc_map(roc_map, secondary_curves=None):
         cmap="viridis",
         #extent=[time_s[0], time_s[-1], y.min(), y.max()]  # x_min, x_max, y_min, y_max
         extent=[
-            edges[0],
-            edges[-1],            
-            # time_s[0] - half_step,
-            # time_s[-1] + half_step,
+            edges[0],     # time_s[0] - half_step,
+            edges[-1],    # time_s[-1] + half_step,
             y.min(),
             y.max(),
         ],    
     )
-
     fig.colorbar(im, ax=ax, pad=0.01, label="Counts")
     
     for t_edge in edges:   #time_s:
@@ -98,7 +86,7 @@ def plot_roc_map(roc_map, secondary_curves=None):
     if ax_load is not None:
         for label, curve in secondary_curves.items():
             ax_load.plot(curve["x"], curve["y"], lw=1.2, alpha=0.8, label=label)
-        # ax.set_ylabel("Load")
+        # ax_load.set_ylabel("Load")
         ax_load.legend(loc="upper left", frameon=False)
         style_line_axes(ax_load)
         ax_load.set_xlabel("Time (s)")
