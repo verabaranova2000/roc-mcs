@@ -35,10 +35,6 @@ def load_motor_scan(file, entry_id):
     
 
 
-    from pathlib import Path
-import numpy as np
-import h5py
-
 
 def export_motor_scans(
     entry_ids,
