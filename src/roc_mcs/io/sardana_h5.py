@@ -36,11 +36,7 @@ def load_motor_scan(file, entry_id):
 
 
 
-def export_motor_scans(
-    entry_ids,
-    h5_file,
-    out_folder,
-):
+def export_motor_scans(entry_ids, h5_file, out_folder):
     """
     Экспортирует моторные сканы из h5 в отдельные txt-файлы.
 
