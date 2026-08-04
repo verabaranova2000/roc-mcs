@@ -11,7 +11,7 @@ MODEL_TRAJECTORY = {
     "gauss": {
         "param_keys": ("S", "theta0", "sigma"),
         "rel_spans": (0.10, 0.03, 0.20),
-        "ns": (25, 11, 25),
+        "ns": (20, 11, 20),
         "rel_keep": 1.05,
         "max_keep": None,
         "q_alpha": 0.01,
@@ -38,7 +38,7 @@ MODEL_TRAJECTORY = {
     "pvoigt": {
         "param_keys": ("S", "theta0", "H", "eta"),
         "rel_spans": (0.10, 0.03, 0.20, 0.15),
-        "ns": (25, 11, 25, 21),
+        "ns": (20, 11, 20, 20),
         "rel_keep": 1.05,
         "max_keep": None,
         "q_alpha": 0.01,

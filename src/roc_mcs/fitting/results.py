@@ -34,7 +34,8 @@ class ExperimentArtifact:
     roc_map: dict
     fit_tables: dict
     fit_results: dict
-    trajectory_results: dict
+    trajectory_results: dict    # сырой результат анализа траекторий
+    trajectory_store: dict        # готовые ScalarTrajectory для графиков
     metrics: dict
     metadata: dict
     model_config: dict

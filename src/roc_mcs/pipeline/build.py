@@ -126,6 +126,9 @@ def build_secondary_curves(control_log, roc_map):
     """
     Подготовка плотных кривых внешнего воздействия
     для наложения на графики траекторий.
+    Если лог нагрузки длиннее, чем серия сканов, 
+    его хвост вне диапазона сканов в этот же рисунок лучше не тянуть.
+    Иначе получаем не «информативную общую ось», а просто лишнюю пустую ширину справа.    
     """
     t0 = roc_map["time_elapsed_s"][0]
     t_end = roc_map["time_elapsed_s"][-1]  # или edges[-1], если передашь его
@@ -316,6 +319,7 @@ def run_experiment(
         fit_tables=fit_tables,
         fit_results=fit_results,
         trajectory_results=trajectory_results,
+        trajectory_store=trajectory_store,
         metrics=metrics,
         metadata={
             "input_folder": str(input_folder),

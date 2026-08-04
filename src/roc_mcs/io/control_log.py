@@ -3,8 +3,9 @@ import pandas as pd
 import re
 
 
-def find_periodic_log_file(folder,
-                      pattern="cycle_control_log_*.csv"):
+
+def find_control_log_file(folder,
+                      pattern="*_control_log_*.csv"):
     """
     Поиск лог-файла управления экспериментом.
     """
@@ -16,9 +17,9 @@ def find_periodic_log_file(folder,
     return files[0]
 
 
-def load_periodic_log(file):
+def load_control_log(file):
     """
-    Чтение полного periodic_control_log.
+    Чтение полного control_log-файла.
     """
     return pd.read_csv(file, sep=";")  
 
@@ -26,9 +27,13 @@ def load_periodic_log(file):
 def extract_scan_points(df_log):
     """
     Извлечение моментов запуска MCS-сканов.
+    Универсально для PERIODIC_SCAN_START и CYCLE_SCAN_START.
     """
     scans = []
-    mask = df_log["state"].str.contains("CYCLE_SCAN_START", na=False)
+    # mask = df_log["state"].str.contains("CYCLE_SCAN_START", na=False)
+    # mask = df_log["state"].str.contains(r"_SCAN_START_", regex=True, na=False)
+    mask = df_log["state"].str.contains(r"^[A-Z_]+_SCAN_START_\d+$",
+                                        regex=True, na=False,)
     for _, row in df_log[mask].iterrows():
         m = re.search( r"SCAN_START_(\d+)", row["state"])
         if m is None:
@@ -46,7 +51,7 @@ def extract_scan_points(df_log):
 
 def build_control_log(folder):
     """
-    Подготовка данных из periodic_control_log.
+    Подготовка данных из *_control_log-файла.
 
     Возвращает:
         control_log["raw"]
@@ -65,8 +70,8 @@ def build_control_log(folder):
             давление во времени
     """
 
-    file = find_periodic_log_file(folder)
-    df_log = load_periodic_log(file)
+    file = find_control_log_file(folder)
+    df_log = load_control_log(file)
     scan_points = extract_scan_points(df_log)
     control_log = {
         "file_name": file.name,
