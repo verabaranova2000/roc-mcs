@@ -979,8 +979,9 @@ def run_calibration(
         )
         result = fine_result
 
-    log(f"Успешно! Лучшие параметры: A={result.A_best:.4f}, B={result.B_best:.4f}")
-    
+    # log(f"Успешно! Лучшие параметры: \n   A={result.A_best:.4f} \n   B={result.B_best:.4f}")
+    log(f"Успешно! Лучшие параметры: \n   A = {result.A_best: 10.6f}\n   B = {result.B_best: 10.6f}")
+
     # --- Проверка результата: откалиброванная ось, score(B) при фиксированном A_best; рисунок ---
     set_status("Формирование графиков диагностики...", 95, 100)
     theta_mca = result.A_best * s_mca + result.B_best

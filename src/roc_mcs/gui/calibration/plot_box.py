@@ -43,6 +43,7 @@ class PlotBox(QFrame):
     """
     # --- Геометрия блока графика ---
     BOX_HEIGHT = 260              # Общая высота одного блока графика
+    BOX_MIN_WIDTH = 240           # Минимальная ширина одного блока графика
     PLOT_AREA_HEIGHT = 205        # Высота внутренней области Matplotlib
     TITLE_HEIGHT = 16             # Высота заголовка блока
     OUTER_MARGINS = (4, 3, 4, 4)  # Внешние отступы внутри блока: L, T, R, B
@@ -58,6 +59,10 @@ class PlotBox(QFrame):
         # жестко фиксируем общий размер блока
         self.setFixedHeight(self.BOX_HEIGHT)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+        # Фиксируем минимальные размеры компонента
+        self.setMinimumHeight(self.BOX_HEIGHT)
+        self.setMinimumWidth(self.BOX_MIN_WIDTH)
 
         self.setStyleSheet("""
             QFrame#PlotBox {

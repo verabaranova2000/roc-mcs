@@ -109,30 +109,13 @@ class CalibrationWidget(QWidget):
         self.input_form.setVerticalSpacing(6)
         self.input_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
 
-        
-        # --- 1. Поле MCS файла ---
-        self.input_mcs_path = DropLineEdit()
-        # Просто подключаем сигнал нашей новой строгой кнопки к функции открытия проводника
-        self.input_mcs_path.browse_requested.connect(self.browse_mcs_file)
-        
-        self.btn_preview_mcs = QToolButton()
-        icon = QIcon("gaussian_icon.svg")  # 📈
-        self.btn_preview_mcs.setIcon(icon)
-        self.btn_preview_mcs.setIconSize(QSize(18, 18))
-        self.btn_preview_mcs.setToolTip("Предварительный просмотр спектра")
-        self.btn_preview_mcs.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_preview_mcs.setStyleSheet("QToolButton { font-size: 14px; border: 1px solid #ccc; border-radius: 4px; padding: 2px 4px; background-color: #f8f9fa; } QToolButton:hover { background-color: #e2e6ea; }")
-        self.btn_preview_mcs.clicked.connect(lambda: self.preview_data(source="mcs"))
-        
-        mcs_layout = QHBoxLayout()
-        mcs_layout.setContentsMargins(0, 0, 0, 0)
-        mcs_layout.setSpacing(5)
-        mcs_layout.addWidget(self.input_mcs_path)
-        
-        mcs_layout.addWidget(self.btn_preview_mcs)
-        self.input_form.addRow("Файл MCS:", mcs_layout)
+        # Общий стиль для кнопок предпросмотра
+        preview_btn_style = (
+            "QToolButton { font-size: 14px; border: 1px solid #ccc; border-radius: 4px; padding: 2px 4px; background-color: #f8f9fa; } "
+            "QToolButton:hover { background-color: #e2e6ea; }"
+        )
 
-        # --- 2. Поле entry скана ---
+        # --- 1. Поле entry скана ---
         self.combo_entry_id = EntryComboBox()
         if self.entry_provider:
             ids = self.entry_provider.list_ids()
@@ -147,7 +130,7 @@ class CalibrationWidget(QWidget):
         self.btn_preview_entry.setIconSize(QSize(18, 18))
         self.btn_preview_entry.setToolTip("Предварительный просмотр эталона")
         self.btn_preview_entry.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_preview_entry.setStyleSheet(self.btn_preview_mcs.styleSheet())
+        self.btn_preview_entry.setStyleSheet(preview_btn_style)
         self.btn_preview_entry.clicked.connect(lambda: self.preview_data(source="entry"))  # поменяли подключение кнопок
         
 
@@ -158,6 +141,29 @@ class CalibrationWidget(QWidget):
         entry_layout.addWidget(self.btn_preview_entry)
         
         self.input_form.addRow("Entry ID:", entry_layout)
+
+
+        # --- 2. Поле MCS файла ---
+        self.input_mcs_path = DropLineEdit()
+        # Просто подключаем сигнал нашей новой строгой кнопки к функции открытия проводника
+        self.input_mcs_path.browse_requested.connect(self.browse_mcs_file)
+        
+        self.btn_preview_mcs = QToolButton()
+        icon = QIcon("gaussian_icon.svg")  # 📈
+        self.btn_preview_mcs.setIcon(icon)
+        self.btn_preview_mcs.setIconSize(QSize(18, 18))
+        self.btn_preview_mcs.setToolTip("Предварительный просмотр спектра")
+        self.btn_preview_mcs.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_preview_mcs.setStyleSheet(preview_btn_style)
+        self.btn_preview_mcs.clicked.connect(lambda: self.preview_data(source="mcs"))
+        
+        mcs_layout = QHBoxLayout()
+        mcs_layout.setContentsMargins(0, 0, 0, 0)
+        mcs_layout.setSpacing(5)
+        mcs_layout.addWidget(self.input_mcs_path)
+        
+        mcs_layout.addWidget(self.btn_preview_mcs)
+        self.input_form.addRow("Файл MCS:", mcs_layout)
 
         # --- 3. Выбор ветви ---
         self.combo_branch = QComboBox()
@@ -191,16 +197,16 @@ class CalibrationWidget(QWidget):
         self.layout_inputs.setContentsMargins(0, 0, 0, 0)
         self.layout_inputs.setSpacing(self.RIGHT_PANEL_GAP)
         
-        # --- Верхний ряд: исходные данные ---
+        # --- Верхний ряд: исходные данные (preview) ---
         preview_row = QHBoxLayout()
         preview_row.setContentsMargins(0, 0, 0, 0)
         preview_row.setSpacing(self.PREVIEW_ROW_GAP)
         
-        self.preview_mcs = PlotBox("MCS preview")
         self.preview_entry = PlotBox("Entry preview")
-        
-        preview_row.addWidget(self.preview_mcs, 1)
+        self.preview_mcs = PlotBox("MCS preview")
+
         preview_row.addWidget(self.preview_entry, 1)
+        preview_row.addWidget(self.preview_mcs, 1)
         
         self.layout_inputs.addLayout(preview_row)
         
@@ -229,7 +235,7 @@ class CalibrationWidget(QWidget):
         status_layout.setSpacing(10)
         
         # Текстовый статус текущей операции (занимает всё свободное место слева)
-        self.lbl_status = QLabel("Готово")
+        self.lbl_status = QLabel("")
         self.lbl_status.setStyleSheet("color: #333333; border: none; font-size: 11px;")
         status_layout.addWidget(self.lbl_status, stretch=1)
         
@@ -259,11 +265,96 @@ class CalibrationWidget(QWidget):
         status_layout.addWidget(self.progress_bar)
         main_layout.addWidget(self.status_container)
 
+        # --- Динамическая валидация готовности к калибровке ---
+        self.input_mcs_path.textChanged.connect(self.update_ready_state)
+        self.combo_entry_id.currentIndexChanged.connect(self.update_ready_state)
+        self.combo_entry_id.currentTextChanged.connect(self.update_ready_state)
 
+        # Первичный расчет состояния при загрузке окна
+        self.update_ready_state()
         
     def log(self, text):
         """Вывод сообщений в консоль GUI"""
-        self.log_console.append(text)
+        # self.log_console.append(text)
+        # Используем <pre> для гарантированного сохранения всех пробелов и отступов
+        formatted_msg = f'<pre style="margin: 0; line-height: 1.2;">{text}</pre>'
+        self.log_console.append(formatted_msg)
+
+    # @property
+    # def current_entry_id(self):
+    #     """
+    #     Строгий геттер для Entry ID. 
+    #     Гарантирует синхронизацию видимого текста и внутренних данных.
+    #     """
+    #     text = self.combo_entry_id.currentText().strip()
+    #     if not text:
+    #         return None
+        
+    #     # 1. Проверяем, есть ли введенный текст в базе списка
+    #     index = self.combo_entry_id.findText(text)
+    #     if index != -1:
+    #         return self.combo_entry_id.itemData(index)
+        
+    #     # 2. Если пользователь ввел новый ID вручную
+    #     return int(text) if text.isdigit() else text
+
+    @property
+    def current_entry_id(self):
+        """
+        Геттер для Entry ID. 
+        Гарантирует, что введенный текст является валидным числовым идентификатором.
+        """
+        text = self.combo_entry_id.currentText().strip()
+        if not text:
+            return None
+        
+        # Если в комбобоксе выбран реальный элемент из выпадающего списка
+        index = self.combo_entry_id.findText(text)
+        if index != -1 and text == self.combo_entry_id.itemText(index):
+            return self.combo_entry_id.itemData(index)
+        
+        # Если пользователь вводит текст руками: проверяем, что это строго целое число
+        if text.isdigit():
+            return int(text)
+            
+        # Если ввели буквы ("ь", "abc" и т.д.) — считаем, что валидного ID нет
+        return None
+
+
+    # ===============================
+    # Статус готовности к калибровке
+    # ===============================    
+    def update_ready_state(self):
+        """
+        Проверяет полноту введенных данных, обновляет текст строки статуса
+        и блокирует/разблокирует кнопку выполнения калибровки.
+        """
+        # Проверяем наличие пути к MCS-файлу
+        mcs_path = self.input_mcs_path.text().strip()
+        has_mcs = bool(mcs_path)
+        
+        # Проверяем выбор Entry ID (выбран ли пункт в combo или введен текст)
+        # entry_id = self.combo_entry_id.currentData() or self.combo_entry_id.currentText().strip()
+        # has_entry = bool(entry_id) and self.combo_entry_id.currentIndex() != -1
+        has_entry = self.current_entry_id is not None
+
+        # Динамическая реакция интерфейса
+        if has_mcs and has_entry:
+            self.lbl_status.setText("Готов к калибровке")
+            self.lbl_status.setStyleSheet("color: #2b78e4; border: none; font-size: 11px; font-weight: bold;")
+            self.act_run.setEnabled(True)
+        elif not has_mcs and not has_entry:
+            self.lbl_status.setText("Ожидание данных: укажите MCS-файл и Entry ID")
+            self.lbl_status.setStyleSheet("color: #666666; border: none; font-size: 11px;")
+            self.act_run.setEnabled(False)
+        elif not has_mcs:
+            self.lbl_status.setText("Ожидание данных: укажите MCS-файл")
+            self.lbl_status.setStyleSheet("color: #666666; border: none; font-size: 11px;")
+            self.act_run.setEnabled(False)
+        else:
+            self.lbl_status.setText("Ожидание данных: выберите Entry ID")
+            self.lbl_status.setStyleSheet("color: #666666; border: none; font-size: 11px;")
+            self.act_run.setEnabled(False)
 
     # ===========================
     # Метод вызова проводника
@@ -299,7 +390,8 @@ class CalibrationWidget(QWidget):
     # ===========================
     def preview_data(self, source="both", silent=False):
         mcs_path = self.input_mcs_path.text().strip()
-        entry_id = self.combo_entry_id.currentData()
+        # entry_id = self.combo_entry_id.currentData()
+        entry_id = self.current_entry_id
         branch = self.combo_branch.currentText()
     
         if source in ("mcs", "both") and mcs_path:
@@ -329,7 +421,8 @@ class CalibrationWidget(QWidget):
 
     def start_calibration(self):
         mcs_path = self.input_mcs_path.text().strip()
-        entry_id = self.combo_entry_id.currentData()
+        # entry_id = self.combo_entry_id.currentData()
+        entry_id = self.current_entry_id
         branch = self.combo_branch.currentText()
 
         if not mcs_path or entry_id is None:
@@ -395,8 +488,8 @@ class CalibrationWidget(QWidget):
 
     def on_calibration_finished(self, result, fig):
         self.act_run.setEnabled(True)
-        self.log("\n[УСПЕХ] Расчет завершен успешно!")
-        self.log(f"Параметры калибровки:\nA* = {result.A_best:.6f}\nB* = {result.B_best:.6f}")
+        # self.log("\n[УСПЕХ] Расчет завершен успешно!")
+        # self.log(f"Параметры калибровки:\nA* = {result.A_best:.6f}\nB* = {result.B_best:.6f}")
 
         self.lbl_status.setText("Готово")     # Красиво завершаем статус-бар
         self.lbl_progress_text.setText("")
