@@ -4,8 +4,11 @@ from scipy.signal import find_peaks, savgol_filter, peak_prominences
 from tqdm.auto import tqdm
 from dataclasses import dataclass
 
-from roc_mcs.processing.moments import compute_profile_moments
 
+from roc_mcs.io.mcs import load_mcs
+from roc_mcs.processing.alignment import find_phase
+from roc_mcs.processing.alignment import extract_branch
+from roc_mcs.visualization.calibration import plot_calibration_diagnostics
 
 """
 Применение калибровки
@@ -535,7 +538,7 @@ def find_inner_minimum(B_scan, scores, edge_frac=0.12, smooth=True):
 
 
 
-def search_A_by_inner_B_minimum(
+def search_A_by_inner_B_minimum_v0(
     s_mca, y_mca,
     theta_motor, y_motor,
     A_scan, 
@@ -544,6 +547,7 @@ def search_A_by_inner_B_minimum(
     n_grid=500,
     delta=0.03,
     block_size=2048,
+    verbose=True,
 ):
     """
     Parameters
@@ -579,10 +583,10 @@ def search_A_by_inner_B_minimum(
 
     y_mca_n = normalize01(y_mca)
     y_motor_n = normalize01(y_motor)
-    
+
     score_map = np.empty((len(A_scan), len(B_scan)), dtype=float)
     rows = []
-    for i, A in enumerate(tqdm(A_scan, desc="Searching A")):       
+    for i, A in enumerate(tqdm(A_scan, desc="Searching A", disable=not verbose)):       
         scores = score_B_scan(
             A=A,
             s_mca=s_mca,
@@ -610,8 +614,99 @@ def search_A_by_inner_B_minimum(
             "reason": info.get("reason", ""),
             "n_finite": np.isfinite(scores).sum(),
         })
+
     results = pd.DataFrame(rows).reset_index(drop=True)
     return results, score_map
+
+
+
+
+def search_A_by_inner_B_minimum(
+    s_mca, y_mca,
+    theta_motor, y_motor,
+    A_scan, 
+    B_scan,
+    edge_frac=0.10,
+    n_grid=500,
+    delta=0.03,
+    block_size=2048,
+    verbose=True,
+    step_callback=None  # <-- НОВЫЙ АРГУМЕНТ ДЛЯ GUI
+):
+    """
+    Parameters
+    ----------
+    s_mca : array-like
+        Нормированная координата ROC-кривой, полученной из MCS.
+    
+    y_mca : array-like
+        Интенсивность ROC-кривой из MCS.
+    
+    theta : array-like
+        Угловая координата моторного скана (угл. сек.).
+    
+    y_motor : array-like
+        Интенсивность моторного скана.
+    
+    A_scan : array-like
+        Сетка масштабного коэффициента A.
+    
+    B_scan : array-like
+        Сетка сдвига B.
+    """
+    # Если вдруг оси не отсортированы, отсортируем один раз
+    if np.any(np.diff(s_mca) < 0):
+        order = np.argsort(s_mca)
+        s_mca = s_mca[order]
+        y_mca = y_mca[order]
+
+    if np.any(np.diff(theta_motor) < 0):
+        order = np.argsort(theta_motor)
+        theta_motor = theta_motor[order]
+        y_motor = y_motor[order]
+
+    y_mca_n = normalize01(y_mca)
+    y_motor_n = normalize01(y_motor)
+
+    total_steps = len(A_scan)
+    score_map = np.empty((len(A_scan), len(B_scan)), dtype=float)
+    rows = []
+    for i, A in enumerate(tqdm(A_scan, desc="Searching A", disable=not verbose)):       
+        scores = score_B_scan(
+            A=A,
+            s_mca=s_mca,
+            y_mca=y_mca_n,
+            theta_motor=theta_motor,
+            y_motor=y_motor_n,
+            B_scan=B_scan,
+            n_grid=n_grid,
+            delta=delta,
+            block_size=block_size,
+        )
+        score_map[i] = scores
+
+        B_best, score_best, info = find_inner_minimum(
+            B_scan,
+            scores,
+            edge_frac=edge_frac,
+            smooth=True,
+        )
+
+        rows.append({
+            "A": A,
+            "B_best": B_best,
+            "score_best": score_best,
+            "reason": info.get("reason", ""),
+            "n_finite": np.isfinite(scores).sum(),
+        })
+
+        # Сигнализируем в GUI на каждой итерации
+        if step_callback:
+            step_callback(i + 1, total_steps)
+
+    results = pd.DataFrame(rows).reset_index(drop=True)
+    return results, score_map
+
 
 
 
@@ -704,3 +799,216 @@ def check_search_result(A_scan, B_scan,
         "B_too_close_to_edge": B_too_close,
         "ok": (not A_too_close) and (not B_too_close),
     }
+
+
+
+
+# ==================
+# Пайплайн
+# ==================
+def run_calibration(
+    file_path_mcs,
+    branch_mcs="down",
+    entry_reference_id=None,
+    entry_provider=None,
+    a_factor=6.0,
+    coarse_nA=201,
+    coarse_nB=2001,
+    refine=True,
+    refine_A_frac=0.15,
+    refine_B_frac=0.10,
+    refine_nA=401,
+    refine_nB=1001,
+    verbose=True,
+    log_callback=print,         # <-- По умолчанию print
+    progress_callback=None      # <-- Ожидает сигналы вида (status_text, current, total)
+):
+    def log(msg):
+        if verbose and log_callback:
+            log_callback(msg)
+
+    
+    def set_status(msg, current=0, total=100):
+        if progress_callback:
+            progress_callback(msg, current, total)
+            
+            
+    if entry_provider is None:
+        raise ValueError("Нет entry_provider")
+
+    log("---> Старт калибровки...")
+    set_status("Подготовка данных...", 0, 100)
+    
+    mcs = load_mcs(file_path_mcs)
+
+    # --- 1. MCA КДО ---
+    counts = mcs["counts"]
+    n_channels = mcs["n_channels"]
+    phi, scores = find_phase(counts, n_channels)
+    s_mca, y_mca = extract_branch(counts, phi, n_channels, branch=branch_mcs)
+    log(f"1. Фаза определена: phi = {phi}")
+    log(f"2. Ветвь {branch_mcs} извлечена: s_mca, y_mca")
+    set_status("Загрузка моторной КДО...", 10, 100)
+    # plt.plot(s_mca, y_mca)
+    # plt.grid(True)
+    # plt.show()
+
+    # --- 3. Моторная КДО ---
+    curve_motor = entry_provider.load(entry_reference_id)
+    theta_motor = curve_motor["theta"]
+    y_motor = curve_motor["intensity"]
+    log(f"3. Моторная КДО загружена: ID={entry_reference_id}")
+    set_status("Данные загружены. Настройка сеток...", 20, 100)
+    # plt.plot(theta_motor, y_motor)
+    # plt.grid(True)
+    # plt.show()
+
+    # --- 4.  Поиск с автоматическим расширением диапазона ---
+    attempt = 0
+    max_attempts = 3
+    while attempt < max_attempts:
+        if attempt == 0:
+            log("Грубый поиск диапазонов A, B...")
+            set_status("Оценка диапазонов...")
+        else:
+            log("Минимум на границе — расширяю диапазон и повторяю поиск.")
+            set_status(f"Расширение диапазона (попытка {attempt+1})...")
+        A_scan, B_scan, estimate = guess_scan_ranges(
+            s_mca=s_mca,
+            y_mca=y_mca,
+            theta_motor=theta_motor,
+            y_motor=y_motor,
+            a_factor=a_factor,
+            nA=coarse_nA, 
+            nB=coarse_nB,
+            verbose=verbose,
+        )
+
+        # Функция-обертка для передачи прогресса из цикла в GUI
+        def coarse_step_cb(current, total):
+            set_status(f"Searching A (Грубый поиск, поп. {attempt+1})", current, total)
+        
+        df_res, score_map = search_A_by_inner_B_minimum(
+            s_mca=s_mca,
+            y_mca=y_mca,
+            theta_motor=theta_motor,
+            y_motor=y_motor,
+            A_scan=A_scan,
+            B_scan=B_scan,
+            verbose=verbose,
+            step_callback=coarse_step_cb  # <-- ПЕРЕДАЕМ ОБЕРТКУ
+        )
+    
+        coarse_result = CalibrationSearchResult(
+            A_scan=A_scan,
+            B_scan=B_scan,
+            estimate=estimate,
+            df_res=df_res,
+            score_map=score_map,
+        )            
+        if coarse_result.boundary_report["ok"]:
+            break
+        a_factor *= 1.5
+        attempt += 1
+    
+    if not coarse_result.boundary_report["ok"]:
+        raise RuntimeError(
+            "Не удалось найти устойчивый минимум: диапазон поиска недостаточен.")
+    result = coarse_result
+    set_status("Грубый поиск завершен", 70, 100)
+    
+    # # --- Проверка результата: откалиброванная ось, score(B) при фиксированном A_best; рисунок ---
+    # theta_mca = coarse_result.A_best * s_mca + coarse_result.B_best
+    # # --- score(B) при фиксированном A_best ---
+    # score_vs_B_at_best_A = score_B_scan(  # вычисляет score для всех B из B_scan при фиксированном A
+    #     A=coarse_result.A_best,
+    #     s_mca=s_mca,
+    #     y_mca=normalize01(y_mca),
+    #     theta_motor=theta_motor,
+    #     y_motor=normalize01(y_motor),
+    #     B_scan=coarse_result.B_scan,
+    # )
+    # fig, axes = plot_calibration_diagnostics(
+    #     score_surface=coarse_result.score_map,
+    #     a_grid=coarse_result.A_scan,
+    #     b_grid=coarse_result.B_scan,
+    #     score_vs_B_at_best_A=score_vs_B_at_best_A,
+    #     a_best=coarse_result.A_best,
+    #     b_best=coarse_result.B_best,
+    #     minima_path_df=coarse_result.df_res,
+    #     theta_motor=theta_motor,
+    #     profile_motor=y_motor,
+    #     theta_reconstructed=theta_mca,
+    #     profile_reconstructed=y_mca,
+    # )
+    # plt.show()
+    
+    # --- 6. Локальное уточнение, если coarse-этап нормальный ---
+    if refine and coarse_result.boundary_report["ok"]:
+        log("7. Локальное уточнение вокруг найденного минимума...")
+        set_status("Подготовка сетки точного поиска...")
+        A_scan_fine, B_scan_fine, refine_estimate = guess_refinement_scan_ranges(
+            coarse_result,
+            refine_A_frac=refine_A_frac,
+            refine_B_frac=refine_B_frac,
+            nA=refine_nA,
+            nB=refine_nB,
+            verbose=verbose
+        )
+        
+        def fine_step_cb(current, total):
+            set_status("Searching A (Локальное уточнение)", current, total)
+            
+        df_res, score_map = search_A_by_inner_B_minimum(
+            s_mca=s_mca,
+            y_mca=y_mca,
+            theta_motor=theta_motor,
+            y_motor=y_motor,
+            A_scan=A_scan_fine,
+            B_scan=B_scan_fine,
+            verbose=verbose, 
+            step_callback=fine_step_cb  # <-- ПЕРЕДАЕМ ОБЕРТКУ
+        )
+
+        fine_result = CalibrationSearchResult(
+            A_scan=A_scan_fine,
+            B_scan=B_scan_fine,
+            estimate=refine_estimate,
+            df_res=df_res,
+            score_map=score_map,
+        )
+        result = fine_result
+
+    log(f"Успешно! Лучшие параметры: A={result.A_best:.4f}, B={result.B_best:.4f}")
+    
+    # --- Проверка результата: откалиброванная ось, score(B) при фиксированном A_best; рисунок ---
+    set_status("Формирование графиков диагностики...", 95, 100)
+    theta_mca = result.A_best * s_mca + result.B_best
+    score_vs_B_at_best_A = score_B_scan(  # вычисляет score для всех B из B_scan при фиксированном A
+        A=result.A_best,
+        s_mca=s_mca,
+        y_mca=normalize01(y_mca),
+        theta_motor=theta_motor,
+        y_motor=normalize01(y_motor),
+        B_scan=result.B_scan,
+    )
+
+
+    fig, axes = plot_calibration_diagnostics(
+        score_surface=result.score_map,
+        a_grid=result.A_scan,
+        b_grid=result.B_scan,
+        score_vs_B_at_best_A=score_vs_B_at_best_A,
+        a_best=result.A_best,
+        b_best=result.B_best,
+        minima_path_df=result.df_res,
+        theta_motor=theta_motor,
+        profile_motor=y_motor,
+        theta_reconstructed=theta_mca,
+        profile_reconstructed=y_mca,
+    )
+    # plt.show()
+
+    # Возвращаем объект результата и готовую фигуру Matplotlib (БЕЗ plt.show()!)
+    set_status("Калибровка завершена", 100, 100)
+    return result, fig

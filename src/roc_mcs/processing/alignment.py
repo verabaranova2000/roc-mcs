@@ -1,5 +1,15 @@
 import numpy as np
 
+
+"""
+find_phase(...)
+↓
+extract_branch(...)
+
+Здесь extract_branch() сразу выделяет одну монотонную ветвь, 
+которая потом используется как ROC-кривая.
+"""
+
 def find_phase(counts, n_channels, window=15):
     """
     Автоматически подбирает фазовый сдвиг, при котором две ветви ROC-кривой
