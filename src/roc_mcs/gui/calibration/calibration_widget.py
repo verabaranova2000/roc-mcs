@@ -1,5 +1,7 @@
 # calibration_widget.py
 
+from importlib.resources import files
+from pathlib import Path
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
     QTextEdit, 
@@ -14,14 +16,21 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtGui import QAction, QIcon
 from PyQt6.QtCore import Qt, QSize
 
-
+from roc_mcs.io.sardana_h5 import H51DEntryProvider
 from roc_mcs.gui.calibration.calibration_worker import CalibrationWorker
 from roc_mcs.gui.calibration.drop_line_edit import DropLineEdit
 from roc_mcs.gui.calibration.entry_combo_box import EntryComboBox
 from roc_mcs.gui.calibration.plot_box import PlotBox
+from roc_mcs.gui.calibration.h5_settings_dialog import H5SettingsDialog
 from roc_mcs.io.mcs import load_mcs
 from roc_mcs.processing.alignment import find_phase
 from roc_mcs.processing.alignment import extract_branch
+
+# --- путь к иконке ---
+GAUSSIAN_ICON = str(files("roc_mcs.gui.resources").joinpath("icons", "gaussian_icon.svg"))
+SETTING_ICON = str(files("roc_mcs.gui.resources").joinpath("icons", "setting_icon.svg"))
+INFO_ICON = str(files("roc_mcs.gui.resources").joinpath("icons", "info_icon.svg"))
+
 
 class CalibrationWidget(QWidget):
     """
@@ -36,6 +45,10 @@ class CalibrationWidget(QWidget):
     PREVIEW_ROW_GAP = 6              # Горизонтальный зазор между верхними графиками
 
     STATUS_BAR_HEIGHT = 30           # Высота нижней статусной панели
+
+    # --- Стили статус-бара ---
+    STYLE_NORMAL = "color: #666666; border: none; font-size: 11px;"
+    STYLE_READY = "color: #2b78e4; border: none; font-size: 11px; font-weight: bold;"
 
     def __init__(self, entry_provider=None, parent=None):
         super().__init__(parent)
@@ -90,16 +103,26 @@ class CalibrationWidget(QWidget):
                                 self)
         self.act_stop.triggered.connect(lambda: self.log("[INFO] Stop пока не реализован"))
         
-        self.act_info = QAction(self.style().standardIcon(QStyle.StandardPixmap.SP_MessageBoxInformation),
+        self.act_info = QAction(QIcon(INFO_ICON),
+                                # self.style().standardIcon(QStyle.StandardPixmap.SP_MessageBoxInformation),
                                 "Info",
                                 self)
         self.act_info.triggered.connect(lambda: self.log("[INFO] Info пока не реализован"))
-        
+
+        self.act_settings = QAction(QIcon(SETTING_ICON), 
+                                    "HDF5 settings", 
+                                    self)
+        self.act_settings.triggered.connect(self.open_h5_settings)
+
         toolbar.addAction(self.act_run)
         toolbar.addAction(self.act_stop)
         toolbar.addAction(self.act_info)
+        toolbar.addAction(self.act_settings)
         
         input_outer.addWidget(toolbar)
+
+        # --- Состояние ---
+        self.entry_h5_path = None
         
         # Правая часть — поля
         self.fields_widget = QWidget()
@@ -125,7 +148,7 @@ class CalibrationWidget(QWidget):
 
         
         self.btn_preview_entry = QToolButton()
-        icon = QIcon("gaussian_icon.svg")  # 📈
+        icon = QIcon(GAUSSIAN_ICON)        # 📈
         self.btn_preview_entry.setIcon(icon)
         self.btn_preview_entry.setIconSize(QSize(18, 18))
         self.btn_preview_entry.setToolTip("Предварительный просмотр эталона")
@@ -149,7 +172,7 @@ class CalibrationWidget(QWidget):
         self.input_mcs_path.browse_requested.connect(self.browse_mcs_file)
         
         self.btn_preview_mcs = QToolButton()
-        icon = QIcon("gaussian_icon.svg")  # 📈
+        icon = QIcon(GAUSSIAN_ICON)        # 📈
         self.btn_preview_mcs.setIcon(icon)
         self.btn_preview_mcs.setIconSize(QSize(18, 18))
         self.btn_preview_mcs.setToolTip("Предварительный просмотр спектра")
@@ -211,7 +234,7 @@ class CalibrationWidget(QWidget):
         self.layout_inputs.addLayout(preview_row)
         
         # --- Нижний график: результат калибровки ---
-        self.preview_result = PlotBox("Результат калибровки")
+        self.preview_result = PlotBox("Result")  # "Результат калибровки"
         self.layout_inputs.addWidget(self.preview_result)
 
         # --- Добавляем правую панель в splitter ---
@@ -280,23 +303,6 @@ class CalibrationWidget(QWidget):
         formatted_msg = f'<pre style="margin: 0; line-height: 1.2;">{text}</pre>'
         self.log_console.append(formatted_msg)
 
-    # @property
-    # def current_entry_id(self):
-    #     """
-    #     Строгий геттер для Entry ID. 
-    #     Гарантирует синхронизацию видимого текста и внутренних данных.
-    #     """
-    #     text = self.combo_entry_id.currentText().strip()
-    #     if not text:
-    #         return None
-        
-    #     # 1. Проверяем, есть ли введенный текст в базе списка
-    #     index = self.combo_entry_id.findText(text)
-    #     if index != -1:
-    #         return self.combo_entry_id.itemData(index)
-        
-    #     # 2. Если пользователь ввел новый ID вручную
-    #     return int(text) if text.isdigit() else text
 
     @property
     def current_entry_id(self):
@@ -341,20 +347,53 @@ class CalibrationWidget(QWidget):
         # Динамическая реакция интерфейса
         if has_mcs and has_entry:
             self.lbl_status.setText("Готов к калибровке")
-            self.lbl_status.setStyleSheet("color: #2b78e4; border: none; font-size: 11px; font-weight: bold;")
+            self.lbl_status.setStyleSheet(self.STYLE_READY)
             self.act_run.setEnabled(True)
         elif not has_mcs and not has_entry:
             self.lbl_status.setText("Ожидание данных: укажите MCS-файл и Entry ID")
-            self.lbl_status.setStyleSheet("color: #666666; border: none; font-size: 11px;")
+            self.lbl_status.setStyleSheet(self.STYLE_NORMAL)
             self.act_run.setEnabled(False)
         elif not has_mcs:
             self.lbl_status.setText("Ожидание данных: укажите MCS-файл")
-            self.lbl_status.setStyleSheet("color: #666666; border: none; font-size: 11px;")
+            self.lbl_status.setStyleSheet(self.STYLE_NORMAL)
             self.act_run.setEnabled(False)
         else:
             self.lbl_status.setText("Ожидание данных: выберите Entry ID")
-            self.lbl_status.setStyleSheet("color: #666666; border: none; font-size: 11px;")
+            self.lbl_status.setStyleSheet(self.STYLE_NORMAL)
             self.act_run.setEnabled(False)
+
+    # ===========================
+    # Метод настройки: путь к data.h5
+    # ===========================
+    def open_h5_settings(self):
+        current_path = self.entry_h5_path or ""
+
+        dialog = H5SettingsDialog(current_path=current_path, parent=self)
+        if dialog.exec() != dialog.DialogCode.Accepted:
+            return
+
+        new_path = Path(dialog.get_path())
+        self.entry_h5_path = new_path
+        self.entry_provider = H51DEntryProvider(new_path)
+
+        self.reload_entry_ids()
+        self.log(f"[INFO] HDF5 путь обновлён: {new_path}")
+
+    def reload_entry_ids(self):
+        """
+        Метод обновления combo box
+        Чтобы после смены файла список entry обновлялся:
+        """
+        self.combo_entry_id.blockSignals(True)
+        self.combo_entry_id.clear()
+
+        if self.entry_provider:
+            for entry_id in self.entry_provider.list_ids():
+                self.combo_entry_id.addItem(str(entry_id), entry_id)
+
+        self.combo_entry_id.setCurrentIndex(-1)
+        self.combo_entry_id.blockSignals(False)
+
 
     # ===========================
     # Метод вызова проводника
@@ -376,6 +415,7 @@ class CalibrationWidget(QWidget):
     # ===========================
     def update_progress(self, status_msg, current, total):
         self.lbl_status.setText(status_msg)      # Обновляем текст слева
+        self.lbl_status.setStyleSheet(self.STYLE_NORMAL)
         if total > 0 and current > 0:            # Обновляем цифры справа (например, "201 / 201")
             self.lbl_progress_text.setText(f"{current} / {total}")
             pct = int((current / total) * 100)   # Рассчитываем проценты для самого бара
@@ -434,6 +474,7 @@ class CalibrationWidget(QWidget):
         # --- ИЗМЕНЕНИЕ 1: Сброс нового статус-бара перед запуском ---
         self.progress_bar.setValue(0)
         self.lbl_status.setText("Чтение файлов...")
+        self.lbl_status.setStyleSheet(self.STYLE_NORMAL)
         self.lbl_progress_text.setText("")
         
         self.log_console.clear()
@@ -492,6 +533,7 @@ class CalibrationWidget(QWidget):
         # self.log(f"Параметры калибровки:\nA* = {result.A_best:.6f}\nB* = {result.B_best:.6f}")
 
         self.lbl_status.setText("Готово")     # Красиво завершаем статус-бар
+        self.lbl_status.setStyleSheet(self.STYLE_READY)
         self.lbl_progress_text.setText("")
         self.progress_bar.setValue(100)
         
