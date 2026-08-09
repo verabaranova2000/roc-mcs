@@ -52,7 +52,11 @@ class CalibrationWidget(QWidget):
 
     def __init__(self, entry_provider=None, parent=None):
         super().__init__(parent)
-        self.entry_provider = entry_provider # Ссылка на словарь/ТРС_data.h5
+        self.entry_provider = entry_provider                              # Ссылка на словарь/ТРС_data.h5
+        if self.entry_provider and getattr(self.entry_provider, "file_path", None):
+            self.entry_h5_path = Path(self.entry_provider.file_path)      # извлекаем путь из провайдера, если он там есть
+        else:
+            self.entry_h5_path = None
         self.init_ui()
 
     def init_ui(self):
@@ -121,8 +125,8 @@ class CalibrationWidget(QWidget):
         
         input_outer.addWidget(toolbar)
 
-        # --- Состояние ---
-        self.entry_h5_path = None
+        # # --- Состояние ---
+        # self.entry_h5_path = None
         
         # Правая часть — поля
         self.fields_widget = QWidget()
@@ -335,32 +339,42 @@ class CalibrationWidget(QWidget):
         Проверяет полноту введенных данных, обновляет текст строки статуса
         и блокирует/разблокирует кнопку выполнения калибровки.
         """
-        # Проверяем наличие пути к MCS-файлу
+        # 1. Проверяем наличие пути к MCS-файлу
         mcs_path = self.input_mcs_path.text().strip()
         has_mcs = bool(mcs_path)
-        
-        # Проверяем выбор Entry ID (выбран ли пункт в combo или введен текст)
-        # entry_id = self.combo_entry_id.currentData() or self.combo_entry_id.currentText().strip()
-        # has_entry = bool(entry_id) and self.combo_entry_id.currentIndex() != -1
+
+        # 2. Проверяем наличие источника данных (загружен ли HDF5 или словарь)
+        has_provider = self.entry_provider is not None
+
+        # 3. Проверяем выбор Entry ID (выбран ли пункт в combo или введен текст)
         has_entry = self.current_entry_id is not None
 
         # Динамическая реакция интерфейса
-        if has_mcs and has_entry:
+        if has_mcs and has_provider and has_entry:            # < --- Все данные собраны
             self.lbl_status.setText("Готов к калибровке")
             self.lbl_status.setStyleSheet(self.STYLE_READY)
             self.act_run.setEnabled(True)
-        elif not has_mcs and not has_entry:
-            self.lbl_status.setText("Ожидание данных: укажите MCS-файл и Entry ID")
+        elif not has_mcs and not has_provider:                # < --- Нехватка: Нет ни MCS, ни HDF5
+            self.lbl_status.setText("Ожидание данных: укажите MCS-файл и путь к HDF5")
             self.lbl_status.setStyleSheet(self.STYLE_NORMAL)
             self.act_run.setEnabled(False)
-        elif not has_mcs:
+        elif not has_provider:                                # < --- Нехватка: MCS загружен, но провайдер HDF5 пуст
+            self.lbl_status.setText("Ожидание данных: укажите путь к HDF5")
+            self.lbl_status.setStyleSheet(self.STYLE_NORMAL)
+            self.act_run.setEnabled(False)
+        elif not has_mcs and not has_entry:                   # < --- Нехватка: База HDF5 есть, но ничего не выбрано и нет MCS
+            self.lbl_status.setText("Ожидание данных: укажите MCS-файл и выберите Entry ID")
+            self.lbl_status.setStyleSheet(self.STYLE_NORMAL)
+            self.act_run.setEnabled(False)
+        elif not has_mcs:                                     # < --- Нехватка: нет только MCS; база есть, Entry выбран
             self.lbl_status.setText("Ожидание данных: укажите MCS-файл")
             self.lbl_status.setStyleSheet(self.STYLE_NORMAL)
             self.act_run.setEnabled(False)
-        else:
+        else:                                                 # < --- Нехватка: нет только ENTRY ID; все файлы на месте, осталось выбрать скан
             self.lbl_status.setText("Ожидание данных: выберите Entry ID")
             self.lbl_status.setStyleSheet(self.STYLE_NORMAL)
             self.act_run.setEnabled(False)
+
 
     # ===========================
     # Метод настройки: путь к data.h5
@@ -377,6 +391,7 @@ class CalibrationWidget(QWidget):
         self.entry_provider = H51DEntryProvider(new_path)
 
         self.reload_entry_ids()
+        self.update_ready_state()    # обновить статус интерфейса
         self.log(f"[INFO] HDF5 путь обновлён: {new_path}")
 
     def reload_entry_ids(self):

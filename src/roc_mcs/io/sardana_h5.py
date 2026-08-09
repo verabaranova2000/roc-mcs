@@ -157,6 +157,7 @@ class Dict1DEntryProvider:
     """ Provider 1D entry, хранящихся в словаре. """
     def __init__(self, curves_dict):
         self.curves_dict = curves_dict
+        self.file_path = None  # У словаря нет файла на диске
 
     def list_ids(self):
         """ Возвращает список доступных ID. """        

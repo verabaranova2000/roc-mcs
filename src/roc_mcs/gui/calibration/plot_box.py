@@ -11,7 +11,7 @@ import matplotlib.pyplot as plt
 from matplotlib.ticker import MaxNLocator, ScalarFormatter
 
 
-from roc_mcs.processing.calibration import normalize01
+from roc_mcs.processing.utils import normalize01
 
 
 def _style_scientific_axes(ax, title, xlabel, ylabel):

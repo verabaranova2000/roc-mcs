@@ -6,7 +6,7 @@ from matplotlib.lines import Line2D
 from matplotlib.patches import ConnectionPatch
 import matplotlib.patheffects as pe
 
-from roc_mcs.processing.calibration import normalize01
+from roc_mcs.processing.utils import normalize01
 
 def text_append(
     ax,
