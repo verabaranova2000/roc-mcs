@@ -873,7 +873,7 @@ def run_calibration(
     
     # --- 6. Локальное уточнение, если coarse-этап нормальный ---
     if refine and coarse_result.boundary_report["ok"]:
-        log("7. Локальное уточнение вокруг найденного минимума...")
+        log("4. Локальное уточнение вокруг найденного минимума...")
         set_status("Подготовка сетки точного поиска...")
         A_scan_fine, B_scan_fine, refine_estimate = guess_refinement_scan_ranges(
             coarse_result,

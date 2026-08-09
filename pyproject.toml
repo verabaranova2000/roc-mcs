@@ -15,7 +15,10 @@ dependencies = [
     "openpyxl",
     "PyYAML",
     "tqdm",
-    "scipy"
+    "scipy",
+    "h5py",
+    "PyQt6"
+
 ]
 
 [tool.setuptools]
