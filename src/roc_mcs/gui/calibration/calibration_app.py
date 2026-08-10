@@ -1,35 +1,156 @@
+# import os
+# import sys
+# from pathlib import Path
+
+
+# # ============================================================
+# # Автоматическая настройка окружения
+# # ============================================================
+
+# def _find_project_root() -> Path:
+#     """
+#     Возвращает корень репозитория roc-mcs.
+
+#     Структура:
+#         roc-mcs/
+#         └── src/
+#             └── roc_mcs/
+#                 └── gui/
+#                     └── calibration/
+#                         └── calibration_app.py
+#     """
+#     return Path(__file__).resolve().parents[4]
+
+
+# def _find_virtualenv(project_root: Path) -> Path | None:
+#     """
+#     Ищет виртуальное окружение в корне проекта.
+
+#     Поддерживаются:
+#         .venv
+#         venv
+#     """
+
+#     for name in (".venv", "venv"):
+#         env_dir = project_root / name
+
+#         if sys.platform == "win32":
+#             python_exe = env_dir / "Scripts" / "python.exe"
+#         else:
+#             python_exe = env_dir / "bin" / "python"
+
+#         if python_exe.is_file():
+#             return python_exe
+
+#     return None
+
+
+# def _is_same_python(python_a: Path, python_b: Path) -> bool:
+#     """Проверяет, являются ли два пути одним и тем же Python."""
+
+#     try:
+#         return python_a.resolve() == python_b.resolve()
+#     except OSError:
+#         return os.path.normcase(str(python_a)) == os.path.normcase(str(python_b))
+
+
+# def _restart_in_virtualenv() -> None:
+#     """
+#     Если в проекте есть virtual environment и приложение
+#     запущено не из него — перезапускает приложение через
+#     Python из virtual environment.
+#     """
+
+#     project_root = _find_project_root()
+
+#     # --------------------------------------------------------
+#     # Делаем src доступным для импорта roc_mcs
+#     # --------------------------------------------------------
+
+#     src_dir = project_root / "src"
+
+#     if src_dir.is_dir() and str(src_dir) not in sys.path:
+#         sys.path.insert(0, str(src_dir))
+
+#     # --------------------------------------------------------
+#     # Ищем virtual environment
+#     # --------------------------------------------------------
+
+#     venv_python = _find_virtualenv(project_root)
+
+#     # Если virtual environment нет — ничего не меняем.
+#     if venv_python is None:
+#         os.chdir(project_root)
+#         return
+
+#     current_python = Path(sys.executable)
+
+#     # Мы уже работаем из нужного окружения.
+#     if _is_same_python(current_python, venv_python):
+#         os.chdir(project_root)
+#         return
+
+#     # --------------------------------------------------------
+#     # Нашли virtual environment, но сейчас используется
+#     # другой Python → перезапускаем приложение через него.
+#     # --------------------------------------------------------
+
+#     script_path = Path(__file__).resolve()
+
+#     if sys.platform == "win32":
+#         pythonw = venv_python.with_name("pythonw.exe")
+
+#         if pythonw.is_file():
+#             executable = pythonw
+#         else:
+#             executable = venv_python
+#     else:
+#         executable = venv_python
+
+#     # Работаем относительно корня проекта.
+#     os.chdir(project_root)
+
+#     # Передаём управление Python из virtual environment.
+#     os.execv(
+#         str(executable),
+#         [str(executable), str(script_path), *sys.argv[1:]],
+#     )
+
+
+# # ============================================================
+# # Запускаем bootstrap ДО импортов приложения
+# # ============================================================
+
+# _restart_in_virtualenv()
+
+
+
+
+
+
+# ============ Диагностика ================
 import os
 import sys
 from pathlib import Path
 
 
-# ============================================================
-# Автоматическая настройка окружения
-# ============================================================
-
-def _find_project_root() -> Path:
-    """
-    Возвращает корень репозитория roc-mcs.
-
-    Структура:
-        roc-mcs/
-        └── src/
-            └── roc_mcs/
-                └── gui/
-                    └── calibration/
-                        └── calibration_app.py
-    """
-    return Path(__file__).resolve().parents[4]
+LOG_FILE = Path(__file__).resolve().with_name("_calibration_startup.log")
 
 
-def _find_virtualenv(project_root: Path) -> Path | None:
-    """
-    Ищет виртуальное окружение в корне проекта.
+def _log(message):
+    with LOG_FILE.open("a", encoding="utf-8") as f:
+        f.write(message + "\n")
 
-    Поддерживаются:
-        .venv
-        venv
-    """
+
+try:
+    _log("\n========== START ==========")
+    _log(f"__file__ = {__file__}")
+    _log(f"sys.executable = {sys.executable}")
+    _log(f"cwd = {os.getcwd()}")
+    _log(f"sys.path = {sys.path}")
+
+    project_root = Path(__file__).resolve().parents[4]
+    _log(f"project_root = {project_root}")
 
     for name in (".venv", "venv"):
         env_dir = project_root / name
@@ -39,89 +160,29 @@ def _find_virtualenv(project_root: Path) -> Path | None:
         else:
             python_exe = env_dir / "bin" / "python"
 
-        if python_exe.is_file():
-            return python_exe
-
-    return None
-
-
-def _is_same_python(python_a: Path, python_b: Path) -> bool:
-    """Проверяет, являются ли два пути одним и тем же Python."""
-
-    try:
-        return python_a.resolve() == python_b.resolve()
-    except OSError:
-        return os.path.normcase(str(python_a)) == os.path.normcase(str(python_b))
-
-
-def _restart_in_virtualenv() -> None:
-    """
-    Если в проекте есть virtual environment и приложение
-    запущено не из него — перезапускает приложение через
-    Python из virtual environment.
-    """
-
-    project_root = _find_project_root()
-
-    # --------------------------------------------------------
-    # Делаем src доступным для импорта roc_mcs
-    # --------------------------------------------------------
+        _log(f"checking {python_exe}")
+        _log(f"exists = {python_exe.is_file()}")
 
     src_dir = project_root / "src"
 
     if src_dir.is_dir() and str(src_dir) not in sys.path:
         sys.path.insert(0, str(src_dir))
 
-    # --------------------------------------------------------
-    # Ищем virtual environment
-    # --------------------------------------------------------
-
-    venv_python = _find_virtualenv(project_root)
-
-    # Если virtual environment нет — ничего не меняем.
-    if venv_python is None:
-        os.chdir(project_root)
-        return
-
-    current_python = Path(sys.executable)
-
-    # Мы уже работаем из нужного окружения.
-    if _is_same_python(current_python, venv_python):
-        os.chdir(project_root)
-        return
-
-    # --------------------------------------------------------
-    # Нашли virtual environment, но сейчас используется
-    # другой Python → перезапускаем приложение через него.
-    # --------------------------------------------------------
-
-    script_path = Path(__file__).resolve()
-
-    if sys.platform == "win32":
-        pythonw = venv_python.with_name("pythonw.exe")
-
-        if pythonw.is_file():
-            executable = pythonw
-        else:
-            executable = venv_python
-    else:
-        executable = venv_python
-
-    # Работаем относительно корня проекта.
     os.chdir(project_root)
 
-    # Передаём управление Python из virtual environment.
-    os.execv(
-        str(executable),
-        [str(executable), str(script_path), *sys.argv[1:]],
-    )
+    _log(f"new cwd = {os.getcwd()}")
+    _log(f"new sys.path = {sys.path}")
 
+except Exception as e:
+    _log(f"BOOTSTRAP ERROR: {type(e).__name__}: {e}")
 
-# ============================================================
-# Запускаем bootstrap ДО импортов приложения
-# ============================================================
+    import traceback
 
-_restart_in_virtualenv()
+    with LOG_FILE.open("a", encoding="utf-8") as f:
+        traceback.print_exc(file=f)
+
+    raise
+
 
 
 # ============================================================
