@@ -291,15 +291,17 @@ def _bootstrap():
 
     script_path = Path(__file__).resolve()
 
-    if sys.platform == "win32":
-        pythonw = venv_python.with_name("pythonw.exe")
+    ## if sys.platform == "win32":
+    ##     pythonw = venv_python.with_name("pythonw.exe")
 
-        if pythonw.is_file():
-            executable = pythonw
-        else:
-            executable = venv_python
-    else:
-        executable = venv_python
+    ##     if pythonw.is_file():
+    ##         executable = pythonw
+    ##     else:
+    ##         executable = venv_python
+    ## else:
+    ##     executable = venv_python
+    ## Замена на ЭТО (но вместе с приложением откроется консоль):
+    executable = venv_python
 
     # Передаём управление Python из virtual environment.
     os.execv(

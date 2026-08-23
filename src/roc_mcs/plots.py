@@ -60,19 +60,29 @@ def plot_roc_map(roc_map, secondary_curves=None):
     edges[0] = time_s[0] - 0.5 * dt[0]
     edges[-1] = time_s[-1] + 0.5 * dt[-1]   
   
-    im = ax.imshow(
-        Z,
-        aspect="auto",
-        origin="lower",
+    # im = ax.imshow(
+    #     Z,
+    #     aspect="auto",
+    #     origin="lower",
+    #     cmap="viridis",
+    #     #extent=[time_s[0], time_s[-1], y.min(), y.max()]  # x_min, x_max, y_min, y_max
+    #     extent=[
+    #         edges[0],     # time_s[0] - half_step,
+    #         edges[-1],    # time_s[-1] + half_step,
+    #         y.min(),
+    #         y.max(),
+    #     ],    
+    # )
+    # --- ИСПРАВЛЕНИЕ: Заменяем imshow на pcolormesh для корректной отрисовки неравномерной сетки y
+    im = ax.pcolormesh(
+        time_s, 
+        y, 
+        Z, 
         cmap="viridis",
-        #extent=[time_s[0], time_s[-1], y.min(), y.max()]  # x_min, x_max, y_min, y_max
-        extent=[
-            edges[0],     # time_s[0] - half_step,
-            edges[-1],    # time_s[-1] + half_step,
-            y.min(),
-            y.max(),
-        ],    
+        shading="auto",
+        rasterized=True  # Ускоряет рендер и предотвращает артефакты сетки в векторных форматах
     )
+    # -------------------------
     fig.colorbar(im, ax=ax, pad=0.01, label="Counts")
     
     for t_edge in edges:   #time_s:
