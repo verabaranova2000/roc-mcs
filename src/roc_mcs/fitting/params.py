@@ -143,12 +143,13 @@ def lorentz_bounds(p0):
         "gamma": (1e-6, 10 * gamma0),
     }
      
-def gauss_bounds(p0):
+def gauss_bounds(p0, dtheta=None):
     S0, theta0, sigma0 = p0
+    min_w = dtheta if dtheta is not None else 0.2
     return {
         "S": (0.5 * S0, 1.5 * S0),
         "theta0": (theta0 - 5, theta0 + 5),
-        "sigma": (0.2, sigma0),
+        "sigma": (min_w, max(sigma0 * 5, min_w * 1.5)),  # Безопасная верхняя граница
     }
     
 def gauss_us_bounds(p0):
@@ -169,12 +170,13 @@ def voigt_bounds(p0):
         "gamma": (0.1*gamma0, 5*gamma0),
     }    
 
-def pvoigt_bounds(p0):
+def pvoigt_bounds(p0, dtheta=None):
     S0, theta0, H0, eta0 = p0
+    min_w = dtheta if dtheta is not None else 0.2
     return {
         "S": (0.5*S0, 1.5*S0),
         "theta0": (theta0-5, theta0+5),
-        "H": (0.2, 5*H0),
+        "H": (min_w, max(5*H0, min_w * 1.5)),
         "eta": (0.0, 1.0),
     }
     
@@ -188,17 +190,17 @@ def emg_bounds(p0):
         "lam": (0.0, 5.0),
     }    
 
-def split_voigt_bounds(p0):
+def split_voigt_bounds(p0, dtheta=None):
     S0, theta0, bGl, bCl, bGr, bCr = p0
-    eps = 1      # шаг theta-сетки
+    # eps = 1      # шаг theta-сетки
+    min_w = dtheta if dtheta is not None else 1.0   # старый eps (шаг theta-сетки) был 1
     return {
-        "S": (0.2 * S0, 5.0 * S0),
+"S": (0.2 * S0, 5.0 * S0),
         "theta0": (theta0 - 5, theta0 + 5),
-
-        "beta_Gl": (eps, 10.0 * bGl),
-        "beta_Cl": (eps, 10.0 * bCl),
-        "beta_Gr": (eps, 10.0 * bGr),
-        "beta_Cr": (eps, 10.0 * bCr),
+        "beta_Gl": (min_w, max(10.0 * bGl, min_w * 1.5)),
+        "beta_Cl": (min_w, max(10.0 * bCl, min_w * 1.5)),
+        "beta_Gr": (min_w, max(10.0 * bGr, min_w * 1.5)),
+        "beta_Cr": (min_w, max(10.0 * bCr, min_w * 1.5)),
     }
 
     

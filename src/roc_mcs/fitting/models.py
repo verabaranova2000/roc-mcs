@@ -12,21 +12,29 @@ from roc_mcs.fitting.kernels import ultrasound_RC
 np.trapezoid(...)
     Численная перенормировка, потому что интегрируем не по всей прямой, 
     а по конечному диапазону theta, т.е. хвосты обрезаются -> площадь не дооценивается
+    Защита от underflow (if area > 0): при нулевой площади (выход за границы сетки / экстремальное сужение) 
+    деление пропускается во избежание генерации NaN.
 """
 
 def profile_lorentz(th, gamma):
     L = (1 / np.pi) * gamma / (th**2 + gamma**2)
-    L /= np.trapezoid(L, th)
+    area = np.trapezoid(L, th)
+    if area > 0:
+        L /= area
     return L
 
 def profile_gauss(th, sigma):
     G = np.exp(-(th**2) / (2 * sigma**2))
-    G /= np.trapezoid(G, th)
+    area = np.trapezoid(G, th)
+    if area > 0:
+        G /= area
     return G
 
 def profile_voigt(th, sigma, gamma):
     V = voigt_profile(th, sigma, gamma)
-    V /= np.trapezoid(V, th)
+    area = np.trapezoid(V, th)
+    if area > 0:
+        V /= area
     return V  
 
 def profile_pvoigt(th, H, eta):

@@ -73,7 +73,8 @@ MODEL_ANALYSIS_v0 = {
 
 MODEL_ANALYSIS = {
     "lorentz": {
-        "fwhm": lambda r, theta: 2 * r.parameters["gamma"].value,
+        "fwhm": lambda r, theta: 2 * r.parameters["gamma"].value,  # ⚠ Это удобно для ModelResult, но для fitted_peak_catalog неудобно
+        "fwhm_from_params": lambda p: 2 * p["gamma"],              # < - поэтому сделаем это...
         "derived": {},
         "plot_groups": [
             [("theta0", "θ₀"), ("FWHM", "FWHM")],
@@ -83,6 +84,7 @@ MODEL_ANALYSIS = {
 
     "gauss": {
         "fwhm": lambda r, theta: 2 * np.sqrt(2 * np.log(2)) * r.parameters["sigma"].value,
+        "fwhm_from_params": lambda p: (2 * np.sqrt(2 * np.log(2)) * p["sigma"]),
         "derived": {},
         "plot_groups": [
             [("theta0", "θ₀"), ("FWHM", "FWHM")],
@@ -119,6 +121,7 @@ MODEL_ANALYSIS = {
 
     "pvoigt": {
         "fwhm": lambda r, theta: r.parameters["H"].value,
+        "fwhm_from_params": lambda p: p["H"],
         "derived": {},
         "plot_groups": [
             [("theta0", "θ₀"), ("FWHM", "FWHM")],
