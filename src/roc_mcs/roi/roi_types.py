@@ -16,8 +16,7 @@ class BaseROI:
 
 @dataclass
 class RotatedRectROI(BaseROI):    # Разньше называлось RotatedROI 
-    """Rotated rectangular ROI in data coordinates."""
-
+    """Вращающийся прямоугольник в координатах данных."""
     cx: float
     cy: float
     width: float
@@ -26,9 +25,6 @@ class RotatedRectROI(BaseROI):    # Разньше называлось RotatedR
 
     def copy(self) -> "RotatedRectROI":
         return RotatedRectROI(self.cx, self.cy, self.width, self.height, self.angle)
-
-    # def to_dict(self) -> dict:
-    #     return asdict(self)
 
     @classmethod
     def from_dict(cls, d: dict) -> "RotatedRectROI":
@@ -171,7 +167,6 @@ class ROI:
     def to_dict(self) -> dict:
         return asdict(self)
 
-
     @classmethod
     def from_selector_roi(cls, roi: BaseROI, **kwargs) -> "ROI":
         """
@@ -220,7 +215,6 @@ class ROI:
                 type=roi_type, label=label, color=color, mode=mode
             )
         
-
     @classmethod
     def from_dict(cls, d: dict) -> "ROI":
         if {"cx", "cy", "width", "height"}.issubset(d.keys()):
@@ -254,7 +248,6 @@ class ROI:
             )
         raise ValueError(f"Unrecognized ROI schema: {sorted(d.keys())}")
 
-
     @property
     def is_valid(self) -> bool:
         """
@@ -268,8 +261,6 @@ class ROI:
         elif self.type == 'rect':                         # Прямоугольник обязан иметь площадь. 
             return self.width > 0 and self.height > 0     # Линия нулевой толщины (клик+протяжка по одной оси) - это не прямоугольник.
         return False                                      # Неизвестный тип на всякий случай блокируем
-
-
 
 
 @dataclass
