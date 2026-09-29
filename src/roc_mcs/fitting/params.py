@@ -97,11 +97,17 @@ def voigt_guess(theta, intensity):
 # --- pseudo-Voigt ---
 def pvoigt_guess(theta, intensity):
     S0 = np.trapezoid(intensity, theta)
+    if not np.isfinite(S0) or S0 <= 0:
+        raise ValueError(f"Invalid pvoigt area S0={S0}")
     theta0 = np.trapezoid(theta * intensity, theta) / S0
     H0 = estimate_fwhm(theta, intensity)
-    if not np.isfinite(H0):     # запасной вариант
-        sigma0 = np.sqrt(np.trapezoid((theta - theta0)**2 * intensity, theta) / S0)
+    dtheta = float(np.median(np.diff(theta)))
+    if not np.isfinite(H0) or H0 <= 0:     # запасной вариант
+        variance = np.trapezoid((theta - theta0) ** 2 * intensity, theta) / S0
+        sigma0 = np.sqrt(max(variance, 0.0))
         H0 = 2*np.sqrt(2*np.log(2))*sigma0
+    if not np.isfinite(H0) or H0 <= 0:
+        H0 = dtheta
     eta0 = 0.5
     return S0, theta0, H0, eta0    
 
@@ -135,7 +141,7 @@ def split_voigt_guess(theta, intensity):
 # ==================================================
 # Границы
 # ==================================================
-def lorentz_bounds(p0):
+def lorentz_bounds(p0, dtheta=None):
     S0, theta0, gamma0 = p0
     return {
         "S": (0.5 * S0, 2.0 * S0),
@@ -152,7 +158,7 @@ def gauss_bounds(p0, dtheta=None):
         "sigma": (min_w, max(sigma0 * 5, min_w * 1.5)),  # Безопасная верхняя граница
     }
     
-def gauss_us_bounds(p0):
+def gauss_us_bounds(p0, dtheta=None):
     S0, theta0, sigma0, _ = p0
     return {
         "S": (0.5 * S0, 1.5 * S0),
@@ -161,7 +167,7 @@ def gauss_us_bounds(p0):
         "Delta": (1, 20.0),   # 🚨 Не меньше шага theta!
     }
 
-def voigt_bounds(p0):
+def voigt_bounds(p0, dtheta=None):
     S0, theta0, sigma0, gamma0 = p0
     return {
         "S": (0.5*S0, 2*S0),
@@ -180,7 +186,7 @@ def pvoigt_bounds(p0, dtheta=None):
         "eta": (0.0, 1.0),
     }
     
-def emg_bounds(p0):
+def emg_bounds(p0, dtheta=None):
     S0, theta0, sigma0, gamma0, lam0 = p0
     return {
         "S": (0.5*S0, 1.5*S0),

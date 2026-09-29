@@ -1,5 +1,6 @@
 import numpy as np
 from scipy.special import voigt_profile
+import jax.numpy as jnp
 
 from roc_mcs.fitting.kernels import ultrasound_RC
 
@@ -263,6 +264,116 @@ def batch_model_split_voigt(theta, S, theta0, beta_Gl, beta_Cl, beta_Gr, beta_Cr
     y = y / beta
 
     return S * y
+
+
+# ==================================================
+# Jacobian
+# ==================================================
+
+def _normalize_batch_with_derivative(y, dy, theta):
+    """Нормирует профиль и одновременно вычисляет производную нормированного профиля."""
+    area = np.trapezoid(y, theta, axis=-1)
+    darea = np.trapezoid(dy, theta, axis=-1)
+    inv_area = 1.0 / area
+    y_norm = y * inv_area[:, None]
+    dy_norm = dy * inv_area[:, None] - y * (darea * inv_area**2)[:, None]
+    return y_norm, dy_norm
+
+def batch_jac_pvoigt(theta, S, theta0, H, eta):
+    """
+    Аналитический Jacobian batch PVoigt.
+
+    Возвращает массив формы (B, M, 4):
+        [:, :, 0] = d(model) / dS
+        [:, :, 1] = d(model) / dtheta0
+        [:, :, 2] = d(model) / dH
+        [:, :, 3] = d(model) / deta
+    """
+    theta = np.asarray(theta, dtype=float)
+
+    S = _col(S)
+    theta0 = _col(theta0)
+    H = _col(H)
+    eta = _col(eta)
+
+    th = theta[None, :] - theta0
+    th2 = th * th
+
+    cH = 2 * np.sqrt(2 * np.log(2))
+    sigma = H / cH
+    gamma = H / 2
+
+    # ------------------------------------------------------------
+    # Gaussian
+    # ------------------------------------------------------------
+    G0 = np.exp(-th2 / (2 * sigma * sigma))
+    dG0_dtheta0 = G0 * th / sigma**2
+    dG0_dH = G0 * th2 / sigma**3 / cH
+
+    # ------------------------------------------------------------
+    # Lorentzian
+    # ------------------------------------------------------------
+    den = th2 + gamma * gamma
+    L0 = (1 / np.pi) * gamma / den
+    dL0_dtheta0 = (1 / np.pi) * 2 * th * gamma / den**2
+    dL0_dH = (1 / np.pi) * (th2 - gamma * gamma) / den**2  / 2
+
+    # ------------------------------------------------------------
+    # Нормируем компоненты и их производные.
+    # ------------------------------------------------------------
+    G = _normalize_batch(G0, theta)
+    L = _normalize_batch(L0, theta)
+    G_theta0 = _normalize_batch_with_derivative(G0, dG0_dtheta0, theta)[1]
+    G_H = _normalize_batch_with_derivative( G0, dG0_dH, theta)[1]
+    L_theta0 = _normalize_batch_with_derivative(L0, dL0_dtheta0, theta)[1]
+    L_H = _normalize_batch_with_derivative(L0, dL0_dH, theta)[1]
+
+    # ------------------------------------------------------------
+    # PVoigt = eta*L + (1-eta)*G
+    # ------------------------------------------------------------
+    P = eta * L + (1 - eta) * G
+    dP_dtheta0 = eta * L_theta0 + (1 - eta) * G_theta0
+
+    dP_dH = eta * L_H + (1 - eta) * G_H
+    dP_deta = L - G
+
+    # ------------------------------------------------------------
+    # Финальный Jacobian модели y = S * P.
+    # ------------------------------------------------------------
+    J = np.empty((S.shape[0], theta.size, 4), dtype=float)
+    J[:, :, 0] = P
+    J[:, :, 1] = S * dP_dtheta0
+    J[:, :, 2] = S * dP_dH
+    J[:, :, 3] = S * dP_deta
+    return J
+
+
+
+# ==================================================
+# JAX models
+# ==================================================
+
+def jax_model_pvoigt(theta, S, theta0, H, eta):
+    """JAX-модель одного PVoigt-компонента."""
+    th = theta - theta0
+    th2 = th * th
+
+    cH = 2.0 * jnp.sqrt(2.0 * jnp.log(2.0))
+    tiny = jnp.finfo(theta.dtype).tiny
+
+    sigma = jnp.maximum(H / cH, tiny)
+    gamma = jnp.maximum(H / 2.0, tiny)
+
+    G0 = jnp.exp(-th2 / (2.0 * sigma * sigma))
+    L0 = (1.0 / jnp.pi) * gamma / (th2 + gamma * gamma)
+
+    area_G = jnp.trapezoid(G0, theta)
+    area_L = jnp.trapezoid(L0, theta)
+
+    G = G0 / jnp.maximum(area_G, tiny)
+    L = L0 / jnp.maximum(area_L, tiny)
+
+    return S * (eta * L + (1.0 - eta) * G)
 
 # ==================================================
 # Numerical helpers
