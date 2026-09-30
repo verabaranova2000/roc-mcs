@@ -303,6 +303,28 @@ def make_jax_lm_solver_v4(
             "lambda": lam,
         }
 
+    # @jax.jit
+    # def solve(obs, valid, x0, lb, ub, theta):
+    #     obs = jnp.asarray(obs, dtype=jnp.float64)
+    #     valid = jnp.asarray(valid, dtype=bool)
+    #     x0 = jnp.asarray(x0, dtype=jnp.float64)
+    #     lb = jnp.asarray(lb, dtype=jnp.float64)
+    #     ub = jnp.asarray(ub, dtype=jnp.float64)
+    #     theta = jnp.asarray(theta, dtype=jnp.float64)
+
+    #     B = obs.shape[0]
+    #     groups = []
+    #     for start in range(0, B, microbatch_size):
+    #         end = min(start + microbatch_size, B)
+    #         groups.append(solve_group(
+    #             obs[start:end], valid[start:end], x0[start:end],
+    #             lb[start:end], ub[start:end], theta
+    #         ))
+
+    #     return {key: jnp.concatenate([group[key] for group in groups], axis=0) for key in groups[0]}
+
+    # return solve, model_batch, residual_batch, jac_batch
+
     @jax.jit
     def solve(obs, valid, x0, lb, ub, theta):
         obs = jnp.asarray(obs, dtype=jnp.float64)
@@ -313,19 +335,41 @@ def make_jax_lm_solver_v4(
         theta = jnp.asarray(theta, dtype=jnp.float64)
 
         B = obs.shape[0]
-        groups = []
-        for start in range(0, B, microbatch_size):
-            end = min(start + microbatch_size, B)
-            groups.append(solve_group(
-                obs[start:end], valid[start:end], x0[start:end],
-                lb[start:end], ub[start:end], theta
-            ))
+        mb = min(microbatch_size, B)
+        n_groups = (B + mb - 1) // mb
+        padded_B = n_groups * mb
+        pad = padded_B - B
 
-        return {key: jnp.concatenate([group[key] for group in groups], axis=0) for key in groups[0]}
+        # Дополняем последний microbatch; невалидные строки не влияют на fit.
+        obs = jnp.concatenate([obs, jnp.zeros((pad, obs.shape[1]), dtype=obs.dtype)], axis=0)
+        valid = jnp.concatenate([valid, jnp.zeros((pad, valid.shape[1]), dtype=bool)], axis=0)
+        x0 = jnp.concatenate([x0, jnp.repeat(x0[-1:], pad, axis=0)], axis=0)
+        lb = jnp.concatenate([lb, jnp.repeat(lb[-1:], pad, axis=0)], axis=0)
+        ub = jnp.concatenate([ub, jnp.repeat(ub[-1:], pad, axis=0)], axis=0)
+
+        obs_g = obs.reshape(n_groups, mb, -1)
+        valid_g = valid.reshape(n_groups, mb, -1)
+        x0_g = x0.reshape(n_groups, mb, -1)
+        lb_g = lb.reshape(n_groups, mb, -1)
+        ub_g = ub.reshape(n_groups, mb, -1)
+
+        def scan_body(_, xs):
+            obs_i, valid_i, x0_i, lb_i, ub_i = xs
+            return None, solve_group(obs_i, valid_i, x0_i, lb_i, ub_i, theta)
+
+        _, groups = lax.scan(
+            scan_body,
+            None,
+            (obs_g, valid_g, x0_g, lb_g, ub_g),
+            unroll=1,
+        )
+
+        def flatten_groups(a):
+            return a.reshape((padded_B,) + a.shape[2:])[:B]
+
+        return {key: flatten_groups(value) for key, value in groups.items()}
 
     return solve, model_batch, residual_batch, jac_batch
-
-
 
 
 # --------- Production fitter ------------

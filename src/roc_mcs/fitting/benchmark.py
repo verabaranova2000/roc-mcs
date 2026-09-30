@@ -31,9 +31,6 @@ def _sync_jax_tree(tree):
 def benchmark_jax_full(
     data_yxt,
     theta,
-    peak_catalog,
-    pixel_peaks,
-    spec,
     B=128,
     prepared_fit=None,
     prepared_fit_time_s=0.0,
@@ -49,7 +46,7 @@ def benchmark_jax_full(
     if prepared_fit is None:
         raise ValueError("benchmark_jax_full requires prepared_fit")
 
-    expected_keys = set(pixel_peaks)
+    expected_keys = {(int(x), int(y)) for group in prepared_fit.groups.values() for x, y in zip(group.x, group.y)}
     seen = set()
 
     stats = {
@@ -212,12 +209,8 @@ def benchmark_jax_full(
             ms["size"].append(int(group.size))
             ms["max_iter"].append(group_max)
             ms["mean_iter"].append(group_mean)
-            ms["max_over_mean"].append(
-                group_max / group_mean if group_mean > 0.0 else 1.0
-            )
-            ms["effective_fraction"].append(
-                group_mean / group_max if group_max > 0 else 1.0
-            )
+            ms["max_over_mean"].append(group_max / group_mean if group_mean > 0.0 else 1.0)
+            ms["effective_fraction"].append(group_mean / group_max if group_max > 0 else 1.0)
 
         success = np.asarray(out["success"])[:n_actual]
         cost = np.asarray(out["cost"])[:n_actual]
@@ -250,10 +243,7 @@ def benchmark_jax_full(
             next_progress += progress_step
 
     if seen != expected_keys:
-        raise AssertionError(
-            f"Coverage mismatch: missing={len(expected_keys-seen)}, "
-            f"extra={len(seen-expected_keys)}"
-        )
+        raise AssertionError(f"Coverage mismatch: missing={len(expected_keys-seen)}, extra={len(seen-expected_keys)}")
 
     total_fit = sum(s["time_s"] for s in stats.values())
     total_success = sum(s["success"] for s in stats.values())
@@ -299,7 +289,6 @@ def benchmark_jax_full(
             CONV_REASON_NAMES.get(code, f"unknown_{code}"): int(np.sum(reasons == code))
             for code in (1, 2, 3, 4)
         }
-
         px_s = s["pixels"] / max(s["time_s"], 1e-15)
 
         rows.append({
