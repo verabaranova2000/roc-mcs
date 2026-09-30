@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 import numpy as np
 
+from roc_mcs.peaks.catalog import enrich_peak_catalog
 
 """ Подготовка и пакетирование задач fitting.
 
@@ -9,7 +10,7 @@ import numpy as np
 peak_catalog + data_yxt + ModelSpec
     │
     ▼
-prepare_peak_catalog()
+enrich_peak_catalog()
     │
     ▼
 prepare_fit_data()
@@ -116,27 +117,6 @@ class FitBatch:
 
 
 
-def prepare_peak_catalog(peak_catalog, Nx):
-    """
-    Переводит сырой catalog в удобное для fitting представление:
-        (x, y)
-        ↓
-        pixel_id
-        ↓
-        сортировка
-        ↓
-        component_id
-        ↓
-        n_components
-    """
-    pc = peak_catalog.copy()
-    pc["pixel_id"] = pc["y"].astype(int) * Nx + pc["x"].astype(int)
-    pc = pc.sort_values(["pixel_id", "theta"]).reset_index(drop=True)
-    pc["component_id"] = pc.groupby("pixel_id", sort=False).cumcount()
-    pc["n_components"] = pc.groupby("pixel_id")["component_id"].transform("size").astype(int)
-    return pc
-
-
 
 def initialize_component(
     spec, theta, intensity, seed, left_neighbor=None, right_neighbor=None,
@@ -237,7 +217,7 @@ def prepare_fit_data(
     """
     Один раз вычисляет seeds, x0 и bounds для всех pixel.
     Подготовка данных:
-        prepare_peak_catalog
+        enrich_peak_catalog
             → unique pixel groups
             → определить K
             → создать массивы
@@ -247,7 +227,7 @@ def prepare_fit_data(
             → metadata
     """
     Ny, Nx, M = data_yxt.shape
-    pc = prepare_peak_catalog(peak_catalog, Nx)
+    pc = enrich_peak_catalog(peak_catalog, Nx)
 
     active_names = tuple(
         name for name in spec.param_names
@@ -470,240 +450,3 @@ def pad_batch_arrays(batch, target_B=128):
     ], axis=0)
 
     return obs, valid, x0, lb, ub, n
-
-
-
-
-
-# # ==============
-# # Восстанавливаю
-# # ==============
-
-# @dataclass(frozen=True, slots=True)
-# class PreparedFitGroup:
-#     K: int
-#     pixel_id: np.ndarray
-#     x: np.ndarray
-#     y: np.ndarray
-#     peak_id: np.ndarray
-#     theta_index: np.ndarray
-#     theta_detected: np.ndarray
-#     prominence: np.ndarray
-#     height: np.ndarray
-#     x0: np.ndarray
-#     lb: np.ndarray
-#     ub: np.ndarray
-#     fixed: dict[str, np.ndarray]
-
-
-# @dataclass(frozen=True, slots=True)
-# class PreparedFitData:
-#     groups: dict[int, PreparedFitGroup]
-#     theta_valid: np.ndarray
-#     active_names: tuple[str, ...]
-#     param_names: tuple[str, ...]
-#     add_background: bool
-
-
-# def prepare_fit_data(
-#     data_yxt, theta, peak_catalog, spec,
-#     allow_center_shift=True, center_window=40.0, add_background=True,
-# ):
-#     """Один раз вычисляет seeds, x0 и bounds для всех pixel."""
-#     Ny, Nx, M = data_yxt.shape
-#     pc = prepare_peak_catalog(peak_catalog, Nx)
-
-#     active_names = tuple(
-#         name for name in spec.param_names
-#         if allow_center_shift or name != "theta0"
-#     )
-#     A = len(active_names)
-
-#     theta = np.asarray(theta, dtype=float)
-#     theta_valid = np.isfinite(theta)
-#     theta_span = float(theta.max() - theta.min())
-#     theta_step = float(np.median(np.diff(theta)))
-
-#     pixel_id_col = pc["pixel_id"].to_numpy(dtype=np.int64, copy=False)
-#     x_col = pc["x"].to_numpy(dtype=np.int64, copy=False)
-#     y_col = pc["y"].to_numpy(dtype=np.int64, copy=False)
-#     peak_id_col = pc["peak_id"].to_numpy(dtype=np.int64, copy=False)
-#     theta_index_col = pc["theta_index"].to_numpy(dtype=np.int64, copy=False)
-#     theta_col = pc["theta"].to_numpy(dtype=float, copy=False)
-#     prominence_col = pc["prominence"].to_numpy(dtype=float, copy=False)
-#     height_col = pc["height"].to_numpy(dtype=float, copy=False)
-
-#     pixel_ids, pixel_starts, pixel_counts = np.unique(
-#         pixel_id_col, return_index=True, return_counts=True
-#     )
-#     pixel_K = pixel_counts.astype(np.int16, copy=False)
-
-#     groups = {}
-
-#     for K in sorted(np.unique(pixel_K)):
-#         K = int(K)
-#         pixel_indices = np.flatnonzero(pixel_K == K)
-#         N = len(pixel_indices)
-
-#         pixel_id = np.empty(N, dtype=np.int64)
-#         x = np.empty(N, dtype=np.int64)
-#         y = np.empty(N, dtype=np.int64)
-#         peak_id = np.empty((N, K), dtype=np.int64)
-#         theta_index = np.empty((N, K), dtype=np.int64)
-#         theta_detected = np.empty((N, K), dtype=np.float64)
-#         prominence = np.empty((N, K), dtype=np.float64)
-#         height = np.empty((N, K), dtype=np.float64)
-
-#         Q = K * A + int(add_background)
-#         x0 = np.empty((N, Q), dtype=np.float64)
-#         lb = np.empty((N, Q), dtype=np.float64)
-#         ub = np.empty((N, Q), dtype=np.float64)
-
-#         fixed = {
-#             name: np.empty((N, K), dtype=np.float64)
-#             for name in spec.param_names
-#             if name not in active_names
-#         }
-
-#         for b, pidx in enumerate(pixel_indices):
-#             base = int(pixel_starts[pidx])
-#             end = base + K
-#             rows = slice(base, end)
-
-#             pid = int(pixel_ids[pidx])
-#             xx = int(x_col[base])
-#             yy = int(y_col[base])
-
-#             pixel_id[b] = pid
-#             x[b] = xx
-#             y[b] = yy
-
-#             obs_b = np.asarray(data_yxt[yy, xx], dtype=np.float64)
-#             valid_b = theta_valid & np.isfinite(obs_b)
-
-#             peak_id[b] = peak_id_col[rows]
-#             theta_index[b] = theta_index_col[rows]
-#             theta_detected[b] = theta_col[rows]
-#             prominence[b] = prominence_col[rows]
-#             height[b] = height_col[rows]
-
-#             centers = theta_detected[b]
-
-#             for k in range(K):
-#                 seed = PeakFitSeed(
-#                     peak_id=int(peak_id[b, k]),
-#                     theta_index=int(theta_index[b, k]),
-#                     theta_detected=float(theta_detected[b, k]),
-#                     prominence=float(prominence[b, k]),
-#                     height=float(height[b, k]),
-#                 )
-
-#                 guess, bounds = initialize_component(
-#                     spec,
-#                     theta,
-#                     obs_b,
-#                     seed,
-#                     left_neighbor=centers[k - 1] if k else None,
-#                     right_neighbor=centers[k + 1] if k + 1 < K else None,
-#                     center_window=center_window,
-#                     theta_span=theta_span,
-#                     theta_step=theta_step,
-#                 )
-
-#                 for j, name in enumerate(active_names):
-#                     qj = k * A + j
-#                     x0[b, qj] = guess[name]
-#                     lo, hi = bounds.get(name, (-np.inf, np.inf))
-#                     lb[b, qj] = -np.inf if lo is None else lo
-#                     ub[b, qj] = np.inf if hi is None else hi
-
-#                 for name in fixed:
-#                     fixed[name][b, k] = guess[name]
-
-#             if add_background:
-#                 bg0 = float(np.percentile(obs_b[valid_b], 10))
-#                 x0[b, -1] = max(bg0, 0.0)
-#                 lb[b, -1] = 0.0
-#                 ub[b, -1] = np.inf
-
-#         groups[K] = PreparedFitGroup(
-#             K=K,
-#             pixel_id=pixel_id,
-#             x=x,
-#             y=y,
-#             peak_id=peak_id,
-#             theta_index=theta_index,
-#             theta_detected=theta_detected,
-#             prominence=prominence,
-#             height=height,
-#             x0=x0,
-#             lb=lb,
-#             ub=ub,
-#             fixed=fixed,
-#         )
-
-#     return PreparedFitData(
-#         groups=groups,
-#         theta_valid=theta_valid,
-#         active_names=active_names,
-#         param_names=tuple(spec.param_names),
-#         add_background=bool(add_background),
-#     )
-
-
-
-
-# def iter_fit_batches(
-#     data_yxt, theta, peak_catalog, spec, max_batch_pixels=1024,
-#     allow_center_shift=True, center_window=40.0, add_background=True,
-#     prepared=None,
-# ):
-#     """Быстрая нарезка заранее подготовленных pixel-данных."""
-#     if prepared is None:
-#         prepared = prepare_fit_data(
-#             data_yxt, theta, peak_catalog, spec,
-#             allow_center_shift=allow_center_shift,
-#             center_window=center_window,
-#             add_background=add_background,
-#         )
-
-#     for K in sorted(prepared.groups):
-#         g = prepared.groups[K]
-#         N = len(g.pixel_id)
-
-#         for start in range(0, N, max_batch_pixels):
-#             end = min(start + max_batch_pixels, N)
-
-#             # Векторно получаем спектры текущих pixel.
-#             obs = np.asarray(
-#                 data_yxt[g.y[start:end], g.x[start:end]],
-#                 dtype=np.float64,
-#             )
-#             valid = prepared.theta_valid[None, :] & np.isfinite(obs)
-
-#             fixed = {
-#                 name: values[start:end]
-#                 for name, values in g.fixed.items()
-#             }
-
-#             yield FitBatch(
-#                 batch_id=start // max_batch_pixels,
-#                 K=K,
-#                 pixel_id=g.pixel_id[start:end],
-#                 x=g.x[start:end],
-#                 y=g.y[start:end],
-#                 obs=obs,
-#                 valid=valid,
-#                 peak_id=g.peak_id[start:end],
-#                 theta_index=g.theta_index[start:end],
-#                 theta_detected=g.theta_detected[start:end],
-#                 prominence=g.prominence[start:end],
-#                 height=g.height[start:end],
-#                 x0=g.x0[start:end],
-#                 lb=g.lb[start:end],
-#                 ub=g.ub[start:end],
-#                 fixed=fixed,
-#                 active_names=prepared.active_names,
-#                 param_names=prepared.param_names,
-#                 add_background=prepared.add_background,
-#             )

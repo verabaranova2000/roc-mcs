@@ -95,6 +95,32 @@ def build_peak_catalog(
     )
 
 
+def enrich_peak_catalog(peak_catalog, Nx):
+    """
+    Функция добавляет производные поля (исходный каталог обогащается метаданными):
+        pixel_id
+        component_id
+        n_components
+        
+    Переводит сырой catalog в удобное для fitting представление:
+        (x, y)
+        ↓
+        pixel_id
+        ↓
+        сортировка
+        ↓
+        component_id
+        ↓
+        n_components
+    """
+    pc = peak_catalog.copy()
+    pc["pixel_id"] = pc["y"].astype(int) * Nx + pc["x"].astype(int)
+    pc = pc.sort_values(["pixel_id", "theta"]).reset_index(drop=True)
+    pc["component_id"] = pc.groupby("pixel_id", sort=False).cumcount()
+    pc["n_components"] = pc.groupby("pixel_id")["component_id"].transform("size").astype(int)
+    return pc
+
+
 def build_pixel_peak_lookup(peak_catalog):
     """
     Формирует lookup обнаруженных пиков по координатам detector pixel.
