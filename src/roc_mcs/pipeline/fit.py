@@ -1,7 +1,8 @@
 from tqdm import tqdm
 import numpy as np
 
-from roc_mcs.fitting.optimize import FitConfig, fit_curve
+# from roc_mcs.fitting.optimize import FitConfig, fit_curve
+from roc_mcs.fitting.backends.scipy_backend import FitConfig, fit_curve
 from roc_mcs.fitting.registry import validate_model
 from roc_mcs.fitting.postprocessing import augment_results
 from roc_mcs.plots import plot_model_evolution, plot_residual_maps
