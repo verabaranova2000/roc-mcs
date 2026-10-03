@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 from matplotlib.ticker import AutoMinorLocator
 
 from roc_mcs.fitting.registry import ModelSpec
-from roc_mcs.fitting.batching import PreparedFitGroup, prepare_fit_data
+from roc_mcs.fitting.preparation import PreparedFitGroup, prepare_fit_data
 
 
 # ------------------------

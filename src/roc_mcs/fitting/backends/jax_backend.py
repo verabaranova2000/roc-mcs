@@ -5,7 +5,7 @@ import jax.numpy as jnp
 from jax import lax
 
 
-from roc_mcs.fitting.batching import iter_fit_batches, pad_batch_arrays, prepare_fit_data
+from roc_mcs.fitting.preparation import iter_fit_batches, pad_batch_arrays, prepare_fit_data
 
 
 
@@ -224,27 +224,6 @@ def make_jax_lm_solver_v4(
             "lambda": lam,
         }
 
-    # @jax.jit
-    # def solve(obs, valid, x0, lb, ub, theta):
-    #     obs = jnp.asarray(obs, dtype=jnp.float64)
-    #     valid = jnp.asarray(valid, dtype=bool)
-    #     x0 = jnp.asarray(x0, dtype=jnp.float64)
-    #     lb = jnp.asarray(lb, dtype=jnp.float64)
-    #     ub = jnp.asarray(ub, dtype=jnp.float64)
-    #     theta = jnp.asarray(theta, dtype=jnp.float64)
-
-    #     B = obs.shape[0]
-    #     groups = []
-    #     for start in range(0, B, microbatch_size):
-    #         end = min(start + microbatch_size, B)
-    #         groups.append(solve_group(
-    #             obs[start:end], valid[start:end], x0[start:end],
-    #             lb[start:end], ub[start:end], theta
-    #         ))
-
-    #     return {key: jnp.concatenate([group[key] for group in groups], axis=0) for key in groups[0]}
-
-    # return solve, model_batch, residual_batch, jac_batch
 
     @jax.jit
     def solve(obs, valid, x0, lb, ub, theta):
@@ -380,6 +359,11 @@ def fit_jax(
                 "optimality": np.asarray(out["optimality"])[:n_actual],
                 "n_iter": np.asarray(out["n_iter"])[:n_actual],
                 "convergence_reason": np.asarray(out["convergence_reason"])[:n_actual],
+                "pixel_id": np.asarray(batch.pixel_id)[:n_actual],
+                "peak_id": np.asarray(batch.peak_id)[:n_actual],
+                "n_valid": np.asarray(batch.valid.sum(axis=1))[:n_actual],
+                "lb": np.asarray(batch.lb)[:n_actual],
+                "ub": np.asarray(batch.ub)[:n_actual],
                 "x_pixel": np.asarray(batch.x)[:n_actual],
                 "y_pixel": np.asarray(batch.y)[:n_actual],
             })

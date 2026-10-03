@@ -6,8 +6,8 @@ import jax.numpy as jnp
 from time import perf_counter
 
 
-from roc_mcs.fitting.optimize import JAX_SOLVER_CONFIG
-from roc_mcs.fitting.batching import iter_fit_batches, pad_batch_arrays, prepare_fit_data
+from roc_mcs.fitting.backends.jax_backend import JAX_SOLVER_CONFIG
+from roc_mcs.fitting.preparation import iter_fit_batches, pad_batch_arrays
 
 
 

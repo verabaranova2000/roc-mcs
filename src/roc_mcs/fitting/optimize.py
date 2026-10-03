@@ -14,7 +14,7 @@
 # from roc_mcs.fitting.metrics import compute_fit_metrics
 # from roc_mcs.fitting.results import FitResult
 # from roc_mcs.fitting.registry import MODEL_SPECS
-# from roc_mcs.fitting.batching import iter_fit_batches, pad_batch_arrays, prepare_fit_data
+# from roc_mcs.fitting.preparation import iter_fit_batches, pad_batch_arrays, prepare_fit_data
 
 
 # @dataclass(slots=True)
