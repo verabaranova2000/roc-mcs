@@ -139,13 +139,15 @@ def _summarize_fit(result, intensity_fit, noise_sigma=None):
 
 def _fit_lmfit_one(
     model, template, data_yxt, theta, prepared_fit, K,
-    row, *, add_background=True, noise_sigma=None
+    row, *, add_background=True, noise_sigma=None, valid_mask=None
 ):
     """Внутренний helper для одного fit. Общий для single-pixel и all-pixels подгона."""
     group = prepared_fit.groups[K]
     x, y = int(group.x[row]), int(group.y[row])
     intensity = np.asarray(data_yxt[y, x, :], dtype=float)
-    valid = prepared_fit.theta_valid & np.isfinite(intensity)
+    valid = prepared_fit.theta_valid & np.isfinite(intensity)   # базовая валидность: окно теты + отсутствие NaN в данных
+    if valid_mask is not None:                                  # накладываем пользовательскую маску спайков, если она передана
+        valid &= np.asarray(valid_mask, dtype=bool)
     if not np.any(valid):
         raise ValueError(f"No valid data points at ({x}, {y})")
 
@@ -169,6 +171,7 @@ def _find_prepared_pixel(prepared_fit, x, y):
 def fit_lmfit_pixel(
     data_yxt, theta, peak_catalog, spec, *, x, y, prepared_fit=None,
     allow_center_shift=True, center_window=40.0, add_background=True, noise_sigma=None,
+    valid_mask=None
 ):
     """Фитирует одну rocking curve через общий LMFit backend."""
     data_yxt = np.asarray(data_yxt, dtype=float)
@@ -179,13 +182,17 @@ def fit_lmfit_pixel(
     if prepared_fit is None:
         prepared_fit = prepare_fit_data(
             data_yxt=data_yxt, theta=theta, peak_catalog=peak_catalog, spec=spec,
+            valid_mask=valid_mask,
             allow_center_shift=allow_center_shift, center_window=center_window, add_background=add_background,
         )
     K, row = _find_prepared_pixel(prepared_fit, x, y)
     model, template = _make_lmfit_fitter(spec=spec, K=K, add_background=add_background)
+    pixel_mask = valid_mask[int(y), int(x)] if valid_mask is not None else None  # Вырезаем 1D маску для конкретного пикселя (y, x)
+
     result, valid, residual, diagnostics = _fit_lmfit_one(
         model=model, template=template, data_yxt=data_yxt, theta=theta,
         prepared_fit=prepared_fit, K=K, row=row, add_background=add_background, noise_sigma=noise_sigma,
+        valid_mask=pixel_mask,
     )
     group = prepared_fit.groups[K]
     fitted_records = _make_lmfit_peak_records(result=result, group=group, spec=spec, row=row) if result.success else []
@@ -208,6 +215,7 @@ def fit_lmfit(
     add_background=True,
     noise_sigma=None,
     progress=True,
+    valid_mask=None,
 ):
     """Multi-peak LMFit для всех pixels с detected peaks."""
     data_yxt = np.asarray(data_yxt, dtype=float)
@@ -222,6 +230,7 @@ def fit_lmfit(
             theta=theta,
             peak_catalog=peak_catalog,
             spec=spec,
+            valid_mask=valid_mask,
             allow_center_shift=allow_center_shift,
             center_window=center_window,
             add_background=add_background,
@@ -248,11 +257,13 @@ def fit_lmfit(
                 x = int(group.x[row])
                 y = int(group.y[row])
                 detected_mask[y, x] = True
+                pixel_mask = valid_mask[y, x] if valid_mask is not None else None   # Вырезаем маску для пикселя
                 try:
                     result, valid, residual, diagnostics = _fit_lmfit_one(
                         model=model, template=template,
                         data_yxt=data_yxt, theta=theta, prepared_fit=prepared_fit,
                         K=K, row=row, add_background=add_background, noise_sigma=noise_sigma,
+                        valid_mask=pixel_mask,
                     )
                     success = bool(result.success)
                     if success:

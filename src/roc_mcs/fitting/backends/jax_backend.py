@@ -287,6 +287,7 @@ def fit_jax(
     peak_catalog,
     spec,
     *,
+    valid_mask=None,           # <--- 1. ДОБАВИЛИ АРГУМЕНТ
     B=128,
     solver_config=None,
     allow_center_shift=True,
@@ -305,6 +306,7 @@ def fit_jax(
         theta=theta,
         peak_catalog=peak_catalog,
         spec=spec,
+        valid_mask=valid_mask, # <--- 2. ПРОКИНУЛИ В ПОДГОТОВКУ
         allow_center_shift=allow_center_shift,
         center_window=center_window,
         add_background=add_background,
@@ -313,7 +315,12 @@ def fit_jax(
     solvers = {}
     theta_j = jnp.asarray(theta, dtype=jnp.float64)
 
-    batches = iter_fit_batches(data_yxt=data_yxt, prepared=prepared, max_batch_pixels=B)
+    batches = iter_fit_batches(
+        data_yxt=data_yxt, 
+        prepared=prepared,
+        valid_mask=valid_mask,  # <--- 4. ПРОКИНУЛИ В ГЕНЕРАТОР БАТЧЕЙ 
+        max_batch_pixels=B
+    )
     if progress:
         from tqdm.auto import tqdm
 

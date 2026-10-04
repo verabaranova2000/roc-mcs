@@ -210,6 +210,7 @@ def prepare_fit_data(
     theta, 
     peak_catalog, 
     spec,
+    valid_mask=None,            # <--- 1. ДОБАВИЛИ АРГУМЕНТ (по умолчанию None для совместимости)
     allow_center_shift=True, 
     center_window=40.0, 
     add_background=True,
@@ -294,7 +295,11 @@ def prepare_fit_data(
             y[b] = yy
 
             obs_b = np.asarray(data_yxt[yy, xx], dtype=np.float64)
-            valid_b = theta_valid & np.isfinite(obs_b)
+            valid_b = theta_valid & np.isfinite(obs_b)                # Базовая проверка: тета валидна и в данных нет NaN
+            if valid_mask is not None:                                # Если пользователь передал маску, просто "докручиваем" ее сверху
+                valid_b &= np.asarray(valid_mask[yy, xx], dtype=bool) # Явное приведение защитит от ошибки типов in-place
+            obs_init = obs_b.copy()
+            obs_init[~valid_b] = np.nan
 
             peak_id[b] = peak_id_col[rows]
             theta_index[b] = theta_index_col[rows]
@@ -315,7 +320,7 @@ def prepare_fit_data(
                 guess, bounds = initialize_component(
                     spec,
                     theta,
-                    obs_b,
+                    obs_init,
                     seed,
                     left_neighbor=centers[k - 1] if k else None,
                     right_neighbor=centers[k + 1] if k + 1 < K else None,
@@ -362,7 +367,7 @@ def prepare_fit_data(
     )
 
 
-def iter_fit_batches(data_yxt, prepared, max_batch_pixels=1024):
+def iter_fit_batches(data_yxt, prepared, valid_mask=None, max_batch_pixels=1024):
     """
     Возвращает batch'и из заранее подготовленных fit-данных.
     Выполняет:
@@ -371,7 +376,7 @@ def iter_fit_batches(data_yxt, prepared, max_batch_pixels=1024):
            slice
             ↓
            obs
-           valid
+           valid   (с учетом theta_valid, isfinite и valid_mask)
             ↓
            FitBatch
     """
@@ -383,8 +388,16 @@ def iter_fit_batches(data_yxt, prepared, max_batch_pixels=1024):
             sl = slice(start, end)
             x = group.x[sl]
             y = group.y[sl]
-            obs = np.asarray(data_yxt[y, x], dtype=np.float64)
-            valid = prepared.theta_valid[None, :] & np.isfinite(obs)
+            obs = np.asarray(data_yxt[y, x], dtype=np.float64)                 # извлекаем срезы наблюдений размера (B, M)
+            valid = prepared.theta_valid[None, :] & np.isfinite(obs)           # базовая маска: корректность углов theta и отсутствие NaN/Inf в скане
+            if valid_mask is not None:                                         # интеграция внешней маски фильтрации спайков (valid_mask)
+                mask_slice = np.asarray(valid_mask[y, x], dtype=bool)          # векторизованная выборка маски по батчу пикселей (y, x)
+                # Защита от расхождения размерностей:
+                # - Если valid_mask 3D (Ny, Nx, M): mask_slice имеет форму (B, M)
+                # - Если valid_mask 2D (Ny, Nx): mask_slice имеет форму (B,), расширяем до (B, 1)
+                if mask_slice.ndim == 1:
+                    mask_slice = mask_slice[:, None]
+                valid = valid & mask_slice                                      # поэлементное логическое И (учитываются ТОЛЬКО физически чистые точки)
             fixed = {name: values[sl] for name, values in group.fixed.items()}
             yield FitBatch(
                 batch_id=start // max_batch_pixels,
