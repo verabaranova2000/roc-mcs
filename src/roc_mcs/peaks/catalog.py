@@ -5,8 +5,9 @@ from collections import defaultdict
 
 from roc_mcs.peaks.detection import PIXEL_PEAK_CONFIG, detect_peaks
 from roc_mcs.utils import to_yxt
+from roc_mcs.processing.background import BackgroundStats, estimate_background_stats
 
-def build_peak_catalog(
+def build_peak_catalog_v0(
     data_3d,
     th,
     window_size=3,
@@ -93,6 +94,100 @@ def build_peak_catalog(
         bg_sigma,
         bg_threshold,
     )
+
+
+def build_peak_catalog(
+    data_3d,
+    th,
+    window_size=3,
+    peak_detection_config=PIXEL_PEAK_CONFIG,
+    background_stats=None,
+):
+    """
+    Формирует каталог локальных максимумов дифракционного сигнала.
+    
+    Каждая строка соответствует одному peak event (обнаруженному пику в локальной
+    области ROC), определяемой пространственной окрестностью 3×3.
+    
+    Столбцы:
+        peak_id
+        x, y
+        theta_index
+        theta
+        prominence
+        height
+    
+    Пространственная группировка пиков (clustering) и отслеживание ветвей
+    на данном этапе не выполняются.
+    """
+    data = to_yxt(data_3d, th)
+    Ny, Nx, Ntheta = data.shape
+
+    # ------------------------------------------------------
+    # Шум — ровно моя прежняя оценка
+    # ------------------------------------------------------
+    # max_map = np.max(data, axis=-1)
+    # q30 = np.percentile(max_map, 30)
+    # bg_pixels = max_map[max_map <= q30]
+    # bg_median = np.median(bg_pixels)
+    # bg_mad = np.median( np.abs(bg_pixels - bg_median))
+    # bg_sigma = 1.4826 * bg_mad if bg_mad > 0 else 1.0
+    # bg_threshold = bg_median + 5 * bg_sigma
+
+    # print( f"background median   = {bg_median:.6g}")
+    # print(f"noise sigma          = {bg_sigma:.6g}")
+    # print(f"background threshold = {bg_threshold:.6g}")
+
+    background = estimate_background_stats(data) if background_stats is None else background_stats
+    max_map = np.max(data, axis=-1)
+
+    print(f"background median   = {background.median:.6g}")
+    print(f"noise sigma          = {background.sigma:.6g}")
+    print(f"background threshold = {background.threshold:.6g}")
+
+    # ------------------------------------------------------
+    # Peak catalogue
+    # ------------------------------------------------------
+    records = []
+    half_w = window_size // 2
+    peak_id = 0
+    for y in tqdm(range(Ny), desc="Building peak catalogue", unit="row"):
+        y_s = max(0, y - half_w)
+        y_e = min(Ny, y + half_w + 1)
+        for x in range(Nx):
+            if max_map[y, x] < background.threshold:
+                continue
+            x_s = max(0, x - half_w)
+            x_e = min(Nx, x + half_w + 1)
+            mean_curve = np.mean(data[y_s:y_e, x_s:x_e, :], axis=(0, 1))
+            smooth, peaks, props, valid_mask = (
+                detect_peaks(
+                    mean_curve,
+                    peak_detection_config,
+                    noise_sigma=background.sigma,
+                )
+            )
+            for k, is_valid in enumerate(valid_mask):
+                if not is_valid:
+                    continue
+                peak_index = int(peaks[k])
+                records.append({
+                    "peak_id": peak_id,
+                    "x": x,
+                    "y": y,
+                    "theta_index": peak_index,
+                    "theta": float(th[peak_index]),
+                    "prominence": float(props["prominences"][k]),
+                    "width_samples": float(props["widths"][k]),                         # ширина в отсчётах
+                    "width_theta": float(props["widths"][k] * np.median(np.diff(th))),  # ширина в углах
+                    "left_ip": float(props["left_ips"][k]),       # левая граница пика
+                    "right_ip": float(props["right_ips"][k]),     # правая граница пика
+                    "height": float(smooth[peak_index]),
+                })
+                peak_id += 1
+    peak_catalog = pd.DataFrame(records)
+    return peak_catalog, background.sigma, background.threshold
+
 
 
 def enrich_peak_catalog(peak_catalog, Nx):
