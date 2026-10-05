@@ -192,16 +192,25 @@ def initialize_component(
         raise ValueError(f"Too few points around peak {seed.peak_id}")
 
     guess = spec.make_initial_guess(theta_local, intensity_local)
-    if "theta0" in spec.param_names:
-        guess["theta0"] = seed.theta_detected
+    # if "theta0" in spec.param_names:
+    #     guess["theta0"] = seed.theta_detected
 
-    bounds = spec.make_bounds(guess, dtheta=theta_step)
+    # bounds = spec.make_bounds(guess, dtheta=theta_step)
+    # if "theta0" in spec.param_names:
+    #     bounds["theta0"] = (
+    #         seed.theta_detected - center_window,
+    #         seed.theta_detected + center_window,
+    #     )
+    # return guess, bounds
     if "theta0" in spec.param_names:
-        bounds["theta0"] = (
-            seed.theta_detected - center_window,
-            seed.theta_detected + center_window,
-        )
-    return guess, bounds
+        guess["theta0"]=seed.theta_detected
+    bounds=spec.make_bounds(guess,dtheta=theta_step)
+    if "theta0" in spec.param_names:
+        lo0=max(float(theta[0]),seed.theta_detected-center_window)
+        hi0=min(float(theta[-1]),seed.theta_detected+center_window)
+        if lo0>=hi0: raise ValueError(f"Некорректное theta0 window для peak {seed.peak_id}")
+        bounds["theta0"]=(lo0,hi0)
+    return guess,bounds
 
 
 
@@ -338,6 +347,8 @@ def prepare_fit_data(
                     fixed[name][b, k] = guess[name]
 
             if add_background:
+                if not np.any(valid_b):
+                    raise ValueError(f"Для pixel_id={pid} не осталось валидных точек.")
                 bg0 = float(np.percentile(obs_b[valid_b], 10))
                 x0[b, -1] = max(bg0, 0.0)
                 lb[b, -1] = 0.0
