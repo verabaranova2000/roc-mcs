@@ -1,12 +1,22 @@
 from dataclasses import dataclass
 import numpy as np
-import numpy as np
-import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.axes import Axes
 from tqdm.auto import tqdm
 
 
 from roc_mcs.processing.background import BackgroundStats, estimate_background_stats
+
+
+@dataclass(frozen=True, slots=True)
+class KappaThresholdFit:
+    """Данные, необходимые для анализа и построения kappa-fit."""
+    kappa: float
+    n_spikes: np.ndarray
+    kappas_positive: np.ndarray
+    n_spikes_positive: np.ndarray
+    p_left: np.ndarray
+    p_right: np.ndarray
 
 
 @dataclass(frozen=True, slots=True)
@@ -19,53 +29,10 @@ class SpikeMaskResult:
     history: list[dict]
     converged: bool
     iterations: int
+    kappa_fits: list[KappaThresholdFit] | None = None
 
 
 
-# def interpolate_masked_points(data_3d: np.ndarray, spike_mask: np.ndarray) -> np.ndarray:
-#     """Заменяет spike-точки линейной интерполяцией между соседними точками по theta."""
-#     data_3d = np.asarray(data_3d, dtype=float)
-#     spike_mask = np.asarray(spike_mask, dtype=bool)
-
-#     if data_3d.ndim != 3:
-#         raise ValueError(f"data_3d должен быть 3D, получено ndim={data_3d.ndim}")
-#     if spike_mask.shape != data_3d.shape:
-#         raise ValueError(f"spike_mask имеет форму {spike_mask.shape}, ожидалась {data_3d.shape}")
-
-#     cleaned_data = data_3d.copy()
-#     y_left = np.roll(data_3d, 1, axis=0)              # соседи по оси theta
-#     y_right = np.roll(data_3d, -1, axis=0)
-#     y_left[0] = data_3d[0]                            # чиним краевые эффекты (если спайк на самом первом или последнем кадре)
-#     y_right[-1] = data_3d[-1]
-
-#     cleaned_data[spike_mask] = (y_left[spike_mask] + y_right[spike_mask]) / 2.0    # интерполяция плохих точек (заменяем средним соседних)   
-#     return cleaned_data
-
-
-def interpolate_masked_points(data_3d: np.ndarray, spike_mask: np.ndarray) -> np.ndarray:
-    """Заменяет spike-точки интерполяцией по theta."""
-    data_3d = np.asarray(data_3d, dtype=float)
-    spike_mask = np.asarray(spike_mask, dtype=bool)
-
-    if data_3d.ndim != 3:
-        raise ValueError(f"data_3d должен быть 3D, получено ndim={data_3d.ndim}")
-    if spike_mask.shape != data_3d.shape:
-        raise ValueError(f"spike_mask имеет форму {spike_mask.shape}, ожидалась {data_3d.shape}")
-    if data_3d.shape[0] < 2:
-        raise ValueError("Для интерполяции требуется минимум два theta-отсчёта.")
-
-    cleaned_data = data_3d.copy()
-
-    left = np.roll(data_3d, 1, axis=0)
-    right = np.roll(data_3d, -1, axis=0)
-
-    cleaned_data[1:-1][spike_mask[1:-1]] = (
-        left[1:-1][spike_mask[1:-1]] + right[1:-1][spike_mask[1:-1]]
-    ) / 2.0
-    cleaned_data[0][spike_mask[0]] = data_3d[1][spike_mask[0]]
-    cleaned_data[-1][spike_mask[-1]] = data_3d[-2][spike_mask[-1]]
-
-    return cleaned_data
 
 
 def interpolate_masked_points(
@@ -167,18 +134,13 @@ def find_kappa_threshold(
     background_variance: float,
     kappas: np.ndarray | None = None,
     verbose: bool = False,
-) -> tuple[float, np.ndarray]:
+) -> KappaThresholdFit:
     """
     Находит порог kappa по излому зависимости числа спайков от kappa.
     Использует метод кусочно-линейной регрессии (Piecewise Linear Fit).
     
     spike_mask == True   → спайк
     spike_mask == False  → не спайк
-
-    Возвращает:
-        best_kappa : float
-        n_spikes : np.ndarray
-            Число обнаруженных спайков для каждого значения kappas.
     """
     data_3d = np.asarray(data_3d, dtype=float)
     if data_3d.ndim != 3:
@@ -188,70 +150,53 @@ def find_kappa_threshold(
     if kappas is None:
         kappas = np.linspace(2.0, 40.0, 39)
     kappas = np.asarray(kappas, dtype=float)
-    if kappas.ndim != 1 or len(kappas) < 7 or np.any(~np.isfinite(kappas)) or np.any(np.diff(kappas) <= 0):
-        raise ValueError("kappas должен быть одномерным, конечным и строго возрастающим массивом минимум из 7 значений.")
     if kappas.ndim != 1 or len(kappas) < 7 or np.any(~np.isfinite(kappas))  or np.any(kappas <= 0) or np.any(np.diff(kappas) <= 0):
         raise ValueError("kappas должен быть одномерным, конечным, положительным и строго возрастающим массивом минимум из 7 значений.")
 
     z_scores = _compute_spike_z_scores(data_3d, background_variance)
     finite = np.isfinite(data_3d)
     n_spikes = []
-    for kappa in kappas:
-        n_spikes.append(np.count_nonzero(finite & (z_scores >= kappa)))
-
-    n_spikes = np.asarray(n_spikes, dtype=int)
+    n_spikes = np.asarray([np.count_nonzero(finite & (z_scores >= k)) for k in kappas], dtype=int)
 
     positive = n_spikes > 0                             # игнорируем точки, где n_spikes == 0, чтобы избежать log(0)
-    x = kappas[positive]
+    kappas_positive = kappas[positive]
     y = np.log10(n_spikes[positive])                    # логарифмический масштаб, так как процессы экспоненциальные
-    if len(x) < 7:
+    n_spikes_positive = n_spikes[positive]
+
+    if len(kappas_positive) < 7:
         raise ValueError("Недостаточно точек с ненулевым числом спайков для поиска излома.")
 
     min_error = np.inf
     best_p_left = best_p_right = None
 
     # --- Поиск оптимальной точки разбиения (требуем минимум 3 точки для линии) ---
-    for i in range(3, len(x) - 3):
-        p_left = np.polyfit(x[:i], y[:i], 1)       # Линейная регрессия (полином 1 степени) для левого и правого участков
-        p_right = np.polyfit(x[i:], y[i:], 1)
-        error = np.sum((np.polyval(p_left, x[:i]) - y[:i]) ** 2) + np.sum((np.polyval(p_right, x[i:]) - y[i:]) ** 2)   # сумма квадратов ошибок (Residual Sum of Squares)
-        if error < min_error:                      # Сохраняем модель с минимальной ошибкой
+    for i in range(3, len(kappas_positive) - 3):
+        p_left = np.polyfit(kappas_positive[:i], y[:i], 1)       # Линейная регрессия (полином 1 степени) для левого и правого участков
+        p_right = np.polyfit(kappas_positive[i:], y[i:], 1)
+        error = np.sum((np.polyval(p_left, kappas_positive[:i]) - y[:i]) ** 2) + np.sum((np.polyval(p_right, kappas_positive[i:]) - y[i:]) ** 2)   # сумма квадратов ошибок (Residual Sum of Squares)
+        if error < min_error:                                    # Сохраняем модель с минимальной ошибкой
             min_error = error
             best_p_left, best_p_right = p_left, p_right
 
     if best_p_left is None or best_p_right is None or np.isclose(best_p_left[0], best_p_right[0]):
         raise ValueError("Не удалось надёжно определить точку излома.")
 
-    # Точка пересечения двух прямых (точная координата X (kappa))
-    # a₁x + b₁ = a₂x + b₂ ⇒ x = (b₂ − b₁) / (a₁ − a₂)
+    # Точка пересечения двух прямых (точная координата X (kappa)):   a₁x + b₁ = a₂x + b₂ ⇒ x = (b₂ − b₁) / (a₁ − a₂)
     kappa = (best_p_right[1] - best_p_left[1]) / (best_p_left[0] - best_p_right[0])
-    if not np.isfinite(kappa) or not x.min() <= kappa <= x.max():
+    if not np.isfinite(kappa) or not kappas_positive.min() <= kappa <= kappas_positive.max():
         raise ValueError(f"Найденный kappa={kappa:.6g} вне диапазона точек с ненулевым числом спайков.")
 
-    # График
     if verbose:
         print(f"Selected kappa = {kappa:.4f}")
 
-        plt.rcParams.update({'font.family': 'serif', 'font.size': 12})
-        fig, ax = plt.subplots(figsize=(8, 5))
-        
-        ax.plot(x, 10**y, 'ko-', markersize=3, label='Экспериментальные данные')
-        
-        x_fit_left = np.linspace(min(x), kappa + 2, 50)            # генерация точек для отрисовки найденных прямых
-        x_fit_right = np.linspace(kappa - 2, max(x), 50)
-        
-        ax.plot(x_fit_left, 10**np.polyval(best_p_left, x_fit_left), 'b--', linewidth=2, label='Тренд шума')
-        ax.plot(x_fit_right, 10**np.polyval(best_p_right, x_fit_right), 'r--', linewidth=2, label='Тренд спайков')
-        ax.axvline(kappa, color='green', linestyle=':', linewidth=2, label=f'Оптимальная kappa = {kappa:.2f}')
-        
-        ax.set_yscale('log')
-        ax.set_xlabel('Порог kappa (сигмы)')
-        ax.set_ylabel('Количество спайков')
-        ax.set_title('Автоматический расчет точки излома (Piecewise Linear Fit)')
-        ax.grid(True, alpha=0.3)
-        ax.legend()
-        plt.show()
-    return float(kappa), n_spikes
+    return KappaThresholdFit(
+        kappa=float(kappa),
+        n_spikes=n_spikes,
+        kappas_positive=kappas_positive,
+        n_spikes_positive=n_spikes_positive,
+        p_left=best_p_left,
+        p_right=best_p_right,
+    )
 
 
 def refine_spike_mask(
@@ -260,6 +205,7 @@ def refine_spike_mask(
     max_iter: int = 5,
     tol: float = 1e-3,
     verbose: bool = False,
+    collect_kappa_fits: bool = False,
 ) -> SpikeMaskResult:
     """Итеративно уточняет оценку фона и kappa до сходимости."""
     raw = np.asarray(data_3d, dtype=float)
@@ -272,6 +218,7 @@ def refine_spike_mask(
 
     background = estimate_background_stats(raw)
     history = []
+    kappa_fits = [] if collect_kappa_fits else None
     prev_kappa = None
     converged = False
     spike_mask = np.zeros(raw.shape, dtype=bool)
@@ -280,28 +227,19 @@ def refine_spike_mask(
 
     iterator = tqdm(range(max_iter), desc="Spike refinement", unit=" iter") if verbose else range(max_iter)
     for iteration in iterator:
-        kappa, _ = find_kappa_threshold(
-            raw,
-            background_variance=background.sigma**2,
-            kappas=kappas,
-            verbose=verbose,
-        )
-        spike_mask = build_spike_mask(
-            raw,
-            background_variance=background.sigma**2,
-            kappa=kappa,
-            verbose=False,
-        )
+        kappa_fit = find_kappa_threshold(raw, background_variance=background.sigma**2, kappas=kappas, verbose=False)
+        kappa = kappa_fit.kappa
+        if kappa_fits is not None:
+            kappa_fits.append(kappa_fit)
+
+        spike_mask = build_spike_mask(raw, background_variance=background.sigma**2, kappa=kappa, verbose=False)
         clean_data = interpolate_masked_points(raw, spike_mask)
         new_background = estimate_background_stats(clean_data)
         
         if verbose:
             tqdm.write(f"iter {iteration + 1}/{max_iter} | σ={background.sigma:.4g} | κ={kappa:.4f} | spikes={np.count_nonzero(spike_mask)}")
         sigma_rel_change = abs(new_background.sigma - background.sigma) / max(abs(background.sigma), 1e-12)
-        kappa_rel_change = (
-            np.inf if prev_kappa is None
-            else abs(kappa - prev_kappa) / max(abs(prev_kappa), 1e-12)
-        )
+        kappa_rel_change = np.inf if prev_kappa is None else abs(kappa - prev_kappa) / max(abs(prev_kappa), 1e-12)
 
         history.append({
             "iteration": iteration,
@@ -318,7 +256,7 @@ def refine_spike_mask(
             break
 
         prev_kappa = kappa
-        # background = new_background
+
 
     return SpikeMaskResult(
         spike_mask=spike_mask,
@@ -328,7 +266,28 @@ def refine_spike_mask(
         history=history,
         converged=converged,
         iterations=len(history),
+        kappa_fits=kappa_fits,
     )
 
 
 
+def plot_kappa_threshold(fit: KappaThresholdFit, ax: Axes | None = None) -> Axes:
+    """Рисует piecewise fit для выбранного kappa."""
+    if ax is None:
+        _, ax = plt.subplots(figsize=(8, 5))
+
+    ax.plot(fit.kappas_positive, fit.n_spikes_positive, "ko-", markersize=3, label="Экспериментальные данные")
+
+    x_fit_left = np.linspace(fit.kappas_positive.min(), fit.kappa + 2, 50)
+    x_fit_right = np.linspace(fit.kappa - 2, fit.kappas_positive.max(), 50)
+    ax.plot(x_fit_left, 10 ** np.polyval(fit.p_left, x_fit_left), "b--", linewidth=2, label="Тренд шума")
+    ax.plot(x_fit_right, 10 ** np.polyval(fit.p_right, x_fit_right), "r--", linewidth=2, label="Тренд спайков")
+    ax.axvline(fit.kappa, color="green", linestyle=":", linewidth=2, label=f"Оптимальная kappa = {fit.kappa:.2f}")
+
+    ax.set_yscale("log")
+    ax.set_xlabel("Порог kappa (сигмы)")
+    ax.set_ylabel("Количество спайков")
+    ax.set_title("Автоматический расчёт точки излома")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    return ax

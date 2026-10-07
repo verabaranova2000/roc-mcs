@@ -96,7 +96,7 @@ def build_peak_catalog_v0(
     )
 
 
-def build_peak_catalog(
+def build_peak_catalog_v1(
     data_3d,
     th,
     window_size=3,
@@ -187,6 +187,96 @@ def build_peak_catalog(
                 peak_id += 1
     peak_catalog = pd.DataFrame(records)
     return peak_catalog, background.sigma, background.threshold
+
+
+
+def build_peak_catalog(
+    data_3d,
+    th,
+    window_size=3,
+    peak_detection_config=PIXEL_PEAK_CONFIG,
+    background_stats=None,
+):
+    """
+    Формирует каталог локальных максимумов дифракционного сигнала.
+    
+    Каждая строка соответствует одному peak event (обнаруженному пику в локальной
+    области ROC), определяемой пространственной окрестностью 3×3.
+    
+    Столбцы:
+        peak_id
+        x, y
+        theta_index
+        theta
+        prominence
+        height
+    
+    Пространственная группировка пиков (clustering) и отслеживание ветвей
+    на данном этапе не выполняются.
+    """
+    data_3d = np.asarray(data_3d, dtype=float)
+
+    # BackgroundStats работает с каноническим layout (Ntheta, Ny, Nx).
+    background = (
+        estimate_background_stats(data_3d)
+        if background_stats is None
+        else background_stats
+    )
+
+    # Для локальных ROC дальше используем (Ny, Nx, Ntheta).
+    data = to_yxt(data_3d, th)
+    Ny, Nx, Ntheta = data.shape
+
+    max_map = np.max(data, axis=-1)
+
+    print(f"background median   = {background.median:.6g}")
+    print(f"noise sigma          = {background.sigma:.6g}")
+    print(f"background threshold = {background.threshold:.6g}")
+
+    records = []
+    half_w = window_size // 2
+    peak_id = 0
+
+    for y in tqdm(range(Ny), desc="Building peak catalogue", unit="row"):
+        y_s = max(0, y - half_w)
+        y_e = min(Ny, y + half_w + 1)
+
+        for x in range(Nx):
+            if max_map[y, x] < background.threshold:
+                continue
+
+            x_s = max(0, x - half_w)
+            x_e = min(Nx, x + half_w + 1)
+            mean_curve = np.mean(data[y_s:y_e, x_s:x_e, :], axis=(0, 1))
+            smooth, peaks, props, valid_mask = detect_peaks(
+                mean_curve,
+                peak_detection_config,
+                noise_sigma=background.sigma,
+            )
+
+            for k, is_valid in enumerate(valid_mask):
+                if not is_valid:
+                    continue
+
+                peak_index = int(peaks[k])
+
+                records.append({
+                    "peak_id": peak_id,
+                    "x": x,
+                    "y": y,
+                    "theta_index": peak_index,
+                    "theta": float(th[peak_index]),
+                    "prominence": float(props["prominences"][k]),
+                    "width_samples": float(props["widths"][k]),
+                    "width_theta": float(
+                        props["widths"][k] * np.median(np.diff(th))
+                    ),
+                    "left_ip": float(props["left_ips"][k]),
+                    "right_ip": float(props["right_ips"][k]),
+                    "height": float(smooth[peak_index]),
+                })
+                peak_id += 1
+    return pd.DataFrame(records), background.sigma, background.threshold
 
 
 
