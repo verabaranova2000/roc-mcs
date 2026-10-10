@@ -1,5 +1,7 @@
 import h5py
 import numpy as np
+import os
+import tempfile
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, Union
@@ -172,6 +174,58 @@ class H5ScanRepository:
         if raw.shape[-1] == th_len:
             return 2
         return 0
+
+
+    def export_scan_copy_with_maps(self, scan_key: str, output_path: Union[str, Path], maps: Dict[str, np.ndarray], *, map_attrs: Dict[str, Dict[str, Any]] | None = None, overwrite: bool = False, compression: str | None = "gzip", compression_opts: int | None = 4) -> Path:
+        """Создаёт новый HDF5 только с выбранным scan и добавляет 2D-карты; исходник не меняется."""
+        if scan_key not in self.scans:
+            raise KeyError(f"Неизвестный scan_key: {scan_key}")
+        if not maps:
+            raise ValueError("maps не должен быть пустым")
+        out=Path(output_path).expanduser().resolve()
+        if out == self.h5_path:
+            raise ValueError("output_path совпадает с исходным HDF5")
+        if out.exists() and not overwrite:
+            raise FileExistsError(f"Файл уже существует: {out}")
+        out.parent.mkdir(parents=True,exist_ok=True)
+        for name, arr in maps.items():
+            if not isinstance(name,str) or not name or "/" in name:
+                raise ValueError(f"Некорректное имя карты: {name!r}")
+            a=np.asarray(arr)
+            if a.ndim!=2 or not np.issubdtype(a.dtype,np.number):
+                raise ValueError(f"Карта {name!r} должна быть числовым 2D-массивом, shape={a.shape}, dtype={a.dtype}")
+        info=self.scans[scan_key]
+        fd,tmp_name=tempfile.mkstemp(prefix=out.name+".tmp-",dir=out.parent); os.close(fd); tmp=Path(tmp_name)
+        try:
+            with h5py.File(self.h5_path,"r") as src, h5py.File(tmp,"w") as dst:
+                src.copy(info.key,dst,name=info.key)
+                g=dst[info.key]; raw_shape=tuple(src[info.raw_path].shape); th_len=int(src[info.th_path].shape[0])
+                if len(raw_shape)!=3: raise ValueError(f"Исходный raw не 3D: {raw_shape}")
+                if raw_shape[0]==th_len: expected=raw_shape[1:]
+                elif raw_shape[-1]==th_len: expected=raw_shape[:2]
+                else: raise ValueError(f"Не удалось определить theta axis: raw={raw_shape}, th={th_len}")
+                for name, arr in maps.items():
+                    if tuple(arr.shape)!=tuple(expected): raise ValueError(f"Карта {name!r}: shape {arr.shape}, ожидается {expected}")
+                    if name in g:
+                        if not overwrite: raise ValueError(f"Карта уже существует: {scan_key}/{name}")
+                        del g[name]
+                    kw={} if compression is None else {"compression":compression,"compression_opts":compression_opts}
+                    ds=g.create_dataset(name,data=arr,**kw)
+                    ds.attrs["source_scan"] = scan_key
+                    ds.attrs["source_h5"] = str(self.h5_path)
+                    if map_attrs and name in map_attrs:
+                        for key,value in map_attrs[name].items():
+                            if isinstance(value,(str,int,float,bool,np.integer,np.floating,np.bool_)):
+                                ds.attrs[str(key)]=value.item() if isinstance(value,(np.generic,)) else value
+                            else:
+                                raise TypeError(f"Атрибут {name}/{key} должен быть скаляром")
+                dst.flush()
+            if out.exists(): out.unlink()
+            tmp.replace(out)
+        finally:
+            if tmp.exists(): tmp.unlink()
+        return out
+
 
     def get_map(self, scan_key: str, map_name: str) -> np.ndarray:
         """

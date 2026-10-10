@@ -4,30 +4,6 @@ import re
 from roc_mcs.roi.roi_types import ROI
 
 """
-Работа с ROI: извлечение ROC-кривых и пространственный отбор
-
-        текст инспектора → parse_roi_text() → ROI
-                                  │
-                    ┌─────────────┴─────────────┐
-                    ▼                           ▼
-             extract_from_roi()        filter_peak_catalog_by_roi()
-                    │                           │
-              point / line / rect          roi_pixel_mask()
-                    │                           │
-                    ▼                           ▼
-              ROC-кривые ROI              peak_catalog_roi
-                                                │
-                                                ▼
-                                         fit_jax → D1 → E2/F → G
-
-    E1 строит контрольный пул отдельно: в него при необходимости входят
-    остатки и из пикселей вне ROI тестового семейства.
-    extract_from_roi(): None — кривые пикселей; "mean"/"sum" — агрегация.
-    roi_pixel_mask(): маска центров пикселей прямоугольной ROI.
-"""
-
-
-"""
 Извлечение ROC-кривых из ROI
 
         текст инспектора
@@ -50,7 +26,6 @@ from roc_mcs.roi.roi_types import ROI
                 "mean" -> одна средняя кривая
                 "sum"  -> одна суммарная кривая
 """
-
 
 
 def parse_roi_text(text):
@@ -87,8 +62,6 @@ def parse_roi_text(text):
     height = float(size.group(2))
     roi_angle = float(angle.group(1)) if angle else 0.0
     roi_label = label.group(1).strip() if label else ""
-    if not np.all(np.isfinite([cx, cy, width, height, roi_angle])):
-        raise ValueError("Параметры ROI должны быть конечными числами.")
 
     if width > 0 and height > 0:
         roi_type = "rect"
@@ -154,25 +127,11 @@ def extract_from_roi(
     count : int
         Число пикселей, вошедших в ROI.
     """
-    raw = np.asarray(raw)
-    th = np.asarray(th, dtype=float)
     if raw.ndim != 3:
         raise ValueError(f"Ожидался трёхмерный массив raw, получен массив формы {raw.shape}.")
-    if th.ndim != 1:
-        raise ValueError(f"Ожидалась одномерная ось th, получена форма {th.shape}.")
     if axis not in (0, 2):
         raise ValueError(f"Неподдерживаемая ось угла axis={axis}. Допустимые значения: 0 или 2.")
-    try:
-        nx_i, ny_i = int(nx), int(ny)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError("nx и ny должны быть положительными целыми числами.") from exc
-    if nx_i != nx or ny_i != ny or nx_i <= 0 or ny_i <= 0:
-        raise ValueError("nx и ny должны быть положительными целыми числами.")
-    expected_yx = raw.shape[1:] if axis == 0 else raw.shape[:2]
-    if expected_yx != (ny_i, nx_i) or raw.shape[axis] != len(th):
-        raise ValueError(f"Несогласованные raw/th/размеры: raw={raw.shape}, th={th.shape}, axis={axis}, nx={nx_i}, ny={ny_i}.")
-    nx, ny = nx_i, ny_i
-
+    
     mode = None if reduction_mode is None else reduction_mode.lower()
     if mode not in (None, "mean", "sum"):
         raise ValueError(
@@ -192,52 +151,6 @@ def extract_from_roi(
         f"Неподдерживаемый тип ROI: {roi.type!r}. "
         "Допустимые типы: 'point', 'line' или 'rect'."
     )
-
-
-def _rect_roi_window_mask(roi, nx, ny):
-    """Возвращает ограниченную маску прямоугольной ROI и её срезы."""
-    if str(getattr(roi, "type", "")).lower() != "rect":
-        raise ValueError("Маска поддерживается только для прямоугольной ROI.")
-    roi = roi.normalized()
-    values = np.asarray([roi.cx, roi.cy, roi.width, roi.height, roi.angle], dtype=float)
-    if not np.all(np.isfinite(values)) or roi.width <= 0 or roi.height <= 0:
-        raise ValueError("Некорректные параметры прямоугольной ROI.")
-    try:
-        bbox = np.asarray(roi.bbox, dtype=float)
-    except (TypeError, ValueError, AttributeError) as exc:
-        raise ValueError("Не удалось получить bbox прямоугольной ROI.") from exc
-    if bbox.shape != (4,) or not np.all(np.isfinite(bbox)):
-        raise ValueError("bbox ROI должен содержать четыре конечные координаты.")
-    x0, x1, y0, y1 = map(float, bbox)
-    if x1 < x0 or y1 < y0:
-        raise ValueError("Некорректный bbox прямоугольной ROI.")
-    x_min = int(np.clip(np.floor(x0), 0, nx))
-    x_max = int(np.clip(np.ceil(x1), 0, nx))
-    y_min = int(np.clip(np.floor(y0), 0, ny))
-    y_max = int(np.clip(np.ceil(y1), 0, ny))
-    xs = np.arange(x_min, x_max, dtype=float)
-    ys = np.arange(y_min, y_max, dtype=float)
-    xx, yy = np.meshgrid(xs, ys)
-    a = np.deg2rad(float(roi.angle)); c, s = float(np.cos(a)), float(np.sin(a))
-    dx = xx - float(roi.cx); dy = yy - float(roi.cy)
-    u = c * dx + s * dy; v = -s * dx + c * dy
-    mask = (np.abs(u) <= 0.5 * float(roi.width) + 1e-9) & (np.abs(v) <= 0.5 * float(roi.height) + 1e-9)
-    return roi, x_min, x_max, y_min, y_max, mask
-
-
-def roi_pixel_mask(roi, nx, ny):
-    """Возвращает маску (ny, nx) центров пикселей внутри прямоугольной ROI."""
-    try:
-        nx_i, ny_i = int(nx), int(ny)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError("nx и ny должны быть положительными целыми числами.") from exc
-    if nx_i != nx or ny_i != ny or nx_i <= 0 or ny_i <= 0:
-        raise ValueError("nx и ny должны быть положительными целыми числами.")
-    _, x_min, x_max, y_min, y_max, local = _rect_roi_window_mask(roi, nx_i, ny_i)
-    mask = np.zeros((ny_i, nx_i), dtype=bool)
-    mask[y_min:y_max, x_min:x_max] = local
-    return mask
-
 
 
 # ===========================================================================
@@ -345,24 +258,57 @@ def _extract_from_rect_roi(raw, th, axis, roi, nx, ny, reduction_mode=None):
 
     При "mean" или "sum" возвращается одна агрегированная кривая.
     """
-    roi, x_min, x_max, y_min, y_max, mask = _rect_roi_window_mask(roi, nx, ny)
+    roi = roi.normalized()
+    x0, x1, y0, y1 = roi.bbox
+    x_min = max(0, int(np.floor(x0)))
+    x_max = min(nx, int(np.ceil(x1)))
+    y_min = max(0, int(np.floor(y0)))
+    y_max = min(ny, int(np.ceil(y1)))
+
+    if x_max <= x_min or y_max <= y_min:
+        empty = (
+            np.empty((0, len(th)))
+            if reduction_mode is None
+            else np.array([], dtype=float)
+        )
+        return th.copy(), empty, 0
+    
+    xs = np.arange(x_min, x_max, dtype=float)
+    ys = np.arange(y_min, y_max, dtype=float)
+    xx, yy = np.meshgrid(xs, ys)
+
+    theta = np.deg2rad(float(roi.angle))
+    c, s = float(np.cos(theta)), float(np.sin(theta))
+    dx = xx - float(roi.cx)
+    dy = yy - float(roi.cy)
+    u = c * dx + s * dy
+    v = -s * dx + c * dy
+    
+    mask = (np.abs(u) <= 0.5 * float(roi.width) + 1e-9) & (np.abs(v) <= 0.5 * float(roi.height) + 1e-9)
     count = int(mask.sum())
 
     if count <= 0:
-        empty = np.empty((0, len(th))) if reduction_mode is None else np.array([], dtype=float)
+        empty = (
+            np.empty((0, len(th)))
+            if reduction_mode is None
+            else np.array([], dtype=float)
+        )
         return th.copy(), empty, 0
 
     if axis == 0:
         sub = raw[:, y_min:y_max, x_min:x_max]
         if reduction_mode is None:
-            return th.copy(), np.asarray(sub[:, mask].T, dtype=float), count
+            curves = sub[:, mask].T
+            return th.copy(), np.asarray(curves, dtype=float), count
         curve = sub[:, mask].sum(axis=1)
     else:
         sub = raw[y_min:y_max, x_min:x_max, :]
         if reduction_mode is None:
-            return th.copy(), np.asarray(sub[mask, :], dtype=float), count
+            curves = sub[mask, :]
+            return th.copy(), np.asarray(curves, dtype=float), count
         curve = sub[mask, :].sum(axis=0)
 
     if reduction_mode == "mean":
         curve = curve / float(count)
+
     return th.copy(), np.asarray(curve, dtype=float), count

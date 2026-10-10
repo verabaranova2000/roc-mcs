@@ -70,3 +70,52 @@ def to_yxt(data_3d, th):
         data = np.moveaxis(data, theta_axis, -1)
         
     return data
+
+
+
+def print_histogram_bins(
+    data,
+    bins=30,
+    *,
+    name=None,
+    precision=6,
+    compact=False,
+):
+    """
+    Печатает численные значения столбиков гистограммы.
+
+    Example
+    ------
+    print_histogram_bins(
+        pool.n_control,
+        bins=min(40, max(5, int(np.sqrt(len(pool.n_control))))),
+        name="control points / pixel",
+        compact=True,
+    )
+    """
+    data = np.asarray(data)
+    data = data[np.isfinite(data)]
+    counts, edges = np.histogram(data, bins=bins)
+    if name is not None:
+        print(f"\n{name}")
+    if compact:
+        for left, right, count in zip(edges[:-1], edges[1:], counts):
+            print(f"{left:.{precision}f}–{right:.{precision}f} : {count}")
+        return
+
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    print(
+        f"{'bin':>4} "
+        f"{'x_left':>12} "
+        f"{'x_right':>12} "
+        f"{'x_center':>12} "
+        f"{'count':>8}"
+    )
+    for i, (left, right, center, count) in enumerate(zip(edges[:-1], edges[1:], centers, counts)):
+        print(
+            f"{i:4d} "
+            f"{left:12.{precision}f} "
+            f"{right:12.{precision}f} "
+            f"{center:12.{precision}f} "
+            f"{count:8d}"
+        )
