@@ -35,6 +35,7 @@ def make_jax_lm_solver_v4(
     bound_tol=1e-10,
     ridge=1e-12,
     microbatch_size=None,
+    add_background=True,
 ):
     """Batch LM/GN с независимыми microbatch-циклами."""
     if spec.jax_func is None:
@@ -52,7 +53,7 @@ def make_jax_lm_solver_v4(
 
     n_params = len(spec.param_names)
     q_model = K * n_params
-    q = q_model + 1
+    q = q_model + int(add_background)
     eye = jnp.eye(q, dtype=jnp.float64)
     model_func = spec.jax_func
 
@@ -61,9 +62,18 @@ def make_jax_lm_solver_v4(
 
     model_components = jax.vmap(component_model, in_axes=(0, None), out_axes=0)
 
+    # def model_single(params, theta):
+    #     comp = params[:q_model].reshape(K, n_params)
+    #     return jnp.sum(model_components(comp, theta), axis=0) + params[-1]
     def model_single(params, theta):
+        """
+        Фон должен присутствовать в модели только по настройке.
+        Это принципиальная часть исправления. При add_background=False solver больше не воспринимает 
+        последний параметр одного из пиков как фон и не пытается извлечь несуществующий дополнительный параметр.
+        """
         comp = params[:q_model].reshape(K, n_params)
-        return jnp.sum(model_components(comp, theta), axis=0) + params[-1]
+        prediction = jnp.sum(model_components(comp, theta), axis=0)
+        return prediction + params[-1] if add_background else prediction
 
     def model_with_aux_single(params, theta):
         pred = model_single(params, theta)
@@ -341,14 +351,17 @@ def fit_jax(
                     ftol=solver_config["ftol"],
                     xtol=solver_config["xtol"],
                     gtol=solver_config["gtol"],
+                    add_background=add_background,
                 )
 
             obs, valid, x0, lb, ub, n_actual = pad_batch_arrays(batch, B)
 
-            expected_q = K * len(spec.param_names) + 1
+            expected_q = K * len(spec.param_names) + int(add_background)
             if x0.shape[1] != expected_q:
                 raise ValueError(f"JAX solver expects {expected_q} parameters for {spec.name!r}, K={K}; got {x0.shape[1]}")
-
+            expected_q = K * len(spec.param_names) + int(add_background)
+            if x0.shape[1] != expected_q:
+                raise ValueError(f"JAX solver expects {expected_q} parameters for {spec.name!r}, K={K}, add_background={add_background}; got {x0.shape[1]}")
             out = solvers[K](
                 jnp.asarray(obs, dtype=jnp.float64),
                 jnp.asarray(valid, dtype=bool),
