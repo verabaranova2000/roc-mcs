@@ -111,6 +111,28 @@ class ROI:
     def _normalize_angle(angle: float) -> float:
         return ((float(angle) + 180.0) % 360.0) - 180.0
 
+    # 📍𓂃𓂃𓂃
+    def to_local(self, x, y):
+        """Переводит координаты детектора xy в локальные uv."""
+        x, y = np.broadcast_arrays(np.asarray(x, float), np.asarray(y, float))
+        a = math.radians(float(self.angle)); c, s = math.cos(a), math.sin(a)
+        dx, dy = x - self.cx, y - self.cy
+        return c * dx + s * dy, -s * dx + c * dy
+
+    def to_detector(self, u, v):
+        """Переводит локальные координаты uv в координаты детектора xy."""
+        u, v = np.broadcast_arrays(np.asarray(u, float), np.asarray(v, float))
+        a = math.radians(float(self.angle)); c, s = math.cos(a), math.sin(a)
+        return self.cx + c * u - s * v, self.cy + s * u + c * v
+
+    def contains(self, x, y, tol=1e-9):
+        """Проверяет, лежат ли точки внутри прямоугольной ROI."""
+        r = self.normalized()
+        if r.type.lower() != "rect": raise ValueError("contains поддерживает только прямоугольную ROI")
+        u, v = r.to_local(x, y)
+        return (np.abs(u) <= r.width / 2 + tol) & (np.abs(v) <= r.height / 2 + tol)
+    # 𓂃𓂃𓂃📍
+
     @property
     def area(self) -> float:
         if self.type in ("line", "point"):
@@ -136,10 +158,12 @@ class ROI:
                 [ w2,  h2],
                 [-w2,  h2],
             ], dtype=float)
-        theta = math.radians(float(r.angle))
-        c, s = math.cos(theta), math.sin(theta)
-        rot = np.array([[c, -s], [s, c]], dtype=float)
-        return local @ rot.T + np.array([r.cx, r.cy], dtype=float)
+        x, y = r.to_detector(local[:, 0], local[:, 1])  # 📍
+        return np.column_stack((x, y))                  # 📍
+        # theta = math.radians(float(r.angle))
+        # c, s = math.cos(theta), math.sin(theta)
+        # rot = np.array([[c, -s], [s, c]], dtype=float)
+        # return local @ rot.T + np.array([r.cx, r.cy], dtype=float)
 
     @property
     def bbox(self) -> Tuple[float, float, float, float]:
@@ -282,3 +306,15 @@ class SavedROI:
         roi_data = d.get("roi", d)
         roi = ROI.from_dict(roi_data).normalized()
         return cls(id=int(d.get("id", 0)), roi=roi, curve=None, count=int(d.get("count", 0)))
+
+
+
+@dataclass(frozen=True)
+class ROIVolume:
+    """Объём ROI; x/y — одномерные оси xy или uv."""
+    x: np.ndarray
+    y: np.ndarray
+    theta: np.ndarray
+    volume: np.ndarray
+    coord_system: str
+    roi: ROI

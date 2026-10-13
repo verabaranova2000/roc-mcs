@@ -6,7 +6,7 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, Union
 
-from roc_mcs.roi.extraction import extract_from_roi
+from roc_mcs.roi.extraction import extract_from_roi, extract_roi_volume
 from roc_mcs.roi.roi_types import ROI
 
 
@@ -312,3 +312,9 @@ class H5ScanRepository:
             ny=ny,
             reduction_mode=reduction_mode,
         )
+
+
+    def volume_from_roi(self, scan_key, roi, *, valid_mask=None, order=1):
+        """Извлекает 3D-объём ROI из выбранного скана."""
+        c = self.load_scan(scan_key)
+        return extract_roi_volume(c["raw"], c["th"], roi, axis=c["axis"], valid_mask=valid_mask, order=order)

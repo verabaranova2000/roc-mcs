@@ -1,7 +1,8 @@
 import numpy as np
 import re
+from scipy.ndimage import map_coordinates
 
-from roc_mcs.roi.roi_types import ROI
+from roc_mcs.roi.roi_types import ROI, ROIVolume
 
 """
 Работа с ROI: извлечение ROC-кривых и пространственный отбор
@@ -218,9 +219,10 @@ def _rect_roi_window_mask(roi, nx, ny):
     xs = np.arange(x_min, x_max, dtype=float)
     ys = np.arange(y_min, y_max, dtype=float)
     xx, yy = np.meshgrid(xs, ys)
-    a = np.deg2rad(float(roi.angle)); c, s = float(np.cos(a)), float(np.sin(a))
-    dx = xx - float(roi.cx); dy = yy - float(roi.cy)
-    u = c * dx + s * dy; v = -s * dx + c * dy
+    # a = np.deg2rad(float(roi.angle)); c, s = float(np.cos(a)), float(np.sin(a))
+    # dx = xx - float(roi.cx); dy = yy - float(roi.cy)
+    # u = c * dx + s * dy; v = -s * dx + c * dy
+    u, v = roi.to_local(xx, yy)   # 📍
     mask = (np.abs(u) <= 0.5 * float(roi.width) + 1e-9) & (np.abs(v) <= 0.5 * float(roi.height) + 1e-9)
     return roi, x_min, x_max, y_min, y_max, mask
 
@@ -366,3 +368,47 @@ def _extract_from_rect_roi(raw, th, axis, roi, nx, ny, reduction_mode=None):
     if reduction_mode == "mean":
         curve = curve / float(count)
     return th.copy(), np.asarray(curve, dtype=float), count
+
+
+
+def extract_roi_volume(raw, th, roi, *, axis=0, valid_mask=None, order=1):
+    """Извлекает объём ROI: xy без поворота, uv с интерполяцией."""
+    raw = np.asarray(raw); th = np.asarray(th, dtype=float)
+    if raw.ndim != 3 or th.ndim != 1: raise ValueError("raw должен быть 3D, th — 1D")
+    if axis not in (0, 2) or raw.shape[axis] != len(th): raise ValueError("Несогласованные raw, th или axis")
+    if order not in (0, 1): raise ValueError("order должен быть 0 или 1")
+    data = np.moveaxis(raw, axis, 0); nt, ny, nx = data.shape
+    r = roi.normalized()
+    if r.type.lower() != "rect" or not np.all(np.isfinite([r.cx, r.cy, r.width, r.height, r.angle])) or min(r.width, r.height) <= 0:
+        raise ValueError("Ожидается корректная прямоугольная ROI")
+    mask = None
+    if valid_mask is not None:
+        m = np.asarray(valid_mask, dtype=bool)
+        if m.ndim == 2 and m.shape == (ny, nx): mask = np.broadcast_to(m, (nt, ny, nx))
+        elif m.shape == raw.shape: mask = np.moveaxis(m, axis, 0)
+        elif m.shape == (ny, nx, nt): mask = np.moveaxis(m, 2, 0)
+        elif m.shape == data.shape: mask = m
+        else: raise ValueError(f"Неверная форма valid_mask: {m.shape}")
+    aligned = abs(np.sin(2 * np.deg2rad(r.angle))) < 1e-10
+    if aligned:
+        r, x0, x1, y0, y1, region = _rect_roi_window_mask(r, nx, ny)
+        xs0, ys0 = np.arange(x0, x1), np.arange(y0, y1)
+        xs, ys = xs0[region.any(axis=0)], ys0[region.any(axis=1)]
+        if not len(xs) or not len(ys): raise ValueError("ROI не содержит центров пикселей детектора")
+        sub = np.asarray(data[:, ys, :][:, :, xs], dtype=float)
+        good = np.isfinite(sub)
+        if mask is not None: good &= mask[:, ys, :][:, :, xs]
+        vol = np.transpose(np.where(good, sub, np.nan), (2, 1, 0))
+        return ROIVolume(xs.astype(float), ys.astype(float), th.copy(), vol, "xy", r.copy())
+    u = np.linspace(-r.width / 2, r.width / 2, max(2, int(np.ceil(r.width)) + 1))
+    v = np.linspace(-r.height / 2, r.height / 2, max(2, int(np.ceil(r.height)) + 1))
+    U, V = np.meshgrid(u, v, indexing="ij")
+    Xd, Yd = r.to_detector(U, V)
+    coords = [Yd, Xd]; vol = np.empty((len(u), len(v), nt), dtype=float)
+    for i, layer in enumerate(data):
+        layer = np.asarray(layer, dtype=float); good = np.isfinite(layer)
+        if mask is not None: good &= mask[i]
+        num = map_coordinates(np.where(good, layer, 0.0), coords, order=order, mode="constant", cval=0.0)
+        den = map_coordinates(good.astype(float), coords, order=order, mode="constant", cval=0.0)
+        vol[:, :, i] = np.divide(num, den, out=np.full_like(num, np.nan), where=den > 1e-8)
+    return ROIVolume(u, v, th.copy(), vol, "uv", r.copy())
