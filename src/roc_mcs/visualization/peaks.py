@@ -361,3 +361,26 @@ def plot_pixel_neighborhood(
     )
     fig.set_constrained_layout_pads(w_pad=0.0, h_pad=0.0, hspace=0.0, wspace=0.0)
     return fig, axes
+
+
+
+
+def print_peak_counts_table(peak_catalog, shape):
+    """ 
+    Принимает peak_catalog, печатает таблицу и учитывает пиксели с нулём пиков.
+    Здесь считаются именно пики из peak_catalog, сгруппированные по координатам (y, x). 
+    Поэтому один пиксель, в котором обнаружено 3 пика на разных значениях theta, попадёт в строку «3».
+    Передавать shape=ny,nx (где ny,nx=data_yxt.shape[:2]), чтобы функция правильно учитывала пиксели без пиков.
+    """
+    total = shape[0] * shape[1]
+    counts = peak_catalog.groupby(["y", "x"]).size()
+    dist = counts.value_counts().to_dict()
+    dist[0] = total - len(counts)
+
+    w = max(5, max(map(len, map(str, dist))))
+    p = max(9, max(len(f"{n:,}") for n in dist.values()))
+
+    print(f"{'Пиков':>{w}} | {'Пикселей':>{p}} | {'Доля':>7}")
+    print(f"{'-'*w}-+-{'-'*p}-+-{'-'*7}")
+    for k, n in sorted(dist.items()):
+        print(f"{k:>{w}} | {n:>{p},} | {n/total:6.2%}")

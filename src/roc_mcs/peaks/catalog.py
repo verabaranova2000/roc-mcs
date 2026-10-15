@@ -437,3 +437,7 @@ def filter_peak_catalog_by_roi(peak_catalog, roi, nx, ny):
     info = {"roi_pixels": int(mask.sum()), "rows_before": int(len(peak_catalog)), "rows_after": int(len(out)),
             "pixels_before": int(pc["pixel_id"].nunique()), "pixels_after": int(check["pixel_id"].nunique())}
     return out, info
+
+
+
+

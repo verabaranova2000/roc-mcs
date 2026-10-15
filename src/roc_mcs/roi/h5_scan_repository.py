@@ -1,13 +1,21 @@
+# from __future__ import annotations
+import os,tempfile
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any,Dict,List,Tuple,Union
 import h5py
 import numpy as np
-import os
-import tempfile
-from dataclasses import dataclass, asdict
-from pathlib import Path
-from typing import Any, Dict, List, Tuple, Union
 
-from roc_mcs.roi.extraction import extract_from_roi, extract_roi_volume
+from roc_mcs.roi.extraction import extract_from_roi,extract_roi_volume
 from roc_mcs.roi.roi_types import ROI
+from roc_mcs.roi.spatial_pooling import (
+    PoolSpec,
+    normalize_pool,
+    pool_centers,
+    pool_native,
+    pool_valid_yxt
+)
+
 
 
 """
@@ -45,32 +53,70 @@ scan   raw + th   2D-карты
      ROC-данные ROI    
 """
 
+BUILTIN_MAPS=("Mean projection","Max projection","Sum projection")
 
-@dataclass
+@dataclass(frozen=True,slots=True)
 class ScanInfo:
-    """Метаданные scan и пути к связанным HDF5-данным."""
-    key: str
-    kind: str
-    raw_path: str
-    th_path: str
-    map_paths: Dict[str, str]
+    """Пути и тип scan внутри HDF5."""
+    key:str
+    kind:str
+    raw_path:str
+    th_path:str
+    map_paths:Dict[str,str]
 
+@dataclass(frozen=True,slots=True)
+class ScanData:
+    """Данные scan в одном строго определённом spatial-view."""
+    key:str
+    data:np.ndarray
+    th:np.ndarray
+    axis:int
+    pool:PoolSpec
+    source_shape_yx:tuple[int,int]
+    maps:Dict[str,np.ndarray]
 
+    @property
+    def shape_yx(self)->tuple[int,int]: return self.data.shape[1:] if self.axis==0 else self.data.shape[:2]
+    @property
+    def raw(self)->np.ndarray: return self.data
+    @property
+    def yxt(self)->np.ndarray: return np.moveaxis(self.data,self.axis,-1) if self.axis!=2 else self.data
+    @property
+    def tyx(self)->np.ndarray: return np.moveaxis(self.data,self.axis,0) if self.axis!=0 else self.data
+    @property
+    def view(self)->str: return self.pool.tag
+    def __getitem__(self,key:str)->Any:
+        table={"data":self.data,"raw":self.data,"th":self.th,"axis":self.axis,"maps":self.maps,"pool":self.pool,"view":self.view,"shape_yx":self.shape_yx,"source_shape_yx":self.source_shape_yx,"spatial_pool":self.pool,"spatial_pool_signature":self.pool.signature}
+        try: return table[key]
+        except KeyError: raise KeyError(key) from None
 
 class H5ScanRepository:
-    """Поиск, загрузка и кэширование scan-данных из HDF5."""
+    """HDF5-источник с переключаемым raw/count-pool spatial-view."""
 
-    def __init__(self, h5_path: Union[str, Path]):
-        """Создаёт repository для указанного HDF5-файла."""
-        self.h5_path = Path(h5_path).expanduser().resolve()
-        if not self.h5_path.exists():
-            raise FileNotFoundError(f"HDF5 file not found: {self.h5_path}")
-        self.scans: Dict[str, ScanInfo] = self._discover_scans()
-        if not self.scans:
-            raise ValueError("No usable scan groups were found in the HDF5 file.")
-        self._cache: Dict[str, Dict[str, Any]] = {}
+    def __init__(self,h5_path:Union[str,Path],*,pool:None|int|PoolSpec|dict=None,spatial_pool=None):
+        self.h5_path=Path(h5_path).expanduser().resolve()
+        if not self.h5_path.exists(): raise FileNotFoundError(f"HDF5 file not found: {self.h5_path}")
+        if pool is not None and spatial_pool is not None: raise ValueError("задайте только pool; spatial_pool оставлен лишь для совместимости")
+        self._pool=normalize_pool(pool if pool is not None else spatial_pool)
+        self.scans=self._discover_scans()
+        if not self.scans: raise ValueError("No usable scan groups were found in the HDF5 file.")
+        self._source_cache:Dict[str,ScanData]={}
+        self._view_cache:Dict[tuple[str,str],ScanData]={}
+        self._map_cache:Dict[tuple[str,str,str],np.ndarray]={}
 
-    def _discover_scans(self) -> Dict[str, ScanInfo]:
+    @property
+    def pool(self)->PoolSpec: return self._pool
+    @property
+    def view(self)->str: return self._pool.tag
+    @property
+    def view_signature(self)->str: return self._pool.signature
+
+    def set_pool(self,pool:None|int|PoolSpec|dict=1,*,stride:int|None=None)->"H5ScanRepository":
+        """Переключает spatial-view без повторного чтения HDF5."""
+        self._pool=normalize_pool(pool,stride=stride)
+        return self
+
+    def _discover_scans(self)->Dict[str,ScanInfo]:
         """
         Ищет внутри HDF5 подходящие scan'ы.
         Различает entry*_CALC и entry*.
@@ -79,198 +125,149 @@ class H5ScanRepository:
             raw_data
             theta
             available maps
-        """
-        scans: Dict[str, ScanInfo] = {}
-        with h5py.File(self.h5_path, "r") as f:
-            for name, obj in f.items():
-                if not isinstance(obj, h5py.Group):
-                    continue
-
+        """        
+        scans:Dict[str,ScanInfo]={}
+        with h5py.File(self.h5_path,"r") as f:
+            for name,obj in f.items():
+                if not isinstance(obj,h5py.Group): continue
                 # Processed scans: entry###_CALC with raw_data_2D and raw_data_th.
-                if name.endswith("_CALC") and "raw_data_2D" in obj and "raw_data_th" in obj:
-                    map_paths: Dict[str, str] = {}
-                    for ds_name, ds_obj in obj.items():
-                        if not isinstance(ds_obj, h5py.Dataset):
-                            continue
-                        if ds_name in {"raw_data_2D", "raw_data_th", "raw_data_total_int"}:
-                            continue
-                        map_paths[ds_name] = f"{name}/{ds_name}"
-                    scans[name] = ScanInfo(
-                        key=name,
-                        kind="processed",
-                        raw_path=f"{name}/raw_data_2D",
-                        th_path=f"{name}/raw_data_th",
-                        map_paths=map_paths,
-                    )
+                if name.endswith("_CALC") and "raw_data_2D" in obj and "raw_data_th" in obj: 
+                    maps={k:f"{name}/{k}" for k,v in obj.items() if isinstance(v,h5py.Dataset) and v.ndim==2 and k not in {"raw_data_2D","raw_data_th","raw_data_total_int"}}
+                    scans[name]=ScanInfo(name,"processed",f"{name}/raw_data_2D",f"{name}/raw_data_th",maps)
                     continue
-
                 # Raw scans: entry###/measurement/Frame and th.
-                if "measurement" in obj and isinstance(obj["measurement"], h5py.Group):
-                    meas = obj["measurement"]
-                    if all(k in meas for k in ("Frame", "th")):
-                        scans[name] = ScanInfo(
-                            key=name,
-                            kind="raw",
-                            raw_path=f"{name}/measurement/Frame",
-                            th_path=f"{name}/measurement/th",
-                            map_paths={},
-                        )
+                meas=obj.get("measurement")
+                if isinstance(meas,h5py.Group) and all(k in meas for k in ("Frame","th")):
+                    scans[name]=ScanInfo(name,"raw",f"{name}/measurement/Frame",f"{name}/measurement/th",{})
         return scans
 
-    def scan_keys(self) -> List[str]:
+    def scan_keys(self)->List[str]: 
         """Возвращает идентификаторы найденных scan'ов."""
-        return list(self.scans.keys())
+        return list(self.scans)
 
-    def available_maps(self, scan_key: str) -> List[str]:
+    def available_maps(self,scan_key:str)->List[str]:
         """Возвращает доступные 2D-карты для указанного scan."""
-        info = self.scans[scan_key]
-        if info.map_paths:
-            return list(info.map_paths.keys())
-        return ["Mean projection", "Max projection", "Sum projection"]
+        self._require_scan(scan_key)
+        return list(BUILTIN_MAPS) if self.pool.active else list(self.scans[scan_key].map_paths) or list(BUILTIN_MAPS)
 
-    def _load_dataset(self, dataset_path: str) -> np.ndarray:
+    def _require_scan(self,scan_key:str)->None:
+        if scan_key not in self.scans: raise KeyError(f"Unknown scan: {scan_key}")
+
+    def _load_dataset(self,path:str)->np.ndarray:
         """Загружает указанный HDF5 dataset в NumPy-массив."""
-        with h5py.File(self.h5_path, "r") as f:
-            return np.asarray(f[dataset_path])
-
-    def load_scan(self, scan_key: str) -> Dict[str, Any]:
-        """
-        Загружает данные scan и сохраняет их в кэше:
-            raw
-            th
-            axis
-            maps
-        Возвращает raw, th, ось θ и кэш 2D-карт.
-        """
-        if scan_key in self._cache:
-            return self._cache[scan_key]
-
-        info = self.scans[scan_key]
-        raw = self._load_dataset(info.raw_path)
-        th = self._load_dataset(info.th_path)
-        axis = self._infer_angle_axis(raw, th)
-
-        cache = {
-            "raw": raw,
-            "th": th,
-            "axis": axis,
-            "maps": {},
-        }
-        self._cache[scan_key] = cache
-        return cache
+        with h5py.File(self.h5_path,"r") as f: return np.asarray(f[path])
 
     @staticmethod
-    def _infer_angle_axis(raw: np.ndarray, th: np.ndarray) -> int:
+    def _theta_1d(th:np.ndarray)->np.ndarray:
+        th=np.asarray(th).squeeze()
+        if th.ndim!=1 or th.size<1: raise ValueError(f"theta должна быть 1D, shape={th.shape}")
+        return th
+
+    @staticmethod
+    def _infer_angle_axis(raw:np.ndarray,th:np.ndarray)->int:
         """
         Определяет, где в 3D массиве находится ось theta.
         Например:
             (raw[theta, y, x]) или (raw[y, x, theta])
         """
-        if raw.ndim != 3:
-            raise ValueError(f"Expected 3D raw data, got shape {raw.shape}")
-        th_len = len(th)
-        if raw.shape[0] == th_len:
-            return 0
-        if raw.shape[-1] == th_len:
-            return 2
-        return 0
+        if raw.ndim!=3: raise ValueError(f"Expected 3D raw data, got shape {raw.shape}")
+        candidates=[ax for ax in (0,2) if raw.shape[ax]==th.size]
+        if len(candidates)==1: return candidates[0]
+        if not candidates: raise ValueError(f"Не найдена theta-axis: raw={raw.shape}, theta={th.size}")
+        raise ValueError(f"Theta-axis неоднозначна: raw={raw.shape}, theta={th.size}, candidates={candidates}")
 
+    @staticmethod
+    def _readonly(a:np.ndarray)->np.ndarray:
+        a=np.asarray(a); a.setflags(write=False); return a
 
-    def export_scan_copy_with_maps(self, scan_key: str, output_path: Union[str, Path], maps: Dict[str, np.ndarray], *, map_attrs: Dict[str, Dict[str, Any]] | None = None, overwrite: bool = False, compression: str | None = "gzip", compression_opts: int | None = 4) -> Path:
-        """Создаёт новый HDF5 только с выбранным scan и добавляет 2D-карты; исходник не меняется."""
-        if scan_key not in self.scans:
-            raise KeyError(f"Неизвестный scan_key: {scan_key}")
-        if not maps:
-            raise ValueError("maps не должен быть пустым")
-        out=Path(output_path).expanduser().resolve()
-        if out == self.h5_path:
-            raise ValueError("output_path совпадает с исходным HDF5")
-        if out.exists() and not overwrite:
-            raise FileExistsError(f"Файл уже существует: {out}")
-        out.parent.mkdir(parents=True,exist_ok=True)
-        for name, arr in maps.items():
-            if not isinstance(name,str) or not name or "/" in name:
-                raise ValueError(f"Некорректное имя карты: {name!r}")
-            a=np.asarray(arr)
-            if a.ndim!=2 or not np.issubdtype(a.dtype,np.number):
-                raise ValueError(f"Карта {name!r} должна быть числовым 2D-массивом, shape={a.shape}, dtype={a.dtype}")
-        info=self.scans[scan_key]
-        fd,tmp_name=tempfile.mkstemp(prefix=out.name+".tmp-",dir=out.parent); os.close(fd); tmp=Path(tmp_name)
-        try:
-            with h5py.File(self.h5_path,"r") as src, h5py.File(tmp,"w") as dst:
-                src.copy(info.key,dst,name=info.key)
-                g=dst[info.key]; raw_shape=tuple(src[info.raw_path].shape); th_len=int(src[info.th_path].shape[0])
-                if len(raw_shape)!=3: raise ValueError(f"Исходный raw не 3D: {raw_shape}")
-                if raw_shape[0]==th_len: expected=raw_shape[1:]
-                elif raw_shape[-1]==th_len: expected=raw_shape[:2]
-                else: raise ValueError(f"Не удалось определить theta axis: raw={raw_shape}, th={th_len}")
-                for name, arr in maps.items():
-                    if tuple(arr.shape)!=tuple(expected): raise ValueError(f"Карта {name!r}: shape {arr.shape}, ожидается {expected}")
-                    if name in g:
-                        if not overwrite: raise ValueError(f"Карта уже существует: {scan_key}/{name}")
-                        del g[name]
-                    kw={} if compression is None else {"compression":compression,"compression_opts":compression_opts}
-                    ds=g.create_dataset(name,data=arr,**kw)
-                    ds.attrs["source_scan"] = scan_key
-                    ds.attrs["source_h5"] = str(self.h5_path)
-                    if map_attrs and name in map_attrs:
-                        for key,value in map_attrs[name].items():
-                            if isinstance(value,(str,int,float,bool,np.integer,np.floating,np.bool_)):
-                                ds.attrs[str(key)]=value.item() if isinstance(value,(np.generic,)) else value
-                            else:
-                                raise TypeError(f"Атрибут {name}/{key} должен быть скаляром")
-                dst.flush()
-            if out.exists(): out.unlink()
-            tmp.replace(out)
-        finally:
-            if tmp.exists(): tmp.unlink()
-        return out
+    def load_source(self,scan_key:str)->ScanData:
+        """Исходный scan на detector-grid, всегда без pooling."""
+        self._require_scan(scan_key)
+        if scan_key in self._source_cache: return self._source_cache[scan_key]
+        info=self.scans[scan_key]; raw=self._load_dataset(info.raw_path); th=self._theta_1d(self._load_dataset(info.th_path)); axis=self._infer_angle_axis(raw,th)
+        raw=self._readonly(raw); th=self._readonly(th); shape_yx=raw.shape[1:] if axis==0 else raw.shape[:2]
+        data=ScanData(scan_key,raw,th,axis,PoolSpec(),tuple(map(int,shape_yx)),{})
+        self._source_cache[scan_key]=data; return data
 
+    def load_scan_raw(self,scan_key:str)->ScanData: return self.load_source(scan_key)
 
-    def get_map(self, scan_key: str, map_name: str) -> np.ndarray:
+    def load_scan(self,scan_key:str)->ScanData:
         """
-        Возвращает 2D-карту для указанного scan.
-        Поддерживаются карты: 
-            Mean projection,
-            Max projection,
-            Sum projection,
-            а также сохранённые в HDF5 карты
+        Scan в текущем spatial-view. Загружает данные scan и сохраняет их в кэше:
+            raw
+            th
+            axis
+            maps
+        Возвращает raw, th, ось θ и кэш 2D-карт.        
         """
-        info = self.scans[scan_key]
-        cache = self.load_scan(scan_key)
-        maps = cache["maps"]
-        if map_name in maps:
-            return maps[map_name]
+        src=self.load_source(scan_key); key=(scan_key,self.pool.signature)
+        if key in self._view_cache: return self._view_cache[key]
+        if not self.pool.active: return src
+        raw=self._readonly(pool_native(src.data,src.axis,self.pool)); data=ScanData(scan_key,raw,src.th,src.axis,self.pool,src.source_shape_yx,{})
+        self._view_cache[key]=data; return data
 
-        if map_name in info.map_paths:
-            arr = self._load_dataset(info.map_paths[map_name])
-            maps[map_name] = arr
-            return arr
+    def source_yxt(self,scan_key:str)->np.ndarray: return self.load_source(scan_key).yxt
+    def source_tyx(self,scan_key:str)->np.ndarray: return self.load_source(scan_key).tyx
+    def data_yxt(self,scan_key:str)->np.ndarray: return self.load_scan(scan_key).yxt
+    def data_tyx(self,scan_key:str)->np.ndarray: return self.load_scan(scan_key).tyx
 
-        raw = cache["raw"]
-        axis = cache["axis"]
-        if map_name == "Mean projection":
-            arr = raw.mean(axis=axis)
-        elif map_name == "Max projection":
-            arr = raw.max(axis=axis)
-        elif map_name == "Sum projection":
-            arr = raw.sum(axis=axis)
+    def valid_yxt(self,scan_key:str,source_valid:np.ndarray|None=None)->np.ndarray:
+        """Переводит source-grid valid-mask в Y×X×theta текущего view."""
+        src=self.load_source(scan_key)
+        if source_valid is None: valid=np.ones(src.data.shape,dtype=bool)
         else:
-            arr = raw.max(axis=axis)
-        maps[map_name] = arr
-        return arr
+            valid=np.asarray(source_valid,dtype=bool)
+            if valid.shape!=src.data.shape: raise ValueError(f"source_valid должен иметь source-shape {src.data.shape}, получено {valid.shape}")
+        yxt=np.moveaxis(valid,src.axis,-1) if src.axis!=2 else valid
+        out=pool_valid_yxt(yxt,self.pool); out.setflags(write=False); return out
+
+    def valid_from_invalid(self,scan_key:str,source_invalid:np.ndarray)->np.ndarray:
+        """Spike/invalid-mask source-grid → valid Y×X×theta текущего view."""
+        invalid=np.asarray(source_invalid,dtype=bool); src=self.load_source(scan_key)
+        if invalid.shape!=src.data.shape: raise ValueError(f"source_invalid должен иметь source-shape {src.data.shape}, получено {invalid.shape}")
+        return self.valid_yxt(scan_key,~invalid)
+
+    def centers_xy(self,scan_key:str)->tuple[np.ndarray,np.ndarray]:
+        """Центры текущего view в координатах исходного detector-grid."""
+        return pool_centers(self.load_source(scan_key).source_shape_yx,self.pool)
+
+    def grid_info(self,scan_key:str)->dict[str,Any]:
+        scan=self.load_scan(scan_key); x,y=self.centers_xy(scan_key)
+        return {"view":self.view,"pool":self.pool,"shape_yx":scan.shape_yx,"source_shape_yx":scan.source_shape_yx,"x":x,"y":y}
+
+    def view_key(self,scan_key:str)->tuple[str,str]:
+        """Стабильный ключ scan + spatial-view для GUI/session-state."""
+        self._require_scan(scan_key); return scan_key,self.view_signature
+
+    def pool_source(self,scan_key:str,source_data:np.ndarray)->np.ndarray:
+        """Применяет текущий pooling к массиву source-grid в native layout."""
+        src=self.load_source(scan_key); a=np.asarray(source_data)
+        if a.shape!=src.data.shape: raise ValueError(f"source_data должен иметь source-shape {src.data.shape}, получено {a.shape}")
+        return pool_native(a,src.axis,self.pool)
+
+    def get_map(self,scan_key:str,map_name:str)->np.ndarray:
+        """2D-карта строго на grid текущего spatial-view."""
+        self._require_scan(scan_key); key=(scan_key,self.pool.signature,map_name)
+        if key in self._map_cache: return self._map_cache[key]
+        info=self.scans[scan_key]
+        if map_name in info.map_paths:
+            if self.pool.active: raise ValueError(f"HDF5-карта {map_name!r} относится к raw-grid и недоступна в {self.view}")
+            arr=self._load_dataset(info.map_paths[map_name]); expected=self.load_source(scan_key).source_shape_yx
+            if arr.shape!=expected: raise ValueError(f"HDF5-карта {map_name!r}: shape={arr.shape}, ожидается source-grid {expected}")
+            arr=self._readonly(arr); self._map_cache[key]=arr; self.load_source(scan_key).maps[map_name]=arr; return arr
+        scan=self.load_scan(scan_key); raw=scan.data; axis=scan.axis
+        if map_name=="Mean projection": arr=raw.mean(axis=axis)
+        elif map_name=="Max projection": arr=raw.max(axis=axis)
+        elif map_name=="Sum projection": arr=raw.sum(axis=axis)
+        else: raise KeyError(f"Unknown map: {map_name}")
+        arr=self._readonly(arr); self._map_cache[key]=arr; scan.maps[map_name]=arr; return arr
 
     # ===========================
     # Извлечение данных из ROI
     # ===========================
-    def curve_from_roi(
-        self,
-        scan_key: str,
-        roi: ROI,
-        reduction_mode: str = "mean",
-    ) -> Tuple[np.ndarray, np.ndarray, int]:
+    def curve_from_roi(self,scan_key:str,roi:ROI,reduction_mode:str="mean")->Tuple[np.ndarray,np.ndarray,int]:
         """
-        Извлекает ROC-данные из ROI выбранного скана.
+        ROC из ROI на текущем spatial-view. Извлекает ROC-данные из ROI выбранного скана.
 
         Parameters
         ----------
@@ -290,31 +287,45 @@ class H5ScanRepository:
         count : int
             Число пикселей (или отсчётов) в ROI.
         """
-        cache = self.load_scan(scan_key)
-        raw = cache["raw"]
-        th = cache["th"]
-        axis = cache["axis"]
+        scan=self.load_scan(scan_key); ny,nx=scan.shape_yx
+        return extract_from_roi(raw=scan.data,th=scan.th,axis=scan.axis,roi=roi,nx=nx,ny=ny,reduction_mode=reduction_mode)
 
-        if raw.ndim != 3:
-            raise ValueError(f"Expected 3D raw data, got {raw.shape}")
+    def volume_from_roi(self,scan_key:str,roi:ROI,*,valid_mask=None,order=1):
+        """3D ROI-объём на текущем spatial-view."""
+        scan=self.load_scan(scan_key)
+        return extract_roi_volume(scan.data,scan.th,roi,axis=scan.axis,valid_mask=valid_mask,order=order)
 
-        if axis == 0:
-            ny, nx = raw.shape[1], raw.shape[2]
-        else:
-            ny, nx = raw.shape[0], raw.shape[1]
-
-        return extract_from_roi(
-            raw=raw,
-            th=th,
-            axis=axis,
-            roi=roi,
-            nx=nx,
-            ny=ny,
-            reduction_mode=reduction_mode,
-        )
-
-
-    def volume_from_roi(self, scan_key, roi, *, valid_mask=None, order=1):
-        """Извлекает 3D-объём ROI из выбранного скана."""
-        c = self.load_scan(scan_key)
-        return extract_roi_volume(c["raw"], c["th"], roi, axis=c["axis"], valid_mask=valid_mask, order=order)
+    def export_scan_copy_with_maps(self,scan_key:str,output_path:Union[str,Path],maps:Dict[str,np.ndarray],*,map_attrs:Dict[str,Dict[str,Any]]|None=None,overwrite:bool=False,compression:str|None="gzip",compression_opts:int|None=4)->Path:
+        """Копирует scan и добавляет только source-grid 2D-карты."""
+        self._require_scan(scan_key)
+        if not maps: raise ValueError("maps не должен быть пустым")
+        source_shape=self.load_source(scan_key).source_shape_yx
+        for name,arr in maps.items():
+            if not isinstance(name,str) or not name or "/" in name: raise ValueError(f"Некорректное имя карты: {name!r}")
+            a=np.asarray(arr)
+            if a.ndim!=2 or not np.issubdtype(a.dtype,np.number): raise ValueError(f"Карта {name!r} должна быть числовым 2D-массивом")
+            if a.shape!=source_shape: raise ValueError(f"Карта {name!r}: shape={a.shape}; export принимает только source-grid {source_shape}")
+        out=Path(output_path).expanduser().resolve()
+        if out==self.h5_path: raise ValueError("output_path совпадает с исходным HDF5")
+        if out.exists() and not overwrite: raise FileExistsError(f"Файл уже существует: {out}")
+        out.parent.mkdir(parents=True,exist_ok=True); info=self.scans[scan_key]
+        fd,tmp_name=tempfile.mkstemp(prefix=out.name+".tmp-",dir=out.parent); os.close(fd); tmp=Path(tmp_name)
+        try:
+            with h5py.File(self.h5_path,"r") as src,h5py.File(tmp,"w") as dst:
+                src.copy(info.key,dst,name=info.key); group=dst[info.key]
+                for name,arr in maps.items():
+                    if name in group:
+                        if not overwrite: raise ValueError(f"Карта уже существует: {scan_key}/{name}")
+                        del group[name]
+                    kw={} if compression is None else {"compression":compression,"compression_opts":compression_opts}
+                    ds=group.create_dataset(name,data=arr,**kw); ds.attrs["source_scan"]=scan_key; ds.attrs["source_h5"]=str(self.h5_path); ds.attrs["grid"]="source"
+                    if map_attrs and name in map_attrs:
+                        for k,v in map_attrs[name].items():
+                            if not isinstance(v,(str,int,float,bool,np.integer,np.floating,np.bool_)): raise TypeError(f"Атрибут {name}/{k} должен быть скаляром")
+                            ds.attrs[str(k)]=v.item() if isinstance(v,np.generic) else v
+                dst.flush()
+            if out.exists(): out.unlink()
+            tmp.replace(out)
+        finally:
+            if tmp.exists(): tmp.unlink()
+        return out
