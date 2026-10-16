@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import numpy as np
 
 from roc_mcs.peaks.catalog import enrich_peak_catalog
@@ -85,12 +85,13 @@ class PreparedFitGroup:
 
 @dataclass(frozen=True, slots=True)
 class PreparedFitData:
-    """Полностью подготовленная задача fitting до разбиения на batch'и."""
+    """Подготовленные группы и ошибки отдельных пикселей."""
     groups: dict[int, PreparedFitGroup]
     theta_valid: np.ndarray
     active_names: tuple[str, ...]
     param_names: tuple[str, ...]
     add_background: bool
+    preparation_errors: dict[int, str] = field(default_factory=dict)
 
 @dataclass(frozen=True)
 class FitBatch:
@@ -265,6 +266,7 @@ def prepare_fit_data(
     pixel_K = pixel_counts.astype(np.int16, copy=False)
 
     groups = {}
+    preparation_errors = {}
     for K in sorted(np.unique(pixel_K)):
         K = int(K)
         pixel_indices = np.flatnonzero(pixel_K == K)
@@ -278,104 +280,60 @@ def prepare_fit_data(
         theta_detected = np.empty((N, K), dtype=np.float64)
         prominence = np.empty((N, K), dtype=np.float64)
         height = np.empty((N, K), dtype=np.float64)
-
         Q = K * A + int(add_background)
         x0 = np.empty((N, Q), dtype=np.float64)
         lb = np.empty((N, Q), dtype=np.float64)
         ub = np.empty((N, Q), dtype=np.float64)
-
-        fixed = {
-            name: np.empty((N, K), dtype=np.float64)
-            for name in spec.param_names
-            if name not in active_names
-        }
+        fixed = {name: np.empty((N, K), dtype=np.float64) for name in spec.param_names if name not in active_names}
+        keep = np.ones(N, dtype=bool)
 
         for b, pidx in enumerate(pixel_indices):
-            base = int(pixel_starts[pidx])
-            end = base + K
-            rows = slice(base, end)
+            base = int(pixel_starts[pidx]); end = base + K; rows = slice(base, end)
+            pid = int(pixel_ids[pidx]); xx = int(x_col[base]); yy = int(y_col[base])
+            pixel_id[b], x[b], y[b] = pid, xx, yy
+            peak_id[b] = peak_id_col[rows]; theta_index[b] = theta_index_col[rows]
+            theta_detected[b] = theta_col[rows]; prominence[b] = prominence_col[rows]; height[b] = height_col[rows]
+            try:
+                obs_b = np.asarray(data_yxt[yy, xx], dtype=np.float64)
+                valid_b = theta_valid & np.isfinite(obs_b)
+                if valid_mask is not None:
+                    mask_b = np.asarray(valid_mask[yy, xx], dtype=bool)
+                    if mask_b.ndim == 0: mask_b = np.full(valid_b.shape, bool(mask_b), dtype=bool)
+                    elif mask_b.shape != valid_b.shape: raise ValueError(f"valid_mask в пикселе имеет форму {mask_b.shape}, ожидалась {valid_b.shape}")
+                    valid_b &= mask_b
+                obs_init = obs_b.copy(); obs_init[~valid_b] = np.nan
+                centers = theta_detected[b]
+                for k in range(K):
+                    seed = PeakFitSeed(peak_id=int(peak_id[b, k]), theta_index=int(theta_index[b, k]),
+                                       theta_detected=float(theta_detected[b, k]), prominence=float(prominence[b, k]), height=float(height[b, k]))
+                    guess, bounds = initialize_component(
+                        spec, theta, obs_init, seed,
+                        left_neighbor=centers[k - 1] if k else None,
+                        right_neighbor=centers[k + 1] if k + 1 < K else None,
+                        center_window=center_window, theta_span=theta_span, theta_step=theta_step,
+                    )
+                    for j, name in enumerate(active_names):
+                        qj = k * A + j; x0[b, qj] = guess[name]
+                        lo, hi = bounds.get(name, (-np.inf, np.inf)); lb[b, qj] = -np.inf if lo is None else lo; ub[b, qj] = np.inf if hi is None else hi
+                    for name in fixed: fixed[name][b, k] = guess[name]
+                if add_background:
+                    if not np.any(valid_b): raise ValueError("не осталось валидных точек для фона")
+                    bg0 = float(np.percentile(obs_b[valid_b], 10)); x0[b, -1] = max(bg0, 0.0); lb[b, -1] = 0.0; ub[b, -1] = np.inf
+            except Exception as exc:
+                keep[b] = False
+                preparation_errors[pid] = f"{type(exc).__name__}: {exc}"
 
-            pid = int(pixel_ids[pidx])
-            xx = int(x_col[base])
-            yy = int(y_col[base])
-
-            pixel_id[b] = pid
-            x[b] = xx
-            y[b] = yy
-
-            obs_b = np.asarray(data_yxt[yy, xx], dtype=np.float64)
-            valid_b = theta_valid & np.isfinite(obs_b)                # Базовая проверка: тета валидна и в данных нет NaN
-            if valid_mask is not None:                                # Если пользователь передал маску, просто "докручиваем" ее сверху
-                valid_b &= np.asarray(valid_mask[yy, xx], dtype=bool) # Явное приведение защитит от ошибки типов in-place
-            obs_init = obs_b.copy()
-            obs_init[~valid_b] = np.nan
-
-            peak_id[b] = peak_id_col[rows]
-            theta_index[b] = theta_index_col[rows]
-            theta_detected[b] = theta_col[rows]
-            prominence[b] = prominence_col[rows]
-            height[b] = height_col[rows]
-
-            centers = theta_detected[b]
-
-            for k in range(K):
-                seed = PeakFitSeed(
-                    peak_id=int(peak_id[b, k]),
-                    theta_index=int(theta_index[b, k]),
-                    theta_detected=float(theta_detected[b, k]),
-                    prominence=float(prominence[b, k]),
-                    height=float(height[b, k]),
-                )
-                guess, bounds = initialize_component(
-                    spec,
-                    theta,
-                    obs_init,
-                    seed,
-                    left_neighbor=centers[k - 1] if k else None,
-                    right_neighbor=centers[k + 1] if k + 1 < K else None,
-                    center_window=center_window,
-                    theta_span=theta_span,
-                    theta_step=theta_step,
-                )
-                for j, name in enumerate(active_names):
-                    qj = k * A + j
-                    x0[b, qj] = guess[name]
-                    lo, hi = bounds.get(name, (-np.inf, np.inf))
-                    lb[b, qj] = -np.inf if lo is None else lo
-                    ub[b, qj] = np.inf if hi is None else hi
-                for name in fixed:
-                    fixed[name][b, k] = guess[name]
-
-            if add_background:
-                if not np.any(valid_b):
-                    raise ValueError(f"Для pixel_id={pid} не осталось валидных точек.")
-                bg0 = float(np.percentile(obs_b[valid_b], 10))
-                x0[b, -1] = max(bg0, 0.0)
-                lb[b, -1] = 0.0
-                ub[b, -1] = np.inf
-
+        if not keep.any():
+            continue
         groups[K] = PreparedFitGroup(
-            K=K,
-            pixel_id=pixel_id,
-            x=x,
-            y=y,
-            peak_id=peak_id,
-            theta_index=theta_index,
-            theta_detected=theta_detected,
-            prominence=prominence,
-            height=height,
-            x0=x0,
-            lb=lb,
-            ub=ub,
-            fixed=fixed,
+            K=K, pixel_id=pixel_id[keep], x=x[keep], y=y[keep], peak_id=peak_id[keep],
+            theta_index=theta_index[keep], theta_detected=theta_detected[keep],
+            prominence=prominence[keep], height=height[keep], x0=x0[keep], lb=lb[keep], ub=ub[keep],
+            fixed={name: values[keep] for name, values in fixed.items()},
         )
-    return PreparedFitData(
-        groups=groups,
-        theta_valid=theta_valid,
-        active_names=active_names,
-        param_names=tuple(spec.param_names),
-        add_background=bool(add_background),
-    )
+    return PreparedFitData(groups=groups, theta_valid=theta_valid, active_names=active_names,
+                           param_names=tuple(spec.param_names), add_background=bool(add_background),
+                           preparation_errors=preparation_errors)
 
 
 def iter_fit_batches(data_yxt, prepared, valid_mask=None, max_batch_pixels=1024):

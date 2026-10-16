@@ -2,11 +2,10 @@ import numpy as np
 import pandas as pd
 from tqdm.auto import tqdm
 from lmfit import Model, Parameters
-import matplotlib.pyplot as plt
-from matplotlib.ticker import AutoMinorLocator
 
 from roc_mcs.fitting.registry import ModelSpec
 from roc_mcs.fitting.preparation import PreparedFitGroup, prepare_fit_data
+from roc_mcs.fitting.result_normalization import broadcast_valid_mask, summarize_residuals, validate_valid_mask
 
 
 # ------------------------
@@ -105,30 +104,15 @@ def _make_lmfit_peak_records(result, group, spec: ModelSpec, row: int):
 _PIXEL_FIT_COLUMNS = (
     "x", "y", "n_detected", "n_fitted", "fit_status", "model",
     "n_data", "n_varying", "dof", "chisqr", "redchi", "rmse",
-    "p95_abs_residual", "max_abs_residual", "rmse_over_noise",
-    "aic", "bic", "fit_nfev", "message",
+    "p95_abs_residual", "max_abs_residual", "rmse_over_noise", "aic", "bic", "fit_nfev", "message",
+    "bg_background", "bg_background_error",
 )
 
 def _summarize_fit(result, intensity_fit, noise_sigma=None):
-    """Считает pixel-level QC и residual."""
-    residual = np.asarray(intensity_fit - result.best_fit, dtype=float)
-    n_data = len(intensity_fit)
+    """Считает общие QC-метрики и residual = данные - модель."""
     n_varying = sum(p.vary for p in result.params.values())
-    rmse = float(np.sqrt(np.mean(residual**2)))
-    diagnostics = {
-        "n_data": n_data,
-        "n_varying": n_varying,
-        "dof": n_data - n_varying,
-        "chisqr": float(result.chisqr),
-        "redchi": float(result.redchi),
-        "rmse": rmse,
-        "p95_abs_residual": float(np.percentile(np.abs(residual), 95)),
-        "max_abs_residual": float(np.max(np.abs(residual))),
-        "rmse_over_noise": rmse / noise_sigma if noise_sigma is not None and np.isfinite(noise_sigma) and noise_sigma > 0 else np.nan,
-        "aic": float(result.aic),
-        "bic": float(result.bic),
-        "fit_nfev": int(result.nfev),
-    }
+    diagnostics, residual = summarize_residuals(intensity_fit, result.best_fit, n_varying=n_varying, noise_sigma=noise_sigma)
+    diagnostics["fit_nfev"] = int(result.nfev)
     return diagnostics, residual
 
 
@@ -178,6 +162,7 @@ def fit_lmfit_pixel(
     theta = np.asarray(theta, dtype=float)
     if len(theta) != data_yxt.shape[-1]:
         raise ValueError(f"theta length {len(theta)} != data theta dimension {data_yxt.shape[-1]}")
+    valid_mask = broadcast_valid_mask(valid_mask, data_yxt.shape)
 
     if prepared_fit is None:
         prepared_fit = prepare_fit_data(
@@ -223,7 +208,8 @@ def fit_lmfit(
     Ny, Nx, Ntheta = data_yxt.shape
     if len(theta) != Ntheta:
         raise ValueError(f"theta length {len(theta)} != data theta dimension {Ntheta}")
-        
+    valid_mask = broadcast_valid_mask(valid_mask, data_yxt.shape)
+
     if prepared_fit is None:
         prepared_fit = prepare_fit_data(
             data_yxt=data_yxt,
@@ -247,6 +233,8 @@ def fit_lmfit(
     pixel_records = []
     total_pixels = sum(len(group.pixel_id) for group in prepared_fit.groups.values())
     detected_mask = np.zeros((Ny, Nx), dtype=bool)
+    if not peak_catalog.empty:
+        detected_mask[peak_catalog["y"].to_numpy(dtype=int), peak_catalog["x"].to_numpy(dtype=int)] = True
     
     iterator = tqdm(total=total_pixels, desc="LMFit fitting", unit="pixel", disable=not progress)
     try:
@@ -265,37 +253,43 @@ def fit_lmfit(
                         K=K, row=row, add_background=add_background, noise_sigma=noise_sigma,
                         valid_mask=pixel_mask,
                     )
-                    success = bool(result.success)
+                    success = bool(result.success and np.isfinite(np.asarray(result.best_fit, dtype=float)).all())
+                    if success and any(not np.isfinite(float(p.value)) for p in result.params.values()):
+                        success = False
+                    pixel_params = {"bg_background": np.nan, "bg_background_error": np.nan}
                     if success:
                         peak_records = _make_lmfit_peak_records(result=result, group=group, spec=spec, row=row)
                         fit_cube[y, x, valid] = np.asarray(result.best_fit, dtype=np.float32)
                         residual_cube[y, x, valid] = np.asarray(residual, dtype=np.float32)
                         fitted_records.extend(peak_records)
+                        if add_background and "bg_background" in result.params:
+                            bg = result.params["bg_background"]
+                            pixel_params = {"bg_background": float(bg.value), "bg_background_error": np.nan if bg.stderr is None else float(bg.stderr)}
                     pixel_records.append({
-                        "x": x,
-                        "y": y,
-                        "n_detected": K,
-                        "n_fitted": K if success else 0,
-                        "fit_status": "success" if success else "fit_failed",
-                        "model": spec.name,
-                        **diagnostics,
-                        "message": result.message,
+                        "x": x, "y": y, "n_detected": K, "n_fitted": K if success else 0,
+                        "fit_status": "success" if success else "fit_failed", "model": spec.name,
+                        **diagnostics, **pixel_params, "message": result.message,
                     })
                 except Exception as exc:
+                    no_data = isinstance(exc, ValueError) and "No valid data points" in str(exc)
                     pixel_records.append({
-                        "x": x,
-                        "y": y,
-                        "n_detected": K,
-                        "n_fitted": 0,
-                        "fit_status": "exception",
-                        "model": spec.name,
-                        "message": repr(exc),
+                        "x": x, "y": y, "n_detected": K, "n_fitted": 0,
+                        "fit_status": "fit_failed" if no_data else "exception", "model": spec.name,
+                        "message": str(exc) if no_data else repr(exc),
                     })
                 finally:
                     iterator.update(1)
     finally:
         iterator.close()
 
+    # Пиксели, которые не удалось подготовить.
+    counts = peak_catalog.groupby(["x", "y"], sort=False).size().to_dict() if not peak_catalog.empty else {}
+    recorded = {(int(r["x"]), int(r["y"])) for r in pixel_records}
+    for pixel_id, message in getattr(prepared_fit, "preparation_errors", {}).items():
+        yy, xx = divmod(int(pixel_id), Nx)
+        if (xx, yy) not in recorded:
+            pixel_records.append({"x": xx, "y": yy, "n_detected": int(counts.get((xx, yy), 0)), "n_fitted": 0,
+                                 "fit_status": "preparation_failed", "model": spec.name, "message": message})
     # Пиксели без detected peaks.
     for y, x in np.argwhere(~detected_mask):
         pixel_records.append({"x": int(x), "y": int(y), "n_detected": 0, "n_fitted": 0, "fit_status": "no_peaks", "model": spec.name})
@@ -312,86 +306,3 @@ def fit_lmfit(
     )
 
 
-
-
-# ==============================
-# Визуализация
-# ==============================
-
-
-
-# Палитра из 10 контрастных, высокополиграфических цветов для компонентов (Colorblind-friendly)
-ACADEMIC_PEAK_PALETTE = [
-    "#2CA02C",  # Зеленый
-    "#9467BD",  # Фиолетовый
-    "#17BECF",  # Голубой / Циан
-    "#E377C2",  # Розовый
-    "#8C564B",  # Коричневый
-    "#BCBD22",  # Оливковый
-    "#FF7F00",  # Оранжевый
-    "#33A02C",  # Темно-зеленый
-    "#6A3D9A",  # Темно-фиолетовый
-    "#B15928",  # Терракотовый
-]
-
-
-def plot_pixel_fit(
-    data_yxt, theta, x, y, pixel_result,
-    normalize=True, show_diagnostics=False,
-    figsize=(5.5, 4.0), legend_loc="upper left",
-    palette="tab10",
-):
-    """Строит single-pixel fit и опциональные маркеры пиков."""
-    data_yxt = np.asarray(data_yxt, dtype=float)
-    theta = np.asarray(theta, dtype=float)
-    x, y = int(x), int(y)
-
-    result = pixel_result["result"]
-    fitted_peaks = pixel_result["fitted_peaks"]
-    valid = pixel_result["valid"]
-
-    intensity = data_yxt[y, x, :]
-    norm_factor = np.max(intensity) if normalize else 1.0
-    intensity = intensity / norm_factor
-
-    best_fit = np.full(theta.shape, np.nan, dtype=float)
-    best_fit[valid] = result.best_fit / norm_factor
-
-    fig, ax = plt.subplots(figsize=figsize, layout="constrained")
-    components = result.eval_components(params=result.params, theta=theta)
-
-    # --- Палитра ---
-    if isinstance(palette, str) or palette is None:
-        cmap = plt.get_cmap(palette or "tab10")
-        get_color = lambda i: cmap(i % cmap.N)           # цикл по встроенной палитре
-    else:
-        get_color = lambda i: palette[i % len(palette)]  # цикл по списку
-    # --- Эксперимент и Суммарный фит ---
-    ax.plot(theta, intensity, color="black", linewidth=1.2, label="Experimental", zorder=3)
-    ax.plot(theta, best_fit, color="crimson", linewidth=1.2, label="Total fit", zorder=3)
-    # --- Отрисовка компонентов (заливка + контур) ---
-    for i, (_, row) in enumerate(fitted_peaks.reset_index(drop=True).iterrows()):
-        color = get_color(i)
-        component_name = f"peak_{int(row['component_id'])}_"
-        if component_name not in components:
-            continue
-
-        comp_y = components[component_name] / norm_factor
-        ax.fill_between(theta, 0, comp_y, facecolor=color, edgecolor=color, alpha=0.35, linewidth=0.8, label=f"Peak {row['peak_id']}")
-        ax.plot(theta, comp_y, color=color, linestyle="--", linewidth=0.9, alpha=0.85)
-
-        if show_diagnostics:                # диагностические маркеры (опционально)
-            ax.axvline(row["theta_detected"], color=color, linestyle=":", linewidth=1.0, alpha=0.7)
-            ax.axvline(row["theta"], color=color, linestyle="--", linewidth=1.5, alpha=0.7)
-
-    ax.set_xlabel(r"$\theta$ (arcsec)", fontsize=11)
-    ax.set_ylabel(r"$I/I_{\max}$ (rel. u.)" if normalize else "Intensity (counts)", fontsize=11)
-    ax.set_title(f"Pixel ({x}, {y}) Profile Fit", loc="left", fontsize=11, fontweight="bold")
-    ax.set_xlim(theta.min(), theta.max())
-    ax.set_ylim(bottom=0)                   # фиксируем низ на нуле
-    ax.tick_params(which="both", direction="in", top=True, right=True, labelsize=10)
-    ax.xaxis.set_minor_locator(AutoMinorLocator())
-    ax.yaxis.set_minor_locator(AutoMinorLocator())
-    ax.grid(True, linestyle=":", alpha=0.5)
-    ax.legend(loc=legend_loc, frameon=False, fontsize=9.5, handletextpad=0.5, columnspacing=1.0)
-    return fig, ax
