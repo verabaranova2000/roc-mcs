@@ -48,6 +48,7 @@ from roc_mcs.fitting.models import (
     # model_gauss_us_jax,
     # model_voigt_jax,
     jax_model_pvoigt,
+    jax_jac_pvoigt,
     # model_emg_jax,
     # model_split_voigt_jax
 )
@@ -74,11 +75,28 @@ from roc_mcs.fitting.derived import (
 
 @dataclass(frozen=True, slots=True)
 class ModelSpec:
+    """
+    func
+        NumPy-модель одного профиля
+
+    batch_func
+        NumPy batch-модель
+
+    batch_jac_func
+        NumPy аналитический Jacobian batch-модели
+
+    jax_func
+        JAX-модель одного профиля
+
+    jax_jac_func
+        JAX (prediction, analytic Jacobian)      <- возвращает не просто якобиан, чтобы solver не считал PVoigt дважды
+    """
     name: str
     func: Callable
     batch_func: Callable
-    batch_jac_func: Callable | None
+    batch_jac_func: Callable | None      # NumPy reference/validation Jacobian
     jax_func: Callable | None
+    jax_jac_func: Callable | None        # JAX production (prediction, Jacobian)
     param_names: tuple[str, ...]
     guess_fn: Callable
     bounds_fn: Callable
@@ -120,10 +138,10 @@ MODEL_SPECS = {
         batch_func=batch_model_lorentz,
         batch_jac_func=None,
         jax_func=None,
+        jax_jac_func=None,
         param_names=("S", "theta0", "gamma"),
         guess_fn=lorentz_guess,
         bounds_fn=lorentz_bounds,
-        # activation_param="S",
     ),    
     "gauss": ModelSpec(
         name="gauss",
@@ -131,10 +149,10 @@ MODEL_SPECS = {
         batch_func=batch_model_gauss,
         batch_jac_func=None,
         jax_func=None,
+        jax_jac_func=None,
         param_names=("S", "theta0", "sigma"),
         guess_fn=gauss_guess,
         bounds_fn=gauss_bounds,
-        # activation_param="S",
     ),    
     "gauss_us": ModelSpec(
         name="gauss_us",
@@ -142,10 +160,10 @@ MODEL_SPECS = {
         batch_func=model_gauss_us,   # ⚠️
         batch_jac_func=None,
         jax_func=None,
+        jax_jac_func=None,
         param_names=("S", "theta0", "sigma", "Delta"),
         guess_fn=gauss_us_guess,
         bounds_fn=gauss_us_bounds,
-        # activation_param="S",
     ),
     "voigt": ModelSpec(
         name="voigt",
@@ -153,10 +171,10 @@ MODEL_SPECS = {
         batch_func=batch_model_voigt,
         batch_jac_func=None,
         jax_func=None,
+        jax_jac_func=None,
         param_names=("S", "theta0", "sigma", "gamma"),
         guess_fn=voigt_guess,
         bounds_fn=voigt_bounds,
-        # activation_param="S",
     ),    
     "pvoigt": ModelSpec(
         name="pvoigt",
@@ -164,10 +182,10 @@ MODEL_SPECS = {
         batch_func=batch_model_pvoigt,
         batch_jac_func=batch_jac_pvoigt,
         jax_func=jax_model_pvoigt,
+        jax_jac_func=jax_jac_pvoigt,
         param_names=("S","theta0","H","eta"),
         guess_fn=pvoigt_guess,
         bounds_fn=pvoigt_bounds,
-        # activation_param="S",
     ),
     "emg": ModelSpec(
         name="emg",
@@ -175,10 +193,10 @@ MODEL_SPECS = {
         batch_func=batch_model_emg,
         batch_jac_func=None,
         jax_func=None,
+        jax_jac_func=None,
         param_names=("S","theta0","sigma","gamma","lam"),
         guess_fn=emg_guess,
         bounds_fn=emg_bounds,
-        # activation_param="S",
     ),    
     "split_voigt": ModelSpec(
         name="split_voigt",
@@ -186,10 +204,10 @@ MODEL_SPECS = {
         batch_func=batch_model_split_voigt,
         batch_jac_func=None,
         jax_func=None,
+        jax_jac_func=None,
         param_names=("S", "theta0", "beta_Gl", "beta_Cl", "beta_Gr", "beta_Cr"),
         guess_fn=split_voigt_guess,
         bounds_fn=split_voigt_bounds,
-        # activation_param="S",
     )
 }   
 

@@ -281,7 +281,8 @@ def _normalize_batch_with_derivative(y, dy, theta):
 
 def batch_jac_pvoigt(theta, S, theta0, H, eta):
     """
-    Аналитический Jacobian batch PVoigt.
+    НЕ ИСПОЛЬЗУЕТСЯ!!! Делался для прошлой неудачной версии, которая отменена. УБЕРУ ПОТОМ!!!
+    Аналитический Jacobian batch PVoigt. 
 
     Возвращает массив формы (B, M, 4):
         [:, :, 0] = d(model) / dS
@@ -374,6 +375,31 @@ def jax_model_pvoigt(theta, S, theta0, H, eta):
     L = L0 / jnp.maximum(area_L, tiny)
 
     return S * (eta * L + (1.0 - eta) * G)
+
+
+def _jax_normalize_with_derivative(y, dy, theta):
+    """Нормировка y/max(area,tiny) и её производная без underflow tiny**2."""
+    tiny = jnp.finfo(theta.dtype).tiny
+    area = jnp.trapezoid(y,theta)
+    darea = jnp.trapezoid(dy,theta) 
+    safe = jnp.maximum(area,tiny)
+    yn = y/safe
+    dsafe = jnp.where(area>tiny,darea,0.0)
+    return yn,(dy-yn*dsafe)/safe
+
+def jax_jac_pvoigt(theta,S,theta0,H,eta):
+    """Возвращает (model, J) для одного PVoigt; J имеет форму (theta,param)."""
+    th=theta-theta0; th2=th*th; cH=2.0*jnp.sqrt(2.0*jnp.log(2.0)); tiny=jnp.finfo(theta.dtype).tiny
+    sigma_raw=H/cH; gamma_raw=H/2.0; sigma=jnp.maximum(sigma_raw,tiny); gamma=jnp.maximum(gamma_raw,tiny)
+    dsigma=jnp.where(sigma_raw>tiny,1.0/cH,0.0); dgamma=jnp.where(gamma_raw>tiny,0.5,0.0)
+    G0=jnp.exp(-th2/(2.0*sigma*sigma)); den=th2+gamma*gamma; L0=(1.0/jnp.pi)*gamma/den
+    dG_t0=G0*th/(sigma*sigma); dG_H=G0*th2/(sigma**3)*dsigma
+    dL_t0=(1.0/jnp.pi)*2.0*th*gamma/(den*den); dL_H=(1.0/jnp.pi)*(th2-gamma*gamma)/(den*den)*dgamma
+    G,G_t0=_jax_normalize_with_derivative(G0,dG_t0,theta); _,G_H=_jax_normalize_with_derivative(G0,dG_H,theta)
+    L,L_t0=_jax_normalize_with_derivative(L0,dL_t0,theta); _,L_H=_jax_normalize_with_derivative(L0,dL_H,theta)
+    P=eta*L+(1.0-eta)*G; pred=S*P
+    J=jnp.stack((P,S*(eta*L_t0+(1.0-eta)*G_t0),S*(eta*L_H+(1.0-eta)*G_H),S*(L-G)),axis=-1)
+    return pred,J
 
 # ==================================================
 # Numerical helpers

@@ -38,10 +38,22 @@ def make_jax_lm_solver_v4(
     ridge=1e-12,
     microbatch_size=None,
     add_background=True,
+    jacobian_mode="auto",
 ):
-    """Batch LM/GN с независимыми microbatch-циклами."""
+    """
+    Batch LM/GN; auto использует аналитический JAX-Jacobian, если он зарегистрирован.
+    jacobian_mode :
+        Допустимы три режима:
+            auto      ->  analytic, если доступен, иначе autodiff
+            analytic
+            autodiff
+    """
     if spec.jax_func is None:
         raise ValueError(f"JAX backend is not available for model {spec.name!r}")
+    jacobian_mode=str(jacobian_mode).lower()
+    if jacobian_mode not in {"auto","analytic","autodiff"}: raise ValueError("jacobian_mode должен быть 'auto', 'analytic' или 'autodiff'")
+    analytic_func=getattr(spec,"jax_jac_func",None); use_analytic=analytic_func is not None and jacobian_mode in {"auto","analytic"}
+    if jacobian_mode=="analytic" and analytic_func is None: raise ValueError(f"Для модели {spec.name!r} не зарегистрирован analytic JAX Jacobian")
 
     K = int(K)
     if K < 1:
@@ -59,41 +71,34 @@ def make_jax_lm_solver_v4(
     eye = jnp.eye(q, dtype=jnp.float64)
     model_func = spec.jax_func
 
-    def component_model(params, theta):
-        return model_func(theta, *params)
+    def component_model(params,theta): return model_func(theta,*params)
+    model_components=jax.vmap(component_model,in_axes=(0,None),out_axes=0)
 
-    model_components = jax.vmap(component_model, in_axes=(0, None), out_axes=0)
+    def model_single(params,theta):
+        comp=params[:q_model].reshape(K,n_params); prediction=jnp.sum(model_components(comp,theta),axis=0)
+        return prediction+params[-1] if add_background else prediction
 
-    # def model_single(params, theta):
-    #     comp = params[:q_model].reshape(K, n_params)
-    #     return jnp.sum(model_components(comp, theta), axis=0) + params[-1]
-    def model_single(params, theta):
-        """
-        Фон должен присутствовать в модели только по настройке.
-        Это принципиальная часть исправления. При add_background=False solver больше не воспринимает 
-        последний параметр одного из пиков как фон и не пытается извлечь несуществующий дополнительный параметр.
-        """
-        comp = params[:q_model].reshape(K, n_params)
-        prediction = jnp.sum(model_components(comp, theta), axis=0)
-        return prediction + params[-1] if add_background else prediction
+    if use_analytic:
+        def component_value_jac(params,theta): return analytic_func(theta,*params)
+        component_value_jacs=jax.vmap(component_value_jac,in_axes=(0,None),out_axes=(0,0))
+        def model_jac_single(params,theta):
+            comp=params[:q_model].reshape(K,n_params); pred_c,jac_c=component_value_jacs(comp,theta); pred=jnp.sum(pred_c,axis=0); J=jnp.transpose(jac_c,(1,0,2)).reshape(theta.shape[0],q_model)
+            if add_background: pred=pred+params[-1]; J=jnp.concatenate((J,jnp.ones((theta.shape[0],1),dtype=theta.dtype)),axis=1)
+            return J,pred
+    else:
+        def model_with_aux_single(params,theta):
+            pred=model_single(params,theta); return pred,pred
+        model_jac_single=jax.jacfwd(model_with_aux_single,argnums=0,has_aux=True)
 
-    def model_with_aux_single(params, theta):
-        pred = model_single(params, theta)
-        return pred, pred
-
-    model_jac_single = jax.jacfwd(model_with_aux_single, argnums=0, has_aux=True)
-    model_jac_batch = jax.vmap(model_jac_single, in_axes=(0, None), out_axes=(0, 0))
-
-    def residual_single(params, y, valid, theta):
-        pred = model_single(params, theta)
-        y_safe = jnp.where(valid, y, 0.0)
-        return jnp.where(valid, pred - y_safe, 0.0)
-
-    model_batch = jax.vmap(model_single, in_axes=(0, None), out_axes=0)
-    residual_batch = jax.vmap(residual_single, in_axes=(0, 0, 0, None), out_axes=0)
-
-    jac_single = jax.jacfwd(residual_single, argnums=0)
-    jac_batch = jax.vmap(jac_single, in_axes=(0, 0, 0, None), out_axes=0)
+    model_jac_batch=jax.vmap(model_jac_single,in_axes=(0,None),out_axes=(0,0))
+    def residual_single(params,y,valid,theta):
+        pred=model_single(params,theta); y_safe=jnp.where(valid,y,0.0); return jnp.where(valid,pred-y_safe,0.0)
+    model_batch=jax.vmap(model_single,in_axes=(0,None),out_axes=0); residual_batch=jax.vmap(residual_single,in_axes=(0,0,0,None),out_axes=0)
+    if use_analytic:
+        def jac_single(params,y,valid,theta): return jnp.where(valid[:,None],model_jac_single(params,theta)[0],0.0)
+    else:
+        jac_single=jax.jacfwd(residual_single,argnums=0)
+    jac_batch=jax.vmap(jac_single,in_axes=(0,0,0,None),out_axes=0)
 
     def solve_group(obs, valid, x0, lb, ub, theta):
         y_safe = jnp.where(valid, obs, 0.0)
@@ -335,6 +340,7 @@ JAX_SOLVER_CONFIG = {
     "ftol": 1e-8,
     "xtol": 1e-8,
     "gtol": 1e-8,
+    "jacobian_mode": "auto",
 }
 
 def fit_jax(
@@ -395,6 +401,7 @@ def fit_jax(
                     xtol=solver_config["xtol"],
                     gtol=solver_config["gtol"],
                     add_background=add_background,
+                    jacobian_mode=solver_config.get("jacobian_mode","auto"),
                 )
 
             obs, valid, x0, lb, ub, n_actual = pad_batch_arrays(batch, B)
