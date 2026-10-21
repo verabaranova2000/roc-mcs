@@ -112,13 +112,7 @@ def parse_roi_text(text):
 
 
 def extract_from_roi(
-    raw,
-    th,
-    axis,
-    roi,
-    nx,
-    ny,
-    reduction_mode=None,
+    raw, th, axis, roi, nx, ny, reduction_mode=None, *, x_coords=None, y_coords=None, valid_mask=None,
 ):
     """
     Извлекает ROC-кривые из заданной ROI.
@@ -180,6 +174,15 @@ def extract_from_roi(
             f"Неподдерживаемый режим агрегации reduction_mode: {reduction_mode!r}. "
             "Допустимые значения: None, 'mean' или 'sum'."
         )
+    if x_coords is not None or y_coords is not None:
+        if x_coords is None or y_coords is None:
+            raise ValueError("x_coords и y_coords нужно передавать вместе.")
+        x_coords = _validate_grid_axis(x_coords, nx, "x_coords")
+        y_coords = _validate_grid_axis(y_coords, ny, "y_coords")
+        return _extract_from_roi_grid(raw, th, axis, roi, x_coords, y_coords, mode, valid_mask)
+    if valid_mask is not None:
+        raise ValueError("Для valid_mask передай также x_coords и y_coords.")
+
     roi_type = roi.type.lower()
 
     if roi_type == "point":
@@ -219,26 +222,117 @@ def _rect_roi_window_mask(roi, nx, ny):
     xs = np.arange(x_min, x_max, dtype=float)
     ys = np.arange(y_min, y_max, dtype=float)
     xx, yy = np.meshgrid(xs, ys)
-    # a = np.deg2rad(float(roi.angle)); c, s = float(np.cos(a)), float(np.sin(a))
-    # dx = xx - float(roi.cx); dy = yy - float(roi.cy)
-    # u = c * dx + s * dy; v = -s * dx + c * dy
     u, v = roi.to_local(xx, yy)   # 📍
     mask = (np.abs(u) <= 0.5 * float(roi.width) + 1e-9) & (np.abs(v) <= 0.5 * float(roi.height) + 1e-9)
     return roi, x_min, x_max, y_min, y_max, mask
 
 
-def roi_pixel_mask(roi, nx, ny):
-    """Возвращает маску (ny, nx) центров пикселей внутри прямоугольной ROI."""
+def roi_pixel_mask(roi, nx, ny, *, x_coords=None, y_coords=None):
+    """Маска центров пикселей; без осей координаты трактуются как индексы."""
     try:
         nx_i, ny_i = int(nx), int(ny)
     except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError("nx и ny должны быть положительными целыми числами.") from exc
     if nx_i != nx or ny_i != ny or nx_i <= 0 or ny_i <= 0:
         raise ValueError("nx и ny должны быть положительными целыми числами.")
+    if x_coords is not None or y_coords is not None:
+        if x_coords is None or y_coords is None:
+            raise ValueError("x_coords и y_coords нужно передавать вместе.")
+        return roi_grid_mask(roi, _validate_grid_axis(x_coords, nx_i, "x_coords"), _validate_grid_axis(y_coords, ny_i, "y_coords"))
     _, x_min, x_max, y_min, y_max, local = _rect_roi_window_mask(roi, nx_i, ny_i)
     mask = np.zeros((ny_i, nx_i), dtype=bool)
     mask[y_min:y_max, x_min:x_max] = local
     return mask
+
+
+def _validate_grid_axis(values, size, name):
+    a = np.asarray(values, dtype=float)
+    if a.ndim != 1 or a.size != size or a.size == 0 or not np.all(np.isfinite(a)):
+        raise ValueError(f"{name} должна быть конечной непустой 1D-осью длины {size}.")
+    if a.size > 1 and not np.all(np.diff(a) > 0):
+        raise ValueError(f"{name} должна быть строго возрастающей.")
+    return a
+
+
+def roi_grid_mask(roi, x_coords, y_coords):
+    """Маска (Ny_view, Nx_view) для ROI в координатах исходного детектора."""
+    r = roi.normalized()
+    if r.type.lower() != "rect":
+        raise ValueError("roi_grid_mask поддерживает прямоугольную ROI.")
+    x = np.asarray(x_coords, dtype=float); y = np.asarray(y_coords, dtype=float)
+    if x.ndim != 1 or y.ndim != 1:
+        raise ValueError("x_coords и y_coords должны быть одномерными осями.")
+    x = _validate_grid_axis(x, x.size, "x_coords"); y = _validate_grid_axis(y, y.size, "y_coords")
+    xx, yy = np.meshgrid(x, y)
+    return np.asarray(r.contains(xx, yy), dtype=bool)
+
+
+def _nearest_axis_indices(axis_values, values):
+    axis_values, values = np.asarray(axis_values, float), np.asarray(values, float)
+    right = np.clip(np.searchsorted(axis_values, values), 0, len(axis_values) - 1)
+    left = np.maximum(right - 1, 0)
+    choose_left = np.abs(values - axis_values[left]) <= np.abs(values - axis_values[right])
+    idx = np.where(choose_left, left, right)
+    step_left = axis_values[1] - axis_values[0] if len(axis_values) > 1 else 1.0
+    step_right = axis_values[-1] - axis_values[-2] if len(axis_values) > 1 else 1.0
+    half_left, half_right = step_left / 2, step_right / 2
+    inside = (values >= axis_values[0] - half_left) & (values <= axis_values[-1] + half_right)
+    return idx.astype(int), inside
+
+
+def _roi_grid_indices(roi, x_coords, y_coords):
+    """Индексы узлов текущей сетки, центры которых попадают в ROI."""
+    r = roi.normalized(); x = np.asarray(x_coords, float); y = np.asarray(y_coords, float)
+    kind = r.type.lower()
+    if kind == "point":
+        ix, in_x = _nearest_axis_indices(x, np.asarray([r.cx]))
+        iy, in_y = _nearest_axis_indices(y, np.asarray([r.cy]))
+        if not (in_x[0] and in_y[0]): return np.empty(0, int), np.empty(0, int)
+        return iy, ix
+    if kind == "rect":
+        mask = roi_grid_mask(r, x, y)
+        iy, ix = np.nonzero(mask)
+        return iy.astype(int), ix.astype(int)
+    if kind == "line":
+        length = float(r.width)
+        if not np.isfinite(length) or length <= 0: return np.empty(0, int), np.empty(0, int)
+        dx = np.median(np.diff(x)) if len(x) > 1 else 1.0
+        dy = np.median(np.diff(y)) if len(y) > 1 else 1.0
+        step = min(abs(dx), abs(dy))
+        n = max(2, int(np.ceil(length / max(step, 1e-12))) + 1)
+        a = np.deg2rad(float(r.angle)); d = np.linspace(-length / 2, length / 2, n)
+        xs = r.cx + d * np.cos(a); ys = r.cy + d * np.sin(a)
+        ix, in_x = _nearest_axis_indices(x, xs); iy, in_y = _nearest_axis_indices(y, ys)
+        pairs = np.column_stack((iy[in_x & in_y], ix[in_x & in_y]))
+        if not len(pairs): return np.empty(0, int), np.empty(0, int)
+        _, first = np.unique(pairs, axis=0, return_index=True); pairs = pairs[np.sort(first)]
+        return pairs[:, 0].astype(int), pairs[:, 1].astype(int)
+    raise ValueError(f"Неизвестный тип ROI: {r.type!r}")
+
+
+def _extract_from_roi_grid(raw, th, axis, roi, x_coords, y_coords, mode, valid_mask=None):
+    """Извлекает данные из ROI в координатах детектора; маска относится к текущему view."""
+    raw = np.asarray(raw); nt = len(th); ny, nx = (raw.shape[1:] if axis == 0 else raw.shape[:2])
+    iy, ix = _roi_grid_indices(roi, x_coords, y_coords)
+    yxt = np.moveaxis(raw, axis, -1) if axis != 2 else raw
+    curves = np.asarray(yxt[iy, ix, :], dtype=float) if len(ix) else np.empty((0, nt), dtype=float)
+    valid = np.isfinite(curves)
+    if valid_mask is not None:
+        m = np.asarray(valid_mask, dtype=bool)
+        if m.shape == raw.shape: m = np.moveaxis(m, axis, -1) if axis != 2 else m
+        elif m.shape == (ny, nx, nt): pass
+        elif m.shape == (nt, ny, nx): m = np.moveaxis(m, 0, -1)
+        else: raise ValueError(f"valid_mask имеет форму {m.shape}; ожидается current-view raw или Y×X×theta")
+        if len(ix): valid &= m[iy, ix, :]
+    curves = np.where(valid, curves, np.nan)
+    count = len(ix)
+    if mode is None: return th.copy(), curves, count
+    if not count: return th.copy(), np.array([], dtype=float), 0
+    n_valid = np.sum(np.isfinite(curves), axis=0)
+    totals = np.nansum(curves, axis=0)
+    if mode == "sum": curve = np.where(n_valid > 0, totals, np.nan)
+    else: curve = np.divide(totals, n_valid, out=np.full(nt, np.nan), where=n_valid > 0)
+    return th.copy(), np.asarray(curve, dtype=float), count
 
 
 
@@ -371,13 +465,15 @@ def _extract_from_rect_roi(raw, th, axis, roi, nx, ny, reduction_mode=None):
 
 
 
-def extract_roi_volume(raw, th, roi, *, axis=0, valid_mask=None, order=1):
-    """Извлекает объём ROI: xy без поворота, uv с интерполяцией."""
+def extract_roi_volume(raw, th, roi, *, axis=0, valid_mask=None, order=1, x_coords=None, y_coords=None):
+    """Извлекает объём ROI. Геометрия ROI задана в координатах исходной сетки."""
     raw = np.asarray(raw); th = np.asarray(th, dtype=float)
     if raw.ndim != 3 or th.ndim != 1: raise ValueError("raw должен быть 3D, th — 1D")
     if axis not in (0, 2) or raw.shape[axis] != len(th): raise ValueError("Несогласованные raw, th или axis")
     if order not in (0, 1): raise ValueError("order должен быть 0 или 1")
     data = np.moveaxis(raw, axis, 0); nt, ny, nx = data.shape
+    x_axis = _validate_grid_axis(np.arange(nx) if x_coords is None else x_coords, nx, "x_coords")
+    y_axis = _validate_grid_axis(np.arange(ny) if y_coords is None else y_coords, ny, "y_coords")
     r = roi.normalized()
     if r.type.lower() != "rect" or not np.all(np.isfinite([r.cx, r.cy, r.width, r.height, r.angle])) or min(r.width, r.height) <= 0:
         raise ValueError("Ожидается корректная прямоугольная ROI")
@@ -388,27 +484,50 @@ def extract_roi_volume(raw, th, roi, *, axis=0, valid_mask=None, order=1):
         elif m.shape == raw.shape: mask = np.moveaxis(m, axis, 0)
         elif m.shape == (ny, nx, nt): mask = np.moveaxis(m, 2, 0)
         elif m.shape == data.shape: mask = m
-        else: raise ValueError(f"Неверная форма valid_mask: {m.shape}")
+        else: raise ValueError(f"Неверная форма valid_mask: {m.shape}; ожидается маска текущего spatial-view")
+
+    # Для углов, кратных 90°, берём реальные отсчёты сетки без интерполяции.
     aligned = abs(np.sin(2 * np.deg2rad(r.angle))) < 1e-10
     if aligned:
-        r, x0, x1, y0, y1, region = _rect_roi_window_mask(r, nx, ny)
-        xs0, ys0 = np.arange(x0, x1), np.arange(y0, y1)
-        xs, ys = xs0[region.any(axis=0)], ys0[region.any(axis=1)]
-        if not len(xs) or not len(ys): raise ValueError("ROI не содержит центров пикселей детектора")
-        sub = np.asarray(data[:, ys, :][:, :, xs], dtype=float)
-        good = np.isfinite(sub)
-        if mask is not None: good &= mask[:, ys, :][:, :, xs]
+        xx, yy = np.meshgrid(x_axis, y_axis)
+        region = r.contains(xx, yy)
+        x_idx = np.flatnonzero(region.any(axis=0)); y_idx = np.flatnonzero(region.any(axis=1))
+        if not len(x_idx) or not len(y_idx): raise ValueError("ROI не содержит центров пикселей текущей сетки")
+        selected = region[np.ix_(y_idx, x_idx)]
+        sub = np.asarray(data[:, y_idx, :][:, :, x_idx], dtype=float)
+        good = np.isfinite(sub) & selected[None, :, :]
+        if mask is not None: good &= mask[:, y_idx, :][:, :, x_idx]
         vol = np.transpose(np.where(good, sub, np.nan), (2, 1, 0))
-        return ROIVolume(xs.astype(float), ys.astype(float), th.copy(), vol, "xy", r.copy())
-    u = np.linspace(-r.width / 2, r.width / 2, max(2, int(np.ceil(r.width)) + 1))
-    v = np.linspace(-r.height / 2, r.height / 2, max(2, int(np.ceil(r.height)) + 1))
+        return ROIVolume(x_axis[x_idx].copy(), y_axis[y_idx].copy(), th.copy(), vol, "xy", r.copy())
+
+    # Повернутый ROI пересэмплируется с шагом текущего grid, а не исходного пикселя.
+    dx = float(np.median(np.diff(x_axis))) if nx > 1 else 1.0
+    dy = float(np.median(np.diff(y_axis))) if ny > 1 else 1.0
+    step = min(abs(dx), abs(dy))
+    u = np.linspace(-r.width / 2, r.width / 2, max(2, int(np.ceil(r.width / step)) + 1))
+    v = np.linspace(-r.height / 2, r.height / 2, max(2, int(np.ceil(r.height / step)) + 1))
     U, V = np.meshgrid(u, v, indexing="ij")
     Xd, Yd = r.to_detector(U, V)
-    coords = [Yd, Xd]; vol = np.empty((len(u), len(v), nt), dtype=float)
+
+    def to_index(coords, axis_values):
+        if len(axis_values) == 1:
+            idx = np.zeros_like(coords, dtype=float)
+            inside = np.abs(coords - axis_values[0]) <= step / 2
+        else:
+            idx = np.interp(coords, axis_values, np.arange(len(axis_values)), left=np.nan, right=np.nan)
+            inside = np.isfinite(idx)
+        return idx, inside
+
+    ix, inside_x = to_index(Xd, x_axis); iy, inside_y = to_index(Yd, y_axis)
+    in_grid = inside_x & inside_y
+    safe_coords = [np.where(in_grid, iy, -1.0), np.where(in_grid, ix, -1.0)]
+    vol = np.full((len(u), len(v), nt), np.nan, dtype=float)
     for i, layer in enumerate(data):
         layer = np.asarray(layer, dtype=float); good = np.isfinite(layer)
         if mask is not None: good &= mask[i]
-        num = map_coordinates(np.where(good, layer, 0.0), coords, order=order, mode="constant", cval=0.0)
-        den = map_coordinates(good.astype(float), coords, order=order, mode="constant", cval=0.0)
-        vol[:, :, i] = np.divide(num, den, out=np.full_like(num, np.nan), where=den > 1e-8)
+        num = map_coordinates(np.where(good, layer, 0.0), safe_coords, order=order, mode="constant", cval=0.0)
+        den = map_coordinates(good.astype(float), safe_coords, order=order, mode="constant", cval=0.0)
+        vals = np.divide(num, den, out=np.full_like(num, np.nan), where=(den > 1e-8) & in_grid)
+        vol[:, :, i] = vals
     return ROIVolume(u, v, th.copy(), vol, "uv", r.copy())
+

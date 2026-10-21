@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg"
+    width="24" height="24" viewBox="0 0 24 24">
+  <g fill="none"
+     stroke="currentColor"
+     stroke-width="1.5"
+     stroke-linecap="square">
+    <rect x="5" y="5" width="14" height="14"/>
+  </g>
+
+  <g fill="currentColor">
+    <rect x="3" y="3" width="4" height="4"/>
+    <rect x="17" y="3" width="4" height="4"/>
+    <rect x="3" y="17" width="4" height="4"/>
+    <rect x="17" y="17" width="4" height="4"/>
+  </g>
+</svg>

@@ -374,15 +374,33 @@ def build_pixel_peak_lookup(peak_catalog):
 
 
 
-def filter_peak_catalog_by_roi(peak_catalog, roi, nx, ny):
-    """Фильтрует строки peak_catalog по прямоугольной ROI, сохраняя исходные столбцы/ID."""
+def filter_peak_catalog_by_roi(peak_catalog, roi, nx, ny, *, x_coords=None, y_coords=None):
+    """
+    Фильтрует строки peak_catalog по прямоугольной ROI, сохраняя исходные столбцы/ID.
+    Здесь:
+    - nx, ny — размеры текущей сетки;
+    - x_coords, y_coords — координаты центров её пикселей в системе исходного детектора;
+    - peak_catalog должен относиться к этому же spatial-view;
+    - roi хранится в координатах исходного детектора.
+
+    Notes
+    -----
+    Без передачи координат roi_pixel_mask() по умолчанию считает, что ROI задана в индексах текущей сетки. 
+    Это допустимо для старых вызовов, но при pooling может привести к неправильной фильтрации.
+
+    Recommended
+    -----
+    При каждом вызове для pooled-каталога передавать координаты через repo.centers_xy(scan_key). 
+    Тогда ROI остаётся неизменной при переключении представлений, 
+    а фильтрация пиков учитывает геометрию текущей сетки.
+    """
     from roc_mcs.peaks.catalog import enrich_peak_catalog
 
     if not hasattr(peak_catalog, "columns") or not hasattr(peak_catalog, "iloc"):
         raise TypeError("peak_catalog должен быть pandas DataFrame.")
     if len(peak_catalog) == 0:
         raise ValueError("Исходный peak_catalog пуст.")
-    mask = roi_pixel_mask(roi, nx, ny)
+    mask = roi_pixel_mask(roi, nx, ny, x_coords=x_coords, y_coords=y_coords)
     pc = enrich_peak_catalog(peak_catalog, int(nx))
     required = {"x", "y", "pixel_id"}
     if not required.issubset(pc.columns):

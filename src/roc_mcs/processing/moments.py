@@ -18,8 +18,6 @@ class ProfileMoments:
     fw80_int: float
     fw90_int: float
 
-
-
 # --- 1. Вспомогательная функция для CDF ---
 # Она понадобится для интегральных ширин.
 
@@ -33,6 +31,42 @@ def cumulative_trapezoid_manual(y: np.ndarray, x: np.ndarray) -> np.ndarray:
     dx = np.diff(x)
     increments = 0.5 * (y[:-1] + y[1:]) * dx
     return np.concatenate([[0.0], np.cumsum(increments)])
+
+
+
+# def compute_cii(background_result,*,levels=(.05,.10,.25,.50,.75,.90,.95)):
+#     """CII: diagnostic без clipping; production-CDF после clipping."""
+#     th = background_result.theta
+#     corr = np.asarray(background_result.corrected_map,float)
+#     pos = np.clip(corr,0,None)
+#     diag=np.apply_along_axis(lambda y:cumulative_trapezoid_manual(y,th),1,corr)
+#     cdf=np.apply_along_axis(lambda y:cumulative_trapezoid_manual(y,th),1,pos)
+#     dend, pend = diag[:,-1], cdf[:,-1]
+#     diag = np.divide(diag,dend[:,None],out=np.full_like(diag,np.nan),where=np.abs(dend[:,None])>1e-12)
+#     cdf = np.divide(cdf,pend[:,None],out=np.full_like(cdf,np.nan),where=pend[:,None]>1e-12)
+#     q = {float(p):np.full(len(cdf),np.nan) for p in levels}
+#     for i,row in enumerate(cdf):
+#         if np.all(np.isfinite(row)) and row[-1]>0:
+#             for p in q:q[p][i]=np.interp(p,row,th)
+#     roc = {'time_s':background_result.time_s.copy(),'theta_axis':th.copy(),'intensity':pos.copy(),'intensity_raw':background_result.data.copy(),'intensity_bg':background_result.background_map.copy(),'intensity_corrected_unclipped':corr.copy()}
+#     return {'roc_map':roc,'cii':cdf,'cii_diagnostic':diag,'quantiles':q,'levels':tuple(map(float,levels))}
+
+def compute_cii(background_result,*,levels=(.05,.10,.25,.50,.75,.90,.95)):
+    """CII: production после clipping; diagnostic сохраняет знак ошибки фона."""
+    import numpy as np
+    # from roc_mcs.processing.moments import cumulative_trapezoid_manual
+    th=np.asarray(background_result.theta,float);corr=np.asarray(background_result.corrected_map,float);pos=np.clip(corr,0,None)
+    integ=lambda a:np.stack([cumulative_trapezoid_manual(row,th) for row in a])
+    raw=integ(corr);positive=integ(pos);total=positive[:,-1];cdf=np.divide(positive,total[:,None],out=np.full_like(positive,np.nan),where=total[:,None]>1e-12);diag=np.divide(raw,total[:,None],out=np.full_like(raw,np.nan),where=total[:,None]>1e-12);q={float(p):np.full(len(cdf),np.nan) for p in levels}
+    for i,row in enumerate(cdf):
+        if not np.all(np.isfinite(row)) or row[-1]<=0:continue
+        u,idx=np.unique(row,return_index=True)
+        for p in q:
+            if u[0]<=p<=u[-1]:q[p][i]=np.interp(p,u,th[idx])
+    roc={'time_s':background_result.time_s.copy(),'theta_axis':th.copy(),'intensity':pos.copy(),'intensity_raw':background_result.data.copy(),'intensity_bg':background_result.background_map.copy(),'intensity_corrected_unclipped':corr.copy()}
+    return {'roc_map':roc,'cii':cdf,'cii_diagnostic':diag,'quantiles':q,'levels':tuple(map(float,levels)),'positive_area':total,'signed_area':raw[:,-1]}
+
+
 
     
 # --- 2. Основная функция ---

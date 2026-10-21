@@ -265,35 +265,25 @@ class H5ScanRepository:
     # ===========================
     # Извлечение данных из ROI
     # ===========================
-    def curve_from_roi(self,scan_key:str,roi:ROI,reduction_mode:str="mean")->Tuple[np.ndarray,np.ndarray,int]:
-        """
-        ROC из ROI на текущем spatial-view. Извлекает ROC-данные из ROI выбранного скана.
-
-        Parameters
-        ----------
-        scan_key : str
-            Идентификатор скана.
-        roi : ROI
-            Описание выбранной области интереса.
-        reduction_mode : {"mean", "sum"}, optional
-            Способ агрегации кривых ROI.
-
-        Returns
-        -------
-        th : ndarray
-            Угловая ось.
-        data : ndarray
-            Агрегированная ROC-кривая.
-        count : int
-            Число пикселей (или отсчётов) в ROI.
-        """
-        scan=self.load_scan(scan_key); ny,nx=scan.shape_yx
-        return extract_from_roi(raw=scan.data,th=scan.th,axis=scan.axis,roi=roi,nx=nx,ny=ny,reduction_mode=reduction_mode)
+    def curve_from_roi(self,scan_key:str,roi:ROI,reduction_mode:str="mean",*,valid_mask=None)->Tuple[np.ndarray,np.ndarray,int]:
+        """ROC из ROI; геометрия ROI в source-grid, valid_mask — в координатах текущего view."""
+        scan=self.load_scan(scan_key); ny,nx=scan.shape_yx; x_coords,y_coords=self.centers_xy(scan_key)
+        return extract_from_roi(raw=scan.data,th=scan.th,axis=scan.axis,roi=roi,nx=nx,ny=ny,reduction_mode=reduction_mode,x_coords=x_coords,y_coords=y_coords,valid_mask=valid_mask)
 
     def volume_from_roi(self,scan_key:str,roi:ROI,*,valid_mask=None,order=1):
-        """3D ROI-объём на текущем spatial-view."""
-        scan=self.load_scan(scan_key)
-        return extract_roi_volume(scan.data,scan.th,roi,axis=scan.axis,valid_mask=valid_mask,order=order)
+        """Извлекает ROI-объём текущего view; геометрия ROI всегда source-grid."""
+        scan=self.load_scan(scan_key); x_coords,y_coords=self.centers_xy(scan_key)
+        return extract_roi_volume(scan.data,scan.th,roi,axis=scan.axis,valid_mask=valid_mask,order=order,x_coords=x_coords,y_coords=y_coords)
+
+    def view_indices_to_source_xy(self,scan_key:str,x,y):
+        """Преобразует индексы пикселей текущего view в координаты source-grid."""
+        scan=self.load_scan(scan_key); x_axis,y_axis=self.centers_xy(scan_key)
+        xb,yb=np.broadcast_arrays(np.asarray(x),np.asarray(y))
+        if not np.all(np.isfinite(xb)) or not np.all(np.isfinite(yb)): raise ValueError("x/y должны быть конечными индексами")
+        xi,yi=np.rint(xb).astype(int),np.rint(yb).astype(int)
+        if np.any(xi!=xb) or np.any(yi!=yb): raise ValueError("x/y должны быть целочисленными индексами текущего view")
+        if np.any((xi<0)|(xi>=len(x_axis))|(yi<0)|(yi>=len(y_axis))): raise IndexError("x/y выходят за границы текущего view")
+        return x_axis[xi],y_axis[yi]
 
     def export_scan_copy_with_maps(self,scan_key:str,output_path:Union[str,Path],maps:Dict[str,np.ndarray],*,map_attrs:Dict[str,Dict[str,Any]]|None=None,overwrite:bool=False,compression:str|None="gzip",compression_opts:int|None=4)->Path:
         """Копирует scan и добавляет только source-grid 2D-карты."""

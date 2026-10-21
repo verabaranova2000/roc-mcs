@@ -160,10 +160,6 @@ class ROI:
             ], dtype=float)
         x, y = r.to_detector(local[:, 0], local[:, 1])  # 📍
         return np.column_stack((x, y))                  # 📍
-        # theta = math.radians(float(r.angle))
-        # c, s = math.cos(theta), math.sin(theta)
-        # rot = np.array([[c, -s], [s, c]], dtype=float)
-        # return local @ rot.T + np.array([r.cx, r.cy], dtype=float)
 
     @property
     def bbox(self) -> Tuple[float, float, float, float]:
