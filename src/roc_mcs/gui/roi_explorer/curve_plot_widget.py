@@ -84,7 +84,7 @@ class CurvePlotWidget(QWidget):
             return False, {}
         return artist.contains(mouseevent)
 
-    def draw_curves(self, curves_data: list, preview_data: dict = None, *, pixel_data: dict = None, view_label: str | None = None) -> dict:
+    def draw_curves(self, curves_data: list, preview_data: dict = None, *, pixel_data: dict = None, view_label: str | None = None, ) -> dict:
         """Перерисовывает данные и запоминает полный extent для Reset View."""
         self.ax.clear()
         self.ax.set_facecolor("#ffffff")
@@ -92,10 +92,6 @@ class CurvePlotWidget(QWidget):
         self._style_axes()
         curve_lines = {}
         for curve in curves_data:
-            # line, = self.ax.plot(curve["th"], curve["curve"], color=curve["color"],
-            #     linewidth=2.4 if curve["is_selected"] else 1.5,
-            #     alpha=1.0 if curve["is_selected"] else 0.88, label=curve["label"], picker=5)
-            # line._roi_id = curve["id"]
             line, = self.ax.plot(curve["th"], curve["curve"], color=curve["color"],
                 linewidth=2.4 if curve["is_selected"] else 1.5,
                 alpha=1.0 if curve["is_selected"] else 0.88,
@@ -107,11 +103,6 @@ class CurvePlotWidget(QWidget):
             self.ax.plot(preview_data["th"], preview_data["curve"], color="#20252b", linestyle="--", linewidth=1.8, alpha=0.95, label="ROI preview")
         if pixel_data:
             self.ax.plot(pixel_data["th"], pixel_data["curve"], color="#505965", linestyle="-.", linewidth=1.7, alpha=0.95, label=pixel_data["label"])
-        # if curves_data or preview_data or pixel_data:
-        #     self.ax.legend(frameon=False, loc="best", fontsize=8, labelspacing=0.3, handlelength=1.8, borderaxespad=0.5)
-        # else:
-        #     self.ax.text(0.5, 0.5, "No saved ROIs or selected pixel", ha="center", va="center",
-        #                  transform=self.ax.transAxes, color="#737c87", fontsize=9)
         if not (curves_data or preview_data or pixel_data):
             self.ax.text(0.5, 0.5, "No saved ROIs or selected pixel",
                          ha="center", va="center", transform=self.ax.transAxes,
