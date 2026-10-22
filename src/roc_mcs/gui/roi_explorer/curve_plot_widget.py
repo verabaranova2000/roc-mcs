@@ -20,6 +20,7 @@ class CurvePlotWidget(QWidget):
         self._pan_start_ylim = None
         self._base_xlim = None
         self._base_ylim = None
+        self._view_initialized = False
         self.roi_right_click_callback = None
 
         layout = QVBoxLayout(self)
@@ -84,8 +85,12 @@ class CurvePlotWidget(QWidget):
             return False, {}
         return artist.contains(mouseevent)
 
-    def draw_curves(self, curves_data: list, preview_data: dict = None, *, pixel_data: dict = None, view_label: str | None = None, ) -> dict:
-        """Перерисовывает данные и запоминает полный extent для Reset View."""
+    # def draw_curves(self, curves_data: list, preview_data: dict = None, *, pixel_data: dict = None, view_label: str | None = None, ) -> dict:
+    #     """Перерисовывает данные и запоминает полный extent для Reset View."""
+    def draw_curves(self, curves_data: list, preview_data: dict = None, *, pixel_data: dict = None, view_label: str | None = None) -> dict:
+        """Обновляет кривые, сохраняя масштаб пользователя."""
+        previous_xlim = self.ax.get_xlim() if self._view_initialized else None
+        previous_ylim = self.ax.get_ylim() if self._view_initialized else None    
         self.ax.clear()
         self.ax.set_facecolor("#ffffff")
         self.header_label.setText(f"Rocking curves · {view_label}" if view_label else "Rocking curves")
@@ -111,6 +116,11 @@ class CurvePlotWidget(QWidget):
         self.ax.autoscale_view()
         self._base_xlim = self.ax.get_xlim()
         self._base_ylim = self.ax.get_ylim()
+        if previous_xlim is not None and previous_ylim is not None:
+            self.ax.set_xlim(previous_xlim)
+            self.ax.set_ylim(previous_ylim)
+        if curves_data or preview_data or pixel_data:
+            self._view_initialized = True        
         self.canvas.draw_idle()
         return curve_lines
 
