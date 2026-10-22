@@ -4,6 +4,7 @@ from PyQt6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap, QPalette
 from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QFrame, QHBoxLayout, QHeaderView, QLabel, QMenu, QScrollArea, QTableWidget, QTableWidgetItem, QToolButton, QVBoxLayout, QWidget, QSizePolicy, QSizeGrip)
 
 from roc_mcs.gui.roi_explorer.hex_color_picker import CompactColorPicker, _DragTitle
+from roc_mcs.gui.roi_explorer.plot_toolbar_style import ICON_DIR
 
 def _symbol_icon(kind: str, color: QColor, size: int = 16) -> QIcon:
     pix = QPixmap(size, size); pix.fill(Qt.GlobalColor.transparent)
@@ -29,11 +30,11 @@ def _symbol_icon(kind: str, color: QColor, size: int = 16) -> QIcon:
 
 # _ROI_ICON_DIR = Path(r"C:\Users\Baranova Vera\Downloads\рентген практика\h5 файлы\Новая папка\icons")
 
-_ROI_ICON_DIR = Path(__file__).resolve().parents[1] / "resources" / "icons"
+# _ROI_ICON_DIR = Path(__file__).resolve().parents[1] / "resources" / "icons"
 
 def _pane_toggle_icon(expanded: bool, color: QColor | None = None, size: int = 16) -> QIcon:
     """Загружает векторную иконку нужного состояния; fallback остаётся чётким."""
-    path = _ROI_ICON_DIR / ("pane_expanded.svg" if expanded else "pane_collapsed.svg")
+    path = ICON_DIR / ("pane_expanded.svg" if expanded else "pane_collapsed.svg")
     if path.is_file(): return QIcon(str(path))
     pix = QPixmap(size, size); pix.fill(Qt.GlobalColor.transparent)
     p = QPainter(pix); p.setRenderHint(QPainter.RenderHint.Antialiasing)
