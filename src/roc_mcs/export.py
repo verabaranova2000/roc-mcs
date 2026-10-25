@@ -55,12 +55,12 @@ def export_roc_map_excel(
         data[f"t_{t:.1f}s"] = intensity
     roc_df = pd.DataFrame(data)
     # ---------- Metadata ----------
+    time_elapsed_s = roc_map.get("time_elapsed_s", time_s)
     meta_df = pd.DataFrame({
         "file_name": roc_map["file_name"],
-        "datetime": roc_map["time"],        
-        "time_s": time_s,                             # точное время стартов сканов; рабочая ось для анализа
-        "time_elapsed_s": roc_map["time_elapsed_s"]   # исходный elapsed из контроллера
-        #"phi": roc_map["phi"],
+        "datetime": roc_map["time"],
+        "time_s": time_s,
+        "time_elapsed_s": time_elapsed_s,
     })
 
     # ---------- Calibration ----------
@@ -75,14 +75,35 @@ def export_roc_map_excel(
     # ---------- Force and Pressure ----------
     control_df = None
     if control_log is not None:
-        t0 = roc_map["time_elapsed_s"][0]
-        mask = control_log["time_s"] >= t0
-        control_df = pd.DataFrame({
-            "time_s": control_log["time_s"][mask] - t0,
-            "force": control_log["force"][mask],
-            "pressure_mpa": control_log["pressure_mpa"][mask],
-            "state": control_log["state"][mask],
-        })
+        elapsed_axis = roc_map.get("time_elapsed_s", time_s)
+        t0 = float(elapsed_axis[0]) if len(elapsed_axis) else 0.0
+        raw = control_log.get("raw") if isinstance(control_log, dict) else None
+        if raw is not None and hasattr(raw, "columns") and {"elapsed", "force", "pressure_mpa"}.issubset(raw.columns):
+            # При успешной привязке есть абсолютный elapsed MCS-старта; иначе экспортируем лог относительно его начала.
+            aligned = "time_elapsed_s" in roc_map
+            if aligned:
+                end = float(elapsed_axis[-1]) if len(elapsed_axis) else float("inf")
+                mask = (raw["elapsed"] >= t0) & (raw["elapsed"] <= end)
+                selected = raw.loc[mask]
+                log_t0 = t0
+            else:
+                selected = raw
+                log_t0 = float(raw["elapsed"].iloc[0]) if len(raw) else 0.0
+            control_df = pd.DataFrame({
+                "time_s": selected["elapsed"].to_numpy(float) - log_t0,
+                "force": selected["force"].to_numpy(float),
+                "pressure_mpa": selected["pressure_mpa"].to_numpy(float),
+                "state": selected["state"].to_numpy() if "state" in selected else "",
+            })
+        elif all(key in control_log for key in ("time_s", "force", "pressure_mpa")):
+            raw_time = pd.Series(control_log["time_s"]).to_numpy(float)
+            mask = raw_time >= t0
+            control_df = pd.DataFrame({
+                "time_s": raw_time[mask] - t0,
+                "force": pd.Series(control_log["force"]).to_numpy(float)[mask],
+                "pressure_mpa": pd.Series(control_log["pressure_mpa"]).to_numpy(float)[mask],
+                "state": pd.Series(control_log.get("state", [""] * len(raw_time))).to_numpy()[mask],
+            })
 
     with pd.ExcelWriter(output_file) as writer:
         roc_df.to_excel(writer, sheet_name="ROC", index=False)

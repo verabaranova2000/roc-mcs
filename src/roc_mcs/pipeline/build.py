@@ -160,6 +160,7 @@ def run_experiment(
     compute_moments: bool = True,
     fit_models=(),
     trajectory_models=(),
+    branch="up",
 ):
     fit_models = tuple(fit_models or ())
     trajectory_models = tuple(trajectory_models or ())
@@ -170,7 +171,7 @@ def run_experiment(
 
     output_folder = resolve_output_folder(output_folder)
 
-    roc_map, qc = build_roc_map(input_folder)
+    roc_map, qc = build_roc_map(input_folder, branch=branch)
 
     # --- Загрузка control log (optional): для точного времени сканов; для извлечения силы и давления ---    
     control_log = None
@@ -326,6 +327,7 @@ def run_experiment(
             "amplitude": amplitude,
             "reference_amplitude": reference_amplitude,
             "reference_angle": reference_angle,
+            "branch": branch,
         },
         model_config=model_config,
         profile_moments=profile_moments,
