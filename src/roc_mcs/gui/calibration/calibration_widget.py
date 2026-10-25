@@ -1,6 +1,5 @@
 # calibration_widget.py
 
-from importlib.resources import files
 from pathlib import Path
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
@@ -9,11 +8,10 @@ from PyQt6.QtWidgets import (
     QGroupBox, QComboBox,
     QFormLayout,
     QToolButton,
-    QStyle,
     QToolBar,
     QFileDialog
 )
-from PyQt6.QtGui import QAction, QIcon
+from PyQt6.QtGui import QAction
 from PyQt6.QtCore import Qt, QSize
 
 from roc_mcs.io.sardana_h5 import H51DEntryProvider
@@ -25,11 +23,12 @@ from roc_mcs.gui.calibration.h5_settings_dialog import H5SettingsDialog
 from roc_mcs.io.mcs import load_mcs
 from roc_mcs.processing.alignment import find_phase
 from roc_mcs.processing.alignment import extract_branch
+from roc_mcs.gui.components.icon_provider import resource_svg_icon
 
 # --- путь к иконке ---
-GAUSSIAN_ICON = str(files("roc_mcs.gui.resources").joinpath("icons", "gaussian_icon.svg"))
-SETTING_ICON = str(files("roc_mcs.gui.resources").joinpath("icons", "setting_icon.svg"))
-INFO_ICON = str(files("roc_mcs.gui.resources").joinpath("icons", "info_icon.svg"))
+# GAUSSIAN_ICON = str(files("roc_mcs.gui.resources").joinpath("icons", "gaussian_icon.svg"))
+# SETTING_ICON = str(files("roc_mcs.gui.resources").joinpath("icons", "setting_icon.svg"))
+# INFO_ICON = str(files("roc_mcs.gui.resources").joinpath("icons", "info_icon.svg"))
 
 
 class CalibrationWidget(QWidget):
@@ -97,25 +96,22 @@ class CalibrationWidget(QWidget):
             }
         """)
         
-        self.act_run = QAction(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay),
+        self.act_run = QAction(resource_svg_icon("run_icon.svg", widget=self, size=16),
                                "Run calibration",
                                self)
         self.act_run.triggered.connect(self.start_calibration)
         
-        self.act_stop = QAction(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaStop),
+        self.act_stop = QAction(resource_svg_icon("stop_icon.svg", widget=self, size=16),
                                 "Stop",
                                 self)
         self.act_stop.triggered.connect(lambda: self.log("[INFO] Stop пока не реализован"))
         
-        self.act_info = QAction(QIcon(INFO_ICON),
-                                # self.style().standardIcon(QStyle.StandardPixmap.SP_MessageBoxInformation),
-                                "Info",
-                                self)
+        # self.act_info = QAction(QIcon(INFO_ICON), "Info", self)
+        self.act_info = QAction(resource_svg_icon("info_icon.svg", widget=self, size=16), "Info", self)
         self.act_info.triggered.connect(lambda: self.log("[INFO] Info пока не реализован"))
 
-        self.act_settings = QAction(QIcon(SETTING_ICON), 
-                                    "HDF5 settings", 
-                                    self)
+        # self.act_settings = QAction(QIcon(SETTING_ICON), "HDF5 settings", self)
+        self.act_settings = QAction(resource_svg_icon("setting_icon.svg", widget=self, size=16), "HDF5 settings", self)
         self.act_settings.triggered.connect(self.open_h5_settings)
 
         toolbar.addAction(self.act_run)
@@ -136,11 +132,7 @@ class CalibrationWidget(QWidget):
         self.input_form.setVerticalSpacing(6)
         self.input_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
 
-        # Общий стиль для кнопок предпросмотра
-        preview_btn_style = (
-            "QToolButton { font-size: 14px; border: 1px solid #ccc; border-radius: 4px; padding: 2px 4px; background-color: #f8f9fa; } "
-            "QToolButton:hover { background-color: #e2e6ea; }"
-        )
+        # Кнопки предпросмотра наследуют оформление текущей темы.
 
         # --- 1. Поле entry скана ---
         self.combo_entry_id = EntryComboBox()
@@ -152,12 +144,13 @@ class CalibrationWidget(QWidget):
 
         
         self.btn_preview_entry = QToolButton()
-        icon = QIcon(GAUSSIAN_ICON)        # 📈
+        # icon = QIcon(GAUSSIAN_ICON)        # 📈
+        icon = resource_svg_icon("gaussian_icon.svg", widget=self, size=16)        # 📈
         self.btn_preview_entry.setIcon(icon)
         self.btn_preview_entry.setIconSize(QSize(18, 18))
         self.btn_preview_entry.setToolTip("Предварительный просмотр эталона")
         self.btn_preview_entry.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_preview_entry.setStyleSheet(preview_btn_style)
+        self.btn_preview_entry.setObjectName("iconPreviewButton")
         self.btn_preview_entry.clicked.connect(lambda: self.preview_data(source="entry"))  # поменяли подключение кнопок
         
 
@@ -176,12 +169,13 @@ class CalibrationWidget(QWidget):
         self.input_mcs_path.browse_requested.connect(self.browse_mcs_file)
         
         self.btn_preview_mcs = QToolButton()
-        icon = QIcon(GAUSSIAN_ICON)        # 📈
+        # icon = QIcon(GAUSSIAN_ICON)        # 📈
+        icon = resource_svg_icon("gaussian_icon.svg", widget=self, size=16)        # 📈
         self.btn_preview_mcs.setIcon(icon)
         self.btn_preview_mcs.setIconSize(QSize(18, 18))
         self.btn_preview_mcs.setToolTip("Предварительный просмотр спектра")
         self.btn_preview_mcs.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_preview_mcs.setStyleSheet(preview_btn_style)
+        self.btn_preview_mcs.setObjectName("iconPreviewButton")
         self.btn_preview_mcs.clicked.connect(lambda: self.preview_data(source="mcs"))
         
         mcs_layout = QHBoxLayout()

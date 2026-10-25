@@ -600,18 +600,77 @@ def _plot_map(ax, df, col, title, cbar, *, quality_col=None, vmin=None, vmax=Non
     if cmap is not None: kw["cmap"] = cmap
     im = ax.imshow(a, **kw); ax.set(title=title, xlabel="x, pixel", ylabel="y, pixel"); plt.colorbar(im, ax=ax, fraction=.046, pad=.04, label=cbar); return im
 
-def plot_m0_rci_atlas(m0_components, *, K0=1, component_index=0, shape_xy=None, title=None):
-    """Классические RCI-карты M0: площадь окна, центр и FWHM для заданного локального ранга."""
+# def plot_m0_rci_atlas(m0_components, *, K0=1, component_index=0, shape_xy=None, title=None):
+#     """Классические RCI-карты M0: площадь окна, центр и FWHM для заданного локального ранга."""
+#     import matplotlib.pyplot as plt
+#     z = m0_components.loc[(m0_components.K0 == int(K0)) & (m0_components.component_index == int(component_index))].copy()
+#     fig, axs = plt.subplots(1, 4, figsize=(15.5, 4.5), constrained_layout=True)
+#     _plot_map(axs[0], z, "area_window", "A  Component integrated intensity", "Area over measured θ window", quality_col="profile_ok", shape_xy=shape_xy)
+#     _plot_map(axs[1], z, "theta0", "B  Peak position theta0", "theta0", shape_xy=shape_xy)
+#     _plot_map(axs[2], z, "FWHM", "C  Peak width", "FWHM in θ units", shape_xy=shape_xy)
+#     _plot_map(axs[3], z, "S_parameter", "D  Model scale S", "Fitted S parameter", shape_xy=shape_xy)
+#     if title: fig.suptitle(title)
+#     else: fig.suptitle(f"M0 RCI atlas · K={K0}, local component rank={component_index}")
+#     return fig, axs
+
+def plot_m0_rci_atlas(m0_components,*,K0=1,component_index=0,shape_xy=None,title=None,
+                      split_events=None,highlight_splits=False,split_quality_only=False):
+    """RCI-карты M0; опционально отмечает Stage F split-пиксели штриховкой."""
     import matplotlib.pyplot as plt
-    z = m0_components.loc[(m0_components.K0 == int(K0)) & (m0_components.component_index == int(component_index))].copy()
-    fig, axs = plt.subplots(1, 4, figsize=(15.5, 4.5), constrained_layout=True)
-    _plot_map(axs[0], z, "area_window", "A  Component integrated intensity", "Area over measured θ window", quality_col="profile_ok", shape_xy=shape_xy)
-    _plot_map(axs[1], z, "theta0", "B  Peak position theta0", "theta0", shape_xy=shape_xy)
-    _plot_map(axs[2], z, "FWHM", "C  Peak width", "FWHM in θ units", shape_xy=shape_xy)
-    _plot_map(axs[3], z, "S_parameter", "D  Model scale S", "Fitted S parameter", shape_xy=shape_xy)
-    if title: fig.suptitle(title)
-    else: fig.suptitle(f"M0 RCI atlas · K={K0}, local component rank={component_index}")
-    return fig, axs
+    z=m0_components.loc[(m0_components.K0==int(K0))&(m0_components.component_index==int(component_index))].copy()
+
+    split_mask=None
+    if highlight_splits:
+        if split_events is None: raise ValueError("Для highlight_splits=True передайте split_events=H['split_events']")
+        if shape_xy is None: raise ValueError("Для highlight_splits=True требуется shape_xy")
+        req={"x","y","K0","parent_index"}; miss=req.difference(split_events.columns)
+        if miss: raise ValueError(f"В split_events отсутствуют столбцы: {sorted(miss)}")
+        s=split_events.loc[(split_events.K0==int(K0))&(split_events.parent_index==int(component_index))].copy()
+        if split_quality_only:
+            if "map_quality_ok" not in s.columns: raise ValueError("split_quality_only=True требует map_quality_ok")
+            s=s.loc[s.map_quality_ok.astype(bool)]
+
+        ny,nx=map(int,shape_xy); split_mask=np.zeros((ny,nx),bool)
+        if len(s):
+            xy=s[["x","y"]].apply(pd.to_numeric,errors="coerce").to_numpy(float)
+            if np.any(~np.isfinite(xy)) or np.any(xy!=np.rint(xy)): raise ValueError("split_events.x/y должны быть конечными целыми координатами")
+            xy=xy.astype(int)
+            if np.any(xy[:,0]<0)|np.any(xy[:,0]>=nx)|np.any(xy[:,1]<0)|np.any(xy[:,1]>=ny): raise ValueError("split_events.x/y выходят за shape_xy")
+            split_mask[xy[:,1],xy[:,0]]=True
+
+    fig,axs=plt.subplots(1,4,figsize=(15.5,4.5),constrained_layout=True)
+    _plot_map(axs[0],z,"area_window","A  Component integrated intensity","Area over measured θ window",quality_col="profile_ok",shape_xy=shape_xy)
+    _plot_map(axs[1],z,"theta0","B  Peak position theta0","theta0",shape_xy=shape_xy)
+    _plot_map(axs[2],z,"FWHM","C  Peak width","FWHM in θ units",shape_xy=shape_xy)
+    _plot_map(axs[3],z,"S_parameter","D  Model scale S","Fitted S parameter",shape_xy=shape_xy)
+
+    if split_mask is not None and np.any(split_mask):
+        ny,nx=split_mask.shape
+        # overlay=np.where(split_mask,1.0,np.nan)
+        # for ax in axs:
+        #     ax.contourf(overlay,levels=[.5,1.5],colors="none",hatches=["////"],origin="lower",
+        #                 extent=(-.5,nx-.5,-.5,ny-.5),zorder=5)
+        #     ax.contour(split_mask.astype(float),levels=[.5],colors="white",linewidths=.55,origin="lower",
+        #                extent=(-.5,nx-.5,-.5,ny-.5),zorder=6)
+
+        overlay=np.where(split_mask,1.0,np.nan)
+        for ax in axs:
+            ax.contourf(overlay,levels=[.5,1.5],colors=["red"],alpha=.16,origin="lower",
+                        extent=(-.5,nx-.5,-.5,ny-.5),zorder=5)
+            ax.contour(split_mask.astype(float),levels=[.5],colors=["red"],
+                       #colors="white",
+                       linewidths=.3,origin="lower",
+                    extent=(-.5,nx-.5,-.5,ny-.5),zorder=6)
+    
+    base=title or f"M0 RCI atlas · K={K0}, local component rank={component_index}"
+    if highlight_splits:
+        n=int(np.count_nonzero(split_mask))
+        suffix="Stage F e-BH split pixels" if not split_quality_only else "Stage F split pixels · map QC pass"
+        fig.suptitle(f"{base}\nHatching: {suffix} (n={n})")
+    else:
+        fig.suptitle(base)
+    return fig,axs
+
 
 def plot_split_rci_atlas(split_events, *, K0=1, parent_index=0, quality_only=True, shape_xy=None, title=None):
     """Девять карт split-пар; ветви универсально маркируются lower/higher θ, не main/shoulder."""

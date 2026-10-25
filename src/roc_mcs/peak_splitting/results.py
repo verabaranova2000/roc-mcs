@@ -212,9 +212,6 @@ def export_tables(hyp,pix,prefix="real_ebh"):
     """Экспортирует численные результаты для воспроизводимости."""
     hp=f"{prefix}_hypotheses.csv"; pp=f"{prefix}_pixels.csv"; hyp.to_csv(hp,index=False); pix.to_csv(pp,index=False); return hp,pp
 
-def build_ebh_results(snap,hypotheses,df_d1=None):
-    """Универсальное имя для build_ebh_results; вычисления идентичны."""
-    return build_ebh_results(snap,hypotheses,df_d1=df_d1)
 
 
 # ==================== Synthetic evaluation ====================
