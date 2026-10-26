@@ -3,7 +3,8 @@ from __future__ import annotations
 from typing import Any
 import numpy as np
 import pyqtgraph as pg
-from matplotlib import cm
+import matplotlib.pyplot as plt
+# from matplotlib import cm
 from PyQt6 import QtCore, QtWidgets
 from .highlight import RocSliceHighlight
 from .axis_calibration import transform_axis, resample_rows_to_uniform_axis, effective_scale
@@ -35,7 +36,7 @@ class RocMapWidget(pg.PlotWidget):
         
         self.image_item = pg.ImageItem(axisOrder="row-major")
         # Inferno: постоянная цветовая шкала с тёмным минимумом и светлым максимумом.
-        self.image_item.setLookupTable((cm.get_cmap("inferno", 256)(np.linspace(0, 1, 256)) * 255).astype(np.uint8))
+        self.image_item.setLookupTable((plt.get_cmap("inferno", 256)(np.linspace(0, 1, 256)) * 255).astype(np.uint8))
         self.image_item.setZValue(-10)
         self.addItem(self.image_item)
         self._color_levels = None
