@@ -12,7 +12,7 @@ from PyQt6.QtWidgets import (
     QFileDialog
 )
 from PyQt6.QtGui import QAction
-from PyQt6.QtCore import Qt, QSize
+from PyQt6.QtCore import Qt, QSize, pyqtSignal
 
 from roc_mcs.io.sardana_h5 import H51DEntryProvider
 from roc_mcs.gui.calibration.calibration_worker import CalibrationWorker
@@ -32,6 +32,7 @@ from roc_mcs.gui.components.icon_provider import resource_svg_icon
 
 
 class CalibrationWidget(QWidget):
+    calibration_result_ready = pyqtSignal(dict)  # A/B и контекст завершённого расчёта; автономный режим не обязан его использовать.
     """
     Виджет калибровки. 
     Его можно встроить в любое приложение PyQt6 через layout.addWidget()
@@ -49,8 +50,15 @@ class CalibrationWidget(QWidget):
     STYLE_NORMAL = "color: #666666; border: none; font-size: 11px;"
     STYLE_READY = "color: #2b78e4; border: none; font-size: 11px; font-weight: bold;"
 
-    def __init__(self, entry_provider=None, parent=None):
+    def __init__(self, entry_provider=None, parent=None, theme="light"):
         super().__init__(parent)
+        self.theme = "dark" if str(theme).lower() == "dark" else "light"
+        self._calibration_context = {}
+        self._extra_calibration_context = {}
+        if self.theme == "dark":
+            self.STYLE_NORMAL = "color:#aab8ca;border:0;font-size:11px;"
+            self.STYLE_READY = "color:#8fc5ff;border:0;font-size:11px;font-weight:bold;"
+            self.setStyleSheet("QWidget{color:#e2e8f0;} QGroupBox{border:1px solid #384454;margin-top:6px;padding-top:5px;color:#8fc5ff;} QGroupBox::title{subcontrol-origin:margin;left:8px;} QLineEdit,QComboBox,QTextEdit{background:#151c27;color:#e2e8f0;border:1px solid #384454;border-radius:4px;padding:3px;} QPushButton,QToolButton{background:#202a38;color:#e2e8f0;border:1px solid #3a485b;border-radius:4px;padding:4px 7px;} QPushButton:hover,QToolButton:hover{background:#2a394c;} QProgressBar{background:#202a38;color:#e2e8f0;border:1px solid #384454;}")
         self.entry_provider = entry_provider                              # Ссылка на словарь/ТРС_data.h5
         if self.entry_provider and getattr(self.entry_provider, "file_path", None):
             self.entry_h5_path = Path(self.entry_provider.file_path)      # извлекаем путь из провайдера, если он там есть
@@ -96,22 +104,18 @@ class CalibrationWidget(QWidget):
             }
         """)
         
-        self.act_run = QAction(resource_svg_icon("run_icon.svg", widget=self, size=16),
-                               "Run calibration",
-                               self)
+        self.act_run = QAction(resource_svg_icon("run_icon.svg", widget=self, size=16), "Рассчитать калибровку", self)
         self.act_run.triggered.connect(self.start_calibration)
         
-        self.act_stop = QAction(resource_svg_icon("stop_icon.svg", widget=self, size=16),
-                                "Stop",
-                                self)
-        self.act_stop.triggered.connect(lambda: self.log("[INFO] Stop пока не реализован"))
+        self.act_stop = QAction(resource_svg_icon("stop_icon.svg", widget=self, size=16), "Остановить расчёт (не реализовано)", self)
+        self.act_stop.triggered.connect(lambda: self.log("[ИНФО] Остановка расчёта пока не реализована"))
         
         # self.act_info = QAction(QIcon(INFO_ICON), "Info", self)
-        self.act_info = QAction(resource_svg_icon("info_icon.svg", widget=self, size=16), "Info", self)
-        self.act_info.triggered.connect(lambda: self.log("[INFO] Info пока не реализован"))
+        self.act_info = QAction(resource_svg_icon("info_icon.svg", widget=self, size=16), "Справка", self)
+        self.act_info.triggered.connect(lambda: self.log("[СПРАВКА] Укажите моторный эталон в HDF5 и соответствующий MCS-скан того же объекта."))
 
         # self.act_settings = QAction(QIcon(SETTING_ICON), "HDF5 settings", self)
-        self.act_settings = QAction(resource_svg_icon("setting_icon.svg", widget=self, size=16), "HDF5 settings", self)
+        self.act_settings = QAction(resource_svg_icon("setting_icon.svg", widget=self, size=16), "Настроить HDF5", self)
         self.act_settings.triggered.connect(self.open_h5_settings)
 
         toolbar.addAction(self.act_run)
@@ -148,7 +152,7 @@ class CalibrationWidget(QWidget):
         icon = resource_svg_icon("gaussian_icon.svg", widget=self, size=16)        # 📈
         self.btn_preview_entry.setIcon(icon)
         self.btn_preview_entry.setIconSize(QSize(18, 18))
-        self.btn_preview_entry.setToolTip("Предварительный просмотр эталона")
+        self.btn_preview_entry.setToolTip("Предпросмотр моторного эталона")
         self.btn_preview_entry.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_preview_entry.setObjectName("iconPreviewButton")
         self.btn_preview_entry.clicked.connect(lambda: self.preview_data(source="entry"))  # поменяли подключение кнопок
@@ -160,11 +164,11 @@ class CalibrationWidget(QWidget):
         entry_layout.addWidget(self.combo_entry_id)
         entry_layout.addWidget(self.btn_preview_entry)
         
-        self.input_form.addRow("Entry ID:", entry_layout)
+        self.input_form.addRow("Эталонный скан:", entry_layout)
 
 
         # --- 2. Поле MCS файла ---
-        self.input_mcs_path = DropLineEdit()
+        self.input_mcs_path = DropLineEdit(theme=self.theme)
         # Просто подключаем сигнал нашей новой строгой кнопки к функции открытия проводника
         self.input_mcs_path.browse_requested.connect(self.browse_mcs_file)
         
@@ -173,7 +177,7 @@ class CalibrationWidget(QWidget):
         icon = resource_svg_icon("gaussian_icon.svg", widget=self, size=16)        # 📈
         self.btn_preview_mcs.setIcon(icon)
         self.btn_preview_mcs.setIconSize(QSize(18, 18))
-        self.btn_preview_mcs.setToolTip("Предварительный просмотр спектра")
+        self.btn_preview_mcs.setToolTip("Предпросмотр MCS-профиля")
         self.btn_preview_mcs.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_preview_mcs.setObjectName("iconPreviewButton")
         self.btn_preview_mcs.clicked.connect(lambda: self.preview_data(source="mcs"))
@@ -188,22 +192,23 @@ class CalibrationWidget(QWidget):
 
         # --- 3. Выбор ветви ---
         self.combo_branch = QComboBox()
-        self.combo_branch.addItems(["down", "up"])
-        self.combo_branch.setFixedWidth(100)                                                  # Делаем комбобокс компактным
-        self.combo_branch.currentTextChanged.connect(lambda: self.preview_data(silent=True))  # При изменении ветви тоже логично обновлять предпросмотр (опционально)
-        self.input_form.addRow("Ветвь:", self.combo_branch)
+        self.combo_branch.addItem("Нижняя ветвь (down)", "down")
+        self.combo_branch.addItem("Верхняя ветвь (up)", "up")
+        self.combo_branch.setMinimumWidth(150)
+        self.combo_branch.currentTextChanged.connect(lambda *_: self.preview_data(silent=True))
+        self.input_form.addRow("Ветвь скана:", self.combo_branch)
         
         input_outer.addWidget(self.fields_widget)
         left_layout.addWidget(self.input_group)
 
 
         # Консоль
-        log_group = QGroupBox("Лог расчета")
+        log_group = QGroupBox("Ход расчёта")
         log_layout = QVBoxLayout(log_group)
         log_layout.setContentsMargins(2, 5, 2, 2) # Уменьшаем отступы внутри рамки лога
         self.log_console = QTextEdit()
         self.log_console.setReadOnly(True)
-        self.log_console.setStyleSheet("background-color: #1e1e1e; color: #00ff00; font-family: Consolas, Monospace; font-size: 9pt;")
+        self.log_console.setStyleSheet("background:#111720;color:#c4d0df;border:1px solid #303b4a;font-family:Consolas,monospace;font-size:9pt;" if self.theme == "dark" else "background-color:#1e1e1e;color:#00ff00;font-family:Consolas,Monospace;font-size:9pt;")
         log_layout.addWidget(self.log_console)
         
         left_layout.addWidget(log_group)
@@ -223,8 +228,8 @@ class CalibrationWidget(QWidget):
         preview_row.setContentsMargins(0, 0, 0, 0)
         preview_row.setSpacing(self.PREVIEW_ROW_GAP)
         
-        self.preview_entry = PlotBox("Entry preview")
-        self.preview_mcs = PlotBox("MCS preview")
+        self.preview_entry = PlotBox("Эталонный моторный скан", theme=self.theme)
+        self.preview_mcs = PlotBox("Скан многоканальника", theme=self.theme)
 
         preview_row.addWidget(self.preview_entry, 1)
         preview_row.addWidget(self.preview_mcs, 1)
@@ -232,7 +237,7 @@ class CalibrationWidget(QWidget):
         self.layout_inputs.addLayout(preview_row)
         
         # --- Нижний график: результат калибровки ---
-        self.preview_result = PlotBox("Result")  # "Результат калибровки"
+        self.preview_result = PlotBox("Результат калибровки", theme=self.theme)
         self.layout_inputs.addWidget(self.preview_result)
 
         # --- Добавляем правую панель в splitter ---
@@ -249,7 +254,7 @@ class CalibrationWidget(QWidget):
         # --- STATUS BAR ---
         self.status_container = QWidget()
         self.status_container.setFixedHeight(self.STATUS_BAR_HEIGHT)  # Фиксируем высоту подвала
-        self.status_container.setStyleSheet("background-color: #f8f9fa; border-top: 1px solid #dcdcdc;")
+        self.status_container.setStyleSheet("background:#141b26;border-top:1px solid #303b4a;" if self.theme == "dark" else "background-color:#f8f9fa;border-top:1px solid #dcdcdc;")
         
         status_layout = QHBoxLayout(self.status_container)
         status_layout.setContentsMargins(10, 0, 10, 0)
@@ -257,14 +262,14 @@ class CalibrationWidget(QWidget):
         
         # Текстовый статус текущей операции (занимает всё свободное место слева)
         self.lbl_status = QLabel("")
-        self.lbl_status.setStyleSheet("color: #333333; border: none; font-size: 11px;")
+        self.lbl_status.setStyleSheet("color:#cbd5e1;border:0;font-size:11px;" if self.theme == "dark" else "color:#333;border:0;font-size:11px;")
         status_layout.addWidget(self.lbl_status, stretch=1)
         
         # Текст с цифрами прогресса (строго фиксированная ширина, чтобы не скакало!)
         self.lbl_progress_text = QLabel("")
         self.lbl_progress_text.setFixedWidth(130)
         self.lbl_progress_text.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        self.lbl_progress_text.setStyleSheet("color: #555555; border: none; font-family: Consolas, Monospace; font-size: 11px;")
+        self.lbl_progress_text.setStyleSheet("color:#aab8ca;border:0;font-family:Consolas,monospace;font-size:11px;" if self.theme == "dark" else "color:#555;border:0;font-family:Consolas,Monospace;font-size:11px;")
         status_layout.addWidget(self.lbl_progress_text)
         
         # Компактный академичный прогресс-бар
@@ -283,6 +288,8 @@ class CalibrationWidget(QWidget):
             }
         """)
         
+        if self.theme == "dark":
+            self.progress_bar.setStyleSheet("QProgressBar{border:1px solid #3b4a5f;border-radius:2px;background:#202a38;} QProgressBar::chunk{background:#448bd4;border-radius:1px;}")
         status_layout.addWidget(self.progress_bar)
         main_layout.addWidget(self.status_container)
 
@@ -376,7 +383,7 @@ class CalibrationWidget(QWidget):
     def open_h5_settings(self):
         current_path = self.entry_h5_path or ""
 
-        dialog = H5SettingsDialog(current_path=current_path, parent=self)
+        dialog = H5SettingsDialog(current_path=current_path, parent=self, theme=self.theme)
         if dialog.exec() != dialog.DialogCode.Accepted:
             return
 
@@ -387,6 +394,15 @@ class CalibrationWidget(QWidget):
         self.reload_entry_ids()
         self.update_ready_state()    # обновить статус интерфейса
         self.log(f"[INFO] HDF5 путь обновлён: {new_path}")
+
+    def set_h5_path(self, path):
+        """Программно загружает HDF5 и обновляет список эталонных сканов."""
+        new_path = Path(path).expanduser()
+        if not new_path.is_file(): raise FileNotFoundError(f"Файл HDF5 не найден: {new_path}")
+        self.entry_h5_path = new_path
+        self.entry_provider = H51DEntryProvider(new_path)
+        self.reload_entry_ids()
+        self.update_ready_state()
 
     def reload_entry_ids(self):
         """
@@ -441,7 +457,7 @@ class CalibrationWidget(QWidget):
         mcs_path = self.input_mcs_path.text().strip()
         # entry_id = self.combo_entry_id.currentData()
         entry_id = self.current_entry_id
-        branch = self.combo_branch.currentText()
+        branch = self.combo_branch.currentData() or self.combo_branch.currentText()
     
         if source in ("mcs", "both") and mcs_path:
             try:
@@ -472,7 +488,7 @@ class CalibrationWidget(QWidget):
         mcs_path = self.input_mcs_path.text().strip()
         # entry_id = self.combo_entry_id.currentData()
         entry_id = self.current_entry_id
-        branch = self.combo_branch.currentText()
+        branch = self.combo_branch.currentData() or self.combo_branch.currentText()
 
         if not mcs_path or entry_id is None:
             self.log("[ОШИБКА] Укажите путь к MCS файлу и ID entry!")
@@ -494,6 +510,7 @@ class CalibrationWidget(QWidget):
             mcs = load_mcs(mcs_path)
             counts, n_channels = mcs["counts"], mcs["n_channels"]
             phi, _ = find_phase(counts, n_channels)
+            self._cache_phi_mcs = float(phi)  # Фаза этого MCS нужна для протокола калибровки, не для будущей live-серии.
             s_mca, y_mca = extract_branch(counts, phi, n_channels, branch=branch)
 
             curve_entry = self.entry_provider.load(entry_id)
@@ -516,14 +533,23 @@ class CalibrationWidget(QWidget):
             return
 
         
-        self.log(">>> Инициализация расчета...")
-        self.lbl_status.setText("Инициализация расчета...")
+        self.log("Подготовка расчёта...")
+        self.lbl_status.setText("Подготовка расчёта...")
+        self._calibration_context = {
+            "source_mcs": str(Path(mcs_path).expanduser().resolve()),
+            "reference_hdf5": str(self.entry_h5_path or getattr(self.entry_provider, "file_path", "") or ""),
+            "entry_id": str(entry_id),
+            "branch": str(branch),
+            "reference_phi": float(self._cache_phi_mcs),
+        }
+        # Встроенный диалог может добавить Uк; автономная утилита ничего не обязана передавать.
+        self._calibration_context.update(getattr(self, "_extra_calibration_context", {}))
 
         # Формируем kwargs для функции калибровки
         kwargs = {
             'file_path_mcs': mcs_path,
             'entry_reference_id': entry_id,
-            'branch_mcs': self.combo_branch.currentText(),
+            'branch_mcs': branch,
             'entry_provider': self.entry_provider,   # Источник entry (ЕРС_data.h5)
         }
 
@@ -556,6 +582,14 @@ class CalibrationWidget(QWidget):
             theta_reconstructed,
             self._cache_y_mca,
         )
+        payload = dict(self._calibration_context)
+        payload.update({"A": float(result.A_best), "B": float(result.B_best), "unit": "угл. с"})
+        try:
+            score = float(result.best_row.get("score_best", float("nan")))
+            if score == score and abs(score) != float("inf"): payload["score_best"] = score
+        except Exception:
+            pass
+        self.calibration_result_ready.emit(payload)
     
 
     def on_calibration_error(self, err_msg):

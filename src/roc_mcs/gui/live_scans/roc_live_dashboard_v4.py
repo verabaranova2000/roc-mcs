@@ -27,7 +27,7 @@ from roc_mcs.gui.components.icon_rail import IconRail
 from roc_mcs.gui.components.icon_provider import resource_svg_icon, set_icon_theme
 from .demo import make_demo_param_table, make_synthetic_mcs_records
 from .axis_calibration import load_calibration, save_calibration, effective_scale
-from .calibration_ui.dashboard_dialog import CalibrationDialog
+from .calibration_dialog import CalibrationDialog
 from .dashboard_widgets import RocMapWidget, FilmstripWidget, MetricsPlotWidget, LiveMcsAdapter
 from .press_panel import PressControlPanel
 from .experiment_config import ExperimentConfigWidget

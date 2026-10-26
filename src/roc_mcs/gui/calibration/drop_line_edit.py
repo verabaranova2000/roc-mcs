@@ -14,8 +14,9 @@ class DropLineEdit(QLineEdit):
     """
     browse_requested = pyqtSignal()    # Сигнал для передачи клика по кнопке "..." в главное окно
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, theme="light"):
         super().__init__(parent)
+        self.theme = "dark" if str(theme).lower() == "dark" else "light"
         self.setAcceptDrops(True)
         self.setPlaceholderText("Путь к .mcs файлу (перетащите файл сюда)...")
         self.setMinimumHeight(26)   
@@ -29,23 +30,11 @@ class DropLineEdit(QLineEdit):
         self.btn_browse.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_browse.setToolTip("Выбрать файл через проводник")
         
-        # Стилизуем под родную кнопку комбобокса: серый блок с аккуратной границей слева
-        self.btn_browse.setStyleSheet("""
-            QToolButton {
-                background-color: #e5e5e5;
-                border: none;
-                border-left: 1px solid #c0c0c0;
-                color: #333;
-                font-weight: bold;
-                padding-bottom: 2px;
-            }
-            QToolButton:hover {
-                background-color: #d4d4d4;
-            }
-            QToolButton:pressed {
-                background-color: #c0c0c0;
-            }
-        """)
+        # Цвет кнопки согласуется с темой родительского окна.
+        if self.theme == "dark":
+            self.btn_browse.setStyleSheet("QToolButton{background:#283242;border:0;border-left:1px solid #465469;color:#dce4ee;font-weight:bold;padding-bottom:2px;} QToolButton:hover{background:#344257;} QToolButton:pressed{background:#3f5068;}")
+        else:
+            self.btn_browse.setStyleSheet("QToolButton{background:#e5e5e5;border:0;border-left:1px solid #c0c0c0;color:#333;font-weight:bold;padding-bottom:2px;} QToolButton:hover{background:#d4d4d4;} QToolButton:pressed{background:#c0c0c0;}")
         self.btn_browse.clicked.connect(self.browse_requested.emit)
 
         self.textChanged.connect(self._update_tooltip)

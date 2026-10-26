@@ -9,11 +9,14 @@ from PyQt6.QtWidgets import (
 
 class H5SettingsDialog(QDialog):
     """ Диалог настроек пути к H5 """
-    def __init__(self, current_path="", parent=None):
+    def __init__(self, current_path="", parent=None, theme="light"):
         super().__init__(parent)
+        self.theme = "dark" if str(theme).lower() == "dark" else "light"
         self.setWindowTitle("HDF5 settings")
         self.setModal(True)
         self.setMinimumWidth(520)
+        if self.theme == "dark":
+            self.setStyleSheet("QDialog{background:#10141c;color:#e2e8f0;} QLabel{color:#e2e8f0;} QLineEdit{background:#151c27;color:#e2e8f0;border:1px solid #384454;border-radius:4px;padding:4px;} QPushButton,QToolButton{background:#202a38;color:#e2e8f0;border:1px solid #3a485b;border-radius:4px;padding:4px 7px;} QPushButton:hover,QToolButton:hover{background:#2a394c;}")
 
         self.path_edit = QLineEdit(self)
         self.path_edit.setPlaceholderText("Путь к .h5 файлу")
@@ -44,7 +47,7 @@ class H5SettingsDialog(QDialog):
             self,
             "Выберите HDF5 файл",
             str(Path.home()),
-            "HDF5 files (*.h5 *.hdf5);;All files (*)",
+            "Файлы HDF5 (*.h5 *.hdf5);;Все файлы (*)",
         )
         if file_path:
             self.path_edit.setText(file_path)
@@ -53,12 +56,13 @@ class H5SettingsDialog(QDialog):
         return self.path_edit.text().strip()
 
     def accept(self):
-        path = Path(self.get_path())
-        if not path:
+        raw_path = self.get_path()
+        if not raw_path:
             QMessageBox.warning(self, "Ошибка", "Укажите путь к HDF5 файлу.")
             return
-        if not path.exists():
-            QMessageBox.warning(self, "Ошибка", "Файл не найден.")
+        path = Path(raw_path).expanduser()
+        if not path.is_file():
+            QMessageBox.warning(self, "Ошибка", "Файл не найден или путь указывает не на файл.")
             return
         if path.suffix.lower() not in {".h5", ".hdf5"}:
             QMessageBox.warning(self, "Ошибка", "Нужен файл .h5 или .hdf5.")
