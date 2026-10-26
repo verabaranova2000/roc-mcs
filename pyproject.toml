@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "roc-mcs"
 version = "0.1.0"
 description = "Rocking curve analysis for ORTEC MCS measurements"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 
 dependencies = [
     "numpy",
@@ -17,7 +17,9 @@ dependencies = [
     "tqdm",
     "scipy",
     "h5py",
-    "PyQt6"
+    "PyQt6",
+    "jax==0.11.2",
+    "jaxlib==0.11.2",    
 
 ]
 
