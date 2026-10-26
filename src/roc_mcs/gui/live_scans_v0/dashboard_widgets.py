@@ -30,7 +30,7 @@ class RocMapWidget(pg.PlotWidget):
         self.setLabel("left", "Параметр s", units="отн. ед.")
         self.getAxis("left").enableAutoSIPrefix(enable=False)
         
-        self.setTitle("РОК-карта")
+        self.setTitle("ROC-карта")
         self.setMouseTracking(True)
         
         self.image_item = pg.ImageItem(axisOrder="row-major")

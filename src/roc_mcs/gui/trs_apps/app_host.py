@@ -21,7 +21,7 @@ class TRSAppsWindow(QtWidgets.QMainWindow):
         body = QtWidgets.QWidget(self._surface.frame); body.setObjectName("appBody"); row = QtWidgets.QHBoxLayout(body); row.setContentsMargins(0,0,0,0); row.setSpacing(0); outer.addWidget(body,1)
         self.rail = AppLauncherRail(body); row.addWidget(self.rail)
         self.pane_splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal, body); self.pane_splitter.setObjectName("workspaceSplitter"); self.pane_splitter.setChildrenCollapsible(False); self.pane_splitter.setHandleWidth(4); row.addWidget(self.pane_splitter,1)
-        self.pane_a = AppPane("Выберите приложение на левой панели.\n\nLive Scans — потоковая РОК-карта.\nROI Explorer — анализ HDF5-сканов 2D-детектора.", self.pane_splitter)
+        self.pane_a = AppPane("Выберите приложение на левой панели.\n\nLive Scans — потоковая ROC-карта.\nROI Explorer — анализ HDF5-сканов 2D-детектора.", self.pane_splitter)
         self.pane_b = AppPane("Вторая область просмотра.\nВыберите приложение на вертикальной панели.", self.pane_splitter)
         self.pane_splitter.addWidget(self.pane_a); self.pane_splitter.addWidget(self.pane_b); self.pane_b.hide(); self._active_pane = self.pane_a; self._target_pane = self.pane_a
         self.pane_splitter.setSizes([1200, 0])

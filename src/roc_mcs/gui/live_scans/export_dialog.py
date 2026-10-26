@@ -16,7 +16,7 @@ class ExportOptionsDialog(QtWidgets.QDialog):
         rr.addWidget(self.output_folder,1); rr.addWidget(browse); form.addRow("Каталог", row); root.addLayout(form)
         group = QtWidgets.QGroupBox("Что сохранить"); grid = QtWidgets.QVBoxLayout(group); grid.setSpacing(5)
         self.chk_excel = QtWidgets.QCheckBox("Книга Excel (.xlsx): РОК, метаданные, калибровка, нагрузка/давление"); self.chk_excel.setChecked(True)
-        self.chk_figures = QtWidgets.QCheckBox("Графики PNG: РОК-карта и динамика моментов"); self.chk_figures.setChecked(True)
+        self.chk_figures = QtWidgets.QCheckBox("Графики PNG: ROC-карта и динамика моментов"); self.chk_figures.setChecked(True)
         self.chk_moments = QtWidgets.QCheckBox("Рассчитать профильные моменты для таблиц и графиков"); self.chk_moments.setChecked(True)
         self.chk_diagnostics = QtWidgets.QCheckBox("Диагностические графики QC (дополнительные) ")
         self.chk_artifact = QtWidgets.QCheckBox("Полный объект анализа experiment_artifact.pkl (может быть большим)")
