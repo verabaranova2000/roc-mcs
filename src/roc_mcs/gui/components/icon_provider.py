@@ -62,7 +62,7 @@ def _color_name(color: QColor | str | None, palette: QPalette | None, widget: An
 
 
 def _recolor_svg(source: str, color: str) -> str:
-    """Перекрашивает одноцветные fill/stroke, сохраняя none и ссылки на градиенты."""
+    """Перекрашивает одноцветный SVG, включая фигуры без явного fill."""
     source = re.sub(r"\bcurrentColor\b", color, source, flags=re.IGNORECASE)
 
     def paint(value: str) -> str:
@@ -74,6 +74,20 @@ def _recolor_svg(source: str, color: str) -> str:
 
     source = re.sub(r"(\b(?:fill|stroke)\s*=\s*)(['\"])(.*?)\2", attr, source, flags=re.IGNORECASE | re.DOTALL)
     source = re.sub(r"(\b(?:fill|stroke)\s*:\s*)([^;{}\"']+)", lambda m: m.group(1) + paint(m.group(2)), source, flags=re.IGNORECASE)
+
+    # В SVG по умолчанию fill чёрный. Задаём цвет на корневом <svg>,
+    # чтобы перекрашивались и path без собственных fill/stroke.
+    def set_root_fill(match: re.Match[str]) -> str:
+        tag = match.group(0)
+        if re.search(r"\bfill\s*=", tag, flags=re.IGNORECASE):
+            tag = re.sub(r"(\bfill\s*=\s*)(['\"])(.*?)\2", lambda m: m.group(1) + m.group(2) + paint(m.group(3)) + m.group(2), tag, count=1, flags=re.IGNORECASE)
+        else:
+            tag = tag[:-1] + f' fill="{color}">' if tag.endswith('>') else tag + f' fill="{color}"'
+        if not re.search(r"\bcolor\s*=", tag, flags=re.IGNORECASE):
+            tag = tag[:-1] + f' color="{color}">' if tag.endswith('>') else tag + f' color="{color}"'
+        return tag
+
+    source = re.sub(r"<svg\b[^>]*>", set_root_fill, source, count=1, flags=re.IGNORECASE)
     return source
 
 

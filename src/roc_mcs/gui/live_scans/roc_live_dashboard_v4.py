@@ -25,6 +25,7 @@ from roc_mcs.gui.live_scans.folder_watcher import BaseFolderWatcher
 from roc_mcs.gui.components.collapsible_section import CollapsibleSection
 from roc_mcs.gui.components.icon_rail import IconRail
 from roc_mcs.gui.components.icon_provider import resource_svg_icon, set_icon_theme
+from roc_mcs.gui.app_settings import load_settings, save_settings, resolve_setting_path
 from .demo import make_demo_param_table, make_synthetic_mcs_records
 from .axis_calibration import load_calibration, save_calibration, effective_scale
 from .calibration_dialog import CalibrationDialog
@@ -87,7 +88,8 @@ class LiveRocDashboard(QtWidgets.QMainWindow):
         self._sidebar_width = 250
         self._active_sidebar_section = "sample"
         self._calibration_dialog = None
-        self._base_folder_path: Path | None = None
+        configured_experiments_dir = None if self.is_synthetic else resolve_setting_path("experiments_dir", require_exists=True)
+        self._base_folder_path: Path | None = configured_experiments_dir if configured_experiments_dir is not None and configured_experiments_dir.is_dir() else None
         self._active_experiment_folder: Path | None = None
         self._export_worker: PipelineExportWorker | None = None
         self._run_experiment_amplitude_mVpp = 0.0
@@ -97,12 +99,16 @@ class LiveRocDashboard(QtWidgets.QMainWindow):
         if app is not None:
             set_icon_theme(app, "#e2e8f0")
         self._build_ui()
+        if self._base_folder_path is not None and hasattr(self, "edit_base_folder"):
+            self.edit_base_folder.setText(str(self._base_folder_path)); self.edit_base_folder.setToolTip(str(self._base_folder_path))
         self._apply_theme()
         self._update_axis_ui()
         
         # Инициализация старта в зависимости от режима
         if self.is_synthetic:
             self._reset_synthetic_stream()
+        elif self._base_folder_path is not None:
+            self.lbl_status.setText("Сохранённый каталог указан; нажмите кнопку папки, чтобы начать ожидание")
         else:
             self.lbl_status.setText("Выберите базовую папку эксперимента")
 
@@ -655,6 +661,10 @@ class LiveRocDashboard(QtWidgets.QMainWindow):
         self._stop_watching(); self._active_experiment_folder = None; self._clear_state(); self._update_export_button()
         self._base_folder_path = Path(base_folder).expanduser().resolve()
         self.edit_base_folder.setText(str(self._base_folder_path)); self.edit_base_folder.setToolTip(str(self._base_folder_path))
+        try:
+            settings = load_settings(); settings["experiments_dir"] = str(self._base_folder_path); save_settings(settings)
+        except (OSError, ValueError, TypeError) as exc:
+            self.lbl_status.setToolTip(f"Каталог выбран, но не удалось сохранить его в общих настройках: {exc}")
         self._run_experiment_amplitude_mVpp = self.spin_experiment_amplitude.value()
         if self._current_effective_scale() is None:
             answer = QtWidgets.QMessageBox.warning(self, "Угловая шкала не активна", "Нет действующей калибровки или значения U серии. Будет отображаться ось s, не физический угол θ. Продолжить?", QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No, QtWidgets.QMessageBox.StandardButton.No)

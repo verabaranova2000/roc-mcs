@@ -57,7 +57,7 @@ QWidget = QtWidgets.QWidget
 
 import re
 import json
-from PyQt6.QtGui import QCursor, QColor, QKeySequence, QShortcut
+from PyQt6.QtGui import QCursor, QColor, QKeySequence, QShortcut, QPalette
 from PyQt6.QtWidgets import QApplication, QFileDialog, QMenu, QMessageBox, QSplitter, QWidget, QHBoxLayout, QVBoxLayout, QScrollArea, QToolButton, QTableWidgetItem
 from PyQt6.QtCore import Qt, QSize
 
@@ -65,6 +65,10 @@ from PyQt6.QtCore import Qt, QSize
 from roc_mcs.roi.h5_scan_repository import H5ScanRepository
 from roc_mcs.roi.spatial_pooling import PoolSpec, pooled_shape
 from roc_mcs.gui.roi_explorer.roi_manager_widget import _pane_toggle_icon
+from roc_mcs.gui.components.collapsible_section import CollapsibleSection
+from roc_mcs.gui.components.icon_provider import resource_svg_icon
+from roc_mcs.gui.app_settings import resolve_initial_database, remember_hdf5_database, settings_path
+from roc_mcs.gui.roi_explorer.theme import apply_theme as apply_roi_theme, apply_popup_theme, resolve_theme, theme_colors
 from roc_mcs.gui.roi_explorer.plot_workspace_widget import PlotWorkspaceWidget
 from roc_mcs.roi.roi_types import ROI, SavedROI
 
@@ -85,6 +89,7 @@ class RockingCurveExplorerWindow(QMainWindow):
         self.preview_curve: Optional[np.ndarray] = None
         self.preview_th: Optional[np.ndarray] = None
         self.preview_count: int = 0
+        self._preview_fit_pending = False
         self.selected_pixel: Optional[tuple[int, int]] = None  # индексы (x, y) текущего view
         self.reduction_mode = "mean"
         self.current_file: Optional[Path] = None
@@ -96,13 +101,17 @@ class RockingCurveExplorerWindow(QMainWindow):
         self._build_ui()
         self._build_actions()
         self._connect_signals()
-
+        self._apply_theme()
         if h5_path is not None:
             self.load_hdf5(h5_path)
+        else:
+            initial_database = resolve_initial_database()
+            if initial_database is not None: self.load_hdf5(initial_database)
 
     # ---------- UI ----------
     def _build_ui(self) -> None:
         self.central = QWidget(self)
+        self.central.setObjectName("roiExplorerCentral")
         self.setCentralWidget(self.central)
 
         outer = QHBoxLayout(self.central)
@@ -113,14 +122,15 @@ class RockingCurveExplorerWindow(QMainWindow):
         outer.addWidget(self.splitter)
 
         # Левая панель: отдельная узкая рейка остаётся видимой в свёрнутом состоянии.
-        self.left_sidebar = QWidget(self.splitter); self.left_sidebar.setMinimumWidth(262)
+        self.left_sidebar = QWidget(self.splitter); self.left_sidebar.setObjectName("leftSidebarSurface"); self.left_sidebar.setMinimumWidth(262)
         self.left_sidebar_layout = QHBoxLayout(self.left_sidebar); self.left_sidebar_layout.setContentsMargins(0, 0, 0, 0); self.left_sidebar_layout.setSpacing(2)
-        self.left_rail = QWidget(self.left_sidebar); self.left_rail.setFixedWidth(20)
+        self.left_rail = QWidget(self.left_sidebar); self.left_rail.setObjectName("leftSidebarRail"); self.left_rail.setFixedWidth(20)
         left_rail_layout = QVBoxLayout(self.left_rail); left_rail_layout.setContentsMargins(0, 0, 0, 0); left_rail_layout.setSpacing(0)
-        self.left_sidebar_toggle = QToolButton(self.left_rail); self.left_sidebar_toggle.setObjectName("leftSidebarToggle"); self.left_sidebar_toggle.setIcon(_pane_toggle_icon(True)); self.left_sidebar_toggle.setIconSize(QSize(14, 14)); self.left_sidebar_toggle.setFixedSize(20, 20); self.left_sidebar_toggle.setAutoRaise(True); self.left_sidebar_toggle.setCursor(Qt.CursorShape.PointingHandCursor); self.left_sidebar_toggle.setToolTip("Collapse sidebar")
+        self.left_sidebar_toggle = QToolButton(self.left_rail); self.left_sidebar_toggle.setObjectName("leftSidebarToggle"); self.left_sidebar_toggle.setIcon(_pane_toggle_icon(True, QColor(theme_colors(resolve_theme(self))["text"]))); self.left_sidebar_toggle.setIconSize(QSize(14, 14)); self.left_sidebar_toggle.setFixedSize(20, 20); self.left_sidebar_toggle.setAutoRaise(True); self.left_sidebar_toggle.setCursor(Qt.CursorShape.PointingHandCursor); self.left_sidebar_toggle.setToolTip("Collapse sidebar")
         self.left_sidebar_toggle.setStyleSheet("QToolButton { background: transparent; border: none; border-radius: 5px; padding: 1px; } QToolButton:hover { background: palette(midlight); }")
         left_rail_layout.addWidget(self.left_sidebar_toggle, 0, Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop); left_rail_layout.addStretch(1)
-        self.left_scroll = QScrollArea(self.left_sidebar)
+        self.left_scroll = QScrollArea(self.left_sidebar); self.left_scroll.setObjectName("leftSidebarScroll")
+        self.left_scroll.viewport().setObjectName("leftSidebarViewport")
         self.left_scroll.setWidgetResizable(True)
         self.left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.left_sidebar_layout.addWidget(self.left_rail); self.left_sidebar_layout.addWidget(self.left_scroll, 1)
@@ -128,41 +138,36 @@ class RockingCurveExplorerWindow(QMainWindow):
         self.left_sidebar_toggle.clicked.connect(self._toggle_left_sidebar)
 
         left = QWidget()
+        left.setObjectName("leftSidebarContent")
         self.left_scroll.setWidget(left)
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(4, 4, 4, 4)
         left_layout.setSpacing(6)
 
-        # File box
-        file_box = QGroupBox("Data file")
-        file_form = QFormLayout(file_box)
-        file_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
-        self.file_path_edit = QLineEdit()
-        self.file_path_edit.setReadOnly(True)
-        self.file_path_edit.setPlaceholderText("Open an HDF5 file...")
-        self.open_h5_btn = QPushButton("Open HDF5")
-        self.open_h5_btn.clicked.connect(self.open_hdf5_dialog)
-        file_row = QWidget()
-        file_row_layout = QHBoxLayout(file_row)
-        file_row_layout.setContentsMargins(0, 0, 0, 0)
-        file_row_layout.addWidget(self.file_path_edit, 1)
-        file_row_layout.addWidget(self.open_h5_btn)
-        file_form.addRow(file_row)
-        left_layout.addWidget(file_box)
+        # База данных: выбор файла и разовое обновление списка без фонового опроса.
+        file_box = QGroupBox("База данных HDF5")
+        file_form = QFormLayout(file_box); file_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        self.file_path_edit = QLineEdit(); self.file_path_edit.setObjectName("h5PathField"); self.file_path_edit.setReadOnly(True)
+        self.file_path_edit.setPlaceholderText("База не выбрана")
+        self.open_h5_btn = QToolButton(file_box); self.open_h5_btn.setObjectName("databaseOpenButton"); self.open_h5_btn.setFixedSize(32, 28); self.open_h5_btn.setIconSize(QSize(18, 18))
+        self.open_h5_btn.setIcon(resource_svg_icon("folder_open.svg", widget=self.open_h5_btn, size=18)); self.open_h5_btn.setToolTip("Выбрать базу HDF5; путь сохранится для следующего запуска")
+        self.open_h5_btn.setAccessibleName("Выбрать базу HDF5"); self.open_h5_btn.clicked.connect(self.open_hdf5_dialog)
+        self.refresh_scans_btn = QToolButton(file_box); self.refresh_scans_btn.setObjectName("refreshScansButton"); self.refresh_scans_btn.setFixedSize(32, 28); self.refresh_scans_btn.setIconSize(QSize(18, 18))
+        self.refresh_scans_btn.setIcon(resource_svg_icon("refresh.svg", widget=self.refresh_scans_btn, size=18)); self.refresh_scans_btn.setToolTip("Обновить список сканов из базы (без фонового опроса)")
+        self.refresh_scans_btn.setAccessibleName("Обновить список сканов"); self.refresh_scans_btn.setEnabled(False); self.refresh_scans_btn.clicked.connect(self.refresh_scans)
+        file_row = QWidget(file_box); file_row_layout = QHBoxLayout(file_row); file_row_layout.setContentsMargins(0, 0, 0, 0); file_row_layout.setSpacing(4)
+        file_row_layout.addWidget(self.file_path_edit, 1); file_row_layout.addWidget(self.open_h5_btn); file_row_layout.addWidget(self.refresh_scans_btn)
+        file_form.addRow(file_row); left_layout.addWidget(file_box)
 
         # ROI Manager перенесён в компактную рейку слева от карты.
         # Сохраняем совместимость старой логики предварительной ROI.
         self.label_edit = QLineEdit()
         self.label_edit.setPlaceholderText("ROI label")
 
-        # Stats
-        stats_box = QGroupBox("Inspector")
-        stats_layout = QVBoxLayout(stats_box)
-        self.stats_text = QPlainTextEdit()
-        self.stats_text.setReadOnly(True)
-        self.stats_text.setMaximumBlockCount(1000)
-        stats_layout.addWidget(self.stats_text)
-        left_layout.addWidget(stats_box, 1)
+        # Inspector использует общий раскрываемый компонент из gui/components.
+        self.inspector_section = CollapsibleSection("Inspector", expanded=True)
+        self.stats_text = QPlainTextEdit(self.inspector_section.body); self.stats_text.setReadOnly(True); self.stats_text.setMaximumBlockCount(1000)
+        self.inspector_section.content_layout.addWidget(self.stats_text); left_layout.addWidget(self.inspector_section, 1)
 
         left_layout.addStretch(0)
 
@@ -182,7 +187,7 @@ class RockingCurveExplorerWindow(QMainWindow):
         self._curve_lines: Dict[int, Any] = {}
 
         self.status = self.statusBar()
-        self.status.showMessage("Open an HDF5 file to begin.")
+        self.status.showMessage(f"Выберите базу HDF5 кнопкой с папкой. Настройки: {settings_path()}")
 
         # Собираем ГЛАВНЫЙ сплиттер: слева меню, справа - сплиттер с графиками
         self.splitter.addWidget(self.left_sidebar)
@@ -203,17 +208,41 @@ class RockingCurveExplorerWindow(QMainWindow):
         self._curve_pick_cid = self.curve_widget.canvas.mpl_connect("pick_event", self._on_pick_event)        # Он нужен на тот случай, если дальше в коде я решу временно отключить выбор элементов мышкой (например, вызовом canvas.mpl_disconnect(self._pick_cid)).
         
 
+    def _apply_theme(self, theme: str | None = None) -> None:
+        if getattr(self, "_applying_theme", False): return
+        self._applying_theme = True
+        try:
+            active_theme = apply_roi_theme(self, theme)
+            icon_color = QColor(theme_colors(active_theme)["text"])
+            self.left_sidebar_toggle.setIcon(_pane_toggle_icon(not self._left_sidebar_collapsed, icon_color))
+            self.map_widget.apply_theme(active_theme); self.curve_widget.apply_theme(active_theme); self.roi_manager.apply_theme(active_theme)
+            for popup in self.findChildren(QWidget):
+                if popup.objectName() in ("roiEditorPopup", "compactColorPicker"):
+                    update_popup_theme = getattr(popup, "apply_theme", None)
+                    if callable(update_popup_theme): update_popup_theme(active_theme)
+            self.open_h5_btn.setIcon(resource_svg_icon("folder_open.svg", widget=self.open_h5_btn, size=18))
+            self.refresh_scans_btn.setIcon(resource_svg_icon("refresh.svg", widget=self.refresh_scans_btn, size=18))
+        finally:
+            self._applying_theme = False
+
+    def changeEvent(self, event) -> None:
+        super().changeEvent(event)
+        if event.type() in (QtCore.QEvent.Type.PaletteChange, QtCore.QEvent.Type.ApplicationPaletteChange) and hasattr(self, "map_widget"):
+            app = QApplication.instance(); requested = app.property("rocMcsTheme") if app is not None else None
+            target = str(requested).lower() if str(requested).lower() in ("dark", "light") else resolve_theme(app)
+            if not getattr(self, "_applying_theme", False) and target != self.property("rocMcsTheme"): self._apply_theme(target)
+
     def _toggle_left_sidebar(self) -> None:
         """Сворачивает Data file и Inspector, оставляя кнопку на месте."""
         sizes = self.splitter.sizes()
         if not self._left_sidebar_collapsed:
             if sizes and sizes[0] > 22: self._left_sidebar_width = sizes[0]
             self._left_sidebar_collapsed = True; self.left_scroll.hide(); self.left_sidebar.setMinimumWidth(22); self.left_sidebar.setMaximumWidth(22)
-            self.left_sidebar_toggle.setIcon(_pane_toggle_icon(False)); self.left_sidebar_toggle.setToolTip("Expand sidebar")
+            self.left_sidebar_toggle.setIcon(_pane_toggle_icon(False, self.palette().color(QPalette.ColorRole.WindowText))); self.left_sidebar_toggle.setToolTip("Expand sidebar")
             self.splitter.setSizes([22, max(1, sum(sizes) - 22)])
         else:
             self._left_sidebar_collapsed = False; self.left_sidebar.setMaximumWidth(16777215); self.left_sidebar.setMinimumWidth(262); self.left_scroll.show()
-            self.left_sidebar_toggle.setIcon(_pane_toggle_icon(True)); self.left_sidebar_toggle.setToolTip("Collapse sidebar")
+            self.left_sidebar_toggle.setIcon(_pane_toggle_icon(True, self.palette().color(QPalette.ColorRole.WindowText))); self.left_sidebar_toggle.setToolTip("Collapse sidebar")
             total = max(sum(sizes), self.width()); left_width = max(262, self._left_sidebar_width); self.splitter.setSizes([left_width, max(1, total - left_width)])
 
     def _build_actions(self) -> None:
@@ -262,41 +291,46 @@ class RockingCurveExplorerWindow(QMainWindow):
         self.map_widget.roi_btn.toggled.connect(self._toggle_roi_selector_mode)
         # Когда селектор на карте изменяется (тянут за ручку, рисуют линию) -> пересчитываем рокинги и обновляем графики
         self.map_widget.preview_roi_changed.connect(self._on_selector_change)
+        self.map_widget.preview_roi_finished.connect(self._on_selector_finished)
 
     # ---------- HDF5/session ----------
     def load_hdf5(self, h5_path: Union[str, Path]) -> None:
         path = Path(h5_path).expanduser().resolve()
+        repo = None
         try:
-            repo = H5ScanRepository(path)
+            repo = H5ScanRepository(path); scan_keys = list(repo.scan_keys())
         except Exception as exc:
-            QMessageBox.critical(self, "Open HDF5", str(exc))
-            return
+            closer = getattr(repo, "close", None)
+            if callable(closer):
+                try: closer()
+                except Exception: pass
+            QMessageBox.critical(self, "Open HDF5", str(exc)); return
 
-        self.repo = repo
-        self.map_widget.set_pool_spec(repo.pool)
-        self.map_widget.set_pool_enabled(True)
-        self.current_file = path
-        self.file_path_edit.setText(str(path))
-        self.session_scans = {key: [] for key in self.repo.scan_keys()}
-        self.selected_scan = None
-        self.selected_map = None
-        self.selected_roi_id = None
-        self.preview_roi = None
-        self.preview_curve = None
-        self.preview_th = None
-        self.preview_count = 0
-        self.selected_pixel = None
-        self._rebuild_scan_combo()                         # Перестраиваем список сканов
-        if self.map_widget.scan_combo.count() > 0:         # Если в файле есть сканы — принудительно активируем первый из них
-            self.map_widget.scan_combo.setCurrentIndex(0)  # Явно вызываем смену скана, так как blockSignals в _rebuild_scan_combo
-            self._on_scan_changed()                        # мог подавить автоматический вызов сигнала
-        self.status.showMessage(f"Loaded {path.name} with {len(self.repo.scan_keys())} scan(s).")
-        
+        old_repo = self.repo; self.repo = repo
+        self.map_widget.set_pool_spec(repo.pool); self.map_widget.set_pool_enabled(True)
+        self.current_file = path; self.file_path_edit.setText(str(path))
+        self.session_scans = {key: [] for key in scan_keys}
+        self.selected_scan = self.selected_map = self.selected_roi_id = None
+        self.preview_roi = self.preview_curve = self.preview_th = None
+        self.preview_count = 0; self._preview_fit_pending = False; self.selected_pixel = None
+        self._rebuild_scan_combo(preferred_scan=scan_keys[-1] if scan_keys else None)
+        self.refresh_scans_btn.setEnabled(True)
+        if scan_keys: self._on_scan_changed()
+        closer = getattr(old_repo, "close", None)
+        if old_repo is not None and old_repo is not repo and callable(closer):
+            try: closer()
+            except Exception: pass
+        try:
+            remember_hdf5_database(path); config_warning = ""
+        except (OSError, ValueError, TypeError) as exc:
+            config_warning = f" Не удалось сохранить путь в настройках: {exc}"
+        scan_message = f"Открыт последний скан: {scan_keys[-1]}." if scan_keys else "В базе пока нет сканов."
+        self.status.showMessage(f"Загружена {path.name}; сканов: {len(scan_keys)}. {scan_message}{config_warning}", 8000)
 
     def open_hdf5_dialog(self, *args) -> None:
         path, _ = QFileDialog.getOpenFileName(
             self,
-            "Open HDF5 file",
+            "Выбрать базу HDF5",
             str(self.current_file.parent if self.current_file else Path.home()),
             "HDF5 files (*.h5 *.hdf5 *.hdf);;All files (*)",
         )
@@ -304,18 +338,57 @@ class RockingCurveExplorerWindow(QMainWindow):
             self.load_hdf5(path)
 
 
-    def _rebuild_scan_combo(self) -> None:
-        self.map_widget.scan_combo.blockSignals(True)
-        self.map_widget.scan_combo.clear()
-        if self.repo is not None:
-            for scan_key in self.repo.scan_keys():                # Итерируемся и добавляем каждый скан с подсказкой
-                self.map_widget.scan_combo.addItem(scan_key)
-                self.map_widget.scan_combo.setItemData(
-                    self.map_widget.scan_combo.count() - 1, 
-                    scan_key, # Текст подсказки (полное имя)
-                    Qt.ItemDataRole.ToolTipRole
-                )
-        self.map_widget.scan_combo.blockSignals(False)
+    def _rebuild_scan_combo(self, preferred_scan: str | None = None) -> None:
+        combo = self.map_widget.scan_combo; current = preferred_scan or combo.currentText()
+        combo.blockSignals(True)
+        try:
+            combo.clear()
+            if self.repo is not None:
+                for scan_key in self.repo.scan_keys():
+                    combo.addItem(scan_key); combo.setItemData(combo.count() - 1, scan_key, Qt.ItemDataRole.ToolTipRole)
+            index = combo.findText(current) if current else -1
+            if index < 0 and combo.count(): index = combo.count() - 1
+            if index >= 0: combo.setCurrentIndex(index)
+        finally:
+            combo.blockSignals(False)
+
+    def refresh_scans(self, *args) -> None:
+        """Однократно переоткрывает HDF5, сохраняя выбранный скан и ROI."""
+        if self.current_file is None or self.repo is None:
+            self.status.showMessage("Сначала выберите базу HDF5.", 5000); return
+        old_repo = self.repo; old_scan = self.selected_scan; old_map = self.selected_map
+        old_sessions = self.session_scans; old_keys = set(old_repo.scan_keys())
+        new_repo = None
+        try:
+            new_repo = H5ScanRepository(self.current_file)
+            if hasattr(new_repo, "set_pool"): new_repo.set_pool(old_repo.pool)
+            new_keys = list(new_repo.scan_keys())
+        except Exception as exc:
+            closer = getattr(new_repo, "close", None)
+            if callable(closer):
+                try: closer()
+                except Exception: pass
+            self.status.showMessage(f"Не удалось обновить HDF5; текущие данные сохранены: {exc}", 8000); return
+        if not new_keys:
+            closer = getattr(new_repo, "close", None)
+            if callable(closer):
+                try: closer()
+                except Exception: pass
+            self.status.showMessage("В базе пока не обнаружены сканы; прежнее состояние сохранено.", 8000); return
+        self.repo = new_repo; self.session_scans = {key: old_sessions.get(key, []) for key in new_keys}
+        self._rebuild_scan_combo(preferred_scan=old_scan)
+        selected = self.map_widget.scan_combo.currentText()
+        if selected != old_scan or old_scan not in new_keys:
+            self._on_scan_changed()
+        else:
+            self.selected_scan = selected; self.selected_map = old_map
+            self._populate_map_combo(); self.refresh_curves(); self.refresh_roi_table(); self._update_inspector()
+        closer = getattr(old_repo, "close", None)
+        if callable(closer):
+            try: closer()
+            except Exception: pass
+        added = len(set(new_keys) - old_keys)
+        self.status.showMessage(f"Список сканов обновлён: +{added}, всего {len(new_keys)}.", 6000)
         
     def save_session_dialog(self, *args) -> None:
         path, _ = QFileDialog.getSaveFileName(
@@ -586,6 +659,7 @@ class RockingCurveExplorerWindow(QMainWindow):
         self.preview_curve = None
         self.preview_th = None
         self.preview_count = 0
+        self._preview_fit_pending = False
         self.selected_pixel = None
         self._preview_timer.stop()
         self.map_widget.reset_preview_selector()
@@ -724,6 +798,7 @@ class RockingCurveExplorerWindow(QMainWindow):
         self._preview_timer.stop()
         self.preview_roi = self.preview_curve = self.preview_th = None
         self.preview_count = 0
+        self._preview_fit_pending = False
         self._sync_label_box()
         if had_preview:
             self.refresh_curves()
@@ -733,27 +808,22 @@ class RockingCurveExplorerWindow(QMainWindow):
         if roi is None:
             self._clear_preview_state()
             return
-        new_roi = ROI.from_selector_roi(roi, label=self.label_edit.text().strip(), color="#ffffff", mode=self.reduction_mode).normalized()
+        new_roi = ROI.from_selector_roi(roi, label=self.label_edit.text().strip(), color=theme_colors(resolve_theme(self))["roi"], mode=self.reduction_mode).normalized()
         if not new_roi.is_valid:
             self._clear_preview_state()
             return
 
-        old_key = None if self.preview_roi is None else (
-            self.preview_roi.type, self.preview_roi.cx, self.preview_roi.cy,
-            self.preview_roi.width, self.preview_roi.height, self.preview_roi.angle, self.preview_roi.mode,
-        )
-        new_key = (new_roi.type, new_roi.cx, new_roi.cy, new_roi.width, new_roi.height, new_roi.angle, new_roi.mode)      
+        # Оставляем последнюю рассчитанную кривую на экране, пока не готова новая: без мигания.
         self.preview_roi = new_roi
         self._sync_label_box()
-        if old_key != new_key:
-            had_curve = self.preview_curve is not None or self.preview_th is not None
-            self.preview_curve = self.preview_th = None
-            self.preview_count = 0
-            if had_curve:
-                self.refresh_curves()
-                self._update_inspector()        
         self._preview_timer.start(20)
 
+    def _on_selector_finished(self, roi) -> None:
+        """Подгоняет кривую один раз по окончательной геометрии ROI."""
+        if roi is None or self.repo is None or self.selected_scan is None:
+            return
+        self._preview_fit_pending = True
+        self._preview_timer.start(20)
 
     def _update_preview_curve(self) -> None:
         if self.repo is None or self.selected_scan is None or self.preview_roi is None:
@@ -771,7 +841,10 @@ class RockingCurveExplorerWindow(QMainWindow):
         self.preview_th = th
         self.preview_curve = curve
         self.preview_count = count
-        self.refresh_curves()
+        curve_values = np.asarray(curve, dtype=float)
+        fit_view = self._preview_fit_pending and curve_values.size > 0 and np.isfinite(curve_values).any()
+        self._preview_fit_pending = False
+        self.refresh_curves(fit_curve_view=fit_view)
         self._update_inspector()
 
     def pin_preview_roi(self, *args) -> None:
@@ -931,10 +1004,12 @@ class RockingCurveExplorerWindow(QMainWindow):
     def _show_roi_context_menu(self, roi_id: int | None) -> None:
         menu = QMenu(self)
         menu.setStyleSheet("QMenu { font-size: 10px; padding: 3px; } QMenu::item { padding: 4px 18px; } QMenu::separator { height: 1px; background: palette(mid); margin: 3px 5px; }")
+        apply_popup_theme(menu, resolve_theme(self))
         if roi_id is not None and any(int(item.id) == int(roi_id) for item in self.current_rois()):
             self._set_selected_roi_id(int(roi_id))
             export_action = menu.addAction("Save rocking curve…")
             copy_menu = menu.addMenu("Copy")
+            apply_popup_theme(copy_menu, resolve_theme(self))
             metadata_action = copy_menu.addAction("Metadata")
             data_action = copy_menu.addAction("Curve data (theta, I)")
             menu.addSeparator()
@@ -1068,8 +1143,8 @@ class RockingCurveExplorerWindow(QMainWindow):
         self._map_patches = self.map_widget.draw_rois(roi_data_list)   # Отдаем словари в Панель на отрисовку и забираем патчи
 
         
-    def refresh_curves(self) -> None:
-        """Подготавливает профили и передаёт кривые в CurvePlotWidget."""
+    def refresh_curves(self, *, fit_curve_view: bool = False) -> None:
+        """Подготавливает профили; по запросу подгоняет график под новое preview."""
         th = self.repo.load_scan(self.selected_scan)["th"] if (self.repo is not None and self.selected_scan is not None) else None
         curves_data = []
         for pinned in self.current_rois():
@@ -1122,7 +1197,7 @@ class RockingCurveExplorerWindow(QMainWindow):
                 self.selected_pixel = None
         view_label = self._pool_label(self.repo.pool) if self.repo is not None else None
         self._curve_lines = self.curve_widget.draw_curves(
-            curves_data, preview_data, pixel_data=pixel_data, view_label=view_label
+            curves_data, preview_data, pixel_data=pixel_data, view_label=view_label, fit_view=fit_curve_view
         )
 
     def refresh_roi_table(self) -> None:
@@ -1244,3 +1319,13 @@ class RockingCurveExplorerWindow(QMainWindow):
         id_item = self.roi_table.item(row, 0)
         roi_id = id_item.data(Qt.ItemDataRole.UserRole)
         self._set_selected_roi_id(roi_id)
+
+
+    def closeEvent(self, event) -> None:
+        """Освобождает HDF5-дескриптор при закрытии окна."""
+        closer = getattr(self.repo, "close", None)
+        if callable(closer):
+            try: closer()
+            except Exception: pass
+        self.repo = None
+        super().closeEvent(event)

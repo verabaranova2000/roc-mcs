@@ -6,12 +6,14 @@ from matplotlib.figure import Figure
 from matplotlib.ticker import MaxNLocator, ScalarFormatter
 
 from roc_mcs.gui.roi_explorer.curve_tools_widget import CurveToolsWidget
+from roc_mcs.gui.roi_explorer.theme import apply_widget_palette, theme_colors
 
 
 class CurvePlotWidget(QWidget):
     """График кривых; подбор и вычисление данных остаются снаружи."""
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setObjectName("CurvePlotWidget")
         self.setMinimumWidth(260)
         self.setMinimumHeight(350)
         self._pan_active = False
@@ -35,21 +37,27 @@ class CurvePlotWidget(QWidget):
         header_layout.setContentsMargins(10, 2, 10, 1)
         self.header_label = QLabel("Rocking curves", self.header_widget)
         self.header_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.header_label.setStyleSheet("QLabel { color: #343a40; font-size: 10px; font-weight: 600; background: transparent; }")
+        self.header_label.setStyleSheet("QLabel { color: palette(window-text); font-size: 10px; font-weight: 600; background: transparent; }")
         header_layout.addWidget(self.header_label)
         layout.addWidget(self.header_widget)
 
-        self.figure = Figure(figsize=(5, 5), facecolor="#ffffff")
+        self._theme = "light"
+        self.figure = Figure(figsize=(5, 5), facecolor=theme_colors(self._theme)["canvas"])
         self.canvas = FigureCanvasQTAgg(self.figure); self.canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.ax = self.figure.add_subplot(1, 1, 1)
-        self.ax.set_facecolor("#ffffff")
+        self.ax.set_facecolor(theme_colors(self._theme)["axes"])
+        # Художники переиспользуются: во время ROI-preview не очищаем Axes и не мигаем.
+        self._curve_artists = {}
+        self._preview_artist = None
+        self._pixel_artist = None
+        self._empty_artist = None
         self.figure.subplots_adjust(left=0.17, right=0.985, bottom=0.15, top=0.89)              # отступы Figure
         self.cbar = None
         self.map_image = None
         self.coord_label = QLabel("")
         self.coord_label.setObjectName("MapCoordLabel")
         self.coord_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        self.coord_label.setStyleSheet("QLabel#MapCoordLabel { font-family: monospace; font-size: 10px; font-weight: 600; color: #244c73; padding: 2px 5px; background: transparent; }")
+        self.coord_label.setStyleSheet("QLabel#MapCoordLabel { font-family: monospace; font-size: 10px; font-weight: 600; color: palette(window-text); padding: 2px 5px; background: transparent; }")
         layout.addWidget(self.canvas)
         layout.addWidget(self.coord_label)
         layout.addStretch(1)
@@ -60,14 +68,28 @@ class CurvePlotWidget(QWidget):
         self.canvas.mpl_connect("axes_leave_event", self._on_axes_leave)
         self._style_axes()
 
+    def apply_theme(self, theme: str | None = None) -> None:
+        self._theme = str(theme or self._theme).lower()
+        if self._theme not in ("dark", "light"): self._theme = "light"
+        apply_widget_palette(self, self._theme)
+        c = theme_colors(self._theme); self.figure.set_facecolor(c["canvas"]); self.ax.set_facecolor(c["axes"])
+        self.header_label.setStyleSheet(f"QLabel {{ color:{c['text']}; font-size:10px; font-weight:600; background:transparent; }}")
+        self.coord_label.setStyleSheet(f"QLabel#MapCoordLabel {{ font-family:monospace; font-size:10px; font-weight:600; color:{c['muted']}; padding:2px 5px; background:transparent; }}")
+        self._style_axes(); self.toolbar.apply_theme(self._theme)
+        if self._preview_artist is not None: self._preview_artist.set_color(c["text"])
+        if self._pixel_artist is not None: self._pixel_artist.set_color(c["muted"])
+        if self._empty_artist is not None: self._empty_artist.set_color(c["muted"])
+        self.canvas.setStyleSheet(f"background:{c['canvas']};")
+        self.canvas.draw_idle()
+
     def _style_axes(self) -> None:
-        self.ax.set_xlabel("θ", fontsize=9, color="#343a40", labelpad=4)
-        self.ax.set_ylabel("Intensity", fontsize=9, color="#343a40", labelpad=5)
-        self.ax.grid(True, which="major", color="#9aa4b2", linewidth=0.6, alpha=0.25)
-        self.ax.tick_params(axis="both", colors="#4b5563", labelsize=8, direction="out", length=3, width=0.6)
-        for spine in self.ax.spines.values(): 
-            spine.set_color("#aab2bd")
-            spine.set_linewidth(0.7)
+        c = theme_colors(self._theme)
+        self.ax.set_xlabel("θ", fontsize=9, color=c["text"], labelpad=4)
+        self.ax.set_ylabel("Intensity", fontsize=9, color=c["text"], labelpad=5)
+        self.ax.grid(True, which="major", color=c["grid"], linewidth=0.6, alpha=0.25)
+        self.ax.tick_params(axis="both", colors=c["muted"], labelsize=8, direction="out", length=3, width=0.6)
+        for spine in self.ax.spines.values():
+            spine.set_color(c["border"]); spine.set_linewidth(0.7)
         self.ax.yaxis.set_major_locator(MaxNLocator(nbins=4))
         self.ax.yaxis.set_major_formatter(ScalarFormatter(useMathText=True))
         self.ax.ticklabel_format(axis="y", style="sci", scilimits=(0, 0))
@@ -75,7 +97,7 @@ class CurvePlotWidget(QWidget):
         # self.ax.yaxis.get_offset_text().set_fontsize(8)
         scale_label = self.ax.yaxis.get_offset_text()
         scale_label.set_fontsize(8)
-        scale_label.set_color("#4b5563")
+        scale_label.set_color(c["muted"])
         scale_label.set_verticalalignment("bottom")        
 
     @staticmethod
@@ -85,42 +107,84 @@ class CurvePlotWidget(QWidget):
             return False, {}
         return artist.contains(mouseevent)
 
-    # def draw_curves(self, curves_data: list, preview_data: dict = None, *, pixel_data: dict = None, view_label: str | None = None, ) -> dict:
-    #     """Перерисовывает данные и запоминает полный extent для Reset View."""
-    def draw_curves(self, curves_data: list, preview_data: dict = None, *, pixel_data: dict = None, view_label: str | None = None) -> dict:
-        """Обновляет кривые, сохраняя масштаб пользователя."""
+    def draw_curves(self, curves_data: list, preview_data: dict = None, *, pixel_data: dict = None,
+                    view_label: str | None = None, fit_view: bool = False) -> dict:
+        """Обновляет линии на месте; полный автоподбор только по запросу или при первом выводе."""
         previous_xlim = self.ax.get_xlim() if self._view_initialized else None
-        previous_ylim = self.ax.get_ylim() if self._view_initialized else None    
-        self.ax.clear()
-        self.ax.set_facecolor("#ffffff")
-        self.header_label.setText(f"Rocking curves · {view_label}" if view_label else "Rocking curves")
-        self._style_axes()
+        previous_ylim = self.ax.get_ylim() if self._view_initialized else None
+        title = f"Rocking curves · {view_label}" if view_label else "Rocking curves"
+        if self.header_label.text() != title:
+            self.header_label.setText(title)
+
         curve_lines = {}
+        active_ids = set()
         for curve in curves_data:
-            line, = self.ax.plot(curve["th"], curve["curve"], color=curve["color"],
-                linewidth=2.4 if curve["is_selected"] else 1.5,
-                alpha=1.0 if curve["is_selected"] else 0.88,
-                label=curve["label"], picker=self._left_click_picker)
-            line.set_pickradius(5)
-            line._roi_id = curve["id"]            
-            curve_lines[curve["id"]] = line
+            roi_id = curve["id"]
+            active_ids.add(roi_id)
+            line = self._curve_artists.get(roi_id)
+            if line is None or line.axes is not self.ax:
+                line, = self.ax.plot([], [], picker=self._left_click_picker)
+                line.set_pickradius(5)
+                self._curve_artists[roi_id] = line
+            line.set_data(curve["th"], curve["curve"])
+            line.set_color(curve["color"])
+            line.set_linewidth(2.4 if curve["is_selected"] else 1.5)
+            line.set_alpha(1.0 if curve["is_selected"] else 0.88)
+            line.set_linestyle("-")
+            line.set_label(curve["label"])
+            line._roi_id = roi_id
+            line.set_visible(True)
+            curve_lines[roi_id] = line
+
+        for roi_id in tuple(self._curve_artists):
+            if roi_id not in active_ids:
+                line = self._curve_artists.pop(roi_id)
+                try: line.remove()
+                except ValueError: pass
+
+        c = theme_colors(self._theme)
         if preview_data:
-            self.ax.plot(preview_data["th"], preview_data["curve"], color="#20252b", linestyle="--", linewidth=1.8, alpha=0.95, label="ROI preview")
+            if self._preview_artist is None or self._preview_artist.axes is not self.ax:
+                self._preview_artist, = self.ax.plot([], [], linestyle="--", linewidth=1.8, alpha=0.95, label="ROI preview", zorder=4)
+            self._preview_artist.set_data(preview_data["th"], preview_data["curve"])
+            self._preview_artist.set_color(c["text"])
+            self._preview_artist.set_visible(True)
+        elif self._preview_artist is not None:
+            self._preview_artist.set_visible(False)
+            self._preview_artist.set_data([], [])
+
         if pixel_data:
-            self.ax.plot(pixel_data["th"], pixel_data["curve"], color="#505965", linestyle="-.", linewidth=1.7, alpha=0.95, label=pixel_data["label"])
-        if not (curves_data or preview_data or pixel_data):
-            self.ax.text(0.5, 0.5, "No saved ROIs or selected pixel",
-                         ha="center", va="center", transform=self.ax.transAxes,
-                         color="#737c87", fontsize=9)        
-        self.ax.relim()
-        self.ax.autoscale_view()
-        self._base_xlim = self.ax.get_xlim()
-        self._base_ylim = self.ax.get_ylim()
-        if previous_xlim is not None and previous_ylim is not None:
-            self.ax.set_xlim(previous_xlim)
-            self.ax.set_ylim(previous_ylim)
-        if curves_data or preview_data or pixel_data:
-            self._view_initialized = True        
+            if self._pixel_artist is None or self._pixel_artist.axes is not self.ax:
+                self._pixel_artist, = self.ax.plot([], [], linestyle="-.", linewidth=1.7, alpha=0.95, zorder=3)
+            self._pixel_artist.set_data(pixel_data["th"], pixel_data["curve"])
+            self._pixel_artist.set_color(c["muted"])
+            self._pixel_artist.set_label(pixel_data["label"])
+            self._pixel_artist.set_visible(True)
+        elif self._pixel_artist is not None:
+            self._pixel_artist.set_visible(False)
+            self._pixel_artist.set_data([], [])
+
+        has_data = bool(curves_data or preview_data or pixel_data)
+        if not has_data:
+            if self._empty_artist is None or self._empty_artist.axes is not self.ax:
+                self._empty_artist = self.ax.text(0.5, 0.5, "No saved ROIs or selected pixel", ha="center", va="center",
+                    transform=self.ax.transAxes, color=c["muted"], fontsize=9)
+            self._empty_artist.set_color(c["muted"])
+            self._empty_artist.set_visible(True)
+            self._view_initialized = False
+            self._base_xlim = self._base_ylim = None
+            self.ax.set_xlim(0, 1); self.ax.set_ylim(0, 1)
+        else:
+            if self._empty_artist is not None: self._empty_artist.set_visible(False)
+            # Включаем autoscale только для измерения полного extent: set_xlim/set_ylim пользователя его отключают.
+            # Затем текущий зум восстанавливается ниже, кроме финального fit_view после отпускания ROI.
+            self.ax.set_autoscalex_on(True); self.ax.set_autoscaley_on(True)
+            self.ax.relim(); self.ax.autoscale_view()
+            self._base_xlim, self._base_ylim = self.ax.get_xlim(), self.ax.get_ylim()
+            if previous_xlim is not None and previous_ylim is not None and not fit_view:
+                self.ax.set_xlim(previous_xlim); self.ax.set_ylim(previous_ylim)
+            self._view_initialized = True
+
         self.canvas.draw_idle()
         return curve_lines
 

@@ -1,25 +1,29 @@
 """Панель инструментов карты; вычислительная логика остаётся в MapPlotWidget."""
-from PyQt6.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QGridLayout, QComboBox,
+from PyQt6.QtWidgets import (QApplication, QWidget, QHBoxLayout, QVBoxLayout, QGridLayout, QComboBox,
     QDoubleSpinBox, QPushButton, QLabel, QToolButton, QMenu, QWidgetAction, QSpinBox)
-from PyQt6.QtGui import QIcon, QPixmap, QPainter, QLinearGradient, QColor, QActionGroup, QPen, QPolygon
+from PyQt6.QtGui import QIcon, QPixmap, QPainter, QLinearGradient, QColor, QActionGroup, QPen, QPolygon, QPalette
 from PyQt6.QtCore import QSize, Qt, QRectF, QLineF, pyqtSignal, QPointF, QPoint
 
 
 from roc_mcs.gui.roi_explorer.plot_toolbar_style import ICON_DIR, COMPACT_PLOT_TOOLBAR_STYLE
+from roc_mcs.gui.components.icon_provider import svg_icon
+from roc_mcs.gui.roi_explorer.theme import apply_widget_palette, apply_popup_theme, theme_colors
 
 
 
 
-def pooling_preview_pixmap(size: int, stride: int) -> QPixmap:
-    """Компактная схема окна pooling и шага сдвига."""
+def pooling_preview_pixmap(size: int, stride: int, palette: QPalette | None = None) -> QPixmap:
+    """Компактная схема pooling с фоном из текущей палитры."""
     size, stride = max(1, int(size)), max(1, int(stride))
+    palette = palette or QApplication.palette()
+    background = palette.color(QPalette.ColorRole.Base); border = palette.color(QPalette.ColorRole.Mid)
     width, height, side = 88, 66, 27.0
     pixmap = QPixmap(width, height)
-    pixmap.fill(QColor("#fbfcfe"))
+    pixmap.fill(background)
     painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-    painter.setPen(QPen(QColor("#d7dee8"), 1))
-    painter.setBrush(QColor("#fbfcfe"))
+    painter.setPen(QPen(border, 1))
+    painter.setBrush(background)
     painter.drawRoundedRect(QRectF(0.5, 0.5, width - 1, height - 1), 4, 4)
     cell = side / max(size, stride)
     window = cell * size; offset = cell * stride
@@ -68,14 +72,14 @@ class MapToolsWidget(QWidget):
         layout.setContentsMargins(4, 2, 4, 2)
         layout.setSpacing(6)
         self.home_btn = QToolButton(self)
-        self.home_btn.setIcon(QIcon(str(ICON_DIR / "zoom_out_map.svg")))
+        self.home_btn.setIcon(svg_icon(ICON_DIR / "zoom_out_map.svg", widget=self.home_btn))
         self.home_btn.setToolTip("Reset view")
         self.home_btn.clicked.connect(self.reset_view_requested.emit)
         layout.addWidget(self.home_btn)
         self._build_roi_tools(layout)
         self._build_pooling_tools(layout)
         self.pin_roi_btn = QToolButton(self)
-        self.pin_roi_btn.setIcon(QIcon(str(ICON_DIR / "push_pin.svg")))
+        self.pin_roi_btn.setIcon(svg_icon(ICON_DIR / "push_pin.svg", widget=self.pin_roi_btn))
         self.pin_roi_btn.setIconSize(QSize(16, 16))
         self.pin_roi_btn.setToolTip("Pin preview ROI")
         self.pin_roi_btn.clicked.connect(self.pin_roi_requested.emit)
@@ -93,7 +97,7 @@ class MapToolsWidget(QWidget):
         self.auto_contrast_btn = QToolButton(self)
         self.auto_contrast_btn.setText("A")
         self.auto_contrast_btn.setToolTip("Auto Contrast (1.0% - 99.0%)")
-        self.auto_contrast_btn.setStyleSheet("font-weight: bold; font-family: monospace; color: #000080;")
+        self.auto_contrast_btn.setStyleSheet("font-weight: bold; font-family: monospace; color: palette(highlight);")
         layout.addWidget(self.auto_contrast_btn)
         self.low_pct = QDoubleSpinBox(self)
         self.high_pct = QDoubleSpinBox(self)
@@ -110,6 +114,34 @@ class MapToolsWidget(QWidget):
         layout.addWidget(self.range_slider)
         layout.addWidget(self.high_pct)
         self._wire_contrast_controls()
+
+    def apply_theme(self, _theme: str | None = None) -> None:
+        """Согласует панель, flyout-меню и SVG-иконки с активной темой."""
+        active = apply_widget_palette(self, _theme); c = theme_colors(active)
+        icon_color = c["text"]
+        self.home_btn.setIcon(svg_icon(ICON_DIR / "zoom_out_map.svg", color=icon_color, widget=self.home_btn))
+        self.pin_roi_btn.setIcon(svg_icon(ICON_DIR / "push_pin.svg", color=icon_color, widget=self.pin_roi_btn))
+        self.pool_btn.setIcon(svg_icon(ICON_DIR / "pool_stride_dense.svg", color=icon_color, widget=self.pool_btn))
+        for roi_id, button in self.roi_tool_buttons.items():
+            icon_path = self.roi_tools_config[roi_id]["icon"]
+            button.setIcon(svg_icon(icon_path, color=icon_color, widget=button))
+            if roi_id == self.current_roi_type: self.roi_btn.setIcon(svg_icon(icon_path, color=icon_color, widget=self.roi_btn))
+        apply_popup_theme(self.cmap_menu, active); apply_popup_theme(self.roi_menu, active); apply_popup_theme(self.pool_menu, active)
+        apply_widget_palette(self.roi_flyout, active)
+        apply_widget_palette(self.pool_panel, active)
+        self.pool_panel.setAutoFillBackground(True)
+        self.pool_panel.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.pool_panel.setPalette(self.palette())
+        pc = {"window": c["window"], "text": c["text"], "base": c["base"], "button": c["button"], "button_text": c["button_text"], "border": c["border"], "hover": c["hover"], "highlight": c["highlight"], "highlight_text": c["highlight_text"]}
+        self.pool_panel.setStyleSheet(self._pool_panel_base_style + f"""
+            QWidget#PoolingPanel {{ background:{pc['window']}; color:{pc['text']}; border:1px solid {pc['border']}; }}
+            QWidget#PoolingPanel QWidget {{ background:{pc['window']}; color:{pc['text']}; }}
+            QWidget#PoolingPanel QLabel {{ background:transparent; color:{pc['text']}; }}
+            QWidget#PoolingPanel QSpinBox, QWidget#PoolingPanel QDoubleSpinBox, QWidget#PoolingPanel QComboBox,
+            QWidget#PoolingPanel QLineEdit {{ background:{pc['base']}; color:{pc['text']}; border:1px solid {pc['border']}; selection-background-color:{pc['highlight']}; selection-color:{pc['highlight_text']}; }}
+            QWidget#PoolingPanel QPushButton, QWidget#PoolingPanel QToolButton {{ background:{pc['button']}; color:{pc['button_text']}; border:1px solid {pc['border']}; }}
+            QWidget#PoolingPanel QPushButton:hover, QWidget#PoolingPanel QToolButton:hover {{ background:{pc['hover']}; border-color:{pc['highlight']}; }}
+        """)
 
     def _wire_contrast_controls(self) -> None:
         def sync_values(low, high):
@@ -146,6 +178,7 @@ class MapToolsWidget(QWidget):
         self.roi_menu = QMenu(self.roi_btn)
         self.roi_menu.setWindowFlags(self.roi_menu.windowFlags() | Qt.WindowType.NoDropShadowWindowHint)
         flyout = QWidget()
+        self.roi_flyout = flyout
         flyout.setStyleSheet("QWidget { background: transparent; }")
         row = QHBoxLayout(flyout)
         row.setContentsMargins(1, 1, 1, 1)
@@ -155,14 +188,14 @@ class MapToolsWidget(QWidget):
         self.roi_tool_buttons = {}
         for roi_id, info in self.roi_tools_config.items():
             button = QToolButton(flyout)
-            button.setIcon(QIcon(info["icon"]))
+            button.setIcon(svg_icon(info["icon"], widget=button))
             button.setToolTip(info["name"])
             button.setAutoRaise(True)
             button.setCheckable(True)
             button.setProperty("roi_id", roi_id)
             if roi_id == self.current_roi_type:
                 button.setChecked(True)
-                self.roi_btn.setIcon(QIcon(info["icon"]))
+                self.roi_btn.setIcon(svg_icon(info["icon"], widget=self.roi_btn))
                 self.roi_btn.setToolTip(info["name"])
             button.clicked.connect(lambda checked=False, b=button: self.roi_tool_clicked.emit(b))
             row.addWidget(button)
@@ -178,7 +211,7 @@ class MapToolsWidget(QWidget):
 
     def _build_pooling_tools(self, layout) -> None:
         self.pool_btn = self.smart_dropdown_cls(self)
-        self.pool_btn.setIcon(QIcon(str(ICON_DIR / "pool_stride_dense.svg")))
+        self.pool_btn.setIcon(svg_icon(ICON_DIR / "pool_stride_dense.svg", widget=self.pool_btn))
         self.pool_btn.setIconSize(QSize(16, 16))
         self.pool_btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
         self.pool_btn.setAccessibleName("Spatial pooling")
@@ -188,14 +221,16 @@ class MapToolsWidget(QWidget):
         self.pool_menu = QMenu(self.pool_btn)
         self.pool_menu.setWindowFlags(self.pool_menu.windowFlags() | Qt.WindowType.NoDropShadowWindowHint)
         panel = QWidget(self.pool_menu)
+        self.pool_panel = panel
         panel.setObjectName("PoolingPanel")
         panel.setStyleSheet("""
-            QWidget#PoolingPanel { background: #fff; }
-            QWidget#PoolingPanel QLabel { color: #343a40; font-size: 10px; }
-            QWidget#PoolingPanel QSpinBox { min-height: 19px; max-height: 19px; padding: 0 3px; border: 1px solid #cbd2dc; border-radius: 3px; background: #fff; font-size: 10px; }
-            QWidget#PoolingPanel QPushButton { min-height: 20px; max-height: 20px; padding: 0 7px; border: 1px solid #cbd2dc; border-radius: 3px; background: #f5f7fa; font-size: 10px; }
-            QWidget#PoolingPanel QPushButton:hover { background: #e6f2ff; border-color: #8aaed0; }
+            QWidget#PoolingPanel { background: palette(base); color: palette(text); }
+            QWidget#PoolingPanel QLabel { color: palette(text); font-size: 10px; }
+            QWidget#PoolingPanel QSpinBox { min-height: 19px; max-height: 19px; padding: 0 3px; border: 1px solid palette(mid); border-radius: 3px; background: palette(base); color: palette(text); font-size: 10px; }
+            QWidget#PoolingPanel QPushButton { min-height: 20px; max-height: 20px; padding: 0 7px; border: 1px solid palette(mid); border-radius: 3px; background: palette(button); color: palette(button-text); font-size: 10px; }
+            QWidget#PoolingPanel QPushButton:hover { background: palette(midlight); border-color: palette(highlight); }
         """)
+        self._pool_panel_base_style = panel.styleSheet()
         outer = QHBoxLayout(panel)
         outer.setContentsMargins(7, 5, 7, 5)
         outer.setSpacing(7)
@@ -248,7 +283,7 @@ class MapToolsWidget(QWidget):
         self.pool_preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.pool_preview_label.setAccessibleName("Pooling window and stride preview")
         self.pool_preview_label.setToolTip("Схема двух окон: сетка показывает исходные пиксели, диагональный сдвиг — stride, смешанный цвет — пересечение. Для size > 9 сетка показана условно.")
-        self.pool_preview_label.setPixmap(pooling_preview_pixmap(1, 1))
+        self.pool_preview_label.setPixmap(pooling_preview_pixmap(1, 1, self.palette()))
         outer.addWidget(self.pool_preview_label)
         action = QWidgetAction(self.pool_menu)
         action.setDefaultWidget(panel)
@@ -314,18 +349,18 @@ class QRangeSlider(QWidget):
         w = float(self.width())
 
         # 1. Серый трек (подложка)
-        painter.setPen(QPen(QColor("#cccccc"), 3))
+        painter.setPen(QPen(self.palette().color(QPalette.ColorRole.Mid), 3))
         painter.drawLine(6, int(y), int(w - 6), int(y))
 
         # 2. Синий активный диапазон
         x1 = self._val_to_x(self._low)
         x2 = self._val_to_x(self._high)
-        painter.setPen(QPen(QColor("#005fb8"), 3))  # Строгий научный синий
+        painter.setPen(QPen(self.palette().color(QPalette.ColorRole.Highlight), 3))
         painter.drawLine(int(x1), int(y), int(x2), int(y))
 
         # 3. Ползунки (круглые маркеры)
-        painter.setPen(QPen(QColor("#444444"), 1))
-        painter.setBrush(QColor("#ffffff"))
+        painter.setPen(QPen(self.palette().color(QPalette.ColorRole.ButtonText), 1))
+        painter.setBrush(self.palette().color(QPalette.ColorRole.Base))
         painter.drawEllipse(QPointF(x1, y), 4.5, 4.5)
         painter.drawEllipse(QPointF(x2, y), 4.5, 4.5)
 
@@ -372,7 +407,7 @@ class SmartDropdownButton(QToolButton):
         painter = QPainter(self)     # 2. Поверх рисуем наш векторный треугольник
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor("#000080"))  # Мой фирменный чернильно-синий
+        painter.setBrush(self.palette().color(QPalette.ColorRole.Highlight))
         
         rect = self.rect()           # 3. Рассчитываем координаты четко в правом нижнем углу
         size = 6                     # Размер уголка в пикселях (можно поменять на 5 или 7)

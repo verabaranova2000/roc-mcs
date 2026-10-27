@@ -8,11 +8,14 @@ from matplotlib.patches import Rectangle
 from matplotlib.transforms import Affine2D
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 from matplotlib.lines import Line2D
+from matplotlib.colors import to_rgba
 import numpy as np
 
 from roc_mcs.roi.spatial_pooling import PoolSpec
 from  roc_mcs.gui.roi_explorer.map_tools_widget import MapToolsWidget, pooling_preview_pixmap as _pooling_preview_pixmap
 from roc_mcs.gui.roi_explorer.plot_toolbar_style import ICON_DIR
+from roc_mcs.gui.components.icon_provider import svg_icon
+from roc_mcs.gui.roi_explorer.theme import apply_widget_palette, theme_colors
 from roc_mcs.gui.roi_explorer.map_tools_widget import SmartDropdownButton, QRangeSlider
 from roc_mcs.gui.roi_explorer.selectors import RotatedRectangleSelector
 from .selectors.line import LineSelector
@@ -25,37 +28,13 @@ from .selectors.point import PointSelector
 # Стиль для выпадающих списков заголовка (плоские, без рамок и стрелочек, с автошироким выпадающим списком)
 # Делаем списки визуально "плоскими", как текст заголовка
 STYLE_FLAT_COMBOBOX = """
-    QComboBox {
-        border: none;
-        background: transparent;
-        font-size: 10px;
-        font-family: 'DejaVu Sans', 'Arial', sans-serif;
-        font-weight: bold;
-        padding: 2px;
-        color: #000000; 
-    }
-    QComboBox::drop-down { border: none; width: 0px; } /* Прячем стрелочку для чистоты */
-    QComboBox:hover { color: #000080; } /* Ink blue акцент при наведении */
-    QComboBox QAbstractItemView {
-        border: 1px solid #cccccc;
-        background: #ffffff;
-        selection-background-color: #e6f2ff;
-        selection-color: #000080;
-        min-width: 250px; /* <--- ЭТА СТРОКА РЕШАЕТ ПРОБЛЕМУ обрезки текста "..." в выпадающих списках */
-    }
+    QComboBox { border:none; background:transparent; font-size:10px; font-family:'DejaVu Sans','Arial',sans-serif; font-weight:bold; padding:2px; color:palette(window-text); }
+    QComboBox::drop-down { border:none; width:0px; }
+    QComboBox:hover { color:palette(highlight); }
+    QComboBox QAbstractItemView { border:1px solid palette(mid); background:palette(base); color:palette(text); selection-background-color:palette(highlight); selection-color:palette(highlighted-text); min-width:250px; }
 """
-
-# Стиль для строки координат мыши в подвале графика (моноширинный научный шрифт)
-# Здесь QLabel#MapCoordLabel означает: «Примени этот стиль к любому QLabel, у которого ID равен MapCoordLabel»
 STYLE_COORD_LABEL = """
-    QLabel#MapCoordLabel {
-        font-family: monospace;
-        font-size: 10px;
-        font-weight: bold;
-        color: #000080;
-        padding: 2px 5px;
-        background-color: transparent;
-    }
+    QLabel#MapCoordLabel { font-family:monospace; font-size:10px; font-weight:bold; color:palette(window-text); padding:2px 5px; background:transparent; }
 """
 
 
@@ -73,7 +52,8 @@ class MapPlotWidget(QWidget):
     pixel_clicked = pyqtSignal(int, int)   # Индексы пикселя в текущем view: x, y
     data_updated =  pyqtSignal()             # Сигнал, что картинка перерисовалась
     pin_roi_requested = pyqtSignal()         # сигнал умного списка ROI
-    preview_roi_changed = pyqtSignal(object) # Сигнал: передает объект ROI (LineROI, PointROI, RectROI) наверх
+    preview_roi_changed = pyqtSignal(object) # Геометрия ROI при движении селектора.
+    preview_roi_finished = pyqtSignal(object) # Финальная геометрия после отпускания мыши.
 
     # =========================================================================
     # РЕЕСТР ИНСТРУМЕНТОВ (Статичная конфигурация)
@@ -99,6 +79,7 @@ class MapPlotWidget(QWidget):
     
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setObjectName("MapPlotWidget")
         self.repo = None                    # Ссылка на данные
         self._pool_spec = PoolSpec()
 
@@ -134,6 +115,7 @@ class MapPlotWidget(QWidget):
         # self.canvas.setFixedHeight(450)  # Подобрать цифру, при которой карта выглядит идеально квадратной
         
         self.ax = self.figure.add_subplot(1, 1, 1)
+        self._theme = "light"
         self.cbar = None
         self.map_image = None
         self.roi_right_click_callback = None
@@ -163,6 +145,7 @@ class MapPlotWidget(QWidget):
         # ЭТАЖ 2: УМНЫЙ ЗАГОЛОВОК (Интерактивная замена title)
         # ========================================================
         self.header_widget = QWidget()
+        self.header_widget.setObjectName("MapHeader")
         self.header_layout = QHBoxLayout(self.header_widget)
         self.header_layout.setContentsMargins(10, 4, 10, 0)   # Отступы: чуть-чуть сверху, чтобы отделить от тулбара, снизу 0, чтобы прижать к графику
         self.header_layout.setSpacing(6)
@@ -183,7 +166,8 @@ class MapPlotWidget(QWidget):
         def create_separator():
             """Создает вертикальный разделитель ' | ' для умного заголовка."""
             lbl = QLabel(" | ")
-            lbl.setStyleSheet("font-size: 15px; font-weight: normal; color: #555555;")
+            lbl.setObjectName("MapHeaderSeparator")
+            lbl.setStyleSheet("font-size: 15px; font-weight: normal; color: palette(window-text);")
             return lbl
     
         # Собираем заголовок по центру
@@ -243,7 +227,7 @@ class MapPlotWidget(QWidget):
     def _update_pool_preview(self, *_args) -> None:
         if hasattr(self, "pool_preview_label"):
             self.pool_preview_label.setPixmap(
-                _pooling_preview_pixmap(self.pool_size_spin.value(), self.pool_stride_spin.value())
+                _pooling_preview_pixmap(self.pool_size_spin.value(), self.pool_stride_spin.value(), self.palette())
             )
     
     def _keep_pool_size_odd(self, value: int) -> None:
@@ -271,10 +255,8 @@ class MapPlotWidget(QWidget):
         label = ("Raw (window 1×1, stride 1)" if not pool.active else
                  f"Count-sum window {pool.size}×{pool.size}, stride {pool.stride}")
         self.pool_btn.setToolTip(f"Spatial view: {label}")
-        self.pool_btn.setStyleSheet(
-            "SmartDropdownButton::menu-indicator { image: none; }" +
-            (" QToolButton { color: #000080; background: #e6f2ff; border: 1px solid #000080; font-weight: bold; }" if pool.active else "")
-        )
+        self.pool_btn.setProperty("poolActive", bool(pool.active))
+        self.pool_btn.style().unpolish(self.pool_btn); self.pool_btn.style().polish(self.pool_btn); self.pool_btn.update()
         
     def set_pool_enabled(self, enabled: bool) -> None:
         self.pool_btn.setEnabled(bool(enabled))
@@ -296,6 +278,44 @@ class MapPlotWidget(QWidget):
 
     # --- Графики ---  
     
+    def apply_theme(self, theme: str | None = None) -> None:
+        self._theme = str(theme or self._theme).lower()
+        if self._theme not in ("dark", "light"): self._theme = "light"
+        apply_widget_palette(self, self._theme)
+        c = theme_colors(self._theme)
+        self.header_widget.setStyleSheet(f"QWidget#MapHeader {{ background:{c['window']}; color:{c['text']}; }}")
+        combo_style = f"""
+            QComboBox {{ border:none; background:transparent; font-size:10px; font-family:'DejaVu Sans','Arial',sans-serif; font-weight:bold; padding:2px; color:{c['text']}; }}
+            QComboBox::drop-down {{ border:none; width:0px; }}
+            QComboBox:hover {{ color:{c['highlight']}; }}
+            QComboBox QAbstractItemView {{ border:1px solid {c['border']}; background:{c['base']}; color:{c['text']}; selection-background-color:{c['highlight']}; selection-color:{c['highlight_text']}; min-width:250px; }}
+        """
+        for combo in (self.scan_combo, self.map_combo, self.reduction_combo):
+            combo.setPalette(self.palette()); combo.setStyleSheet(combo_style)
+            view = combo.view()
+            view.setPalette(combo.palette())
+            view.setAutoFillBackground(True)
+            view.setStyleSheet(f"QListView, QAbstractItemView {{ background:{c['base']}; color:{c['text']}; border:1px solid {c['border']}; outline:0; }} QListView::item, QAbstractItemView::item {{ color:{c['text']}; padding:3px 5px; }} QListView::item:selected, QAbstractItemView::item:selected {{ background:{c['highlight']}; color:{c['highlight_text']}; }}")
+            view.viewport().setPalette(combo.palette()); view.viewport().setAutoFillBackground(True)
+        for label in self.header_widget.findChildren(QLabel, "MapHeaderSeparator"):
+            label.setStyleSheet(f"font-size:15px; font-weight:normal; color:{c['muted']}; background:transparent;")
+        self._apply_axes_theme()
+        self.tools.apply_theme(self._theme)
+        self._update_pool_preview()
+        self.canvas.draw_idle()
+
+    def _apply_axes_theme(self) -> None:
+        c = theme_colors(self._theme)
+        self.figure.set_facecolor(c["canvas"]); self.ax.set_facecolor(c["axes"])
+        self.ax.xaxis.label.set_color(c["text"]); self.ax.yaxis.label.set_color(c["text"])
+        self.ax.tick_params(axis="both", colors=c["muted"])
+        for spine in self.ax.spines.values(): spine.set_color(c["border"])
+        if self.cbar is not None:
+            self.cbar.ax.set_facecolor(c["axes"]); self.cbar.ax.tick_params(colors=c["muted"])
+            self.cbar.outline.set_edgecolor(c["border"])
+            for spine in self.cbar.ax.spines.values(): spine.set_color(c["border"])
+        self.canvas.setStyleSheet(f"background:{c['canvas']};")
+
     @staticmethod
     def _axis_centers(values, size, name):
         a = np.arange(size, dtype=float) if values is None else np.asarray(values, dtype=float)
@@ -362,6 +382,7 @@ class MapPlotWidget(QWidget):
         formatter.set_powerlimits((0, 0))
         self.cbar.ax.yaxis.set_major_formatter(formatter)
         self.cbar.ax.yaxis.set_major_locator(MaxNLocator(nbins=5))
+        self._apply_axes_theme()
         if first_draw and self.roi_btn.isChecked():
             self._apply_current_roi_tool(active=True)
         self.canvas.draw_idle()
@@ -614,7 +635,7 @@ class MapPlotWidget(QWidget):
         self._current_roi_type = roi_id
         info = self.ROI_TOOLS_CONFIG[roi_id]
         # --- Обновляем главную кнопку ---
-        self.roi_btn.setIcon(QIcon(info["icon"]))       
+        self.roi_btn.setIcon(svg_icon(info["icon"], widget=self.roi_btn))       
         self.roi_btn.setToolTip(info["name"])
         # --- Переключаем "зажатость" кнопок внутри flyout ---
         for i in range(btn.parent().layout().count()):  
@@ -657,17 +678,18 @@ class MapPlotWidget(QWidget):
         SelectorClass = config["selector_class"]
         
         if SelectorClass is not None:
+            colors = theme_colors(self._theme)
             self._current_selector = SelectorClass(   # Создаем новый инстанс нужного селектора (RotatedRectangle, Line или Point)
                 self.ax,
                 on_change=self._on_selector_changed,
-                onselect=self._on_selector_changed,  # чтобы откликивались и промежуточные движения, и завершение
+                onselect=self._on_selector_selected,  # чтобы откликивались и промежуточные движения, и завершение
                 min_size=1.0,
                 handle_size=7.0,
                 rotation_handle_offset=18.0,
-                edgecolor="white",
-                facecolor=(1.0, 1.0, 1.0, 0.05),
-                activecolor="#ffd54a",
-                hovercolor="#7ad7ff",
+                edgecolor=colors["roi"],
+                facecolor=to_rgba(colors["roi"], alpha=0.08),
+                activecolor=colors["roi"],
+                hovercolor=colors["roi_hover"],
                 lw=2.0,
                 allow_create=True,
                 allow_move=True,
@@ -684,12 +706,10 @@ class MapPlotWidget(QWidget):
             print(f"Инструмент {self._current_roi_type} еще в разработке!")
 
     def _on_selector_changed(self, roi):
-        """
-        Прокси-метод передачи объекта ROI наружу.
-        Селектор изменил геометрию (потянули за ручку) -> передаем объект ROI наружу.
-        MapPlotWidget не "лезет" в главное окно и не пытается самостоятельно вызывать расчет кривых качания.
-        Он лишь говорит во внешний мир: 
-            «Привет! У меня тут пользователь потянул за ручку ROI, вот новые координаты (object), делайте с ними что хотите»
-        RockingCurveExplorerWindow поймает это через self.map_widget.preview_roi_changed.connect(...)
-        """
+        """Передаёт наружу промежуточную геометрию, не вмешиваясь в расчёт кривой."""
         self.preview_roi_changed.emit(roi)
+
+    def _on_selector_selected(self, roi):
+        """Сообщает отдельно о завершении рисования/перемещения ROI."""
+        self.preview_roi_changed.emit(roi)
+        self.preview_roi_finished.emit(roi)

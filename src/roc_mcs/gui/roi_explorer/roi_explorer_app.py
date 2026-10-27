@@ -37,18 +37,13 @@ def main() -> int:
         bootstrap()
         from PyQt6 import QtWidgets
         from roc_mcs.gui.components.icon_provider import set_icon_theme
+        from roc_mcs.gui.roi_explorer.theme import resolve_theme, theme_colors
         from roc_mcs.gui.roi_explorer.explorer_window import RockingCurveExplorerWindow
-        app=QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv); app.setApplicationName("ROI Explorer"); app.setOrganizationName("ROC-MCS"); set_icon_theme(app,"#d8e0ec")
+        app=QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv); app.setApplicationName("ROI Explorer"); app.setOrganizationName("ROC-MCS"); theme=resolve_theme(app); set_icon_theme(app, theme_colors(theme)["text"])
         path=Path(sys.argv[1]).expanduser() if len(sys.argv)>1 else None
         if path is not None and not path.is_absolute(): path=(launch_cwd/path).resolve()
-        if path is None:
-            start=Path.home()
-            last=Path(os.environ.get("USERPROFILE",str(Path.home())))/"Desktop"/"For_Sardana"
-            if last.is_dir(): start=last
-            selected,_=QtWidgets.QFileDialog.getOpenFileName(None,"Открыть HDF5 со сканами 2D-детектора",str(start),"HDF5 (*.h5 *.hdf5 *.hdf);;Все файлы (*)")
-            if not selected: return 0
-            path=Path(selected)
-        if not path.is_file(): raise FileNotFoundError(f"Файл не найден: {path}")
+        if path is not None and not path.is_file(): raise FileNotFoundError(f"Файл не найден: {path}")
+        # Без аргумента окно открывается сразу; путь берётся из настроек, если база доступна.
         window=RockingCurveExplorerWindow(path); window.show(); return app.exec()
     except SystemExit: raise
     except Exception:

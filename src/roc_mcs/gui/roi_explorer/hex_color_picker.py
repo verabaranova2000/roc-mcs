@@ -3,6 +3,7 @@ from PyQt6.QtCore import QPoint, QPointF, QSize, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QLinearGradient, QPainter, QPen, QPolygon, QPalette
 from PyQt6.QtWidgets import (QColorDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QToolButton,
                              QVBoxLayout, QWidget, QDialog)
+from roc_mcs.gui.roi_explorer.theme import apply_widget_palette, apply_popup_theme, resolve_theme
 
 
 class _DragTitle(QLabel):
@@ -125,7 +126,8 @@ class CompactColorPicker(QFrame):
 
     def __init__(self, color: str = "#1f77b4", parent=None):
         super().__init__(parent, Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint)
-        self.setObjectName("compactColorPicker"); self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True); self._color = QColor(color if QColor(color).isValid() else "#1f77b4")
+        self.setObjectName("compactColorPicker"); apply_widget_palette(self, resolve_theme(parent))
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True); self._color = QColor(color if QColor(color).isValid() else "#1f77b4")
         self.setStyleSheet("""
             QFrame#compactColorPicker { background: palette(window); color: palette(window-text); border: 1px solid palette(mid); border-radius: 5px; }
             QToolButton { border: 1px solid transparent; border-radius: 3px; padding: 0; font-size: 10px; }
@@ -199,6 +201,11 @@ class CompactColorPicker(QFrame):
         self.plane.set_hsv(max(0, h), max(0, s) / 255, max(0, v) / 255)
         self._refresh_controls()
         self.adjustSize()
+        apply_popup_theme(self, resolve_theme(parent))
+
+    def apply_theme(self, theme: str | None = None) -> None:
+        apply_popup_theme(self, theme)
+        self.color_preview.setStyleSheet(f"QFrame {{ background: {self._color.name()}; border: 1px solid palette(mid); border-radius: 2px; }}")
 
     def _refresh_controls(self):
         self.color_preview.setStyleSheet(f"QFrame {{ background: {self._color.name()}; border: 1px solid palette(mid); border-radius: 2px; }}")
@@ -222,7 +229,8 @@ class CompactColorPicker(QFrame):
 
     def _open_advanced(self):
         dialog = QColorDialog(self._color, self); dialog.setWindowTitle("More colors"); dialog.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True); dialog.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, False)
-        dialog.setStyleSheet("QColorDialog { font-size: 10px; } QLabel { margin: 1px; } QPushButton { padding: 2px 7px; min-height: 20px; }")
+        dialog.setStyleSheet("QColorDialog { font-size: 10px; background: palette(window); color: palette(window-text); } QLabel { margin: 1px; color: palette(window-text); } QPushButton { padding: 2px 7px; min-height: 20px; background: palette(button); color: palette(button-text); border: 1px solid palette(mid); border-radius: 3px; } QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox { background: palette(base); color: palette(text); border: 1px solid palette(mid); }")
+        apply_popup_theme(dialog, resolve_theme(self))
         if dialog.exec() == QDialog.DialogCode.Accepted: self._set_color(dialog.selectedColor().name())
 
     def _apply(self):

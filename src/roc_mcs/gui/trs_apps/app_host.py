@@ -13,7 +13,7 @@ class TRSAppsWindow(QtWidgets.QMainWindow):
         super().__init__(parent); self.setObjectName("trsAppsWindow"); self.setWindowTitle("TRS Apps"); self.setWindowIcon(resource_svg_icon("trs_apps.svg", size=32, color="#d8e0ec"))
         self.setWindowFlags(QtCore.Qt.WindowType.Window | QtCore.Qt.WindowType.FramelessWindowHint)
         app = QtWidgets.QApplication.instance()
-        if app is not None: set_icon_theme(app, "#d8e0ec")
+        if app is not None: app.setProperty("rocMcsTheme", "dark"); set_icon_theme(app, "#d8e0ec")
         self._active_pane = None; self._target_pane = None; self._split = False
         self._surface = ChromeSurface(self); self.setCentralWidget(self._surface)
         outer = QtWidgets.QVBoxLayout(self._surface.frame); outer.setContentsMargins(0,0,0,0); outer.setSpacing(0)
@@ -110,10 +110,10 @@ class TRSAppsWindow(QtWidgets.QMainWindow):
             from roc_mcs.gui.live_scans.roc_live_dashboard_v4 import LiveRocDashboard
             return LiveRocDashboard(records=None), "Live Scans"
         if key == "roi_explorer":
-            path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Открыть HDF5 для ROI Explorer", str(Path.home()), "HDF5 files (*.h5 *.hdf5 *.hdf);;All files (*)")
-            if not path: return None, ""
             from roc_mcs.gui.roi_explorer.explorer_window import RockingCurveExplorerWindow
-            page = RockingCurveExplorerWindow(Path(path)); return page, f"ROI · {Path(path).name}"
+            page = RockingCurveExplorerWindow()
+            title = f"ROI · {page.current_file.name}" if page.current_file else "ROI Explorer"
+            return page, title
         return None, ""
     def set_split(self, orientation: QtCore.Qt.Orientation):
         if not self._split:
