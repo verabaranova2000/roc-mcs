@@ -70,6 +70,7 @@ from roc_mcs.gui.components.icon_provider import resource_svg_icon
 from roc_mcs.gui.app_settings import resolve_initial_database, remember_hdf5_database, settings_path
 from roc_mcs.gui.roi_explorer.theme import apply_theme as apply_roi_theme, apply_popup_theme, resolve_theme, theme_colors
 from roc_mcs.gui.roi_explorer.plot_workspace_widget import PlotWorkspaceWidget
+from roc_mcs.gui.roi_explorer.plot_display_settings import PlotDisplaySettingsDialog, load_plot_display_settings, save_plot_display_settings
 from roc_mcs.roi.roi_types import ROI, SavedROI
 
 
@@ -216,6 +217,8 @@ class RockingCurveExplorerWindow(QMainWindow):
             icon_color = QColor(theme_colors(active_theme)["text"])
             self.left_sidebar_toggle.setIcon(_pane_toggle_icon(not self._left_sidebar_collapsed, icon_color))
             self.map_widget.apply_theme(active_theme); self.curve_widget.apply_theme(active_theme); self.roi_manager.apply_theme(active_theme)
+            self.map_widget.apply_display_settings(load_plot_display_settings()["map"]); self.curve_widget.apply_display_settings(load_plot_display_settings()["curve"])
+            self.plot_workspace.apply_theme(active_theme)
             for popup in self.findChildren(QWidget):
                 if popup.objectName() in ("roiEditorPopup", "compactColorPicker"):
                     update_popup_theme = getattr(popup, "apply_theme", None)
@@ -269,6 +272,8 @@ class RockingCurveExplorerWindow(QMainWindow):
         self.map_widget.reduction_combo.currentIndexChanged.connect(self._on_reduction_changed)
         self.map_widget.pool_changed.connect(self._on_pool_changed)
         self.map_widget.pixel_clicked.connect(self._on_pixel_clicked)
+        self.map_widget.settings_requested.connect(self.open_plot_display_settings)
+        self.curve_widget.settings_requested.connect(self.open_plot_display_settings)
         
         # --- Сохранение ROI ---
         self.map_widget.pin_roi_requested.connect(self.pin_preview_roi)    # От кнопки над картой (слушаем сигнал из MapPlotWidget)
@@ -292,6 +297,16 @@ class RockingCurveExplorerWindow(QMainWindow):
         # Когда селектор на карте изменяется (тянут за ручку, рисуют линию) -> пересчитываем рокинги и обновляем графики
         self.map_widget.preview_roi_changed.connect(self._on_selector_change)
         self.map_widget.preview_roi_finished.connect(self._on_selector_finished)
+
+    def open_plot_display_settings(self) -> None:
+        """Настраивает стиль карты и ROC-кривых и сохраняет его в settings.json."""
+        dialog = PlotDisplaySettingsDialog(load_plot_display_settings(), self)
+        apply_popup_theme(dialog, resolve_theme(self))
+        if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+            values = dialog.values()
+            try: save_plot_display_settings(values)
+            except Exception as exc: QMessageBox.warning(self, "Настройки отображения", f"Изменения применены, но сохранить settings.json не удалось:\n{exc}")
+            self.map_widget.apply_display_settings(values["map"]); self.curve_widget.apply_display_settings(values["curve"])
 
     # ---------- HDF5/session ----------
     def load_hdf5(self, h5_path: Union[str, Path]) -> None:
@@ -1322,7 +1337,9 @@ class RockingCurveExplorerWindow(QMainWindow):
 
 
     def closeEvent(self, event) -> None:
-        """Освобождает HDF5-дескриптор при закрытии окна."""
+        """Сохраняет расположение экранов и освобождает HDF5-дескриптор."""
+        try: self.plot_workspace.mdi_area.save_geometry()
+        except Exception: pass
         closer = getattr(self.repo, "close", None)
         if callable(closer):
             try: closer()

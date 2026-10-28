@@ -58,6 +58,7 @@ class MapToolsWidget(QWidget):
     pool_size_changed = pyqtSignal(int)
     pool_stride_changed = pyqtSignal(int)
     pool_apply_requested = pyqtSignal()
+    settings_requested = pyqtSignal()
 
     def __init__(self, roi_tools_config: dict, current_roi_type: str, smart_dropdown_cls, range_slider_cls, parent=None):
         super().__init__(parent)
@@ -67,10 +68,10 @@ class MapToolsWidget(QWidget):
         self.range_slider_cls = range_slider_cls
         self.setObjectName("MapToolBar")
         self.setFixedHeight(26)
-        self.setStyleSheet(COMPACT_PLOT_TOOLBAR_STYLE)
+        self.setStyleSheet(COMPACT_PLOT_TOOLBAR_STYLE + "\nQWidget#MapToolBar QToolButton::menu-indicator { image:none; } QWidget#MapToolBar QMenu::indicator { background:palette(base); border:1px solid palette(mid); } QWidget#MapToolBar QMenu::indicator:checked { background:palette(highlight); }")
         layout = QHBoxLayout(self)
         layout.setContentsMargins(4, 2, 4, 2)
-        layout.setSpacing(6)
+        layout.setSpacing(4)
         self.home_btn = QToolButton(self)
         self.home_btn.setIcon(svg_icon(ICON_DIR / "zoom_out_map.svg", widget=self.home_btn))
         self.home_btn.setToolTip("Reset view")
@@ -88,9 +89,10 @@ class MapToolsWidget(QWidget):
         self.cmap_btn = QToolButton(self)
         self.cmap_btn.setIcon(self._create_cmap_icon())
         self.cmap_btn.setToolTip("Select colormap")
-        self.cmap_menu = QMenu(self.cmap_btn)
+        self.cmap_menu = QMenu(self.cmap_btn); self._cmap_actions = {}
         for name in ("gray", "inferno", "magma", "viridis", "cividis", "plasma"):
-            self.cmap_menu.addAction(name).triggered.connect(lambda checked=False, cmap=name: self.cmap_selected.emit(cmap))
+            action = self.cmap_menu.addAction(name); action.setCheckable(True); action.setChecked(name == "inferno")
+            action.triggered.connect(lambda checked=False, cmap=name: self._select_cmap(cmap)); self._cmap_actions[name] = action
         self.cmap_btn.setMenu(self.cmap_menu)
         self.cmap_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         layout.addWidget(self.cmap_btn)
@@ -102,17 +104,15 @@ class MapToolsWidget(QWidget):
         self.low_pct = QDoubleSpinBox(self)
         self.high_pct = QDoubleSpinBox(self)
         for spin, value in ((self.low_pct, 1.0), (self.high_pct, 99.0)):
-            spin.setRange(0, 100)
-            spin.setDecimals(1)
-            spin.setValue(value)
-            spin.setSuffix("%")
-            spin.setFixedWidth(46)
-            spin.setButtonSymbols(QDoubleSpinBox.ButtonSymbols.NoButtons)
-            spin.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            spin.setRange(0, 100); spin.setDecimals(1); spin.setValue(value); spin.setSuffix("%")
+            spin.setFixedWidth(42); spin.setFixedHeight(19); spin.setButtonSymbols(QDoubleSpinBox.ButtonSymbols.NoButtons)
+            spin.setAlignment(Qt.AlignmentFlag.AlignCenter); spin.setKeyboardTracking(False)
+            spin.setStyleSheet("QDoubleSpinBox { background: palette(base); color: palette(text); border: 1px solid palette(mid); border-radius: 3px; padding: 0 2px; selection-background-color: palette(highlight); selection-color: palette(highlighted-text); }")
         self.range_slider = range_slider_cls(low=1.0, high=99.0)
-        layout.addWidget(self.low_pct)
-        layout.addWidget(self.range_slider)
-        layout.addWidget(self.high_pct)
+        layout.addWidget(self.low_pct); layout.addWidget(self.range_slider); layout.addWidget(self.high_pct)
+        self.settings_btn = QToolButton(self); self.settings_btn.setAutoRaise(True); self.settings_btn.setIcon(svg_icon(ICON_DIR / "setting_icon.svg", widget=self.settings_btn)); self.settings_btn.setIconSize(QSize(15, 15))
+        self.settings_btn.setToolTip("Настройки внешнего вида карты"); self.settings_btn.setAccessibleName("Настройки карты")
+        self.settings_btn.clicked.connect(self.settings_requested.emit); layout.addWidget(self.settings_btn)
         self._wire_contrast_controls()
 
     def apply_theme(self, _theme: str | None = None) -> None:
@@ -121,6 +121,7 @@ class MapToolsWidget(QWidget):
         icon_color = c["text"]
         self.home_btn.setIcon(svg_icon(ICON_DIR / "zoom_out_map.svg", color=icon_color, widget=self.home_btn))
         self.pin_roi_btn.setIcon(svg_icon(ICON_DIR / "push_pin.svg", color=icon_color, widget=self.pin_roi_btn))
+        self.settings_btn.setIcon(svg_icon(ICON_DIR / "setting_icon.svg", color=icon_color, widget=self.settings_btn))
         self.pool_btn.setIcon(svg_icon(ICON_DIR / "pool_stride_dense.svg", color=icon_color, widget=self.pool_btn))
         for roi_id, button in self.roi_tool_buttons.items():
             icon_path = self.roi_tools_config[roi_id]["icon"]
@@ -142,6 +143,12 @@ class MapToolsWidget(QWidget):
             QWidget#PoolingPanel QPushButton, QWidget#PoolingPanel QToolButton {{ background:{pc['button']}; color:{pc['button_text']}; border:1px solid {pc['border']}; }}
             QWidget#PoolingPanel QPushButton:hover, QWidget#PoolingPanel QToolButton:hover {{ background:{pc['hover']}; border-color:{pc['highlight']}; }}
         """)
+
+    def _select_cmap(self, name: str) -> None:
+        self.set_current_cmap(name); self.cmap_selected.emit(name)
+
+    def set_current_cmap(self, name: str) -> None:
+        for key, action in self._cmap_actions.items(): action.setChecked(key == name)
 
     def _wire_contrast_controls(self) -> None:
         def sync_values(low, high):
@@ -247,6 +254,7 @@ class MapToolsWidget(QWidget):
         self.pool_size_spin.setValue(1)
         self.pool_size_spin.setFixedWidth(44)
         self.pool_size_spin.setFixedHeight(19)
+        self.pool_size_spin.setStyleSheet("QSpinBox { background: palette(base); color: palette(text); border: 1px solid palette(mid); border-radius: 3px; padding: 0 2px; selection-background-color: palette(highlight); selection-color: palette(highlighted-text); }")
         self.pool_size_spin.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
         self.pool_size_spin.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.pool_size_spin.setKeyboardTracking(False)
@@ -256,6 +264,7 @@ class MapToolsWidget(QWidget):
         self.pool_stride_spin.setValue(1)
         self.pool_stride_spin.setFixedWidth(44)
         self.pool_stride_spin.setFixedHeight(19)
+        self.pool_stride_spin.setStyleSheet("QSpinBox { background: palette(base); color: palette(text); border: 1px solid palette(mid); border-radius: 3px; padding: 0 2px; selection-background-color: palette(highlight); selection-color: palette(highlighted-text); }")
         self.pool_stride_spin.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
         self.pool_stride_spin.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.pool_stride_spin.setKeyboardTracking(False)
@@ -317,8 +326,8 @@ class QRangeSlider(QWidget):
         self._active_handle = None
 
         self.setFixedHeight(18)
-        self.setMinimumWidth(80)
-        self.setMaximumWidth(140)
+        self.setMinimumWidth(52)
+        self.setMaximumWidth(92)
 
     def low(self) -> float: return self._low
     def high(self) -> float: return self._high

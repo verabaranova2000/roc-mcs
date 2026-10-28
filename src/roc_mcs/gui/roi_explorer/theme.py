@@ -107,6 +107,8 @@ def apply_popup_theme(widget: QWidget, theme: str | None = None) -> str:
             QMenu::item {{ background:transparent; color:{c['text']}; padding:4px 18px; }}
             QMenu::item:selected {{ background:{c['highlight']}; color:{c['highlight_text']}; }}
             QMenu::separator {{ height:1px; background:{c['border']}; margin:3px 5px; }}
+        QMenu::indicator {{ width:12px; height:12px; background:{c['base']}; border:1px solid {c['border']}; border-radius:2px; }}
+        QMenu::indicator:checked {{ background:{c['highlight']}; border:1px solid {c['highlight']}; }}
         """)
     elif widget.objectName() in ("roiEditorPopup", "compactColorPicker"):
         name = widget.objectName()
@@ -172,6 +174,8 @@ def apply_theme(widget: QWidget, theme: str | None = None) -> str:
         QComboBox QAbstractItemView, QMenu {{ background:{c['base']}; color:{c['text']}; border:1px solid {c['border']}; selection-background-color:{c['highlight']}; selection-color:{c['highlight_text']}; }}
         QMenu::item {{ padding:4px 18px; }} QMenu::item:selected {{ background:{c['highlight']}; color:{c['highlight_text']}; }}
         QMenu::separator {{ height:1px; background:{c['border']}; margin:3px 5px; }}
+        QMenu::indicator {{ width:12px; height:12px; background:{c['base']}; border:1px solid {c['border']}; border-radius:2px; }}
+        QMenu::indicator:checked {{ background:{c['highlight']}; border:1px solid {c['highlight']}; }}
         QPushButton, QToolButton {{ background:{c['button']}; color:{c['button_text']}; border:1px solid {c['border']}; border-radius:4px; padding:3px 5px; }}
         QPushButton:hover, QToolButton:hover {{ background:{c['hover']}; }}
         QPushButton:disabled, QToolButton:disabled {{ color:{c['muted']}; background:{c['window']}; border-color:{c['border']}; }}

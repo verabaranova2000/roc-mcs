@@ -8,6 +8,8 @@ from matplotlib.patches import Rectangle
 from matplotlib.transforms import Affine2D
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 from matplotlib.lines import Line2D
+from matplotlib.font_manager import FontProperties
+from mpl_toolkits.axes_grid1.anchored_artists import AnchoredSizeBar
 from matplotlib.colors import to_rgba
 import numpy as np
 
@@ -16,6 +18,7 @@ from  roc_mcs.gui.roi_explorer.map_tools_widget import MapToolsWidget, pooling_p
 from roc_mcs.gui.roi_explorer.plot_toolbar_style import ICON_DIR
 from roc_mcs.gui.components.icon_provider import svg_icon
 from roc_mcs.gui.roi_explorer.theme import apply_widget_palette, theme_colors
+from roc_mcs.gui.roi_explorer.plot_display_settings import load_plot_display_settings
 from roc_mcs.gui.roi_explorer.map_tools_widget import SmartDropdownButton, QRangeSlider
 from roc_mcs.gui.roi_explorer.selectors import RotatedRectangleSelector
 from .selectors.line import LineSelector
@@ -51,6 +54,7 @@ class MapPlotWidget(QWidget):
     pool_changed = pyqtSignal(object)      # Новый PoolSpec выбран пользователем
     pixel_clicked = pyqtSignal(int, int)   # Индексы пикселя в текущем view: x, y
     data_updated =  pyqtSignal()             # Сигнал, что картинка перерисовалась
+    settings_requested = pyqtSignal()
     pin_roi_requested = pyqtSignal()         # сигнал умного списка ROI
     preview_roi_changed = pyqtSignal(object) # Геометрия ROI при движении селектора.
     preview_roi_finished = pyqtSignal(object) # Финальная геометрия после отпускания мыши.
@@ -83,8 +87,9 @@ class MapPlotWidget(QWidget):
         self.repo = None                    # Ссылка на данные
         self._pool_spec = PoolSpec()
 
-        self.setMinimumWidth(300)           # минимальные размеры для всего виджета. Сплиттер физически упрется в этот лимит и не сломает Matplotlib
-        self.setMinimumHeight(350)
+        self.setMinimumSize(340, 190); self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._display_settings = load_plot_display_settings()["map"]
+        self._scalebar_artist = None
         
         # ---Внутреннее состояние ---
         self.current_scan = None
@@ -108,10 +113,10 @@ class MapPlotWidget(QWidget):
         self.main_layout.setSpacing(0)                 # Ноль лишних отступов
 
         # ИНИЦИАЛИЗАЦИЯ MATPLOTLIB
-        self.figure = Figure(figsize=(5, 5)) 
+        self.figure = Figure(figsize=(5, 5), tight_layout=False)
         self.canvas = FigureCanvasQTAgg(self.figure)
-        self.figure.subplots_adjust(left=0.12, right=0.85, bottom=0.1, top=0.99)            # Жесткие отступы. Цифры будут расти в правое поле (right=0.85), не толкая график
-        self.canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)   # жесткая фиксация высоты как в моем классе PLOTBOX!
+        self.figure.subplots_adjust(left=0.12, right=0.91, bottom=0.11, top=0.97)
+        self.canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         # self.canvas.setFixedHeight(450)  # Подобрать цифру, при которой карта выглядит идеально квадратной
         
         self.ax = self.figure.add_subplot(1, 1, 1)
@@ -128,9 +133,10 @@ class MapPlotWidget(QWidget):
         for name in ("home_btn", "roi_btn", "roi_menu", "roi_action_group", "roi_tool_buttons",
                      "pool_btn", "pool_menu", "pool_size_spin", "pool_stride_spin", "pool_apply_btn",
                      "pool_preview_label", "pin_roi_btn", "cmap_btn", "cmap_menu", "auto_contrast_btn",
-                     "low_pct", "high_pct", "range_slider"):
+                     "low_pct", "high_pct", "range_slider", "settings_btn"):
             setattr(self, name, getattr(self.tools, name))
         self.tools.reset_view_requested.connect(self.reset_view)
+        self.tools.settings_requested.connect(self.settings_requested.emit)
         self.tools.pin_roi_requested.connect(self.pin_roi_requested.emit)
         self.tools.cmap_selected.connect(self._on_cmap_selected)
         self.tools.roi_toggled.connect(self._on_roi_toggled)
@@ -147,8 +153,8 @@ class MapPlotWidget(QWidget):
         self.header_widget = QWidget()
         self.header_widget.setObjectName("MapHeader")
         self.header_layout = QHBoxLayout(self.header_widget)
-        self.header_layout.setContentsMargins(10, 4, 10, 0)   # Отступы: чуть-чуть сверху, чтобы отделить от тулбара, снизу 0, чтобы прижать к графику
-        self.header_layout.setSpacing(6)
+        self.header_widget.setFixedHeight(25)
+        self.header_layout.setContentsMargins(6, 0, 6, 0); self.header_layout.setSpacing(5)
 
         self.scan_combo = QComboBox()
         self.map_combo = QComboBox()
@@ -159,9 +165,9 @@ class MapPlotWidget(QWidget):
         self.map_combo.setToolTip("Выбор типа 2D карты (распределение интенсивности, ширины пика, положения и др.).")
         self.reduction_combo.setToolTip("Режим агрегации пикселей (mean/sum) при проецировании ROI в 1D профиль.")
         
-        for combo in (self.scan_combo, self.map_combo, self.reduction_combo):
-            combo.setStyleSheet(STYLE_FLAT_COMBOBOX)                                 # применяем константу стилей
-            combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)   # ВАЖНО: Исправлено для PyQt6. Список сам подгоняет ширину под текст.
+        for combo, minimum in ((self.scan_combo, 80), (self.map_combo, 76), (self.reduction_combo, 55)):
+            combo.setStyleSheet(STYLE_FLAT_COMBOBOX); combo.setMinimumWidth(minimum)
+            combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon); combo.setMinimumContentsLength(5)
         
         def create_separator():
             """Создает вертикальный разделитель ' | ' для умного заголовка."""
@@ -170,14 +176,15 @@ class MapPlotWidget(QWidget):
             lbl.setStyleSheet("font-size: 15px; font-weight: normal; color: palette(window-text);")
             return lbl
     
-        # Собираем заголовок по центру
-        self.header_layout.addStretch()
-        self.header_layout.addWidget(self.scan_combo)
+        # Управление данными остаётся непосредственно над соответствующим полотном.
+        self.header_layout.addWidget(QLabel("Scan", self.header_widget))
+        self.header_layout.addWidget(self.scan_combo, 2)
         self.header_layout.addWidget(create_separator())
-        self.header_layout.addWidget(self.map_combo)
+        self.header_layout.addWidget(QLabel("Map", self.header_widget))
+        self.header_layout.addWidget(self.map_combo, 1)
         self.header_layout.addWidget(create_separator())
+        self.header_layout.addWidget(QLabel("ROI", self.header_widget))
         self.header_layout.addWidget(self.reduction_combo)
-        self.header_layout.addStretch()
 
         # ========================================================
         # ЭТАЖ 3: Строка координат мыши (x,y)
@@ -193,8 +200,7 @@ class MapPlotWidget(QWidget):
         self.main_layout.addWidget(self.toolbar)         # 1. Тулбар наверху
         self.main_layout.addWidget(self.header_widget)   # 2. Интерактивный заголовок
         self.main_layout.addWidget(self.canvas, 1)       # 3. График (занимает всё оставшееся место)
-        self.main_layout.addWidget(self.coord_label)     # 4. Строка координат мыши (x,y)
-        self.main_layout.addStretch(1)                   # 5. Пружина (ставим в самый низ.  Она заберет на себя всё свободное серое пространство в нижней части окна.
+        self.main_layout.addWidget(self.coord_label)
 
  
         # ========================================================
@@ -211,13 +217,14 @@ class MapPlotWidget(QWidget):
         self.scan_combo.currentTextChanged.connect(self.scan_changed.emit)
         self.map_combo.currentTextChanged.connect(self.map_changed.emit)
         self.reduction_combo.currentTextChanged.connect(self.reduction_changed.emit)
+        self.apply_display_settings(self._display_settings)
 
     
     # ============================================================
     # ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ КЛАССА
     # ============================================================
     def _on_cmap_selected(self, cmap_name: str) -> None:
-        self.current_cmap = cmap_name
+        self.current_cmap = cmap_name; self.tools.set_current_cmap(cmap_name)
         self.low_pct.valueChanged.emit(self.low_pct.value())   # вызываем перерисовку холста (сигнал будет подхвачен Главным окном)
 
     def _on_pool_size_changed(self, value: int) -> None:
@@ -283,7 +290,7 @@ class MapPlotWidget(QWidget):
         if self._theme not in ("dark", "light"): self._theme = "light"
         apply_widget_palette(self, self._theme)
         c = theme_colors(self._theme)
-        self.header_widget.setStyleSheet(f"QWidget#MapHeader {{ background:{c['window']}; color:{c['text']}; }}")
+        self.header_widget.setStyleSheet(f"QWidget#MapHeader {{ background:{c['window']}; color:{c['text']}; }} QWidget#MapHeader QLabel {{ color:{c['muted']}; font-size:9px; background:transparent; }}")
         combo_style = f"""
             QComboBox {{ border:none; background:transparent; font-size:10px; font-family:'DejaVu Sans','Arial',sans-serif; font-weight:bold; padding:2px; color:{c['text']}; }}
             QComboBox::drop-down {{ border:none; width:0px; }}
@@ -299,22 +306,62 @@ class MapPlotWidget(QWidget):
             view.viewport().setPalette(combo.palette()); view.viewport().setAutoFillBackground(True)
         for label in self.header_widget.findChildren(QLabel, "MapHeaderSeparator"):
             label.setStyleSheet(f"font-size:15px; font-weight:normal; color:{c['muted']}; background:transparent;")
+        self._apply_axes_theme(); self._update_scalebar(); self.tools.apply_theme(self._theme); self._update_pool_preview()
+        self.coord_label.setStyleSheet(f"QLabel#MapCoordLabel {{ font-family:monospace; font-size:10px; font-weight:600; color:{c['muted']}; padding:1px 4px; background:transparent; }}")
+        self.canvas.draw_idle()
+
+    def apply_display_settings(self, settings: dict | None = None) -> None:
+        if settings is not None: self._display_settings = dict(settings)
+        if self.map_image is not None:
+            show_cbar = bool(self._display_settings.get("show_colorbar", True))
+            if show_cbar and self.cbar is None:
+                divider = make_axes_locatable(self.ax); self.cax = divider.append_axes("right", size="4.2%", pad=0.055); self.cbar = self.figure.colorbar(self.map_image, cax=self.cax)
+                formatter = ScalarFormatter(useMathText=True); formatter.set_powerlimits((-3, 4)); self.cbar.ax.yaxis.set_major_formatter(formatter); self.cbar.ax.yaxis.set_major_locator(MaxNLocator(nbins=4))
+            elif not show_cbar and self.cbar is not None:
+                self.cbar.remove(); self.cbar = None; self.cax = None
+            elif show_cbar and self.cbar is not None:
+                formatter = ScalarFormatter(useMathText=True); formatter.set_powerlimits((-3, 4)); self.cbar.ax.yaxis.set_major_formatter(formatter); self.cbar.ax.yaxis.set_major_locator(MaxNLocator(nbins=4))
         self._apply_axes_theme()
-        self.tools.apply_theme(self._theme)
-        self._update_pool_preview()
+        if self.map_image is not None: self._update_scalebar()
         self.canvas.draw_idle()
 
     def _apply_axes_theme(self) -> None:
-        c = theme_colors(self._theme)
+        c = theme_colors(self._theme); s = self._display_settings; font = str(s.get("font_family", "Segoe UI"))
         self.figure.set_facecolor(c["canvas"]); self.ax.set_facecolor(c["axes"])
-        self.ax.xaxis.label.set_color(c["text"]); self.ax.yaxis.label.set_color(c["text"])
-        self.ax.tick_params(axis="both", colors=c["muted"])
-        for spine in self.ax.spines.values(): spine.set_color(c["border"])
+        for axis, label in ((self.ax.xaxis, self.ax.xaxis.label), (self.ax.yaxis, self.ax.yaxis.label)):
+            label.set_color(c["text"]); label.set_fontname(font); label.set_fontsize(int(s.get("label_size", 9)))
+        self.ax.tick_params(axis="both", colors=c["muted"], labelsize=int(s.get("tick_size", 8)), direction="in", length=3, width=0.65, top=True, right=True, pad=3)
+        for label in (*self.ax.get_xticklabels(), *self.ax.get_yticklabels()): label.set_fontname(font)
+        for spine in self.ax.spines.values(): spine.set_color(c["border"]); spine.set_linewidth(0.7)
         if self.cbar is not None:
-            self.cbar.ax.set_facecolor(c["axes"]); self.cbar.ax.tick_params(colors=c["muted"])
-            self.cbar.outline.set_edgecolor(c["border"])
-            for spine in self.cbar.ax.spines.values(): spine.set_color(c["border"])
+            self.cbar.ax.set_facecolor(c["axes"]); self.cbar.ax.tick_params(colors=c["muted"], labelsize=int(s.get("colorbar_tick_size", 8)), direction="in", length=2.5, width=0.6, pad=2)
+            for label in self.cbar.ax.get_yticklabels(): label.set_fontname(font)
+            offset = self.cbar.ax.yaxis.get_offset_text(); offset.set_fontsize(max(6, int(s.get("colorbar_tick_size", 8))-1)); offset.set_fontname(font); offset.set_color(c["muted"])
+            self.cbar.outline.set_edgecolor(c["border"]); self.cbar.outline.set_linewidth(0.7)
+            for spine in self.cbar.ax.spines.values(): spine.set_color(c["border"]); spine.set_linewidth(0.7)
         self.canvas.setStyleSheet(f"background:{c['canvas']};")
+
+    def _update_scalebar(self) -> None:
+        if self._scalebar_artist is not None:
+            try: self._scalebar_artist.remove()
+            except (ValueError, AttributeError): pass
+            self._scalebar_artist = None
+        s = self._display_settings
+        if not bool(s.get("show_scalebar", False)) or self.map_image is None: return
+        try:
+            pixel_um, length_um = float(s.get("pixel_size_um", 55.0)), float(s.get("scalebar_um", 2000.0))
+            if not np.isfinite(pixel_um) or not np.isfinite(length_um) or pixel_um <= 0 or length_um <= 0: return
+            size_data = length_um / pixel_um
+            xlim = self.ax.get_xlim()
+            if size_data >= abs(xlim[1] - xlim[0]) * 0.72: return
+            label = f"{length_um/1000:g} mm" if length_um >= 1000 else f"{length_um:g} µm"
+            font = FontProperties(family=str(s.get("font_family", "Segoe UI")), size=int(s.get("scalebar_font_size", 9)), weight="bold")
+            bar_color = "#f5f7fa" if self._theme == "dark" else "#263445"
+            self._scalebar_artist = AnchoredSizeBar(self.ax.transData, size_data, label, loc="lower left", pad=0.45,
+                color=bar_color, frameon=False, size_vertical=1.0, fontproperties=font, sep=3, borderpad=0.45)
+            self._scalebar_artist.set_zorder(8); self.ax.add_artist(self._scalebar_artist)
+        except (TypeError, ValueError, RuntimeError):
+            self._scalebar_artist = None
 
     @staticmethod
     def _axis_centers(values, size, name):
@@ -351,6 +398,7 @@ class MapPlotWidget(QWidget):
             self.ax.clear()
             self.ax.set_xlabel("Detector X (source pixels)")
             self.ax.set_ylabel("Detector Y (source pixels)")
+            self.ax.xaxis.set_major_locator(MaxNLocator(nbins=5, integer=True)); self.ax.yaxis.set_major_locator(MaxNLocator(nbins=5, integer=True))
             self.ax.set_aspect("equal", adjustable="box")
             self.map_image = self.ax.imshow(img, origin="lower", cmap=cmap, interpolation="nearest",
                                             extent=extent, vmin=vmin, vmax=vmax)
@@ -368,23 +416,23 @@ class MapPlotWidget(QWidget):
                 self.map_image.autoscale()
             self.ax.set_xlabel("Detector X (source pixels)")
             self.ax.set_ylabel("Detector Y (source pixels)")
+            self.ax.xaxis.set_major_locator(MaxNLocator(nbins=5, integer=True)); self.ax.yaxis.set_major_locator(MaxNLocator(nbins=5, integer=True))
             self.ax.set_aspect("equal", adjustable="box")
             self.ax.set_xlim(old_xlim)
             self.ax.set_ylim(old_ylim)
 
-        if self.cbar is None:
-            divider = make_axes_locatable(self.ax)
-            self.cax = divider.append_axes("right", size="5%", pad=0.08)
-            self.cbar = self.figure.colorbar(self.map_image, cax=self.cax)
-        else:
-            self.cbar.update_normal(self.map_image)
-        formatter = ScalarFormatter(useMathText=True)
-        formatter.set_powerlimits((0, 0))
-        self.cbar.ax.yaxis.set_major_formatter(formatter)
-        self.cbar.ax.yaxis.set_major_locator(MaxNLocator(nbins=5))
-        self._apply_axes_theme()
-        if first_draw and self.roi_btn.isChecked():
-            self._apply_current_roi_tool(active=True)
+        show_cbar = bool(self._display_settings.get("show_colorbar", True))
+        if show_cbar:
+            if self.cbar is None:
+                divider = make_axes_locatable(self.ax); self.cax = divider.append_axes("right", size="4.2%", pad=0.055)
+                self.cbar = self.figure.colorbar(self.map_image, cax=self.cax)
+            else: self.cbar.update_normal(self.map_image)
+            formatter = ScalarFormatter(useMathText=True); formatter.set_powerlimits((-3, 4))
+            self.cbar.ax.yaxis.set_major_formatter(formatter); self.cbar.ax.yaxis.set_major_locator(MaxNLocator(nbins=4))
+        elif self.cbar is not None:
+            self.cbar.remove(); self.cbar = None; self.cax = None
+        self._apply_axes_theme(); self._update_scalebar()
+        if first_draw and self.roi_btn.isChecked(): self._apply_current_roi_tool(active=True)
         self.canvas.draw_idle()
 
     @staticmethod
@@ -484,17 +532,6 @@ class MapPlotWidget(QWidget):
         return map_patches
     
 
-    # --- Авто-адаптация квадрата ---
-    def resizeEvent(self, event):
-        """
-        Перехватываем изменение размера виджета (например, работу сплиттера).
-        Динамически заставляем высоту холста Matplotlib равняться его ширине.
-        """
-        super().resizeEvent(event)
-        current_width = self.width()   # Узнаем текущую ширину виджета (которую нам выделил сплиттер)
-        # Принудительно делаем высоту холста равной его ширине (идеальный квадрат).
-        # А нижняя пружина addStretch(1) из main_layout аккуратно заберет всю оставшуюся пустоту под себя!
-        self.canvas.setFixedHeight(current_width)        
 
     # ========================================================
     # ЕДИНЫЕ ОБРАБОТЧИКИ СОБЫТИЙ МЫШИ
@@ -593,7 +630,7 @@ class MapPlotWidget(QWidget):
             x0, x1, y0, y1 = self.map_image.get_extent()
             self.ax.set_xlim(x0, x1)
             self.ax.set_ylim(y0, y1)
-            self.canvas.draw_idle()
+            self._update_scalebar(); self.canvas.draw_idle()
 
     def _on_scroll_zoom(self, event):
         """Приближение/Отдаление колесиком мыши туда, где находится курсор"""
@@ -618,7 +655,7 @@ class MapPlotWidget(QWidget):
 
         self.ax.set_xlim(new_xlim)
         self.ax.set_ylim(new_ylim)
-        self.canvas.draw_idle()
+        self._update_scalebar(); self.canvas.draw_idle()
 
 
     # ---------------------------------------------------------------------

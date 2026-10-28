@@ -1,5 +1,5 @@
 """Отображение rocking curves с компактной панелью и мышиной навигацией."""
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QSizePolicy
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
@@ -7,15 +7,17 @@ from matplotlib.ticker import MaxNLocator, ScalarFormatter
 
 from roc_mcs.gui.roi_explorer.curve_tools_widget import CurveToolsWidget
 from roc_mcs.gui.roi_explorer.theme import apply_widget_palette, theme_colors
+from roc_mcs.gui.roi_explorer.plot_display_settings import load_plot_display_settings
 
 
 class CurvePlotWidget(QWidget):
     """График кривых; подбор и вычисление данных остаются снаружи."""
+    settings_requested = pyqtSignal()
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("CurvePlotWidget")
-        self.setMinimumWidth(260)
-        self.setMinimumHeight(350)
+        self.setMinimumSize(230, 190); self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._display_settings = load_plot_display_settings()["curve"]
         self._pan_active = False
         self._pan_start_px = None
         self._pan_start_xlim = None
@@ -30,6 +32,7 @@ class CurvePlotWidget(QWidget):
         layout.setSpacing(0)
         self.toolbar = CurveToolsWidget(self)
         self.toolbar.reset_view_requested.connect(self.reset_view)
+        self.toolbar.settings_requested.connect(self.settings_requested.emit)
         layout.addWidget(self.toolbar)
         self.header_widget = QWidget(self)
         self.header_widget.setFixedHeight(24)
@@ -43,7 +46,7 @@ class CurvePlotWidget(QWidget):
 
         self._theme = "light"
         self.figure = Figure(figsize=(5, 5), facecolor=theme_colors(self._theme)["canvas"])
-        self.canvas = FigureCanvasQTAgg(self.figure); self.canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.canvas = FigureCanvasQTAgg(self.figure); self.canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.ax = self.figure.add_subplot(1, 1, 1)
         self.ax.set_facecolor(theme_colors(self._theme)["axes"])
         # Художники переиспользуются: во время ROI-preview не очищаем Axes и не мигаем.
@@ -58,15 +61,19 @@ class CurvePlotWidget(QWidget):
         self.coord_label.setObjectName("MapCoordLabel")
         self.coord_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self.coord_label.setStyleSheet("QLabel#MapCoordLabel { font-family: monospace; font-size: 10px; font-weight: 600; color: palette(window-text); padding: 2px 5px; background: transparent; }")
-        layout.addWidget(self.canvas)
+        layout.addWidget(self.canvas, 1)
         layout.addWidget(self.coord_label)
-        layout.addStretch(1)
         self.canvas.mpl_connect("button_press_event", self._on_mouse_press)
         self.canvas.mpl_connect("button_release_event", self._on_mouse_release)
         self.canvas.mpl_connect("motion_notify_event", self._on_mouse_move)
         self.canvas.mpl_connect("scroll_event", self._on_scroll_zoom)
         self.canvas.mpl_connect("axes_leave_event", self._on_axes_leave)
         self._style_axes()
+        self.apply_display_settings(self._display_settings)
+
+    def apply_display_settings(self, settings: dict | None = None) -> None:
+        if settings is not None: self._display_settings = dict(settings)
+        self._style_axes(); self.canvas.draw_idle()
 
     def apply_theme(self, theme: str | None = None) -> None:
         self._theme = str(theme or self._theme).lower()
@@ -83,22 +90,16 @@ class CurvePlotWidget(QWidget):
         self.canvas.draw_idle()
 
     def _style_axes(self) -> None:
-        c = theme_colors(self._theme)
-        self.ax.set_xlabel("θ", fontsize=9, color=c["text"], labelpad=4)
-        self.ax.set_ylabel("Intensity", fontsize=9, color=c["text"], labelpad=5)
-        self.ax.grid(True, which="major", color=c["grid"], linewidth=0.6, alpha=0.25)
-        self.ax.tick_params(axis="both", colors=c["muted"], labelsize=8, direction="out", length=3, width=0.6)
-        for spine in self.ax.spines.values():
-            spine.set_color(c["border"]); spine.set_linewidth(0.7)
-        self.ax.yaxis.set_major_locator(MaxNLocator(nbins=4))
-        self.ax.yaxis.set_major_formatter(ScalarFormatter(useMathText=True))
-        self.ax.ticklabel_format(axis="y", style="sci", scilimits=(0, 0))
+        c = theme_colors(self._theme); s = self._display_settings; font = str(s.get("font_family", "Segoe UI"))
+        self.ax.set_xlabel("θ", fontsize=int(s.get("label_size", 9)), color=c["text"], labelpad=4, fontname=font)
+        self.ax.set_ylabel("Intensity", fontsize=int(s.get("label_size", 9)), color=c["text"], labelpad=5, fontname=font)
+        self.ax.grid(bool(s.get("show_grid", True)), which="major", color=c["grid"], linewidth=0.55, alpha=0.22)
+        self.ax.tick_params(axis="both", colors=c["muted"], labelsize=int(s.get("tick_size", 8)), direction="in", length=3, width=0.6, pad=3)
+        for label in (*self.ax.get_xticklabels(), *self.ax.get_yticklabels()): label.set_fontname(font)
+        for spine in self.ax.spines.values(): spine.set_color(c["border"]); spine.set_linewidth(0.7)
+        self.ax.yaxis.set_major_locator(MaxNLocator(nbins=4)); self.ax.yaxis.set_major_formatter(ScalarFormatter(useMathText=True)); self.ax.ticklabel_format(axis="y", style="sci", scilimits=(0, 0))
         self.ax.xaxis.set_major_formatter(ScalarFormatter(useOffset=False))
-        # self.ax.yaxis.get_offset_text().set_fontsize(8)
-        scale_label = self.ax.yaxis.get_offset_text()
-        scale_label.set_fontsize(8)
-        scale_label.set_color(c["muted"])
-        scale_label.set_verticalalignment("bottom")        
+        scale_label = self.ax.yaxis.get_offset_text(); scale_label.set_fontsize(max(6, int(s.get("tick_size", 8))-1)); scale_label.set_fontname(font); scale_label.set_color(c["muted"]); scale_label.set_verticalalignment("bottom")
 
     @staticmethod
     def _left_click_picker(artist, mouseevent):
@@ -248,7 +249,3 @@ class CurvePlotWidget(QWidget):
     def _on_axes_leave(self, event) -> None:
         if not self._pan_active: self.coord_label.clear()
 
-    def resizeEvent(self, event) -> None:
-        super().resizeEvent(event)
-        # Совпадает с картой: квадратный холст и одинаковые строки над/под графиком.
-        self.canvas.setFixedHeight(max(120, self.width()))
