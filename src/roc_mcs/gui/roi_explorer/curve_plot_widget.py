@@ -13,6 +13,7 @@ from roc_mcs.gui.roi_explorer.plot_display_settings import load_plot_display_set
 class CurvePlotWidget(QWidget):
     """График кривых; подбор и вычисление данных остаются снаружи."""
     settings_requested = pyqtSignal()
+    theta_guide_toggled = pyqtSignal(bool)
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("CurvePlotWidget")
@@ -33,6 +34,7 @@ class CurvePlotWidget(QWidget):
         self.toolbar = CurveToolsWidget(self)
         self.toolbar.reset_view_requested.connect(self.reset_view)
         self.toolbar.settings_requested.connect(self.settings_requested.emit)
+        self.toolbar.theta_guide_toggled.connect(self.theta_guide_toggled.emit)
         layout.addWidget(self.toolbar)
         self.header_widget = QWidget(self)
         self.header_widget.setFixedHeight(24)
@@ -54,6 +56,8 @@ class CurvePlotWidget(QWidget):
         self._preview_artist = None
         self._pixel_artist = None
         self._empty_artist = None
+        self._theta_guide_value = None
+        self._theta_guide_artist = self.ax.axvline(0, color="#d99b25", linewidth=1.15, linestyle=(0,(3,2)), alpha=0.95, zorder=6, visible=False)
         self.figure.subplots_adjust(left=0.17, right=0.985, bottom=0.15, top=0.89)              # отступы Figure
         self.cbar = None
         self.map_image = None
@@ -108,11 +112,20 @@ class CurvePlotWidget(QWidget):
             return False, {}
         return artist.contains(mouseevent)
 
+    def set_theta_guide(self, theta_value: float | None) -> None:
+        """Показывает вертикальную направляющую выбранного угла θ без изменения масштаба."""
+        self._theta_guide_value = float(theta_value) if theta_value is not None else None
+        if self._theta_guide_value is None: self._theta_guide_artist.set_visible(False)
+        else: self._theta_guide_artist.set_xdata([self._theta_guide_value,self._theta_guide_value]); self._theta_guide_artist.set_visible(True)
+        self.canvas.draw_idle()
+
     def draw_curves(self, curves_data: list, preview_data: dict = None, *, pixel_data: dict = None,
-                    view_label: str | None = None, fit_view: bool = False) -> dict:
-        """Обновляет линии на месте; полный автоподбор только по запросу или при первом выводе."""
+                    view_label: str | None = None, fit_view: bool = False, fit_y: bool = False, theta_guide: float | None = None) -> dict:
+        """Обновляет линии на месте; во время preview подбирает Y, сохраняя ручной X-зум."""
         previous_xlim = self.ax.get_xlim() if self._view_initialized else None
         previous_ylim = self.ax.get_ylim() if self._view_initialized else None
+        self._theta_guide_value = float(theta_guide) if theta_guide is not None else None
+        self._theta_guide_artist.set_visible(False)
         title = f"Rocking curves · {view_label}" if view_label else "Rocking curves"
         if self.header_label.text() != title:
             self.header_label.setText(title)
@@ -182,10 +195,13 @@ class CurvePlotWidget(QWidget):
             self.ax.set_autoscalex_on(True); self.ax.set_autoscaley_on(True)
             self.ax.relim(); self.ax.autoscale_view()
             self._base_xlim, self._base_ylim = self.ax.get_xlim(), self.ax.get_ylim()
+            live_ylim=self.ax.get_ylim()
             if previous_xlim is not None and previous_ylim is not None and not fit_view:
-                self.ax.set_xlim(previous_xlim); self.ax.set_ylim(previous_ylim)
+                self.ax.set_xlim(previous_xlim)
+                self.ax.set_ylim(live_ylim if (fit_y and preview_data) else previous_ylim)
             self._view_initialized = True
-
+        if self._theta_guide_value is not None:
+            self._theta_guide_artist.set_xdata([self._theta_guide_value,self._theta_guide_value]); self._theta_guide_artist.set_visible(True)
         self.canvas.draw_idle()
         return curve_lines
 

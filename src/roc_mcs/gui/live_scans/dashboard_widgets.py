@@ -48,7 +48,7 @@ class RocMapWidget(pg.PlotWidget):
         self.load_view.setZValue(100)
         # 2. Включаем уже существующую правую ось (вместо создания новой)
         self.showAxis('right')
-        right_axis = self.getAxis('right')
+        right_axis = self.getAxis('right'); self._load_metric = "force"
         right_axis.linkToView(self.load_view)
         
         # 3. Синхронизируем ось X нового слоя с основной рок-картой
@@ -78,6 +78,13 @@ class RocMapWidget(pg.PlotWidget):
         self._y_min = 0.0
         self._y_max = 1.0
 
+    def apply_theme(self, theme: str) -> None:
+        dark = str(theme).lower() == "dark"; bg = (16, 20, 28) if dark else (245, 247, 250); fg = "#e2e8f0" if dark else "#263445"; grid = "#344255" if dark else "#cbd5e1"
+        self.setBackground(bg); self.setTitle("ROC-карта", color=fg)
+        for name in ("left", "bottom", "right"):
+            axis = self.getAxis(name); axis.setPen(pg.mkPen(grid)); axis.setTextPen(pg.mkPen(fg))
+        metric = getattr(self, "_load_metric", "force"); self.getAxis("right").setLabel("Давление" if metric == "pressure" else "Сила", units="МПа" if metric == "pressure" else "кг", color="#ff6464")
+
     def _update_load_view_geometry(self):
         """Гарантирует, что слой нагрузки всегда совпадает по размерам с рок-картой."""
         self.load_view.setGeometry(self.getPlotItem().vb.sceneBoundingRect())
@@ -85,6 +92,7 @@ class RocMapWidget(pg.PlotWidget):
 
     def set_load_data(self, time_s: np.ndarray, values: np.ndarray, metric: str = "force"):
         """Отрисовывает нагрузку или давление на правой оси."""
+        self._load_metric = metric
         if metric == "pressure":
             self.getAxis("right").setLabel("Давление", units="МПа", color="#ff6464")
         else:
@@ -190,7 +198,7 @@ class CurveCardWidget(QtWidgets.QWidget):
     def __init__(self, parent=None, compact: bool = False):
         super().__init__(parent=parent)
         self.compact = compact
-        self._active = False
+        self._active = False; self._theme = "dark"
 
         card_h = 160 if not compact else 150
         self.setSizePolicy(
@@ -265,14 +273,18 @@ class CurveCardWidget(QtWidgets.QWidget):
                 return True
         return super().eventFilter(obj, event)
 
+    def apply_theme(self, theme: str) -> None:
+        self._theme = "dark" if str(theme).lower() == "dark" else "light"
+        fg = "rgba(235,240,248,210)" if self._theme == "dark" else "rgba(38,52,69,230)"
+        bg = (18, 20, 26) if self._theme == "dark" else (255, 255, 255)
+        self._title.setStyleSheet(f"color:{fg}; font-size:10px; font-weight:500;"); self._plot.setBackground(bg); self._apply_style(self._active)
+
     def _apply_style(self, active: bool) -> None:
         # одинаковая толщина рамки всегда, меняем только цвет/фон
-        if active:
-            border = "1px solid rgba(255, 215, 120, 190)"
-            bg = "rgba(255,255,255,15)"
+        if self._theme == "dark":
+            border, bg = (("1px solid rgba(255,215,120,190)", "rgba(255,255,255,15)") if active else ("1px solid rgba(145,160,180,55)", "rgba(255,255,255,8)"))
         else:
-            border = "1px solid rgba(145,160,180,55)"
-            bg = "rgba(255,255,255,8)"
+            border, bg = (("1px solid rgba(82,127,168,220)", "rgba(50,80,110,18)") if active else ("1px solid rgba(120,135,150,95)", "rgba(30,50,70,5)"))
 
         self.setStyleSheet(
             f"""
@@ -355,6 +367,7 @@ class FilmstripWidget(QtWidgets.QWidget):
 
     def __init__(self, parent=None, radius: int = 2):
         super().__init__(parent=parent)
+        self._theme = "dark"
         self._cards: list[CurveCardWidget] = []
         self._hover_index = None
 
@@ -394,10 +407,19 @@ class FilmstripWidget(QtWidgets.QWidget):
         self._scroll.viewport().setMouseTracking(True)
         self._scroll.viewport().installEventFilter(self)
 
+    def apply_theme(self, theme: str) -> None:
+        self._theme = "dark" if str(theme).lower() == "dark" else "light"
+        if self._theme == "dark":
+            scroll_style = "QScrollArea{background:transparent;} QScrollBar:horizontal{background:rgba(255,255,255,10);height:14px;margin:2px 18px;border-radius:7px;} QScrollBar::handle:horizontal{background:rgba(255,255,255,75);min-width:40px;border-radius:7px;} QScrollBar::handle:horizontal:hover{background:rgba(255,255,255,105);} QScrollBar::add-line:horizontal,QScrollBar::sub-line:horizontal{width:0;background:none;} QScrollBar::add-page:horizontal,QScrollBar::sub-page:horizontal{background:transparent;}"
+        else:
+            scroll_style = "QScrollArea{background:transparent;} QScrollBar:horizontal{background:rgba(30,50,70,12);height:14px;margin:2px 18px;border-radius:7px;} QScrollBar::handle:horizontal{background:rgba(70,90,110,75);min-width:40px;border-radius:7px;} QScrollBar::handle:horizontal:hover{background:rgba(70,90,110,115);} QScrollBar::add-line:horizontal,QScrollBar::sub-line:horizontal{width:0;background:none;} QScrollBar::add-page:horizontal,QScrollBar::sub-page:horizontal{background:transparent;}"
+        self._scroll.setStyleSheet(scroll_style)
+        for card in self._cards: card.apply_theme(self._theme)
+
     def sync_cards(self, n: int) -> None:
         while len(self._cards) < n:
             idx = len(self._cards)
-            plot = CurveCardWidget(self._content)
+            plot = CurveCardWidget(self._content); plot.apply_theme(self._theme)
             # Внимание: тут карточки не крутят скролл сами, они только сигналят
             plot.sigClicked.connect(lambda i=idx: self.sigIndexClicked.emit(i))
             plot.sigHovered.connect(lambda i=idx: self._on_card_hovered(i))
@@ -514,7 +536,7 @@ class MetricsPlotWidget(pg.GraphicsLayoutWidget):
     """Динамика параметров профиля без подмены отсутствующих данных."""
     def __init__(self, parent=None):
         super().__init__(parent=parent)
-        self.setBackground((16, 20, 28))
+        self._theme = "dark"; self.setBackground((16, 20, 28))
         self._processed_count = 0
         self._cache_area, self._cache_centroid = [], []
         self._cache_fwhm, self._cache_peak = [], []
@@ -538,6 +560,15 @@ class MetricsPlotWidget(pg.GraphicsLayoutWidget):
         self.curve_fwhm, self.curve_area, self.curve_theta, self.curve_centroid = self._curves
         for plot in self._plots[1:]: plot.setXLink(self.plot_fwhm)
         self.set_axis_units("отн. ед. s", False)
+
+    def apply_theme(self, theme: str) -> None:
+        self._theme = "dark" if str(theme).lower() == "dark" else "light"; dark = self._theme == "dark"
+        bg = (16, 20, 28) if dark else (245, 247, 250); fg = "#c7d2e0" if dark else "#263445"; grid = "#344255" if dark else "#cbd5e1"
+        self.setBackground(bg)
+        labels = ("Ширина FWHM", "Площадь профиля", "Положение пика", "Центроид")
+        for plot, label in zip(self._plots, labels):
+            plot.setTitle(label, color=fg, size="9pt")
+            for name in ("left", "bottom"): plot.getAxis(name).setPen(pg.mkPen(grid)); plot.getAxis(name).setTextPen(pg.mkPen(fg))
 
     def set_axis_units(self, unit: str, calibrated: bool) -> None:
         axis_unit = unit if calibrated else "отн. ед. s"

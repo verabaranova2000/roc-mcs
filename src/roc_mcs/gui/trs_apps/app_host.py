@@ -1,23 +1,30 @@
 """Единая оболочка TRS Apps: запуск модулей, вкладки и два split-пространства."""
 from __future__ import annotations
 from pathlib import Path
-from PyQt6 import QtCore, QtWidgets
+from PyQt6 import QtCore, QtGui, QtWidgets
+from roc_mcs.gui.app_settings import load_settings, save_settings
 from roc_mcs.gui.components.icon_provider import resource_svg_icon, set_icon_theme
 from .app_registry import APP_BY_KEY
 from .app_rail import AppLauncherRail
 from .workspace import AppPane
 from .window_chrome import ChromeSurface, WindowTitleBar
+from .global_settings_dialog import TRSGlobalSettingsDialog
+
+_THEME = {
+    "dark": {"window": "#11151b", "surface": "#171c24", "text": "#d8e0ec", "muted": "#98a5b6", "border": "#303744", "hover": "#2a313d", "selected": "#27394d", "accent": "#8da9c7", "base": "#151c27", "tab_text": "#9eabba"},
+    "light": {"window": "#f5f7fa", "surface": "#e8edf3", "text": "#263445", "muted": "#64748b", "border": "#cbd5e1", "hover": "#dfe7f0", "selected": "#d6e6f5", "accent": "#527fa8", "base": "#ffffff", "tab_text": "#526276"},
+}
 
 class TRSAppsWindow(QtWidgets.QMainWindow):
     def __init__(self, parent=None):
-        super().__init__(parent); self.setObjectName("trsAppsWindow"); self.setWindowTitle("TRS Apps"); self.setWindowIcon(resource_svg_icon("trs_apps.svg", size=32, color="#d8e0ec"))
+        super().__init__(parent); self.setObjectName("trsAppsWindow"); self.setWindowTitle("TRS Apps")
         self.setWindowFlags(QtCore.Qt.WindowType.Window | QtCore.Qt.WindowType.FramelessWindowHint)
-        app = QtWidgets.QApplication.instance()
-        if app is not None: app.setProperty("rocMcsTheme", "dark"); set_icon_theme(app, "#d8e0ec")
+        app = QtWidgets.QApplication.instance(); self._system_palette = QtGui.QPalette(app.palette()) if app is not None else QtGui.QPalette()
+        self._settings = load_settings(); self._configure_app_from_settings(self._settings)
         self._active_pane = None; self._target_pane = None; self._split = False
         self._surface = ChromeSurface(self); self.setCentralWidget(self._surface)
         outer = QtWidgets.QVBoxLayout(self._surface.frame); outer.setContentsMargins(0,0,0,0); outer.setSpacing(0)
-        self.title_bar = WindowTitleBar(self, lambda: self.set_split(QtCore.Qt.Orientation.Horizontal), lambda: self.set_split(QtCore.Qt.Orientation.Vertical), self.unsplit, self._surface.frame); outer.addWidget(self.title_bar)
+        self.title_bar = WindowTitleBar(self, lambda: self.set_split(QtCore.Qt.Orientation.Horizontal), lambda: self.set_split(QtCore.Qt.Orientation.Vertical), self.unsplit, self.open_global_settings, self._surface.frame); outer.addWidget(self.title_bar)
         body = QtWidgets.QWidget(self._surface.frame); body.setObjectName("appBody"); row = QtWidgets.QHBoxLayout(body); row.setContentsMargins(0,0,0,0); row.setSpacing(0); outer.addWidget(body,1)
         self.rail = AppLauncherRail(body); row.addWidget(self.rail)
         self.pane_splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal, body); self.pane_splitter.setObjectName("workspaceSplitter"); self.pane_splitter.setChildrenCollapsible(False); self.pane_splitter.setHandleWidth(4); row.addWidget(self.pane_splitter,1)
@@ -26,38 +33,81 @@ class TRSAppsWindow(QtWidgets.QMainWindow):
         self.pane_splitter.addWidget(self.pane_a); self.pane_splitter.addWidget(self.pane_b); self.pane_b.hide(); self._active_pane = self.pane_a; self._target_pane = self.pane_a
         self.pane_splitter.setSizes([1200, 0])
         self.status_label = QtWidgets.QLabel("Готово · выберите приложение слева", self._surface.frame); self.status_label.setObjectName("appStatus"); self.status_label.setMinimumHeight(22); outer.addWidget(self.status_label)
-        for pane in (self.pane_a, self.pane_b):
-            pane.activated.connect(self._activate_pane); pane.closeRequested.connect(self._close_tab)
-        self.rail.appRequested.connect(self.open_app)
-        self._apply_theme(); self._fit_window()
-        if app is not None:
-            app.focusChanged.connect(self._on_focus_changed); app.installEventFilter(self)
+        for pane in (self.pane_a, self.pane_b): pane.activated.connect(self._activate_pane); pane.closeRequested.connect(self._close_tab)
+        self.rail.appRequested.connect(self.open_app); self._apply_theme(); self._fit_window()
+        if app is not None: app.focusChanged.connect(self._on_focus_changed); app.installEventFilter(self)
         self.status_label.setText("Готово · выберите приложение слева")
+
+    def _configure_app_from_settings(self, settings: dict) -> None:
+        app = QtWidgets.QApplication.instance(); mode = str(settings.get("theme", "dark")).lower()
+        if mode not in ("dark", "light", "system"): mode = "dark"
+        palette = QtGui.QPalette(self._system_palette)
+        active = mode if mode in ("dark", "light") else ("dark" if palette.color(QtGui.QPalette.ColorRole.Window).lightnessF() < 0.5 else "light")
+        size = max(12, min(20, self._safe_icon_size(settings.get("icon_size", 16))))
+        self._settings = dict(settings); self._theme_mode = mode; self._active_theme = active; self._icon_size = size
+        if app is None: return
+        colors = _THEME[active]; app.setProperty("rocMcsThemeMode", mode); app.setProperty("rocMcsTheme", active); app.setProperty("rocMcsIconSize", size)
+        roles = {QtGui.QPalette.ColorRole.Window: colors["window"], QtGui.QPalette.ColorRole.WindowText: colors["text"], QtGui.QPalette.ColorRole.Base: colors["base"], QtGui.QPalette.ColorRole.AlternateBase: colors["surface"], QtGui.QPalette.ColorRole.Text: colors["text"], QtGui.QPalette.ColorRole.Button: colors["surface"], QtGui.QPalette.ColorRole.ButtonText: colors["text"], QtGui.QPalette.ColorRole.Highlight: colors["selected"], QtGui.QPalette.ColorRole.HighlightedText: colors["text"], QtGui.QPalette.ColorRole.ToolTipBase: colors["surface"], QtGui.QPalette.ColorRole.ToolTipText: colors["text"], QtGui.QPalette.ColorRole.Mid: colors["border"]}
+        for role, value in roles.items(): palette.setColor(role, QtGui.QColor(value))
+        app.setPalette(palette); set_icon_theme(app, colors["text"])
+
+    @staticmethod
+    def _safe_icon_size(value) -> int:
+        try: return int(value)
+        except (TypeError, ValueError, OverflowError): return 16
+
     def _apply_theme(self):
-        self.setStyleSheet("""
-        QMainWindow#trsAppsWindow, QWidget#chromeSurface { background:#11151b; color:#d8e0ec; }
-        QWidget#chromeFrame { background:#11151b; border:1px solid #303744; border-radius:4px; }
-        QWidget#trsTitleBar { background:#171c24; border-bottom:1px solid #2b323e; }
-        QLabel#appBrand { color:#e1e7f0; font-size:10pt; font-weight:600; }
-        QToolButton#chromeToolButton, QToolButton#windowControl, QToolButton#windowControlDanger { background:transparent; color:#cbd5e1; border:0; border-radius:4px; }
-        QToolButton#chromeToolButton:hover, QToolButton#windowControl:hover { background:#2a313d; }
-        QToolButton#windowControlDanger:hover { background:#8b343b; color:white; border:0; border-radius:4px; }
-        QWidget#appBody { background:#11151b; color:#d8e0ec; }
-        QWidget#appLauncherRail { background:#171c24; border-right:1px solid #2b323e; }
-        QToolButton#appRailButton { background:transparent; border:1px solid transparent; border-radius:5px; padding:3px; }
-        QToolButton#appRailButton:hover { background:#252d39; }
-        QToolButton#appRailButton:checked { background:#27394d; border:1px solid #3b536d; }
-        QToolButton#appRailButton[planned="true"] { color:#7c8797; }
-        QFrame#railSeparator { background:#343c48; border:0; }
-        QSplitter#workspaceSplitter::handle { background:#2b323e; }
-        QTabWidget#appTabs::pane { border:0; background:#11151b; top:0; }
-        QTabWidget#appTabs QTabBar { background:#171c24; }
-        QTabWidget#appTabs QTabBar::tab { background:#171c24; color:#9eabba; padding:8px 13px; border:0; border-right:1px solid #2b323e; min-width:85px; }
-        QTabWidget#appTabs QTabBar::tab:selected { background:#11151b; color:#e5ebf4; border-top:2px solid #8da9c7; padding-top:6px; }
-        QTabWidget#appTabs QTabBar::tab:hover:!selected { background:#202733; color:#d8e0ec; }
-        QLabel#workspaceEmpty { background:#11151b; color:#778395; font-size:10pt; padding:24px; }
-        QLabel#appStatus { background:#171c24; color:#98a5b6; border-top:1px solid #2b323e; padding:3px 9px; }
+        c = _THEME[self._active_theme]
+        self.setWindowIcon(resource_svg_icon("trs_apps.svg", size=32, color=c["text"]))
+        self.setStyleSheet(f"""
+        QMainWindow#trsAppsWindow, QWidget#chromeSurface {{ background:{c['window']}; color:{c['text']}; }}
+        QWidget#chromeFrame {{ background:{c['window']}; border:1px solid {c['border']}; border-radius:4px; }}
+        QWidget#trsTitleBar {{ background:{c['surface']}; border-bottom:1px solid {c['border']}; }}
+        QLabel#appBrand {{ color:{c['text']}; font-size:10pt; font-weight:600; }}
+        QToolButton#chromeToolButton, QToolButton#windowControl, QToolButton#windowControlDanger {{ background:transparent; color:{c['text']}; border:0; border-radius:4px; }}
+        QToolButton#chromeToolButton:hover, QToolButton#windowControl:hover {{ background:{c['hover']}; }}
+        QToolButton#windowControlDanger:hover {{ background:#8b343b; color:white; border:0; border-radius:4px; }}
+        QWidget#appBody {{ background:{c['window']}; color:{c['text']}; }}
+        QWidget#appLauncherRail {{ background:{c['surface']}; border-right:1px solid {c['border']}; }}
+        QToolButton#appRailButton {{ background:transparent; border:1px solid transparent; border-radius:5px; padding:3px; }}
+        QToolButton#appRailButton:hover {{ background:{c['hover']}; }}
+        QToolButton#appRailButton:checked {{ background:{c['selected']}; border:1px solid {c['accent']}; }}
+        QToolButton#appRailButton[planned="true"] {{ color:{c['muted']}; }}
+        QFrame#railSeparator {{ background:{c['border']}; border:0; }}
+        QSplitter#workspaceSplitter::handle {{ background:{c['border']}; }}
+        QTabWidget#appTabs::pane {{ border:0; background:{c['window']}; top:0; }}
+        QTabWidget#appTabs QTabBar {{ background:{c['surface']}; }}
+        QTabWidget#appTabs QTabBar::tab {{ background:{c['surface']}; color:{c['tab_text']}; padding:8px 13px; border:0; border-right:1px solid {c['border']}; min-width:85px; }}
+        QTabWidget#appTabs QTabBar::tab:selected {{ background:{c['window']}; color:{c['text']}; border-top:2px solid {c['accent']}; padding-top:6px; }}
+        QTabWidget#appTabs QTabBar::tab:hover:!selected {{ background:{c['hover']}; color:{c['text']}; }}
+        QLabel#workspaceEmpty {{ background:{c['window']}; color:{c['muted']}; font-size:10pt; padding:24px; }}
+        QLabel#appStatus {{ background:{c['surface']}; color:{c['muted']}; border-top:1px solid {c['border']}; padding:3px 9px; }}
         """)
+        self.title_bar.apply_theme(c["text"], self._icon_size); self.rail.apply_theme(c["text"], self._icon_size)
+        for pane, index, page in self._all_pages():
+            spec = APP_BY_KEY.get(page.property("trsAppKey"));
+            if spec: pane.tabs.setTabIcon(index, resource_svg_icon(spec.icon, size=self._icon_size, color=c["text"]))
+        for button in self.findChildren(QtWidgets.QAbstractButton):
+            if not button.icon().isNull(): button.setIconSize(QtCore.QSize(self._icon_size, self._icon_size))
+
+    def _apply_global_settings_to_pages(self, settings: dict) -> None:
+        colors = _THEME[self._active_theme]
+        for _pane, _index, page in self._all_pages():
+            set_icon_theme(page, colors["text"]); page.setProperty("rocMcsTheme", self._active_theme)
+            method = getattr(page, "apply_global_settings", None)
+            if callable(method): method(settings)
+            for button in page.findChildren(QtWidgets.QAbstractButton):
+                if not button.icon().isNull(): button.setIconSize(QtCore.QSize(self._icon_size, self._icon_size))
+
+    def open_global_settings(self) -> None:
+        dialog = TRSGlobalSettingsDialog(load_settings(), self)
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted: return
+        merged = load_settings(); merged.update(dialog.values())
+        try: save_settings(merged)
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, "Не удалось сохранить настройки", f"settings.json не изменён.\n\n{exc}"); return
+        self._configure_app_from_settings(merged); self._apply_theme(); self._apply_global_settings_to_pages(merged)
+        self.status_label.setText("Глобальные настройки TRS Apps применены")
     def _fit_window(self):
         screen = QtWidgets.QApplication.primaryScreen(); area = screen.availableGeometry() if screen else QtCore.QRect(0,0,1400,900)
         width, height = min(1440, max(800, area.width()-50)), min(920, max(600, area.height()-60))
@@ -101,9 +151,14 @@ class TRSAppsWindow(QtWidgets.QMainWindow):
         target = self._target_pane if self._split and self._target_pane is self.pane_b and self.pane_b.count() == 0 else self._active_pane
         page, title = self._create_app(key)
         if page is None: self._sync_active_rail(); return
-        page.setProperty("trsAppKey", key)
-        icon = resource_svg_icon(spec.icon, size=16, color="#d8e0ec")
+        page.setProperty("trsAppKey", key); page.setProperty("rocMcsTheme", self._active_theme)
+        set_icon_theme(page, _THEME[self._active_theme]["text"])
+        method = getattr(page, "apply_global_settings", None)
+        if callable(method): method(self._settings)
+        icon = resource_svg_icon(spec.icon, size=self._icon_size, color=_THEME[self._active_theme]["text"])
         index = target.add_page(page, title, icon, select=True); target.tabs.setTabToolTip(index, spec.description)
+        for button in page.findChildren(QtWidgets.QAbstractButton):
+            if not button.icon().isNull(): button.setIconSize(QtCore.QSize(self._icon_size, self._icon_size))
         self._activate_pane(target); self.status_label.setText(f"Открыто: {title}")
     def _create_app(self, key: str):
         if key == "live_scans":

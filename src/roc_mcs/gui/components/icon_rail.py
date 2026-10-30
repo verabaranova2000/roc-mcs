@@ -13,7 +13,7 @@ class IconRail(QtWidgets.QWidget):
         super().__init__(parent)
         self.setObjectName("navRail")
         self.setFixedWidth(44)
-        self._buttons: dict[str, QtWidgets.QToolButton] = {}
+        self._buttons: dict[str, QtWidgets.QToolButton] = {}; self._icon_names: dict[str, str] = {}
         self._group = QtWidgets.QButtonGroup(self); self._group.setExclusive(True)
         layout = QtWidgets.QVBoxLayout(self); layout.setContentsMargins(4, 6, 4, 6); layout.setSpacing(5)
         for key, icon_name, label, enabled in items:
@@ -23,8 +23,13 @@ class IconRail(QtWidgets.QWidget):
             button.setToolTip(label); button.setAccessibleName(label); button.setAccessibleDescription(label)
             button.setEnabled(bool(enabled)); button.setProperty("sectionKey", key)
             button.clicked.connect(lambda checked=False, k=key: self.sectionSelected.emit(k) if checked else None)
-            self._group.addButton(button); self._buttons[key] = button; layout.addWidget(button)
+            self._group.addButton(button); self._buttons[key] = button; self._icon_names[key] = icon_name; layout.addWidget(button)
         layout.addStretch(1)
+
+    def apply_theme(self, foreground: str, icon_size: int = 18) -> None:
+        size = max(12, min(20, int(icon_size)))
+        for key, button in self._buttons.items():
+            button.setIcon(resource_svg_icon(self._icon_names[key], widget=button, size=size, color=foreground)); button.setIconSize(QtCore.QSize(size, size))
 
     def set_current(self, key: str) -> None:
         button = self._buttons.get(key)

@@ -14,6 +14,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "experiments_dir": "",
     "mcs_temp_dir": "",
     "mcs32_exe": "",
+    "theme": "dark",
+    "icon_size": 16,
 }
 
 

@@ -1,6 +1,6 @@
 """Панель инструментов карты; вычислительная логика остаётся в MapPlotWidget."""
 from PyQt6.QtWidgets import (QApplication, QWidget, QHBoxLayout, QVBoxLayout, QGridLayout, QComboBox,
-    QDoubleSpinBox, QPushButton, QLabel, QToolButton, QMenu, QWidgetAction, QSpinBox)
+    QDoubleSpinBox, QPushButton, QLabel, QToolButton, QMenu, QWidgetAction, QSpinBox, QDialog, QSizePolicy)
 from PyQt6.QtGui import QIcon, QPixmap, QPainter, QLinearGradient, QColor, QActionGroup, QPen, QPolygon, QPalette
 from PyQt6.QtCore import QSize, Qt, QRectF, QLineF, pyqtSignal, QPointF, QPoint
 
@@ -63,7 +63,7 @@ class MapToolsWidget(QWidget):
     def __init__(self, roi_tools_config: dict, current_roi_type: str, smart_dropdown_cls, range_slider_cls, parent=None):
         super().__init__(parent)
         self.roi_tools_config = roi_tools_config
-        self.current_roi_type = current_roi_type
+        self.current_roi_type = current_roi_type; self._theme = "light"
         self.smart_dropdown_cls = smart_dropdown_cls
         self.range_slider_cls = range_slider_cls
         self.setObjectName("MapToolBar")
@@ -86,38 +86,36 @@ class MapToolsWidget(QWidget):
         self.pin_roi_btn.clicked.connect(self.pin_roi_requested.emit)
         layout.addWidget(self.pin_roi_btn)
         layout.addStretch(1)
-        self.cmap_btn = QToolButton(self)
-        self.cmap_btn.setIcon(self._create_cmap_icon())
-        self.cmap_btn.setToolTip("Select colormap")
+        # Контраст вынесен из узкой панели в отдельный немодальный диалог.
+        self.contrast_dialog = QDialog(self, Qt.WindowType.Tool); self.contrast_dialog.setObjectName("mapContrastDialog")
+        self.contrast_dialog.setWindowTitle("Контраст и цветовая карта"); self.contrast_dialog.setMinimumWidth(310); self.contrast_dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
+        dialog_layout = QGridLayout(self.contrast_dialog); dialog_layout.setContentsMargins(10, 9, 10, 9); dialog_layout.setHorizontalSpacing(7); dialog_layout.setVerticalSpacing(6)
+        self.low_pct = QDoubleSpinBox(self.contrast_dialog); self.high_pct = QDoubleSpinBox(self.contrast_dialog)
+        for spin, value in ((self.low_pct, 1.0), (self.high_pct, 99.0)):
+            spin.setRange(0, 100); spin.setDecimals(1); spin.setValue(value); spin.setSuffix("%"); spin.setFixedWidth(72); spin.setFixedHeight(24)
+            spin.setButtonSymbols(QDoubleSpinBox.ButtonSymbols.NoButtons); spin.setAlignment(Qt.AlignmentFlag.AlignCenter); spin.setKeyboardTracking(False)
+            spin.setStyleSheet("QDoubleSpinBox{background:palette(base);color:palette(text);border:1px solid palette(mid);border-radius:3px;padding:1px 4px;selection-background-color:palette(highlight);selection-color:palette(highlighted-text);}")
+        dialog_layout.addWidget(QLabel("Мин.", self.contrast_dialog), 0, 0); dialog_layout.addWidget(self.low_pct, 0, 1)
+        dialog_layout.addWidget(QLabel("Макс.", self.contrast_dialog), 0, 2); dialog_layout.addWidget(self.high_pct, 0, 3)
+        self.auto_contrast_btn = QToolButton(self.contrast_dialog); self.auto_contrast_btn.setText("A"); self.auto_contrast_btn.setToolTip("Автоконтраст: 1–99-й процентили")
+        self.auto_contrast_btn.setStyleSheet("font-weight:bold;color:palette(highlight);min-width:28px;min-height:24px;")
+        dialog_layout.addWidget(self.auto_contrast_btn, 1, 0)
+        self.cmap_btn = QToolButton(self.contrast_dialog); self.cmap_btn.setIcon(self._create_cmap_icon()); self.cmap_btn.setText("Цветовая карта")
+        self.cmap_btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon); self.cmap_btn.setToolTip("Выбрать цветовую карту")
         self.cmap_menu = QMenu(self.cmap_btn); self._cmap_actions = {}
         for name in ("gray", "inferno", "magma", "viridis", "cividis", "plasma"):
             action = self.cmap_menu.addAction(name); action.setCheckable(True); action.setChecked(name == "inferno")
             action.triggered.connect(lambda checked=False, cmap=name: self._select_cmap(cmap)); self._cmap_actions[name] = action
-        self.cmap_btn.setMenu(self.cmap_menu)
-        self.cmap_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
-        layout.addWidget(self.cmap_btn)
-        self.auto_contrast_btn = QToolButton(self)
-        self.auto_contrast_btn.setText("A")
-        self.auto_contrast_btn.setToolTip("Auto Contrast (1.0% - 99.0%)")
-        self.auto_contrast_btn.setStyleSheet("font-weight: bold; font-family: monospace; color: palette(highlight);")
-        layout.addWidget(self.auto_contrast_btn)
-        self.low_pct = QDoubleSpinBox(self)
-        self.high_pct = QDoubleSpinBox(self)
-        for spin, value in ((self.low_pct, 1.0), (self.high_pct, 99.0)):
-            spin.setRange(0, 100); spin.setDecimals(1); spin.setValue(value); spin.setSuffix("%")
-            spin.setFixedWidth(42); spin.setFixedHeight(19); spin.setButtonSymbols(QDoubleSpinBox.ButtonSymbols.NoButtons)
-            spin.setAlignment(Qt.AlignmentFlag.AlignCenter); spin.setKeyboardTracking(False)
-            spin.setStyleSheet("QDoubleSpinBox { background: palette(base); color: palette(text); border: 1px solid palette(mid); border-radius: 3px; padding: 0 2px; selection-background-color: palette(highlight); selection-color: palette(highlighted-text); }")
-        self.range_slider = range_slider_cls(low=1.0, high=99.0)
-        layout.addWidget(self.low_pct); layout.addWidget(self.range_slider); layout.addWidget(self.high_pct)
+        self.cmap_btn.setMenu(self.cmap_menu); self.cmap_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        dialog_layout.addWidget(self.cmap_btn, 1, 1, 1, 3)
+        self.range_slider = None
         self.settings_btn = QToolButton(self); self.settings_btn.setAutoRaise(True); self.settings_btn.setIcon(svg_icon(ICON_DIR / "setting_icon.svg", widget=self.settings_btn)); self.settings_btn.setIconSize(QSize(15, 15))
         self.settings_btn.setToolTip("Настройки внешнего вида карты"); self.settings_btn.setAccessibleName("Настройки карты")
-        self.settings_btn.clicked.connect(self.settings_requested.emit); layout.addWidget(self.settings_btn)
-        self._wire_contrast_controls()
+        self.settings_btn.clicked.connect(self.settings_requested.emit); self.settings_btn.hide()
 
     def apply_theme(self, _theme: str | None = None) -> None:
         """Согласует панель, flyout-меню и SVG-иконки с активной темой."""
-        active = apply_widget_palette(self, _theme); c = theme_colors(active)
+        active = apply_widget_palette(self, _theme); self._theme = active; c = theme_colors(active)
         icon_color = c["text"]
         self.home_btn.setIcon(svg_icon(ICON_DIR / "zoom_out_map.svg", color=icon_color, widget=self.home_btn))
         self.pin_roi_btn.setIcon(svg_icon(ICON_DIR / "push_pin.svg", color=icon_color, widget=self.pin_roi_btn))
@@ -127,7 +125,7 @@ class MapToolsWidget(QWidget):
             icon_path = self.roi_tools_config[roi_id]["icon"]
             button.setIcon(svg_icon(icon_path, color=icon_color, widget=button))
             if roi_id == self.current_roi_type: self.roi_btn.setIcon(svg_icon(icon_path, color=icon_color, widget=self.roi_btn))
-        apply_popup_theme(self.cmap_menu, active); apply_popup_theme(self.roi_menu, active); apply_popup_theme(self.pool_menu, active)
+        apply_popup_theme(self.cmap_menu, active); apply_popup_theme(self.roi_menu, active); apply_popup_theme(self.pool_menu, active); apply_popup_theme(self.contrast_dialog, active)
         apply_widget_palette(self.roi_flyout, active)
         apply_widget_palette(self.pool_panel, active)
         self.pool_panel.setAutoFillBackground(True)
@@ -150,18 +148,24 @@ class MapToolsWidget(QWidget):
     def set_current_cmap(self, name: str) -> None:
         for key, action in self._cmap_actions.items(): action.setChecked(key == name)
 
-    def _wire_contrast_controls(self) -> None:
+    def bind_range_slider(self, slider) -> None:
+        """Связывает поля контраста с вертикальным ползунком на полотне карты."""
+        self.range_slider = slider
         def sync_values(low, high):
-            self.low_pct.blockSignals(True)
-            self.high_pct.blockSignals(True)
-            self.low_pct.setValue(round(low, 1))
-            self.high_pct.setValue(round(high, 1))
-            self.low_pct.blockSignals(False)
-            self.high_pct.blockSignals(False)
+            self.low_pct.blockSignals(True); self.high_pct.blockSignals(True)
+            self.low_pct.setValue(round(low, 1)); self.high_pct.setValue(round(high, 1))
+            self.low_pct.blockSignals(False); self.high_pct.blockSignals(False)
             self.low_pct.valueChanged.emit(self.low_pct.value())
-        self.range_slider.valueChanged.connect(sync_values)
-        self.low_pct.valueChanged.connect(self.range_slider.setLow)
-        self.high_pct.valueChanged.connect(self.range_slider.setHigh)
+        slider.valueChanged.connect(sync_values); self.low_pct.valueChanged.connect(slider.setLow); self.high_pct.valueChanged.connect(slider.setHigh)
+    def open_contrast_dialog(self, global_pos=None) -> None:
+        self.contrast_dialog.adjustSize()
+        if global_pos is not None and not self.contrast_dialog.isVisible():
+            screen=QApplication.screenAt(global_pos) or QApplication.primaryScreen(); pos=QPoint(global_pos)
+            if screen is not None:
+                area=screen.availableGeometry(); pos.setX(max(area.left(),min(pos.x(),area.right()-self.contrast_dialog.width()+1))); pos.setY(max(area.top(),min(pos.y(),area.bottom()-self.contrast_dialog.height()+1)))
+            self.contrast_dialog.move(pos)
+        apply_popup_theme(self.contrast_dialog, self._theme)
+        self.contrast_dialog.show(); self.contrast_dialog.raise_(); self.contrast_dialog.activateWindow()
 
     @staticmethod
     def _create_cmap_icon() -> QIcon:
@@ -309,98 +313,46 @@ class MapToolsWidget(QWidget):
 
 
 class QRangeSlider(QWidget):
-    """
-   Двухсторонний слайдер (Range Slider) для контраста.
-    Рисует тонкую синюю полоску с двумя круглыми маркерами 
-        [ Low <===◯======◯===> High ]
-    Занимает минимум места и идеально вписывается в тулбары научного ПО.
-    """
-    valueChanged = pyqtSignal(float, float)  # (low, high)
-
-    def __init__(self, low=1.0, high=99.0, min_val=0.0, max_val=100.0, parent=None):
-        super().__init__(parent)
-        self._min = min_val
-        self._max = max_val
-        self._low = low
-        self._high = high
-        self._active_handle = None
-
-        self.setFixedHeight(18)
-        self.setMinimumWidth(52)
-        self.setMaximumWidth(92)
-
-    def low(self) -> float: return self._low
-    def high(self) -> float: return self._high
-
-    def setLow(self, val: float) -> None:
-        self._low = max(self._min, min(val, self._high - 0.5))
-        self.update()
-
-    def setHigh(self, val: float) -> None:
-        self._high = min(self._max, max(val, self._low + 0.5))
-        self.update()
-
-    def _val_to_x(self, val: float) -> float:
-        w = self.width() - 12
-        return 6 + ((val - self._min) / (self._max - self._min)) * w
-
-    def _x_to_val(self, x: float) -> float:
-        w = self.width() - 12
-        if w <= 0: return self._min
-        rel = max(0.0, min(1.0, (x - 6) / w))
-        return self._min + rel * (self._max - self._min)
-
-    def paintEvent(self, event) -> None:
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-
-        y = self.height() / 2.0
-        w = float(self.width())
-
-        # 1. Серый трек (подложка)
-        painter.setPen(QPen(self.palette().color(QPalette.ColorRole.Mid), 3))
-        painter.drawLine(6, int(y), int(w - 6), int(y))
-
-        # 2. Синий активный диапазон
-        x1 = self._val_to_x(self._low)
-        x2 = self._val_to_x(self._high)
-        painter.setPen(QPen(self.palette().color(QPalette.ColorRole.Highlight), 3))
-        painter.drawLine(int(x1), int(y), int(x2), int(y))
-
-        # 3. Ползунки (круглые маркеры)
-        painter.setPen(QPen(self.palette().color(QPalette.ColorRole.ButtonText), 1))
-        painter.setBrush(self.palette().color(QPalette.ColorRole.Base))
-        painter.drawEllipse(QPointF(x1, y), 4.5, 4.5)
-        painter.drawEllipse(QPointF(x2, y), 4.5, 4.5)
-
-    def mousePressEvent(self, event) -> None:
-        x = event.position().x()
-        x1 = self._val_to_x(self._low)
-        x2 = self._val_to_x(self._high)
-        # Определяем, к какому маркеру ближе кликнули
-        if abs(x - x1) < abs(x - x2):
-            self._active_handle = 'low'
-            self.setLow(self._x_to_val(x))
+    """Компактный двухсторонний ползунок диапазона для горизонтальной или вертикальной установки."""
+    valueChanged = pyqtSignal(float, float)
+    def __init__(self, low=1.0, high=99.0, min_val=0.0, max_val=100.0, parent=None, orientation=Qt.Orientation.Horizontal):
+        super().__init__(parent); self._min=float(min_val); self._max=float(max_val); self._low=float(low); self._high=float(high); self._active_handle=None; self._orientation=orientation
+        if orientation == Qt.Orientation.Vertical: self.setFixedWidth(7); self.setMinimumHeight(80); self.setMaximumWidth(7); self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+        else: self.setFixedHeight(18); self.setMinimumWidth(52); self.setMaximumWidth(92)
+        self.setCursor(Qt.CursorShape.PointingHandCursor); self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+    def low(self)->float:return self._low
+    def high(self)->float:return self._high
+    def setLow(self,val:float)->None:self._low=max(self._min,min(float(val),self._high-0.5));self.update()
+    def setHigh(self,val:float)->None:self._high=min(self._max,max(float(val),self._low+0.5));self.update()
+    def _val_to_pos(self,val:float)->float:
+        if self._orientation==Qt.Orientation.Vertical:
+            h=max(1,self.height()-12);return self.height()-6-((val-self._min)/(self._max-self._min))*h
+        w=max(1,self.width()-12);return 6+((val-self._min)/(self._max-self._min))*w
+    def _pos_to_val(self,pos:float)->float:
+        if self._orientation==Qt.Orientation.Vertical:
+            h=max(1,self.height()-12);rel=max(0.0,min(1.0,(self.height()-6-pos)/h))
         else:
-            self._active_handle = 'high'
-            self.setHigh(self._x_to_val(x))
-        self.valueChanged.emit(self._low, self._high)
-
-    def mouseMoveEvent(self, event) -> None:
-        if not self._active_handle: return
-        x = event.position().x()
-        val = self._x_to_val(x)
-        if self._active_handle == 'low':
-            self.setLow(val)
+            w=max(1,self.width()-12);rel=max(0.0,min(1.0,(pos-6)/w))
+        return self._min+rel*(self._max-self._min)
+    def _coordinate(self,event)->float:return event.position().y() if self._orientation==Qt.Orientation.Vertical else event.position().x()
+    def paintEvent(self,event):
+        p=QPainter(self);p.setRenderHint(QPainter.RenderHint.Antialiasing,True);base=self.palette().color(QPalette.ColorRole.Mid);accent=self.palette().color(QPalette.ColorRole.Highlight);edge=self.palette().color(QPalette.ColorRole.ButtonText);fill=self.palette().color(QPalette.ColorRole.Base)
+        if self._orientation==Qt.Orientation.Vertical:
+            x=self.width()/2; a=self._val_to_pos(self._high);b=self._val_to_pos(self._low);p.setPen(QPen(base,3,Qt.PenStyle.SolidLine,Qt.PenCapStyle.RoundCap));p.drawLine(QLineF(x,6,x,self.height()-6));p.setPen(QPen(accent,3,Qt.PenStyle.SolidLine,Qt.PenCapStyle.RoundCap));p.drawLine(QLineF(x,a,x,b))
+            for y in (a,b):p.setPen(QPen(edge,0.8));p.setBrush(fill);p.drawRoundedRect(QRectF(x-3.5,y-2.0,7,4.0),1.1,1.1);p.setPen(QPen(accent,0.8));p.drawLine(QLineF(x-2.2,y,x+2.2,y))
         else:
-            self.setHigh(val)
-        self.valueChanged.emit(self._low, self._high)
-
-    def mouseReleaseEvent(self, event) -> None:
-        self._active_handle = None
-
-
-
+            y=self.height()/2;x1=self._val_to_pos(self._low);x2=self._val_to_pos(self._high);p.setPen(QPen(base,3));p.drawLine(QLineF(6,y,self.width()-6,y));p.setPen(QPen(accent,3));p.drawLine(QLineF(x1,y,x2,y))
+            for x in (x1,x2):p.setPen(QPen(edge,1));p.setBrush(fill);p.drawEllipse(QPointF(x,y),4.5,4.5)
+        p.end()
+    def mousePressEvent(self,event):
+        if event.button()!=Qt.MouseButton.LeftButton:return
+        pos=self._coordinate(event);a=self._val_to_pos(self._low);b=self._val_to_pos(self._high)
+        self._active_handle='low' if abs(pos-a)<=abs(pos-b) else 'high';self._set_position(pos);self.setFocus();event.accept()
+    def mouseMoveEvent(self,event):
+        if self._active_handle:self._set_position(self._coordinate(event));event.accept()
+    def _set_position(self,pos):
+        value=self._pos_to_val(pos);self.setLow(value) if self._active_handle=='low' else self.setHigh(value);self.valueChanged.emit(self._low,self._high)
+    def mouseReleaseEvent(self,event):self._active_handle=None;event.accept()
 
 
 

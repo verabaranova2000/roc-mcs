@@ -45,6 +45,7 @@ QListWidget = QtWidgets.QListWidget
 QListWidgetItem = QtWidgets.QListWidgetItem
 QMainWindow = QtWidgets.QMainWindow
 QMessageBox = QtWidgets.QMessageBox
+QAbstractButton = QtWidgets.QAbstractButton
 QPushButton = QtWidgets.QPushButton
 QPlainTextEdit = QtWidgets.QPlainTextEdit
 QScrollArea = QtWidgets.QScrollArea
@@ -66,8 +67,8 @@ from roc_mcs.roi.h5_scan_repository import H5ScanRepository
 from roc_mcs.roi.spatial_pooling import PoolSpec, pooled_shape
 from roc_mcs.gui.roi_explorer.roi_manager_widget import _pane_toggle_icon
 from roc_mcs.gui.components.collapsible_section import CollapsibleSection
-from roc_mcs.gui.components.icon_provider import resource_svg_icon
-from roc_mcs.gui.app_settings import resolve_initial_database, remember_hdf5_database, settings_path
+from roc_mcs.gui.components.icon_provider import resource_svg_icon, set_icon_theme
+from roc_mcs.gui.app_settings import load_settings, save_settings, resolve_initial_database, remember_hdf5_database, settings_path
 from roc_mcs.gui.roi_explorer.theme import apply_theme as apply_roi_theme, apply_popup_theme, resolve_theme, theme_colors
 from roc_mcs.gui.roi_explorer.plot_workspace_widget import PlotWorkspaceWidget
 from roc_mcs.gui.roi_explorer.plot_display_settings import PlotDisplaySettingsDialog, load_plot_display_settings, save_plot_display_settings
@@ -79,6 +80,16 @@ class RockingCurveExplorerWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("Rocking Curve Explorer")
         self.resize(1100, 700)
+        self._global_settings = load_settings()
+        app = QApplication.instance()
+        requested_theme = str(self._global_settings.get("theme", "system")).lower()
+        active_theme = requested_theme if requested_theme in ("dark", "light") else resolve_theme(app)
+        if app is not None:
+            app.setProperty("rocMcsTheme", active_theme); app.setProperty("rocMcsThemeMode", requested_theme)
+            try: app.setProperty("rocMcsIconSize", min(20, max(12, int(self._global_settings.get("icon_size", 16)))))
+            except (TypeError, ValueError, OverflowError): app.setProperty("rocMcsIconSize", 16)
+            set_icon_theme(app, QColor(theme_colors(active_theme)["text"]))
+        self._preferred_theme = active_theme
 
         self.repo: Optional[H5ScanRepository] = None
         self.session_scans: Dict[str, List[SavedROI]] = {}
@@ -94,7 +105,9 @@ class RockingCurveExplorerWindow(QMainWindow):
         self.selected_pixel: Optional[tuple[int, int]] = None  # индексы (x, y) текущего view
         self.reduction_mode = "mean"
         self.current_file: Optional[Path] = None
+        self._theta_slice_mode = False; self._theta_index = 0; self._theta_scan_cache_key = None; self._theta_scan_cache = None; self._theta_levels_cache = {}; self._show_theta_guide = False
 
+        self._theta_render_timer = QTimer(self); self._theta_render_timer.setSingleShot(True); self._theta_render_timer.setInterval(35); self._theta_render_timer.timeout.connect(self.refresh_map)
         self._preview_timer = QTimer(self)
         self._preview_timer.setSingleShot(True)
         self._preview_timer.timeout.connect(self._update_preview_curve)
@@ -102,7 +115,8 @@ class RockingCurveExplorerWindow(QMainWindow):
         self._build_ui()
         self._build_actions()
         self._connect_signals()
-        self._apply_theme()
+        self._apply_theme(self._preferred_theme)
+        self.splitter.setHandleWidth(8)
         if h5_path is not None:
             self.load_hdf5(h5_path)
         else:
@@ -180,6 +194,7 @@ class RockingCurveExplorerWindow(QMainWindow):
         self.roi_table = self.plot_workspace.roi_table
         self.map_widget = self.plot_workspace.map_widget
         self.curve_widget = self.plot_workspace.curve_widget
+        self.volume_widget = self.plot_workspace.volume_widget
 
         
         self.preview_curve_line = None
@@ -216,17 +231,40 @@ class RockingCurveExplorerWindow(QMainWindow):
             active_theme = apply_roi_theme(self, theme)
             icon_color = QColor(theme_colors(active_theme)["text"])
             self.left_sidebar_toggle.setIcon(_pane_toggle_icon(not self._left_sidebar_collapsed, icon_color))
-            self.map_widget.apply_theme(active_theme); self.curve_widget.apply_theme(active_theme); self.roi_manager.apply_theme(active_theme)
-            self.map_widget.apply_display_settings(load_plot_display_settings()["map"]); self.curve_widget.apply_display_settings(load_plot_display_settings()["curve"])
+            self.map_widget.apply_theme(active_theme); self.curve_widget.apply_theme(active_theme); self.volume_widget.apply_theme(active_theme); self.roi_manager.apply_theme(active_theme)
+            display_settings = load_plot_display_settings(); self.map_widget.apply_display_settings(display_settings["map"]); self.curve_widget.apply_display_settings(display_settings["curve"]); self.volume_widget.apply_display_settings(display_settings["volume"])
             self.plot_workspace.apply_theme(active_theme)
             for popup in self.findChildren(QWidget):
                 if popup.objectName() in ("roiEditorPopup", "compactColorPicker"):
                     update_popup_theme = getattr(popup, "apply_theme", None)
                     if callable(update_popup_theme): update_popup_theme(active_theme)
-            self.open_h5_btn.setIcon(resource_svg_icon("folder_open.svg", widget=self.open_h5_btn, size=18))
-            self.refresh_scans_btn.setIcon(resource_svg_icon("refresh.svg", widget=self.refresh_scans_btn, size=18))
+            self.open_h5_btn.setIcon(resource_svg_icon("folder_open.svg", widget=self.open_h5_btn, size=self._global_icon_size()))
+            self.refresh_scans_btn.setIcon(resource_svg_icon("refresh.svg", widget=self.refresh_scans_btn, size=self._global_icon_size()))
+            if hasattr(self, "display_settings_action"):
+                self.display_settings_action.setIcon(resource_svg_icon("setting_icon.svg", size=self._global_icon_size()))
+            self._apply_global_icon_size()
         finally:
             self._applying_theme = False
+
+    def _global_icon_size(self) -> int:
+        app = QApplication.instance()
+        try: return min(20, max(12, int(app.property("rocMcsIconSize") if app is not None else 16)))
+        except (TypeError, ValueError, OverflowError): return 16
+
+    def _apply_global_icon_size(self) -> None:
+        size = QSize(self._global_icon_size(), self._global_icon_size())
+        for button in self.findChildren(QAbstractButton):
+            if not button.icon().isNull(): button.setIconSize(size)
+        if hasattr(self, "display_settings_action"):
+            self.display_settings_action.setIcon(resource_svg_icon("setting_icon.svg", size=self._global_icon_size()))
+            if hasattr(self,"display_settings_btn"):self.display_settings_btn.setIconSize(size)
+
+    def apply_global_settings(self, settings: dict | None = None) -> None:
+        """Получает общую тему и размер значков от оболочки TRS Apps."""
+        if settings is not None: self._global_settings = dict(settings)
+        app = QApplication.instance(); active = str(app.property("rocMcsTheme") if app is not None else resolve_theme(self)).lower()
+        if active not in ("dark", "light"): active = resolve_theme(self)
+        self._preferred_theme = active; self._apply_theme(active); self._apply_global_icon_size()
 
     def changeEvent(self, event) -> None:
         super().changeEvent(event)
@@ -264,6 +302,23 @@ class RockingCurveExplorerWindow(QMainWindow):
         self.act_quit = QAction("Quit", self)
         self.act_quit.triggered.connect(lambda *_: self.close())
         file_menu.addAction(self.act_quit)
+        self.display_settings_action = QAction(resource_svg_icon("setting_icon.svg", size=self._global_icon_size()), "Настройки экранов", self); self.display_settings_action.setObjectName("roiDisplaySettingsAction"); self.display_settings_action.setToolTip("Настройки отображения окон «Карта», «ROC-кривые» и «3D»"); self.display_settings_action.setStatusTip(self.display_settings_action.toolTip()); self.display_settings_action.triggered.connect(self.open_plot_display_settings)
+        # Кнопка ставится сразу после File, а не в дальний угол строки меню.
+        self.display_settings_btn=QToolButton(self.menuBar()); self.display_settings_btn.setObjectName("roiDisplaySettingsButton"); self.display_settings_btn.setDefaultAction(self.display_settings_action); self.display_settings_btn.setIconSize(QtCore.QSize(self._global_icon_size(),self._global_icon_size())); self.display_settings_btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly); self.display_settings_btn.setAutoRaise(True); self.display_settings_btn.setFixedSize(28,24); self.display_settings_btn.setToolTip(self.display_settings_action.toolTip()); self.display_settings_btn.setStyleSheet("QToolButton#roiDisplaySettingsButton{border:0;padding:1px;background:transparent;} QToolButton#roiDisplaySettingsButton:hover{background:palette(midlight);border-radius:3px;}")
+        self.menuBar().installEventFilter(self); QTimer.singleShot(0,self._position_display_settings_button)
+
+    def _position_display_settings_button(self) -> None:
+        bar=self.menuBar()
+        if not hasattr(self,"display_settings_btn") or bar.width()<80:return
+        menus=[a for a in bar.actions() if a.menu()]
+        anchor=bar.actionGeometry(menus[0]) if menus else None
+        x=(anchor.right()+3) if anchor is not None and anchor.isValid() else 54
+        x=max(0,min(x,bar.width()-self.display_settings_btn.width()))
+        self.display_settings_btn.move(x,max(0,(bar.height()-self.display_settings_btn.height())//2)); self.display_settings_btn.raise_(); self.display_settings_btn.show()
+
+    def eventFilter(self,watched,event):
+        if watched is self.menuBar() and event.type()==QtCore.QEvent.Type.Resize:QTimer.singleShot(0,self._position_display_settings_button)
+        return super().eventFilter(watched,event)
 
     def _connect_signals(self) -> None:
         """ 'Провода', которые соединяют кнопки с функциями """
@@ -271,9 +326,9 @@ class RockingCurveExplorerWindow(QMainWindow):
         self.map_widget.map_combo.currentIndexChanged.connect(self._on_map_changed)
         self.map_widget.reduction_combo.currentIndexChanged.connect(self._on_reduction_changed)
         self.map_widget.pool_changed.connect(self._on_pool_changed)
+        self.map_widget.theta_index_changed.connect(self._on_theta_index_changed)
         self.map_widget.pixel_clicked.connect(self._on_pixel_clicked)
-        self.map_widget.settings_requested.connect(self.open_plot_display_settings)
-        self.curve_widget.settings_requested.connect(self.open_plot_display_settings)
+        self.curve_widget.theta_guide_toggled.connect(self._on_theta_guide_toggled)
         
         # --- Сохранение ROI ---
         self.map_widget.pin_roi_requested.connect(self.pin_preview_roi)    # От кнопки над картой (слушаем сигнал из MapPlotWidget)
@@ -299,14 +354,15 @@ class RockingCurveExplorerWindow(QMainWindow):
         self.map_widget.preview_roi_finished.connect(self._on_selector_finished)
 
     def open_plot_display_settings(self) -> None:
-        """Настраивает стиль карты и ROC-кривых и сохраняет его в settings.json."""
+        """Настраивает стиль Map, ROC и 3D и сохраняет его в settings.json."""
         dialog = PlotDisplaySettingsDialog(load_plot_display_settings(), self)
         apply_popup_theme(dialog, resolve_theme(self))
         if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
             values = dialog.values()
             try: save_plot_display_settings(values)
-            except Exception as exc: QMessageBox.warning(self, "Настройки отображения", f"Изменения применены, но сохранить settings.json не удалось:\n{exc}")
-            self.map_widget.apply_display_settings(values["map"]); self.curve_widget.apply_display_settings(values["curve"])
+            except Exception as exc:
+                warning = QMessageBox(self); warning.setWindowTitle("Настройки отображения"); warning.setIcon(QMessageBox.Icon.Warning); warning.setText(f"Изменения применены, но settings.json не сохранён:\n{exc}"); apply_popup_theme(warning, resolve_theme(self)); warning.exec()
+            self.map_widget.apply_display_settings(values["map"]); self.curve_widget.apply_display_settings(values["curve"]); self.volume_widget.apply_display_settings(values["volume"])
 
     # ---------- HDF5/session ----------
     def load_hdf5(self, h5_path: Union[str, Path]) -> None:
@@ -649,6 +705,7 @@ class RockingCurveExplorerWindow(QMainWindow):
         if self.repo is None or self.map_widget.scan_combo.currentText() == "":
             return
         self.selected_scan = self.map_widget.scan_combo.currentText()
+        self._theta_scan_cache_key = None; self._theta_scan_cache = None; self._theta_levels_cache.clear()
         source = self.repo.load_source(self.selected_scan)
         pool = self.repo.pool
         pool_warning = None
@@ -684,35 +741,85 @@ class RockingCurveExplorerWindow(QMainWindow):
 
 
     def _populate_map_combo(self) -> None:
-        if self.repo is None or self.selected_scan is None:
-            return
-        self.map_widget.map_combo.blockSignals(True)
-        self.map_widget.map_combo.clear()
-
-        maps = self.repo.available_maps(self.selected_scan)
+        if self.repo is None or self.selected_scan is None: return
+        combo = self.map_widget.map_combo; combo.blockSignals(True); combo.clear()
+        maps = list(self.repo.available_maps(self.selected_scan))
         for map_name in maps:
-            self.map_widget.map_combo.addItem(map_name)
-            self.map_widget.map_combo.setItemData(
-                self.map_widget.map_combo.count() - 1, 
-                map_name, # Текст подсказки (полное имя без обрезки)
-                Qt.ItemDataRole.ToolTipRole
-            )
-        current_items = [self.map_widget.map_combo.itemText(i) for i in range(self.map_widget.map_combo.count())]
-        if self.selected_map not in current_items:
-            self.selected_map = self.map_widget.map_combo.itemText(0) if self.map_widget.map_combo.count() else None
-        if self.selected_map is not None:
-            idx = self.map_widget.map_combo.findText(self.selected_map)
-            if idx >= 0:
-                self.map_widget.map_combo.setCurrentIndex(idx)
-        self.map_widget.map_combo.blockSignals(False)
-        self.refresh_map()         # Важно: Принудительный запуск обновления сцены после смены списка карт
-        self.refresh_curves()
-        
+            combo.addItem(str(map_name), str(map_name)); combo.setItemData(combo.count()-1, str(map_name), Qt.ItemDataRole.ToolTipRole)
+        combo.addItem("Срез по θ", "__theta_slice__")
+        combo.setItemData(combo.count()-1, "Показать интенсивность для одного угла θ; ползунок управляет углом", Qt.ItemDataRole.ToolTipRole)
+        if self.selected_map not in maps: self.selected_map = maps[0] if maps else None
+        idx = combo.findData("__theta_slice__") if self._theta_slice_mode else combo.findData(self.selected_map)
+        combo.setCurrentIndex(max(0, idx) if idx >= 0 else 0); combo.blockSignals(False)
+        self._set_theta_axis_for_current_scan()
+        self.map_widget.set_theta_slice_mode(self._theta_slice_mode)
+        self.refresh_map(); self.refresh_curves()
+
+    @staticmethod
+    def _scan_field(scan, key, default=None):
+        if isinstance(scan, dict): return scan.get(key, default)
+        try:
+            value = scan[key]
+            if value is not None: return value
+        except (KeyError, TypeError, IndexError, AttributeError): pass
+        return getattr(scan, key, default)
+
+    def _get_theta_scan(self):
+        if self.repo is None or self.selected_scan is None: return None
+        cache_key = (str(getattr(self.repo, "h5_path", self.current_file or "")), str(self.selected_scan), repr(getattr(self.repo, "pool", None)))
+        if self._theta_scan_cache_key == cache_key and self._theta_scan_cache is not None: return self._theta_scan_cache
+        scan = self.repo.load_scan(self.selected_scan)
+        data = self._scan_field(scan, "data", self._scan_field(scan, "raw", None))
+        theta = self._scan_field(scan, "th", self._scan_field(scan, "theta", None))
+        axis = int(self._scan_field(scan, "axis", 0))
+        data = np.asarray(data) if data is not None else None
+        theta = np.asarray(theta, dtype=float).reshape(-1) if theta is not None else np.empty(0, dtype=float)
+        if data is None or data.ndim != 3: raise ValueError("В выбранном скане не найден трёхмерный массив интенсивности.")
+        ntheta = data.shape[0] if axis == 0 else data.shape[2] if axis == 2 else 0
+        if axis not in (0, 2): raise ValueError(f"Не поддерживается расположение θ-оси: axis={axis}. Ожидается 0 или 2.")
+        if theta.size != ntheta: raise ValueError(f"Число углов θ ({theta.size}) не совпадает с размером массива ({ntheta}).")
+        if not theta.size: raise ValueError("В выбранном скане нет углов θ.")
+        self._theta_scan_cache_key = cache_key; self._theta_scan_cache = (data, theta, axis)
+        return self._theta_scan_cache
+
+    def _set_theta_axis_for_current_scan(self):
+        try:
+            scan = self._get_theta_scan()
+            if scan is None: self.map_widget.set_theta_axis([]); return
+            _, theta, _ = scan
+            self._theta_index = max(0, min(self._theta_index, len(theta)-1))
+            self.map_widget.set_theta_axis(theta, self._theta_index)
+        except Exception as exc:
+            self.map_widget.set_theta_axis([])
+            if self._theta_slice_mode: self.status.showMessage(f"Срез по θ недоступен: {exc}", 8000)
+
+    def _current_theta_value(self):
+        if not self._theta_slice_mode: return None
+        try:
+            _,theta,_=self._get_theta_scan(); idx=max(0,min(int(self._theta_index),len(theta)-1))
+            return float(theta[idx]) if len(theta) else None
+        except Exception: return None
+
+    def _on_theta_guide_toggled(self, enabled: bool) -> None:
+        self._show_theta_guide=bool(enabled)
+        self.curve_widget.set_theta_guide(self._current_theta_value() if self._show_theta_guide else None)
+
+    def _on_theta_index_changed(self, index: int) -> None:
+        self._theta_index = int(index)
+        if self._theta_slice_mode: self._theta_render_timer.start()
+        if self._show_theta_guide: self.curve_widget.set_theta_guide(self._current_theta_value() if self._theta_slice_mode else None)
+
     def _on_map_changed(self, *args) -> None:
-        if self.map_widget.map_combo.currentText():
-            self.selected_map = self.map_widget.map_combo.currentText()
-            self.refresh_map()
-            self.refresh_curves()
+        combo = self.map_widget.map_combo
+        if combo.currentData() == "__theta_slice__":
+            self._theta_slice_mode = True; self._set_theta_axis_for_current_scan(); self.map_widget.set_theta_slice_mode(True); self.refresh_map()
+            if self._show_theta_guide: self.curve_widget.set_theta_guide(self._current_theta_value())
+            return
+        self._theta_slice_mode = False; self.map_widget.set_theta_slice_mode(False)
+        if self._show_theta_guide: self.curve_widget.set_theta_guide(None)
+        value = combo.currentData() or combo.currentText()
+        if value:
+            self.selected_map = str(value); self.refresh_map(); self.refresh_curves()
 
     def _invalidate_curve_cache(self) -> None:
         """Очищает производные профили, зависящие от view или режима редукции."""
@@ -859,7 +966,7 @@ class RockingCurveExplorerWindow(QMainWindow):
         curve_values = np.asarray(curve, dtype=float)
         fit_view = self._preview_fit_pending and curve_values.size > 0 and np.isfinite(curve_values).any()
         self._preview_fit_pending = False
-        self.refresh_curves(fit_curve_view=fit_view)
+        self.refresh_curves(fit_curve_view=fit_view, fit_curve_y=bool(curve_values.size and np.isfinite(curve_values).any()), update_volume=fit_view)
         self._update_inspector()
 
     def pin_preview_roi(self, *args) -> None:
@@ -1111,30 +1218,44 @@ class RockingCurveExplorerWindow(QMainWindow):
         self._update_inspector()
 
     def refresh_map(self, *args) -> None:
-        """Получает карту и параметры контраста, затем передаёт их MapPlotWidget."""
-        if self.repo is None or self.selected_scan is None or self.selected_map is None:
+        """Отрисовывает обычную карту либо интенсивность среза при фиксированном θ."""
+        if self.repo is None or self.selected_scan is None or (self.selected_map is None and not self._theta_slice_mode):
             self.map_widget.ax.clear()
             self.map_widget.ax.text(0.5, 0.5, "Open an HDF5 file", ha="center", va="center", transform=self.map_widget.ax.transAxes)
-            self.map_widget.canvas.draw_idle()
-            return
-        img = self.repo.get_map(self.selected_scan, self.selected_map)
+            self.map_widget.canvas.draw_idle(); return
         x_coords, y_coords = self.repo.centers_xy(self.selected_scan)
-        p_lo = float(self.map_widget.low_pct.value())
-        p_hi = float(self.map_widget.high_pct.value())
-        if p_hi <= p_lo:
-            p_hi = min(100.0, p_lo + 1.0)
+        if self._theta_slice_mode:
+            try:
+                scan = self._get_theta_scan()
+                if scan is None: return
+                data, theta, axis = scan
+                idx = max(0, min(int(self.map_widget.theta_slider.value()), len(theta)-1))
+                img = data[idx, :, :] if axis == 0 else data[:, :, idx]
+                if img.shape != (len(y_coords), len(x_coords)):
+                    raise ValueError(f"Срез θ имеет форму {img.shape}, а оси детектора ожидают {(len(y_coords), len(x_coords))}.")
+                title = f"{self.selected_scan}  |  Срез по θ = {theta[idx]:.6g}°"
+            except Exception as exc:
+                self.status.showMessage(f"Не удалось построить срез по θ: {exc}", 8000); return
+        else:
+            img = self.repo.get_map(self.selected_scan, self.selected_map)
+            title = f"{self.selected_scan}  |  {self.selected_map}"
+        p_lo = float(self.map_widget.low_pct.value()); p_hi = float(self.map_widget.high_pct.value())
+        if p_hi <= p_lo:p_hi=min(100.0,p_lo+1.0)
         try:
-            vmin = float(np.percentile(img, p_lo))
-            vmax = float(np.percentile(img, p_hi))
-        except Exception:
-            vmin, vmax = None, None
-        cmap = self.map_widget.current_cmap
-        title = f"{self.selected_scan}  |  {self.selected_map}"
-        self.map_widget.draw_map(img, title, cmap, vmin, vmax, x_coords=x_coords, y_coords=y_coords)  # 1. Виджет сам нарисует карту и САМ восстановит нужный селектор (линию/прямоугольник)
-        self._draw_pinned_rois()                                                                      # 2. Рисуем закрепившиеся ROI
-        self.map_widget.canvas.draw_idle()                       # draw_map восстанавливает нужный селектор.
-        
-        
+            level_key=(str(getattr(self.repo,"h5_path",self.current_file or "")),str(self.selected_scan),repr(getattr(self.repo,"pool",None)),int(self._theta_index),round(p_lo,2),round(p_hi,2)) if self._theta_slice_mode else None
+            cached=self._theta_levels_cache.get(level_key) if level_key is not None else None
+            if cached is not None:vmin,vmax=cached
+            else:
+                values=np.asarray(img);finite=values[np.isfinite(values)];vmin,vmax=np.percentile(finite,[p_lo,p_hi]) if finite.size else (None,None)
+                if vmin is not None and vmax is not None and vmin>=vmax:vmax=vmin+max(abs(float(vmin))*1e-9,1e-12)
+                if level_key is not None:
+                    if len(self._theta_levels_cache)>=256:self._theta_levels_cache.pop(next(iter(self._theta_levels_cache)))
+                    self._theta_levels_cache[level_key]=(vmin,vmax)
+        except Exception:vmin,vmax=None,None
+        self.map_widget.draw_map(img, title, self.map_widget.current_cmap, vmin, vmax, x_coords=x_coords, y_coords=y_coords)
+        self._draw_pinned_rois()
+        self.map_widget.canvas.draw_idle()
+
     def _draw_pinned_rois(self) -> None:
         """Подготавливает геометрию закреплённых ROI для MapPlotWidget."""
         roi_data_list = []
@@ -1158,7 +1279,7 @@ class RockingCurveExplorerWindow(QMainWindow):
         self._map_patches = self.map_widget.draw_rois(roi_data_list)   # Отдаем словари в Панель на отрисовку и забираем патчи
 
         
-    def refresh_curves(self, *, fit_curve_view: bool = False) -> None:
+    def refresh_curves(self, *, fit_curve_view: bool = False, fit_curve_y: bool = False, update_volume: bool = True) -> None:
         """Подготавливает профили; по запросу подгоняет график под новое preview."""
         th = self.repo.load_scan(self.selected_scan)["th"] if (self.repo is not None and self.selected_scan is not None) else None
         curves_data = []
@@ -1211,9 +1332,25 @@ class RockingCurveExplorerWindow(QMainWindow):
             else:
                 self.selected_pixel = None
         view_label = self._pool_label(self.repo.pool) if self.repo is not None else None
+        theta_guide=self._current_theta_value() if self._show_theta_guide and self._theta_slice_mode else None
         self._curve_lines = self.curve_widget.draw_curves(
-            curves_data, preview_data, pixel_data=pixel_data, view_label=view_label, fit_view=fit_curve_view
+            curves_data, preview_data, pixel_data=pixel_data, view_label=view_label, fit_view=fit_curve_view,
+            fit_y=fit_curve_y, theta_guide=theta_guide
         )
+        if update_volume: self.refresh_volume()
+
+
+    def refresh_volume(self) -> None:
+        """Передаёт 3D-экрану immutable-снимок текущего spatial-view и список ROI."""
+        if self.repo is None or self.selected_scan is None:
+            self.volume_widget.clear_dataset()
+            return
+        try:
+            scan = self.repo.load_scan(self.selected_scan)
+            x_coords, y_coords = self.repo.centers_xy(self.selected_scan)
+            self.volume_widget.set_dataset(scan.data, scan.th, scan.axis, x_coords, y_coords, self.current_rois(), scan_label=self.selected_scan, view_label=self._pool_label(self.repo.pool))
+        except Exception as exc:
+            self.volume_widget.clear_dataset(f"3D viewer: {exc}")
 
     def refresh_roi_table(self) -> None:
         """

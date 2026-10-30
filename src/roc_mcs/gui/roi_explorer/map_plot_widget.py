@@ -1,12 +1,12 @@
-from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QComboBox, QLabel, QSizePolicy, QToolButton
-from PyQt6.QtGui import QIcon
-from PyQt6.QtCore import Qt, pyqtSignal
-from matplotlib.ticker import ScalarFormatter, MaxNLocator
+from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QComboBox, QLabel, QSizePolicy, QToolButton, QSlider, QStyle, QStyleOptionSlider
+from PyQt6.QtGui import QIcon, QPainter, QPen, QPalette
+from PyQt6.QtCore import Qt, pyqtSignal, QPoint, QPointF, QRectF, QTimer
+from matplotlib.ticker import FuncFormatter, MaxNLocator
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.patches import Rectangle
 from matplotlib.transforms import Affine2D
-from mpl_toolkits.axes_grid1 import make_axes_locatable
+from mpl_toolkits.axes_grid1 import make_axes_locatable, axes_size
 from matplotlib.lines import Line2D
 from matplotlib.font_manager import FontProperties
 from mpl_toolkits.axes_grid1.anchored_artists import AnchoredSizeBar
@@ -40,6 +40,51 @@ STYLE_COORD_LABEL = """
     QLabel#MapCoordLabel { font-family:monospace; font-size:10px; font-weight:bold; color:palette(window-text); padding:2px 5px; background:transparent; }
 """
 
+# Геометрия карты: эти значения — основные точки настройки плотности интерфейса.
+MAP_HEADER_HEIGHT = 24
+THETA_ROW_HEIGHT = 20
+THETA_VALUE_LABEL_WIDTH = 66
+THETA_ROW_INNER_GAP = 5
+MAP_HEADER_COMBO_WIDTHS = ((48, 118), (45, 110), (40, 62))
+COLORBAR_WIDTH_FRACTION = 0.014
+COLORBAR_WIDTH_INCH = 0.025
+COLORBAR_GAP_FRACTION = 0.018
+COLORBAR_GAP_INCH = 0.070
+CONTRAST_RAIL_WIDTH = 7
+CONTRAST_BUTTON_HIT_WIDTH = 14
+CONTRAST_BUTTON_HIT_HEIGHT = 12
+
+
+class _ThetaRailSlider(QSlider):
+    """Однозасечечная горизонтальная рейка в стиле контрастного ползунка."""
+    def paintEvent(self, event):
+        opt=QStyleOptionSlider(); self.initStyleOption(opt); style=self.style()
+        groove=style.subControlRect(QStyle.ComplexControl.CC_Slider,opt,QStyle.SubControl.SC_SliderGroove,self)
+        handle=style.subControlRect(QStyle.ComplexControl.CC_Slider,opt,QStyle.SubControl.SC_SliderHandle,self)
+        x0=groove.left()+handle.width()/2; x1=groove.right()-handle.width()/2; y=groove.center().y(); hx=handle.center().x()
+        pal=self.palette(); p=QPainter(self); p.setRenderHint(QPainter.RenderHint.Antialiasing,True)
+        p.setPen(QPen(pal.color(QPalette.ColorRole.Mid),2.2,Qt.PenStyle.SolidLine,Qt.PenCapStyle.RoundCap)); p.drawLine(QPointF(x0,y),QPointF(x1,y))
+        for i in range(5):
+            tx=x0+(x1-x0)*i/4; p.setPen(QPen(pal.color(QPalette.ColorRole.Mid),0.8)); p.drawLine(QPointF(tx,y-3),QPointF(tx,y+3))
+        p.setPen(QPen(pal.color(QPalette.ColorRole.Highlight),2.2,Qt.PenStyle.SolidLine,Qt.PenCapStyle.RoundCap)); p.drawLine(QPointF(x0,y),QPointF(hx,y))
+        r=QRectF(hx-2.5,y-5.2,5,10.4); p.setPen(QPen(pal.color(QPalette.ColorRole.Highlight),0.9)); p.setBrush(pal.color(QPalette.ColorRole.Base)); p.drawRoundedRect(r,1.4,1.4)
+        p.setPen(QPen(pal.color(QPalette.ColorRole.Highlight),1.0)); p.drawLine(QPointF(hx-1.2,y),QPointF(hx+1.2,y)); p.end()
+
+
+
+class _ColorbarOptionsButton(QToolButton):
+    """Небольшая видимая кнопка с расширенной прозрачной областью нажатия."""
+    def __init__(self, parent=None):
+        super().__init__(parent); self._visual_width=5; self.setMinimumSize(0,0); self.setText(""); self.setCursor(Qt.CursorShape.PointingHandCursor); self.setAutoRaise(True); self.setMouseTracking(True)
+    def set_visual_width(self, width): self._visual_width=max(4,int(width)); self.update()
+    def paintEvent(self, event):
+        p=QPainter(self); p.setRenderHint(QPainter.RenderHint.Antialiasing,True); pal=self.palette(); hovered=self.underMouse(); visual_w=min(self._visual_width,max(1,self.width())); visual_h=min(8,max(1,self.height())); x=(self.width()-visual_w)/2; y=(self.height()-visual_h)/2; rect=QRectF(x,y,visual_w,visual_h)
+        p.setPen(QPen(pal.color(QPalette.ColorRole.Highlight if hovered else QPalette.ColorRole.Mid),0.8)); p.setBrush(pal.color(QPalette.ColorRole.Midlight if hovered else QPalette.ColorRole.Button)); p.drawRoundedRect(rect,1.5,1.5); p.setPen(QPen(pal.color(QPalette.ColorRole.ButtonText),1.2))
+        if visual_w>=9:
+            for dx in (-2,0,2):p.drawPoint(QPointF(x+visual_w/2+dx,y+visual_h/2))
+        else:
+            for dy in (-2,0,2):p.drawPoint(QPointF(x+visual_w/2,y+visual_h/2+dy))
+        p.end()
 
 
 class MapPlotWidget(QWidget):
@@ -58,6 +103,7 @@ class MapPlotWidget(QWidget):
     pin_roi_requested = pyqtSignal()         # сигнал умного списка ROI
     preview_roi_changed = pyqtSignal(object) # Геометрия ROI при движении селектора.
     preview_roi_finished = pyqtSignal(object) # Финальная геометрия после отпускания мыши.
+    theta_index_changed = pyqtSignal(int)
 
     # =========================================================================
     # РЕЕСТР ИНСТРУМЕНТОВ (Статичная конфигурация)
@@ -87,7 +133,7 @@ class MapPlotWidget(QWidget):
         self.repo = None                    # Ссылка на данные
         self._pool_spec = PoolSpec()
 
-        self.setMinimumSize(340, 190); self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.setMinimumSize(280, 190); self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self._display_settings = load_plot_display_settings()["map"]
         self._scalebar_artist = None
         
@@ -115,26 +161,35 @@ class MapPlotWidget(QWidget):
         # ИНИЦИАЛИЗАЦИЯ MATPLOTLIB
         self.figure = Figure(figsize=(5, 5), tight_layout=False)
         self.canvas = FigureCanvasQTAgg(self.figure)
-        self.figure.subplots_adjust(left=0.12, right=0.91, bottom=0.11, top=0.97)
+        self.figure.subplots_adjust(left=0.12, right=0.92, bottom=0.11, top=0.985)
         self.canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         # self.canvas.setFixedHeight(450)  # Подобрать цифру, при которой карта выглядит идеально квадратной
         
-        self.ax = self.figure.add_subplot(1, 1, 1)
+        self.ax = self.figure.add_subplot(1, 1, 1); self.ax.set_anchor("N")
         self._theme = "light"
         self.cbar = None
         self.map_image = None
         self.roi_right_click_callback = None
-        self.cax = None                                                             # Заготовим переменную для оси colorbar'а
+        self.cax = None
+        self._cbar_multiplier = None
         
         # Панель вынесена отдельно; публичные атрибуты сохранены для совместимости.
         self.current_cmap = "inferno"
         self.tools = MapToolsWidget(self.ROI_TOOLS_CONFIG, self._current_roi_type, SmartDropdownButton, QRangeSlider, self)
         self.toolbar = self.tools
-        for name in ("home_btn", "roi_btn", "roi_menu", "roi_action_group", "roi_tool_buttons",
-                     "pool_btn", "pool_menu", "pool_size_spin", "pool_stride_spin", "pool_apply_btn",
-                     "pool_preview_label", "pin_roi_btn", "cmap_btn", "cmap_menu", "auto_contrast_btn",
-                     "low_pct", "high_pct", "range_slider", "settings_btn"):
+        for name in ("home_btn", "roi_btn", "roi_menu", "roi_action_group", "roi_tool_buttons", "pool_btn", "pool_menu",
+                     "pool_size_spin", "pool_stride_spin", "pool_apply_btn", "pool_preview_label", "pin_roi_btn", "cmap_btn",
+                     "cmap_menu", "auto_contrast_btn", "low_pct", "high_pct", "settings_btn"):
             setattr(self, name, getattr(self.tools, name))
+        self.range_slider = QRangeSlider(low=1.0, high=99.0, orientation=Qt.Orientation.Vertical, parent=self.canvas)
+        self.range_slider.setObjectName("mapContrastRangeSlider"); self.range_slider.setToolTip("Перетащите верхнюю и нижнюю засечки, чтобы изменить контраст")
+        self.tools.bind_range_slider(self.range_slider)
+        self.contrast_popup_btn = _ColorbarOptionsButton(self.canvas); self.contrast_popup_btn.setObjectName("mapContrastPopupButton")
+        self.contrast_popup_btn.setAutoRaise(False); self.contrast_popup_btn.setToolTip("Контраст, автоконтраст и цветовая карта")
+        self.contrast_popup_btn.setMinimumSize(0, 0); self.contrast_popup_btn.setMaximumSize(16777215, 16777215); self.contrast_popup_btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.contrast_popup_btn.setStyleSheet("QToolButton#mapContrastPopupButton{border:1px solid palette(mid);border-radius:2px;background:palette(button);color:palette(text);font-size:8px;font-weight:700;padding:0;margin:0;} QToolButton#mapContrastPopupButton:hover{border-color:palette(highlight);background:palette(midlight);}")
+        self.contrast_popup_btn.clicked.connect(lambda: self.tools.open_contrast_dialog(self.contrast_popup_btn.mapToGlobal(QPoint(self.contrast_popup_btn.width()//2, self.contrast_popup_btn.height()+2))))
+        self.range_slider.hide(); self.contrast_popup_btn.hide()
         self.tools.reset_view_requested.connect(self.reset_view)
         self.tools.settings_requested.connect(self.settings_requested.emit)
         self.tools.pin_roi_requested.connect(self.pin_roi_requested.emit)
@@ -153,8 +208,8 @@ class MapPlotWidget(QWidget):
         self.header_widget = QWidget()
         self.header_widget.setObjectName("MapHeader")
         self.header_layout = QHBoxLayout(self.header_widget)
-        self.header_widget.setFixedHeight(25)
-        self.header_layout.setContentsMargins(6, 0, 6, 0); self.header_layout.setSpacing(5)
+        self.header_widget.setFixedHeight(MAP_HEADER_HEIGHT); self.header_widget.setMinimumWidth(0); self.header_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.header_layout.setContentsMargins(4, 0, 4, 0); self.header_layout.setSpacing(3)
 
         self.scan_combo = QComboBox()
         self.map_combo = QComboBox()
@@ -165,26 +220,38 @@ class MapPlotWidget(QWidget):
         self.map_combo.setToolTip("Выбор типа 2D карты (распределение интенсивности, ширины пика, положения и др.).")
         self.reduction_combo.setToolTip("Режим агрегации пикселей (mean/sum) при проецировании ROI в 1D профиль.")
         
-        for combo, minimum in ((self.scan_combo, 80), (self.map_combo, 76), (self.reduction_combo, 55)):
-            combo.setStyleSheet(STYLE_FLAT_COMBOBOX); combo.setMinimumWidth(minimum)
-            combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon); combo.setMinimumContentsLength(5)
+        for combo, (minimum, maximum) in zip((self.scan_combo, self.map_combo, self.reduction_combo), MAP_HEADER_COMBO_WIDTHS):
+            combo.setStyleSheet(STYLE_FLAT_COMBOBOX); combo.setMinimumWidth(minimum); combo.setMaximumWidth(maximum)
+            combo.setSizePolicy(QSizePolicy.Policy.Preferred,QSizePolicy.Policy.Fixed); combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon); combo.setMinimumContentsLength(3)
         
         def create_separator():
             """Создает вертикальный разделитель ' | ' для умного заголовка."""
-            lbl = QLabel(" | ")
-            lbl.setObjectName("MapHeaderSeparator")
-            lbl.setStyleSheet("font-size: 15px; font-weight: normal; color: palette(window-text);")
+            lbl = QLabel("|")
+            lbl.setObjectName("MapHeaderSeparator"); lbl.setFixedWidth(9); lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            lbl.setStyleSheet("font-size: 11px; font-weight: normal; color: palette(window-text); background:transparent;")
             return lbl
     
         # Управление данными остаётся непосредственно над соответствующим полотном.
+        self.header_layout.addStretch(1)
         self.header_layout.addWidget(QLabel("Scan", self.header_widget))
-        self.header_layout.addWidget(self.scan_combo, 2)
+        self.header_layout.addWidget(self.scan_combo)
         self.header_layout.addWidget(create_separator())
         self.header_layout.addWidget(QLabel("Map", self.header_widget))
-        self.header_layout.addWidget(self.map_combo, 1)
+        self.header_layout.addWidget(self.map_combo)
         self.header_layout.addWidget(create_separator())
         self.header_layout.addWidget(QLabel("ROI", self.header_widget))
         self.header_layout.addWidget(self.reduction_combo)
+        self.header_layout.addStretch(1)
+
+        # Строка всегда резервирует высоту; содержимое выравнивается по реальной ширине карты.
+        self.theta_row=QWidget(self); self.theta_row.setObjectName("thetaSliceRow"); self.theta_row.setFixedHeight(THETA_ROW_HEIGHT); self.theta_row.setMinimumWidth(0); self.theta_row.setSizePolicy(QSizePolicy.Policy.Expanding,QSizePolicy.Policy.Fixed)
+        theta_layout=QHBoxLayout(self.theta_row); theta_layout.setContentsMargins(0,0,0,0); theta_layout.setSpacing(THETA_ROW_INNER_GAP); self._theta_layout=theta_layout
+        self.theta_slider=_ThetaRailSlider(Qt.Orientation.Horizontal,self.theta_row); self.theta_slider.setObjectName("thetaSliceSlider"); self.theta_slider.setTickPosition(QSlider.TickPosition.NoTicks); self.theta_slider.setFixedHeight(THETA_ROW_HEIGHT-2); self.theta_slider.setTracking(True); self.theta_slider.setMinimumWidth(20); self.theta_slider.setSizePolicy(QSizePolicy.Policy.Expanding,QSizePolicy.Policy.Fixed)
+        self.theta_slider.setMinimum(0); self.theta_slider.setMaximum(0); self.theta_slider.setEnabled(False)
+        self.theta_value_label=QLabel("θ —",self.theta_row); self.theta_value_label.setObjectName("thetaSliceValue"); self.theta_value_label.setAlignment(Qt.AlignmentFlag.AlignRight|Qt.AlignmentFlag.AlignVCenter); self.theta_value_label.setFixedWidth(THETA_VALUE_LABEL_WIDTH)
+        theta_layout.addWidget(self.theta_slider,1); theta_layout.addWidget(self.theta_value_label,0)
+        self._theta_values=np.empty(0,dtype=float); self.theta_slider.valueChanged.connect(self._on_theta_slider_changed)
+        self.theta_slider.hide(); self.theta_value_label.hide()
 
         # ========================================================
         # ЭТАЖ 3: Строка координат мыши (x,y)
@@ -197,15 +264,19 @@ class MapPlotWidget(QWidget):
         # ========================================================
         # СБОРКА ГЛАВНОГО СЛОЯ (main_layout)
         # ========================================================
-        self.main_layout.addWidget(self.toolbar)         # 1. Тулбар наверху
-        self.main_layout.addWidget(self.header_widget)   # 2. Интерактивный заголовок
-        self.main_layout.addWidget(self.canvas, 1)       # 3. График (занимает всё оставшееся место)
+        self.main_layout.addWidget(self.toolbar)
+        self.main_layout.addWidget(self.header_widget)
+        self.main_layout.addWidget(self.theta_row, 0)
+        self.main_layout.addWidget(self.canvas, 1)
         self.main_layout.addWidget(self.coord_label)
+        self.coord_label.setFixedHeight(18)
 
  
         # ========================================================
         # ПОДКЛЮЧЕНИЕ СИГНАЛОВ И СОБЫТИЙ
         # ========================================================
+        self.canvas.mpl_connect("draw_event", self._position_contrast_controls)
+        self.canvas.mpl_connect("draw_event", self._sync_theta_rail_geometry)
         self.canvas.mpl_connect("axes_leave_event", self._on_axes_leave)
         self.canvas.mpl_connect('scroll_event', self._on_scroll_zoom)
         self.canvas.mpl_connect('button_press_event', self._on_mouse_press)         # вместо self._on_mouse_click и self._on_mouse_press_pan 
@@ -220,6 +291,19 @@ class MapPlotWidget(QWidget):
         self.apply_display_settings(self._display_settings)
 
     
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        QTimer.singleShot(0, self.canvas.draw_idle)
+        QTimer.singleShot(0, self._sync_theta_rail_geometry)
+
+    def _sync_theta_rail_geometry(self, _event=None) -> None:
+        """Совмещает рейку θ с шириной axes; строки выше/ниже имеют постоянную высоту."""
+        if not hasattr(self,"_theta_layout") or not hasattr(self,"canvas"): return
+        width=max(1,self.canvas.width()); pos=self.ax.get_position()
+        left=max(0,int(round(pos.x0*width))); right=max(0,int(round((1.0-pos.x1)*width)))
+        old=self._theta_layout.contentsMargins()
+        if old.left()!=left or old.right()!=right: self._theta_layout.setContentsMargins(left,0,right,0)
+
     # ============================================================
     # ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ КЛАССА
     # ============================================================
@@ -305,9 +389,11 @@ class MapPlotWidget(QWidget):
             view.setStyleSheet(f"QListView, QAbstractItemView {{ background:{c['base']}; color:{c['text']}; border:1px solid {c['border']}; outline:0; }} QListView::item, QAbstractItemView::item {{ color:{c['text']}; padding:3px 5px; }} QListView::item:selected, QAbstractItemView::item:selected {{ background:{c['highlight']}; color:{c['highlight_text']}; }}")
             view.viewport().setPalette(combo.palette()); view.viewport().setAutoFillBackground(True)
         for label in self.header_widget.findChildren(QLabel, "MapHeaderSeparator"):
-            label.setStyleSheet(f"font-size:15px; font-weight:normal; color:{c['muted']}; background:transparent;")
+            label.setStyleSheet(f"font-size:11px; font-weight:normal; color:{c['muted']}; background:transparent;")
         self._apply_axes_theme(); self._update_scalebar(); self.tools.apply_theme(self._theme); self._update_pool_preview()
         self.coord_label.setStyleSheet(f"QLabel#MapCoordLabel {{ font-family:monospace; font-size:10px; font-weight:600; color:{c['muted']}; padding:1px 4px; background:transparent; }}")
+        self.theta_row.setStyleSheet(f"QWidget#thetaSliceRow{{background:transparent;}} QLabel#thetaSliceValue{{color:{c['text']};font-family:Segoe UI,Arial,sans-serif;font-size:9px;font-weight:600;background:transparent;padding:0 1px;}}")
+        self.theta_slider.setPalette(self.palette())
         self.canvas.draw_idle()
 
     def apply_display_settings(self, settings: dict | None = None) -> None:
@@ -315,18 +401,92 @@ class MapPlotWidget(QWidget):
         if self.map_image is not None:
             show_cbar = bool(self._display_settings.get("show_colorbar", True))
             if show_cbar and self.cbar is None:
-                divider = make_axes_locatable(self.ax); self.cax = divider.append_axes("right", size="4.2%", pad=0.055); self.cbar = self.figure.colorbar(self.map_image, cax=self.cax)
-                formatter = ScalarFormatter(useMathText=True); formatter.set_powerlimits((-3, 4)); self.cbar.ax.yaxis.set_major_formatter(formatter); self.cbar.ax.yaxis.set_major_locator(MaxNLocator(nbins=4))
+                self.figure.subplots_adjust(right=0.76)
+                divider = make_axes_locatable(self.ax)
+                cbar_width = axes_size.Add(axes_size.Fraction(COLORBAR_WIDTH_FRACTION, axes_size.AxesX(self.ax)), axes_size.Fixed(COLORBAR_WIDTH_INCH))
+                cbar_pad = axes_size.Add(axes_size.Fraction(COLORBAR_GAP_FRACTION, axes_size.AxesX(self.ax)), axes_size.Fixed(COLORBAR_GAP_INCH))
+                self.cax = divider.append_axes("right", size=cbar_width, pad=cbar_pad)
+                self.cbar = self.figure.colorbar(self.map_image, cax=self.cax)
             elif not show_cbar and self.cbar is not None:
-                self.cbar.remove(); self.cbar = None; self.cax = None
-            elif show_cbar and self.cbar is not None:
-                formatter = ScalarFormatter(useMathText=True); formatter.set_powerlimits((-3, 4)); self.cbar.ax.yaxis.set_major_formatter(formatter); self.cbar.ax.yaxis.set_major_locator(MaxNLocator(nbins=4))
+                self.cbar.remove(); self.cbar = None; self.cax = None; self._cbar_multiplier = None; self.figure.subplots_adjust(right=0.91); self.range_slider.hide(); self.contrast_popup_btn.hide()
+            elif show_cbar:
+                self.figure.subplots_adjust(right=0.76)
+            self._configure_colorbar()
         self._apply_axes_theme()
         if self.map_image is not None: self._update_scalebar()
         self.canvas.draw_idle()
 
+    @staticmethod
+    def _power_label(exponent: int) -> str:
+        superscript = str(exponent).translate(str.maketrans("-0123456789", "⁻⁰¹²³⁴⁵⁶⁷⁸⁹"))
+        return f"×10{superscript}"
+
+    def _configure_colorbar(self) -> None:
+        if self.cbar is None or self.map_image is None: return
+        low, high = map(float, self.map_image.get_clim()); peak=max(abs(low),abs(high)); exponent=int(np.floor(np.log10(peak))) if np.isfinite(peak) and peak>0 else 0; scale=10.0**exponent if -300<exponent<300 else 1.0
+        # Верхние 25% шкалы резервируются под множитель; метки туда не попадают.
+        span=max(abs(high-low),1e-300); ticks=MaxNLocator(nbins=5).tick_values(low,high); ticks=ticks[(ticks>=low+span*0.04)&(ticks<=high-span*0.25)]
+        if len(ticks)>4: ticks=ticks[np.linspace(0,len(ticks)-1,4,dtype=int)]
+        if len(ticks)<2: ticks=np.linspace(low+span*0.28,high-span*0.28,3)
+        self.cbar.set_ticks(ticks); self.cbar.ax.yaxis.set_major_formatter(FuncFormatter(lambda value,_pos,denom=scale:f"{value/denom:.2f}")); self.cbar.ax.yaxis.set_ticks_position("right"); self.cbar.ax.tick_params(axis="y",which="both",labelright=True,labelleft=False,pad=1.5); self.cbar.ax.yaxis.get_offset_text().set_visible(False)
+        font=str(self._display_settings.get("font_family","Segoe UI")); size=int(self._display_settings.get("tick_size",8))
+        # Множитель занимает отдельную верхнюю строку. Метки выровнены по его левой границе.
+        if self._cbar_multiplier is None: self._cbar_multiplier=self.cbar.ax.text(1.04,0.985,"",transform=self.cbar.ax.transAxes,ha="left",va="top",clip_on=False,bbox=dict(facecolor="none",edgecolor="none",pad=0))
+        self._cbar_multiplier.set_position((1.03,0.985)); self._cbar_multiplier.set_clip_on(False); self._cbar_multiplier.set_text(self._power_label(exponent)); self._cbar_multiplier.set_fontsize(size); self._cbar_multiplier.set_fontfamily(font)
+        for tick in self.cbar.ax.yaxis.get_major_ticks(): tick.label2.set_ha("left"); tick.label2.set_x(1.03); tick.label2.set_clip_on(False); tick.label2.set_fontsize(size); tick.label2.set_fontfamily(font)
+
+    def _position_contrast_controls(self, _event=None) -> None:
+        """Привязывает ползунок к зазору, а кнопку — к ширине цветовой шкалы."""
+        if not hasattr(self, "range_slider") or self.map_image is None or self.cbar is None or self.cax is None:
+            self.range_slider.hide(); self.contrast_popup_btn.hide(); return
+        cw, ch = max(1, self.canvas.width()), max(1, self.canvas.height())
+        a, b = self.ax.get_position(), self.cax.get_position()
+        slider_w = CONTRAST_RAIL_WIDTH
+        gap_px = max(0, int(round((b.x0 - a.x1) * cw)))
+        sy = max(0, min(ch - 1, int(round((1.0 - a.y1) * ch))))
+        sh = max(1, min(ch - sy, int(round(a.height * ch))))
+        if gap_px >= slider_w:
+            sx = int(round((a.x1 + b.x0) * 0.5 * cw - slider_w / 2))
+            self.range_slider.setGeometry(max(0, min(cw - slider_w, sx)), sy, slider_w, sh)
+            self.range_slider.show(); self.range_slider.raise_()
+        else: self.range_slider.hide()
+        bw = max(1, int(round((b.x1 - b.x0) * cw)))
+        visual_h = max(5, min(8, round(bw * 0.82))); hit_w=max(CONTRAST_BUTTON_HIT_WIDTH,bw); hit_h=max(CONTRAST_BUTTON_HIT_HEIGHT,visual_h)
+        center_x=int(round((b.x0+b.x1)*0.5*cw)); by=int(round((1.0-b.y0)*ch))+1
+        bx=max(0,min(cw-hit_w,center_x-hit_w//2)); by=max(0,min(ch-hit_h,by))
+        self.contrast_popup_btn.set_visual_width(bw); self.contrast_popup_btn.setGeometry(bx,by,hit_w,hit_h); self.contrast_popup_btn.setPalette(self.canvas.palette()); self.contrast_popup_btn.show(); self.contrast_popup_btn.raise_()
+
+    def set_theta_axis(self, values, current_index=None) -> None:
+        """Устанавливает угловую ось без лишних сигналов обновления карты."""
+        axis = np.asarray(values, dtype=float).reshape(-1) if values is not None else np.empty(0, dtype=float)
+        self._theta_values = axis
+        slider = self.theta_slider
+        slider.blockSignals(True); slider.setRange(0, max(0, axis.size - 1))
+        slider.setTickInterval(max(1, (axis.size - 1) // 4))
+        slider.setEnabled(axis.size > 1)
+        index = int(np.clip(current_index if current_index is not None else slider.value(), 0, max(0, axis.size - 1)))
+        slider.setValue(index); slider.blockSignals(False)
+        self._update_theta_label(index)
+
+    def set_theta_slice_mode(self, enabled: bool) -> None:
+        enabled=bool(enabled); self.theta_slider.setVisible(enabled); self.theta_value_label.setVisible(enabled)
+        # theta_row намеренно не скрывается: эта высота всегда зарезервирована.
+        self.theta_row.show(); self._sync_theta_rail_geometry(); self.updateGeometry()
+
+    def _on_theta_slider_changed(self, index: int) -> None:
+        self._update_theta_label(index)
+        self.theta_index_changed.emit(int(index))
+
+    def _update_theta_label(self, index: int) -> None:
+        if self._theta_values.size and 0 <= int(index) < self._theta_values.size:
+            self.theta_value_label.setText(f"θ {self._theta_values[int(index)]:.5g}°")
+            self.theta_slider.setToolTip(f"Срез по углу θ = {self._theta_values[int(index)]:.7g}°")
+        else:
+            self.theta_value_label.setText("θ —"); self.theta_slider.setToolTip("Положение среза по углу θ")
+
     def _apply_axes_theme(self) -> None:
         c = theme_colors(self._theme); s = self._display_settings; font = str(s.get("font_family", "Segoe UI"))
+        self.ax.set_anchor("N")
         self.figure.set_facecolor(c["canvas"]); self.ax.set_facecolor(c["axes"])
         for axis, label in ((self.ax.xaxis, self.ax.xaxis.label), (self.ax.yaxis, self.ax.yaxis.label)):
             label.set_color(c["text"]); label.set_fontname(font); label.set_fontsize(int(s.get("label_size", 9)))
@@ -334,9 +494,10 @@ class MapPlotWidget(QWidget):
         for label in (*self.ax.get_xticklabels(), *self.ax.get_yticklabels()): label.set_fontname(font)
         for spine in self.ax.spines.values(): spine.set_color(c["border"]); spine.set_linewidth(0.7)
         if self.cbar is not None:
-            self.cbar.ax.set_facecolor(c["axes"]); self.cbar.ax.tick_params(colors=c["muted"], labelsize=int(s.get("colorbar_tick_size", 8)), direction="in", length=2.5, width=0.6, pad=2)
-            for label in self.cbar.ax.get_yticklabels(): label.set_fontname(font)
-            offset = self.cbar.ax.yaxis.get_offset_text(); offset.set_fontsize(max(6, int(s.get("colorbar_tick_size", 8))-1)); offset.set_fontname(font); offset.set_color(c["muted"])
+            self.cbar.ax.set_facecolor(c["axes"]); self.cbar.ax.tick_params(colors=c["muted"], labelsize=int(s.get("tick_size", 8)), direction="in", length=2.5, width=0.6, pad=2, labelright=True, labelleft=False)
+            for label in self.cbar.ax.get_yticklabels(): label.set_fontname(str(s.get("font_family", "Segoe UI"))); label.set_fontsize(int(s.get("tick_size", 8))); label.set_ha("left"); label.set_clip_on(False); label.set_x(1.03)
+            offset = self.cbar.ax.yaxis.get_offset_text(); offset.set_visible(False)
+            if self._cbar_multiplier is not None: self._cbar_multiplier.set_color(c["muted"])
             self.cbar.outline.set_edgecolor(c["border"]); self.cbar.outline.set_linewidth(0.7)
             for spine in self.cbar.ax.spines.values(): spine.set_color(c["border"]); spine.set_linewidth(0.7)
         self.canvas.setStyleSheet(f"background:{c['canvas']};")
@@ -356,7 +517,7 @@ class MapPlotWidget(QWidget):
             if size_data >= abs(xlim[1] - xlim[0]) * 0.72: return
             label = f"{length_um/1000:g} mm" if length_um >= 1000 else f"{length_um:g} µm"
             font = FontProperties(family=str(s.get("font_family", "Segoe UI")), size=int(s.get("scalebar_font_size", 9)), weight="bold")
-            bar_color = "#f5f7fa" if self._theme == "dark" else "#263445"
+            bar_color = "#f5f7fa"
             self._scalebar_artist = AnchoredSizeBar(self.ax.transData, size_data, label, loc="lower left", pad=0.45,
                 color=bar_color, frameon=False, size_vertical=1.0, fontproperties=font, sep=3, borderpad=0.45)
             self._scalebar_artist.set_zorder(8); self.ax.add_artist(self._scalebar_artist)
@@ -399,7 +560,7 @@ class MapPlotWidget(QWidget):
             self.ax.set_xlabel("Detector X (source pixels)")
             self.ax.set_ylabel("Detector Y (source pixels)")
             self.ax.xaxis.set_major_locator(MaxNLocator(nbins=5, integer=True)); self.ax.yaxis.set_major_locator(MaxNLocator(nbins=5, integer=True))
-            self.ax.set_aspect("equal", adjustable="box")
+            self.ax.set_aspect("equal", adjustable="box"); self.ax.set_anchor("N")
             self.map_image = self.ax.imshow(img, origin="lower", cmap=cmap, interpolation="nearest",
                                             extent=extent, vmin=vmin, vmax=vmax)
             self.ax.set_xlim(x_edges)
@@ -417,21 +578,24 @@ class MapPlotWidget(QWidget):
             self.ax.set_xlabel("Detector X (source pixels)")
             self.ax.set_ylabel("Detector Y (source pixels)")
             self.ax.xaxis.set_major_locator(MaxNLocator(nbins=5, integer=True)); self.ax.yaxis.set_major_locator(MaxNLocator(nbins=5, integer=True))
-            self.ax.set_aspect("equal", adjustable="box")
+            self.ax.set_aspect("equal", adjustable="box"); self.ax.set_anchor("N")
             self.ax.set_xlim(old_xlim)
             self.ax.set_ylim(old_ylim)
 
         show_cbar = bool(self._display_settings.get("show_colorbar", True))
         if show_cbar:
             if self.cbar is None:
-                divider = make_axes_locatable(self.ax); self.cax = divider.append_axes("right", size="4.2%", pad=0.055)
+                self.figure.subplots_adjust(right=0.76)
+                divider = make_axes_locatable(self.ax)
+                cbar_width = axes_size.Add(axes_size.Fraction(COLORBAR_WIDTH_FRACTION, axes_size.AxesX(self.ax)), axes_size.Fixed(COLORBAR_WIDTH_INCH))
+                cbar_pad = axes_size.Add(axes_size.Fraction(COLORBAR_GAP_FRACTION, axes_size.AxesX(self.ax)), axes_size.Fixed(COLORBAR_GAP_INCH))
+                self.cax = divider.append_axes("right", size=cbar_width, pad=cbar_pad)
                 self.cbar = self.figure.colorbar(self.map_image, cax=self.cax)
             else: self.cbar.update_normal(self.map_image)
-            formatter = ScalarFormatter(useMathText=True); formatter.set_powerlimits((-3, 4))
-            self.cbar.ax.yaxis.set_major_formatter(formatter); self.cbar.ax.yaxis.set_major_locator(MaxNLocator(nbins=4))
+            self._configure_colorbar()
         elif self.cbar is not None:
-            self.cbar.remove(); self.cbar = None; self.cax = None
-        self._apply_axes_theme(); self._update_scalebar()
+            self.cbar.remove(); self.cbar = None; self.cax = None; self._cbar_multiplier = None; self.figure.subplots_adjust(right=0.91); self.range_slider.hide(); self.contrast_popup_btn.hide()
+        self._apply_axes_theme(); self._configure_colorbar(); self._update_scalebar()
         if first_draw and self.roi_btn.isChecked(): self._apply_current_roi_tool(active=True)
         self.canvas.draw_idle()
 
@@ -537,11 +701,19 @@ class MapPlotWidget(QWidget):
     # ЕДИНЫЕ ОБРАБОТЧИКИ СОБЫТИЙ МЫШИ
     # ========================================================
     def _on_mouse_press(self, event) -> None:
-        """Единый обработчик нажатия кнопок мыши"""
-        if event.inaxes != self.ax:
-            return
-            
-        # --- ПРАВЫЙ КЛИК (button == 3 - левая кнопка): Логика ROI ---
+        """Единый обработчик мыши; не запускает создание точки по контуру сохранённой ROI."""
+        if event.inaxes != self.ax: return
+        if event.button == 1 and self._current_roi_type == "point" and self._current_selector is not None:
+            for artist in reversed(tuple(self.ax.patches)+tuple(self.ax.lines)):
+                if not hasattr(artist,"_roi_id"): continue
+                picker=artist.get_picker()
+                try: hit,_=picker(artist,event) if callable(picker) else artist.contains(event)
+                except Exception: hit=False
+                if hit:
+                    # Matplotlib передаёт тот же MouseEvent всем подписчикам; PointSelector проверит флаг.
+                    event._roi_pinned_contour_hit=True
+                    break
+        # --- ПРАВЫЙ КЛИК (button == 3): контекстное меню ROI ---
         if event.button == 3:
             clicked_roi_id = None                     # Если кликнули по карте: ищем, попали ли в прямоугольник
             for patch in reversed(self.ax.patches):   # reversed, чтобы сначала проверять верхние

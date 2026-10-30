@@ -32,11 +32,22 @@ def _configured_environment_is_active() -> bool:
             return True
     return False
 
+def _project_environment_is_active() -> bool:
+    root = project_root(); current = Path(sys.executable).resolve()
+    for name in (".venv314", ".venv", "venv"):
+        env = root / name; expected = env / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+        candidates = [expected, expected.with_name("pythonw.exe")] if os.name == "nt" else [expected]
+        for candidate in candidates:
+            try:
+                if candidate.is_file() and current == candidate.resolve(): return True
+            except OSError: pass
+    return False
+
 def bootstrap() -> None:
     root=project_root(); os.chdir(root); src=root/"src"
     if src.is_dir() and str(src) not in sys.path: sys.path.insert(0,str(src))
-    if _configured_environment_is_active(): return
-    for name in (".venv","venv"):
+    if _configured_environment_is_active() or _project_environment_is_active(): return
+    for name in (".venv314", ".venv", "venv"):
         envdir=root/name; expected=envdir/("Scripts/python.exe" if os.name=="nt" else "bin/python")
         if expected.is_file() and Path(sys.executable).resolve().parent != expected.resolve().parent:
             executable=expected.with_name("pythonw.exe") if os.name=="nt" and expected.with_name("pythonw.exe").is_file() else expected

@@ -20,6 +20,13 @@ class AppLauncherRail(QtWidgets.QWidget):
             button.clicked.connect(lambda checked=False, key=spec.key: self.appRequested.emit(key) if checked else None)
             group.addButton(button); self._buttons[spec.key]=button; layout.addWidget(button)
         layout.addStretch(1)
+    def apply_theme(self, foreground: str, icon_size: int = 16):
+        size = max(12, min(20, int(icon_size)))
+        for spec in APP_SPECS:
+            button = self._buttons[spec.key]
+            color = ("#7c8797" if foreground.lower() == "#d8e0ec" else "#94a3b8") if not spec.available else foreground
+            button.setIcon(resource_svg_icon(spec.icon, widget=button, size=size, color=color)); button.setIconSize(QtCore.QSize(size, size))
+
     def set_active(self, key: str | None):
         for name, button in self._buttons.items(): button.setChecked(name == key)
     def button(self, key: str): return self._buttons.get(key)

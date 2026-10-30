@@ -47,7 +47,7 @@ class LiveRocDashboard(QtWidgets.QMainWindow):
     def __init__(self, records: list | None = None, parent=None):
         super().__init__(parent=parent)
         self.setWindowTitle("Оперативный анализ РОК-кривых")
-        pg.setConfigOptions(antialias=True, foreground=(230, 235, 245), background=(16, 18, 24))
+        pg.setConfigOptions(antialias=True)
 
         # --- АРХИТЕКТУРНОЕ РАЗДЕЛЕНИЕ РЕЖИМОВ ---
         self.is_synthetic = records is not None
@@ -94,10 +94,7 @@ class LiveRocDashboard(QtWidgets.QMainWindow):
         self._export_worker: PipelineExportWorker | None = None
         self._run_experiment_amplitude_mVpp = 0.0
         
-        # Устанавливаем цвет до создания QAction/QIcon: уже созданная QIcon сама не перекрасится.
         app = QtWidgets.QApplication.instance()
-        if app is not None:
-            set_icon_theme(app, "#e2e8f0")
         self._build_ui()
         if self._base_folder_path is not None and hasattr(self, "edit_base_folder"):
             self.edit_base_folder.setText(str(self._base_folder_path)); self.edit_base_folder.setToolTip(str(self._base_folder_path))
@@ -476,11 +473,14 @@ class LiveRocDashboard(QtWidgets.QMainWindow):
         self.metrics_plot.reset()
         self.metrics_plot.update_data(self.time_s, records)
 
-    def _apply_theme(self) -> None:
-        app = QtWidgets.QApplication.instance()
-        if app is not None:
-            set_icon_theme(app, "#e2e8f0")
-        self.setStyleSheet("""
+    def _apply_theme(self, theme: str | None = None) -> None:
+        app = QtWidgets.QApplication.instance(); requested = str(theme or (app.property("rocMcsTheme") if app is not None else "dark")).lower()
+        active = requested if requested in ("dark", "light") else "dark"
+        dark = active == "dark"; fg = "#e2e8f0" if dark else "#263445"; bg = (16, 20, 28) if dark else (245, 247, 250)
+        if app is not None: set_icon_theme(app, fg)
+        pg.setConfigOptions(antialias=True, foreground=(226, 232, 240) if dark else (38, 52, 69), background=bg)
+        self.map_plot.apply_theme(active); self.metrics_plot.apply_theme(active); self.filmstrip.apply_theme(active)
+        qss = """
             QMainWindow, QWidget { background:#10141c; color:#e2e8f0; font-family:'Segoe UI',Arial,sans-serif; font-size:11px; }
             QWidget#appSurface, QWidget#topToolbar { background:#10141c; border:0; }
             QFrame#toolbarDivider { color:#2c3746; background:#2c3746; max-width:1px; }
@@ -518,8 +518,33 @@ class LiveRocDashboard(QtWidgets.QMainWindow):
             QScrollBar:horizontal, QScrollBar:vertical { background:#121823; border:0; width:10px; height:10px; }
             QScrollBar::handle { background:#344255; border-radius:4px; min-width:24px; min-height:24px; }
             QScrollBar::add-line, QScrollBar::sub-line { width:0; height:0; }
-        """)
-        self.btn_sidebar.setIcon(self._pane_icon(True))
+        """
+        if not dark:
+            replacements = {"#10141c":"#f5f7fa", "#e2e8f0":"#263445", "#2c3746":"#cbd5e1", "#263242":"#cbd5e1", "#1b2634":"#e3eaf2", "#303f52":"#bdcad8", "#203349":"#d6e6f5", "#4f83b8":"#527fa8", "#121923":"#ffffff", "#263445":"#526276", "#91a5bb":"#526276", "#dfe8f4":"#263445", "#9eafc3":"#64748b", "#141a24":"#edf1f5", "#9fb9d5":"#475569", "#303b4a":"#cbd5e1", "#d6b878":"#966c18", "#78889d":"#64748b", "#1a2330":"#edf1f5", "#354255":"#cbd5e1", "#15202d":"#dfe7f0", "#637186":"#94a3b8", "#171d27":"#e5eaf0", "#293341":"#cbd5e1", "#151d28":"#ffffff", "#c6d2e1":"#334155", "#45617f":"#89a8c9", "#344255":"#cbd5e1", "#121823":"#f5f7fa", "#2a394c":"#dfe7f0"}
+            tokens = {old: f"__THEME_COLOR_{i}__" for i, old in enumerate(replacements)}
+            for old, token in tokens.items(): qss = qss.replace(old, token)
+            for old, new_color in replacements.items(): qss = qss.replace(tokens[old], new_color)
+        self.setStyleSheet(qss)
+        size = max(12, min(20, int(app.property("rocMcsIconSize") if app is not None else 16)))
+        self.btn_sidebar.setIcon(self._pane_icon(self._sidebar_expanded)); self.btn_open.setIcon(resource_svg_icon("folder_open.svg", widget=self.btn_open, size=size, color=fg)); self.btn_stop.setIcon(resource_svg_icon(WATCH_STOP_ICON, widget=self.btn_stop, size=size, color=fg)); self.btn_export.setIcon(resource_svg_icon("save_icon.svg", widget=self.btn_export, size=size, color=fg))
+        self.nav_rail.apply_theme(fg, size)
+        for button in self.findChildren(QtWidgets.QAbstractButton):
+            if not button.icon().isNull(): button.setIconSize(QtCore.QSize(size, size))
+        for label in self.findChildren(QtWidgets.QLabel):
+            if label.text().startswith("Потоковая обработка ·"): label.setText("Потоковая обработка · " + ("тёмная" if dark else "светлая") + " тема")
+
+    def apply_global_settings(self, settings: dict | None = None) -> None:
+        """Получает глобальные параметры оболочки, не прерывая активный эксперимент."""
+        settings = settings or {}; app = QtWidgets.QApplication.instance(); theme = str(app.property("rocMcsTheme") if app is not None else settings.get("theme", "dark"))
+        self._apply_theme(theme)
+        if self.is_synthetic: return
+        configured = str(settings.get("experiments_dir", "") or "").strip(); candidate = Path(configured).expanduser() if configured else None
+        active = self.base_watcher is not None or self.streamer is not None or self.csv_streamer is not None
+        if not active:
+            self._base_folder_path = candidate.resolve() if candidate is not None and candidate.is_dir() else None
+            self.edit_base_folder.setText(str(self._base_folder_path) if self._base_folder_path else "")
+            self.edit_base_folder.setToolTip(str(self._base_folder_path) if self._base_folder_path else "Базовый каталог не выбран")
+            if self._base_folder_path: self.lbl_status.setText("Сохранённый каталог указан; нажмите кнопку папки, чтобы начать ожидание")
 
     # --- ЛОГИКА МАТЕМАТИКИ И ГРАНИЦ ---
     def _nearest_index(self, x: float) -> int:

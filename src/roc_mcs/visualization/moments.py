@@ -654,3 +654,106 @@ def plot_cii_dynamics_publication(
     if ax_bot is not None:ax_bot.text(.015,.91,"(b)",transform=ax_bot.transAxes,color="black",fontsize=12,fontweight="bold",va="top")
     axes_prof[0].text(.015,.94,"(c)",transform=axes_prof[0].transAxes,color="black",fontsize=12,fontweight="bold",va="top")
     return fig
+
+
+
+# === v3 ===
+
+def plot_cii_dynamics_publication(
+    roc_map:dict,profile_moments:pd.DataFrame=None,secondary_curves:dict=None,quantiles:dict=None,slices:list=None,
+    palette:str="tab10",theta_lim:tuple=None,smooth_window:int=11,smooth_poly:int=3,peak_centers:np.ndarray=None,
+    peak_label:str=r"Центр пика ($\theta_0$)",panel_b_right_curve:dict=None,panel_b_right_label:str="Интегральная интенсивность",
+    panel_b_right_unit:str="отсчёты·угл. сек.",panel_b_right_color:str="#4B0082",intensity_normalization:str="none",
+    intensity_unit:str="отсчёты",panel_gap:float=.12,show_panel_labels:bool=True
+):
+    """Публикационная CII-карта с общей шкалой выбранных rocking curves."""
+    time_s=np.asarray(roc_map["time_s"],float);Z_raw=np.asarray(roc_map["intensity"],float).T
+    y=np.asarray(roc_map.get("theta_axis",roc_map.get("s_axis")),float)
+    if Z_raw.shape!=(len(y),len(time_s)):raise ValueError("intensity должен иметь форму (time, theta)")
+    if slices is None or len(slices)==0:raise ValueError("Задайте slices=[t1,...]")
+    if intensity_normalization not in {"none","max"}:raise ValueError("intensity_normalization: 'none' или 'max'")
+    if panel_gap<0:raise ValueError("panel_gap должен быть >= 0")
+    _print_time_step(time_s);ylabel_map=r"$\theta$, угл. сек." if "theta_axis" in roc_map else r"$\sin(\omega t+\varphi)$"
+    te=_centers_to_edges_1d(time_s);ye=_centers_to_edges_1d(y);vmax=float(np.nanmax(Z_raw))
+
+    if intensity_normalization=="max":
+        map_scale=vmax if np.isfinite(vmax) and vmax>0 else 1.;Z=Z_raw/map_scale
+        map_intensity_label="Нормированная интенсивность\n(макс. карты = 1)"
+    else:
+        exp_order=int(np.floor(np.log10(vmax))) if np.isfinite(vmax) and vmax>0 else 0
+        map_scale=10.**exp_order if exp_order>=3 else 1.;Z=Z_raw/map_scale
+        map_intensity_label=f"Интенсивность ($10^{{{exp_order}}}$ {intensity_unit})" if map_scale!=1 else f"Интенсивность ({intensity_unit})"
+
+    n=len(slices);cmap=plt.get_cmap(palette);colors=[cmap(i%getattr(cmap,"N",10)) for i in range(n)]
+    profiles=[]
+    for t_req in slices:
+        idx=int(np.argmin(np.abs(time_s-float(t_req))));raw=Z_raw[:,idx];w=max(3,int(smooth_window));w+=w%2==0;w=min(w,len(raw) if len(raw)%2 else len(raw)-1)
+        sm=raw if w<=smooth_poly else savgol_filter(raw,window_length=w,polyorder=int(smooth_poly));sm=np.clip(sm,0,None)
+        profiles.append((idx,float(time_s[idx]),sm))
+    selected_max=max((float(np.nanmax(sm)) for _,_,sm in profiles if np.any(np.isfinite(sm))),default=0.)
+    if intensity_normalization=="max":
+        profile_scale=selected_max if selected_max>0 else 1.;profile_intensity_label="Нормированная интенсивность\n(макс. выбранных кривых = 1)"
+    else:
+        profile_scale=map_scale;profile_intensity_label=map_intensity_label
+    profiles=[(idx,tv,sm/profile_scale) for idx,tv,sm in profiles]
+    profile_ymax=max((float(np.nanmax(sm)) for _,_,sm in profiles if np.any(np.isfinite(sm))),default=0.)
+    profile_ylim=(0.,1.05*profile_ymax if profile_ymax>0 else 1.)
+
+    has_bot=(secondary_curves is not None and len(secondary_curves)>0) or panel_b_right_curve is not None
+    fig=plt.figure(figsize=(11.2,max(5.2,1.15*n)));gs=fig.add_gridspec(1,3,width_ratios=[12,6,.28],wspace=float(panel_gap))
+    gs_left=gs[0].subgridspec(2 if has_bot else 1,1,height_ratios=[4,1.2] if has_bot else [1],hspace=.08)
+    ax_map=fig.add_subplot(gs_left[0]);ax_bot=fig.add_subplot(gs_left[1],sharex=ax_map) if has_bot else None
+    gs_right=gs[1].subgridspec(n,1,hspace=0.0);ax_cbar=fig.add_subplot(gs[2])
+    im=ax_map.pcolormesh(te,ye,Z,shading="flat",cmap="viridis",rasterized=True);ax_map.set_ylabel(ylabel_map);ax_map.tick_params(direction="in",labelbottom=not has_bot)
+    if theta_lim is not None:ax_map.set_ylim(theta_lim)
+    if quantiles is not None and .50 in quantiles:ax_map.plot(time_s,quantiles[.50],color="white",lw=1.2,label="Медиана")
+    if profile_moments is not None and "centroid" in profile_moments.columns:ax_map.plot(profile_moments["time_s"],profile_moments["centroid"],color="crimson",lw=1.0,ls="-.",label="Центроид")
+    if peak_centers is not None:
+        pc=np.asarray(peak_centers,float)
+        if pc.shape!=(len(time_s),):raise ValueError("peak_centers должен иметь длину len(time_s)")
+        ax_map.plot(time_s,pc,marker="o",ms=3.2,ls="none",mfc="white",mec="black",mew=.45,label=peak_label)
+    if ax_map.get_legend_handles_labels()[0]:ax_map.legend(loc="upper right",fontsize=8,framealpha=.6,facecolor="black",labelcolor="white",edgecolor="none")
+
+    axes_prof=[]
+    for i,((idx,t_val,sm),color) in enumerate(zip(profiles,colors)):
+        ax=fig.add_subplot(gs_right[i],sharex=axes_prof[0] if axes_prof else None);axes_prof.append(ax)
+        ax.plot(y,sm,color=color,lw=1.2);ax.set_ylim(profile_ylim)
+        ax.annotate(f"{t_val:.1f} с",xy=(.97,.76),xycoords="axes fraction",ha="right",fontsize=8,color=color,bbox=dict(boxstyle="round,pad=.2",fc="white",ec="none",alpha=.88))
+        ax.tick_params(direction="in",labelsize=8);ax.yaxis.set_major_locator(MaxNLocator(nbins=3,prune="both"));ax.grid(ls="--",alpha=.25)
+        if i<n-1:ax.tick_params(labelbottom=False)
+        ax_map.axvline(t_val,color=color,lw=1.05,alpha=.9)
+        if ax_bot is not None:ax_bot.axvline(t_val,color=color,lw=1.0,alpha=.75)
+    axes_prof[-1].set_xlabel(ylabel_map)
+    if theta_lim is not None:axes_prof[-1].set_xlim(theta_lim)
+
+    ax_right_bg=fig.add_subplot(gs[1],frameon=False);ax_right_bg.tick_params(labelcolor="none",top=False,bottom=False,left=False,right=False)
+    ax_right_bg.set_ylabel(profile_intensity_label);ax_right_bg.yaxis.set_label_coords(-.10,.5)
+
+    if has_bot:
+        left_lines=[]
+        if secondary_curves:
+            for label,curve in secondary_curves.items():left_lines+=ax_bot.plot(curve["x"],curve["y"],lw=1.4,alpha=.88,label=label,color=curve.get("color","black"))
+            ax_bot.set_ylabel("")
+        ax_bot.set_xlabel("Время, с");ax_bot.tick_params(axis="both",direction="in",labelsize=8);ax_bot.grid(axis="y",ls="--",alpha=.3)
+        right_lines=[]
+        if panel_b_right_curve is not None:
+            if not {"x","y"}<=set(panel_b_right_curve):raise ValueError("panel_b_right_curve должен содержать 'x' и 'y'")
+            xr=np.asarray(panel_b_right_curve["x"],float);yr=np.asarray(panel_b_right_curve["y"],float)
+            if xr.ndim!=1 or xr.shape!=yr.shape:raise ValueError("panel_b_right_curve x/y должны быть одномерными одинаковой длины")
+            ax_r=ax_bot.twinx();right_lines=ax_r.plot(xr,yr,color=panel_b_right_color,lw=1.15,marker="o",ms=2.8,mfc="white",mec=panel_b_right_color,mew=.55,label=panel_b_right_label)
+            ax_r.set_ylabel("");ax_r.tick_params(axis="y",colors=panel_b_right_color,direction="in",labelsize=8);ax_r.spines["right"].set_color(panel_b_right_color)
+            fmt=ScalarFormatter(useMathText=True);fmt.set_scientific(True);fmt.set_powerlimits((0,0));ax_r.yaxis.set_major_formatter(fmt)
+            off=ax_r.yaxis.get_offset_text();off.set_color(panel_b_right_color);off.set_fontsize(8);off.set_x(1.02)
+        lines=left_lines+right_lines
+        if lines:ax_bot.legend(lines,[l.get_label() for l in lines],loc="best",frameon=True,facecolor="white",framealpha=.9,edgecolor="none",fontsize=7.5,handletextpad=.4,borderpad=.3)
+    else:ax_map.set_xlabel("Время, с")
+
+    for e in te:
+        ax_map.axvline(e,color="white",ls=":",lw=.45,alpha=.18)
+        if ax_bot is not None:ax_bot.axvline(e,color="0.6",ls=":",lw=.45,alpha=.28)
+    ax_map.set_xlim(te[0],te[-1]);fig.colorbar(im,cax=ax_cbar,label=map_intensity_label)
+    if show_panel_labels:
+        ax_map.text(.015,.95,"(а)",transform=ax_map.transAxes,color="white",fontsize=12,fontweight="bold",va="top")
+        if ax_bot is not None:ax_bot.text(.015,.91,"(б)",transform=ax_bot.transAxes,color="black",fontsize=12,fontweight="bold",va="top")
+        axes_prof[0].text(.015,.94,"(в)",transform=axes_prof[0].transAxes,color="black",fontsize=12,fontweight="bold",va="top")
+    return fig

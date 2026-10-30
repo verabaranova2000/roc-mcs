@@ -110,7 +110,8 @@ class PointSelector(BaseROISelector):
     # У точки нет вращения, нет ручек ресайза. Только создание и перемещение.
     # -------------------------------------------------------------------------
     def _process_press(self, event) -> bool:
-        """Определяет: кликнули в существующую точку для переноса, или ставим новую."""
+        """Выбирает точку либо создаёт новую; клик по сохранённой ROI не создаёт preview."""
+        if getattr(event, "_roi_pinned_contour_hit", False): return False
         # 1. Попали в существующую точку? (считаем это телом фигуры)
         if self.roi is not None and self.allow_move and self._event_in_roi(event):
             self._action = Action.MOVING

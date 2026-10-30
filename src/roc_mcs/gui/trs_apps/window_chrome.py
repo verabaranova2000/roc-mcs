@@ -57,7 +57,7 @@ class ChromeSurface(QtWidgets.QWidget):
     def showEvent(self, event): self._layout_handles(); super().showEvent(event)
 
 class WindowTitleBar(QtWidgets.QWidget):
-    def __init__(self, window, split_side, split_stack, unsplit, parent=None):
+    def __init__(self, window, split_side, split_stack, unsplit, open_settings, parent=None):
         super().__init__(parent); self._window = window; self._drag_pos = None
         self.setObjectName("trsTitleBar"); self.setFixedHeight(38)
         row = QtWidgets.QHBoxLayout(self); row.setContentsMargins(9, 0, 6, 0); row.setSpacing(5)
@@ -66,12 +66,18 @@ class WindowTitleBar(QtWidgets.QWidget):
         self.btn_split_side = self._tool("Разделить рабочую область слева направо", "app_split_horizontal.svg", split_side); row.addWidget(self.btn_split_side)
         self.btn_split_stack = self._tool("Разделить рабочую область сверху вниз", "app_split_vertical.svg", split_stack); row.addWidget(self.btn_split_stack)
         self.btn_unsplit = self._tool("Убрать разделение", "app_unsplit.svg", unsplit); row.addWidget(self.btn_unsplit)
+        self.btn_settings = self._tool("Глобальные настройки TRS Apps", "setting_icon.svg", open_settings); row.addWidget(self.btn_settings)
         row.addStretch(1)
+        self._tool_icons = [(self.btn_split_side, "app_split_horizontal.svg"), (self.btn_split_stack, "app_split_vertical.svg"), (self.btn_unsplit, "app_unsplit.svg"), (self.btn_settings, "setting_icon.svg")]
         self.btn_min = self._control("—", "Свернуть окно", window.showMinimized); row.addWidget(self.btn_min)
         self.btn_max = self._control("□", "Развернуть окно", self._toggle_maximize); row.addWidget(self.btn_max)
         self.btn_close = self._control("×", "Закрыть приложение", window.close, danger=True); row.addWidget(self.btn_close)
     def _tool(self, tip, icon, callback):
-        b = QtWidgets.QToolButton(self); b.setObjectName("chromeToolButton"); b.setFixedSize(28,28); b.setIcon(resource_svg_icon(icon, widget=b, size=16)); b.setIconSize(QtCore.QSize(16,16)); b.setToolTip(tip); b.clicked.connect(callback); return b
+        b = QtWidgets.QToolButton(self); b.setObjectName("chromeToolButton"); b.setFixedSize(28,28); b.setIcon(resource_svg_icon(icon, widget=b, size=16)); b.setIconSize(QtCore.QSize(16,16)); b.setToolTip(tip); b.setAccessibleName(tip); b.clicked.connect(callback); return b
+    def apply_theme(self, foreground: str, icon_size: int = 16):
+        size = max(12, min(20, int(icon_size)))
+        for button, name in self._tool_icons:
+            button.setIcon(resource_svg_icon(name, widget=button, size=size, color=foreground)); button.setIconSize(QtCore.QSize(size, size))
     def _control(self, text, tip, callback, danger=False):
         b = QtWidgets.QToolButton(self); b.setObjectName("windowControlDanger" if danger else "windowControl"); b.setText(text); b.setFixedSize(34,28); b.setToolTip(tip); b.clicked.connect(callback); return b
     def _toggle_maximize(self):
