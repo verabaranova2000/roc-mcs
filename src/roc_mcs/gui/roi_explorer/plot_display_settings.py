@@ -7,12 +7,13 @@ from PyQt6.QtWidgets import QCheckBox,QComboBox,QDialog,QDialogButtonBox,QDouble
 from roc_mcs.gui.components.dialog_chrome import install_dialog_titlebar
 from roc_mcs.gui.app_settings import load_settings,save_settings
 from roc_mcs.gui.roi_explorer.volume_rendering import PROJECTION_SCALES,VOLUME_SCALES
+from roc_mcs.gui.roi_explorer.colormap_catalog import NAPARI_STYLE_COLORMAPS
 from roc_mcs.gui.roi_explorer.theme import apply_popup_theme,resolve_theme
 
 DEFAULT_PLOT_DISPLAY_SETTINGS={
     "map":{"font_family":"Segoe UI","tick_size":8,"label_size":9,"colorbar_tick_size":8,"show_colorbar":True,"show_scalebar":False,"scalebar_um":2000.0,"pixel_size_um":55.0,"scalebar_font_size":9},
     "curve":{"font_family":"Segoe UI","tick_size":8,"label_size":9,"show_grid":True},
-    "volume":{"font_family":"Times New Roman","tick_size":14,"label_size":16,"show_grid":True,"show_projection":True,"show_colorbar":False,"show_legend":False,"volume_colorscale_light":"Blues","volume_colorscale_dark":"Magma","projection_colorscale":"Greys","volume_opacity":0.10,"projection_opacity":0.75,"isomin_fraction":0.16,"isomax_fraction":0.95,"surface_count":25,"smooth_sigma":0.5,"volume_stride":2,"quality":"auto","dragmode":"orbit","projection_type":"perspective","rotation_speed":14.0},
+    "volume":{"font_family":"Times New Roman","tick_size":14,"label_size":16,"axis_tick_length":3,"show_grid":True,"show_projection":True,"show_colorbar":True,"show_legend":False,"volume_colormap":"magma","volume_colorscale_light":"Blues","volume_colorscale_dark":"Magma","projection_colorscale":"Greys","volume_opacity":0.10,"projection_opacity":0.75,"isomin_fraction":0.16,"isomax_fraction":0.95,"surface_count":25,"smooth_sigma":0.5,"volume_stride":2,"quality":"auto","dragmode":"orbit","projection_type":"perspective","rotation_speed":14.0},
     "workspace":{"map_geometry":None,"curve_geometry":None,"volume_geometry":None,"orientation":"focus","layout_choice":"focus","layout_ratios":{"focus_left":0.52,"focus_top":0.50,"row":[1/3,1/3,1/3],"column":[0.30,0.30,0.40],"map3d_left":0.50,"map3d_top":0.56},"viewport_size":None},
 }
 _SETTINGS_KEY="roi_explorer_display"
@@ -55,7 +56,8 @@ def load_plot_display_settings()->dict:
         v["font_family"],v["tick_size"],v["label_size"]="Times New Roman",14,16
     v["volume_opacity"]=_safe_float(v.get("volume_opacity"),0.10,0.01,1);v["projection_opacity"]=_safe_float(v.get("projection_opacity"),0.75,0,1);v["isomin_fraction"]=_safe_float(v.get("isomin_fraction"),0.16,0,0.99);v["isomax_fraction"]=_safe_float(v.get("isomax_fraction"),0.95,0.01,1)
     if v["isomax_fraction"]<=v["isomin_fraction"]:v["isomax_fraction"]=min(1,v["isomin_fraction"]+0.05)
-    v["surface_count"]=_safe_int(v.get("surface_count"),25,2,25);v["smooth_sigma"]=_safe_float(v.get("smooth_sigma"),0.5,0,5);v["volume_stride"]=_safe_int(v.get("volume_stride"),2,2,8);v["rotation_speed"]=_safe_float(v.get("rotation_speed"),14,1,90)
+    v["surface_count"]=_safe_int(v.get("surface_count"),25,2,25);v["smooth_sigma"]=_safe_float(v.get("smooth_sigma"),0.5,0,5);v["volume_stride"]=_safe_int(v.get("volume_stride"),2,2,8);v["rotation_speed"]=_safe_float(v.get("rotation_speed"),14,1,90);v["axis_tick_length"]=_safe_int(v.get("axis_tick_length"),3,0,10)
+    if v.get("volume_colormap") not in NAPARI_STYLE_COLORMAPS:v["volume_colormap"]="magma"
     if v.get("volume_colorscale_light") not in VOLUME_SCALES:v["volume_colorscale_light"]="Blues"
     if v.get("volume_colorscale_dark") not in VOLUME_SCALES:v["volume_colorscale_dark"]="Magma"
     if v.get("projection_colorscale") not in PROJECTION_SCALES:v["projection_colorscale"]="Greys"
@@ -118,11 +120,11 @@ class PlotDisplaySettingsDialog(QDialog):
             else:
                 for name,caption in (("show_grid","Координатная сетка"),("show_projection","2D-проекция под объёмом"),("show_colorbar","Цветовая шкала объёма"),("show_legend","Легенда")):
                     w=QCheckBox(caption);w.setChecked(bool(values[name]));controls[name]=w;form.addRow("",w)
-                options=(("volume_colorscale_light","Объём · светлая тема",VOLUME_SCALES),("volume_colorscale_dark","Объём · тёмная тема",VOLUME_SCALES),("projection_colorscale","2D-проекция",PROJECTION_SCALES),("quality","Качество",(("Авто","auto"),("Полное","full"),("Сбалансированное","balanced"),("Быстрое","fast"))),("dragmode","Вращение мышью",(("Орбитальное","orbit"),("Поворот по вертикали","turntable"))),("projection_type","Проекция камеры",(("Перспективная","perspective"),("Ортографическая","orthographic"))))
+                options=(("volume_colormap","Цветовая карта объёма",NAPARI_STYLE_COLORMAPS),("projection_colorscale","2D-проекция",PROJECTION_SCALES),("quality","Качество",(("Авто","auto"),("Полное","full"),("Сбалансированное","balanced"),("Быстрое","fast"))),("dragmode","Вращение мышью",(("Орбитальное","orbit"),("Поворот по вертикали","turntable"))),("projection_type","Проекция камеры",(("Перспективная","perspective"),("Ортографическая","orthographic"))))
                 for name,caption,items in options:w=_combo(items,values[name]);controls[name]=w;form.addRow(caption,w)
                 specs=(("volume_opacity","Прозрачность объёма",0.01,1,2),("projection_opacity","Прозрачность проекции",0,1,2),("isomin_fraction","Нижний порог объёма",0,0.99,2),("isomax_fraction","Верхний порог объёма",0.01,1,2),("smooth_sigma","Сглаживание σ",0,5,2),("rotation_speed","Скорость автоворота, °/с",1,90,1))
                 for name,caption,lo,hi,dec in specs:w=_spin(float(values[name]),lo,hi,dec);controls[name]=w;form.addRow(caption,w)
-                for name,caption,lo,hi in (("surface_count","Изоповерхностей",2,25),("volume_stride","Минимальный шаг прореживания",2,8)):
+                for name,caption,lo,hi in (("surface_count","Изоповерхностей",2,25),("volume_stride","Минимальный шаг прореживания",2,8),("axis_tick_length","Длина ticks 3D, px",0,10)):
                     w=_spin(int(values[name]),lo,hi);controls[name]=w;form.addRow(caption,w)
                 note=QLabel("Авто увеличивает шаг только для больших объёмов. Геометрия ROI и координатные оси не меняются.",page);note.setWordWrap(True);note.setStyleSheet("color:palette(mid);font-size:10px;background:transparent;");form.addRow("",note)
             scroll.setWidget(page);tabs.addTab(scroll,title)

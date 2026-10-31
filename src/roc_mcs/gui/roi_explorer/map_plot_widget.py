@@ -1,6 +1,6 @@
-from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QComboBox, QLabel, QSizePolicy, QToolButton, QSlider, QStyle, QStyleOptionSlider
+from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QComboBox, QLabel, QSizePolicy, QToolButton, QSlider
 from PyQt6.QtGui import QIcon, QPainter, QPen, QPalette
-from PyQt6.QtCore import Qt, pyqtSignal, QPoint, QPointF, QRectF, QTimer
+from PyQt6.QtCore import Qt, pyqtSignal, QPoint, QPointF, QRect, QRectF, QTimer
 from matplotlib.ticker import FuncFormatter, MaxNLocator
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
@@ -19,6 +19,7 @@ from roc_mcs.gui.roi_explorer.plot_toolbar_style import ICON_DIR
 from roc_mcs.gui.components.icon_provider import svg_icon
 from roc_mcs.gui.roi_explorer.theme import apply_widget_palette, theme_colors
 from roc_mcs.gui.roi_explorer.plot_display_settings import load_plot_display_settings
+from roc_mcs.gui.roi_explorer.colormap_catalog import mpl_colormap
 from roc_mcs.gui.roi_explorer.map_tools_widget import SmartDropdownButton, QRangeSlider
 from roc_mcs.gui.roi_explorer.selectors import RotatedRectangleSelector
 from .selectors.line import LineSelector
@@ -42,9 +43,11 @@ STYLE_COORD_LABEL = """
 
 # Геометрия карты: эти значения — основные точки настройки плотности интерфейса.
 MAP_HEADER_HEIGHT = 24
-THETA_ROW_HEIGHT = 20
-THETA_VALUE_LABEL_WIDTH = 66
-THETA_ROW_INNER_GAP = 5
+# Одна и та же постоянная верхняя полоса: θ-рейка — overlay,
+# а Figure оставляет для неё место даже вне режима θ-среза.
+THETA_ROW_HEIGHT = 10
+THETA_VALUE_LABEL_WIDTH = 54
+MAP_AXES_TOP_GAP_PX = THETA_ROW_HEIGHT
 MAP_HEADER_COMBO_WIDTHS = ((48, 118), (45, 110), (40, 62))
 COLORBAR_WIDTH_FRACTION = 0.014
 COLORBAR_WIDTH_INCH = 0.025
@@ -56,19 +59,85 @@ CONTRAST_BUTTON_HIT_HEIGHT = 12
 
 
 class _ThetaRailSlider(QSlider):
-    """Однозасечечная горизонтальная рейка в стиле контрастного ползунка."""
-    def paintEvent(self, event):
-        opt=QStyleOptionSlider(); self.initStyleOption(opt); style=self.style()
-        groove=style.subControlRect(QStyle.ComplexControl.CC_Slider,opt,QStyle.SubControl.SC_SliderGroove,self)
-        handle=style.subControlRect(QStyle.ComplexControl.CC_Slider,opt,QStyle.SubControl.SC_SliderHandle,self)
-        x0=groove.left()+handle.width()/2; x1=groove.right()-handle.width()/2; y=groove.center().y(); hx=handle.center().x()
-        pal=self.palette(); p=QPainter(self); p.setRenderHint(QPainter.RenderHint.Antialiasing,True)
-        p.setPen(QPen(pal.color(QPalette.ColorRole.Mid),2.2,Qt.PenStyle.SolidLine,Qt.PenCapStyle.RoundCap)); p.drawLine(QPointF(x0,y),QPointF(x1,y))
-        for i in range(5):
-            tx=x0+(x1-x0)*i/4; p.setPen(QPen(pal.color(QPalette.ColorRole.Mid),0.8)); p.drawLine(QPointF(tx,y-3),QPointF(tx,y+3))
-        p.setPen(QPen(pal.color(QPalette.ColorRole.Highlight),2.2,Qt.PenStyle.SolidLine,Qt.PenCapStyle.RoundCap)); p.drawLine(QPointF(x0,y),QPointF(hx,y))
-        r=QRectF(hx-2.5,y-5.2,5,10.4); p.setPen(QPen(pal.color(QPalette.ColorRole.Highlight),0.9)); p.setBrush(pal.color(QPalette.ColorRole.Base)); p.drawRoundedRect(r,1.4,1.4)
-        p.setPen(QPen(pal.color(QPalette.ColorRole.Highlight),1.0)); p.drawLine(QPointF(hx-1.2,y),QPointF(hx+1.2,y)); p.end()
+    """Одна горизонтальная засечка в точном стиле вертикальной QRangeSlider.
+
+    Геометрия транспонирована относительно вертикального контрастного
+    ползунка: его засечка 7×4 px становится 4×7 px. Дорожка 3 px и
+    отступы по 6 px сохраняются без зависимости от нативного стиля QSlider.
+    """
+    _TRACK_INSET = 6.0
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setTracking(True)
+        self.setMinimumWidth(0)
+        self.setStyleSheet("QSlider#thetaSliceSlider { background: transparent; border: 0; padding: 0; margin: 0; }")
+
+    def _track_bounds(self) -> tuple[float, float]:
+        # Та же формула, что QRangeSlider._val_to_pos() для Horizontal.
+        track_length = max(1.0, float(self.width()) - 12.0)
+        return self._TRACK_INSET, self._TRACK_INSET + track_length
+
+    def _value_at(self, x: float) -> int:
+        left, right = self._track_bounds()
+        span = self.maximum() - self.minimum()
+        fraction = max(0.0, min(1.0, (float(x) - left) / max(1.0, right - left)))
+        return int(self.minimum() + round(fraction * span))
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        # В точности те же роли/цвета, что и у QRangeSlider.paintEvent().
+        palette = self.palette()
+        base = palette.color(QPalette.ColorRole.Mid)
+        accent = palette.color(QPalette.ColorRole.Highlight)
+        edge = palette.color(QPalette.ColorRole.ButtonText)
+        fill = palette.color(QPalette.ColorRole.Base)
+
+        x0, x1 = self._track_bounds()
+        y = self.height() / 2.0
+        span = self.maximum() - self.minimum()
+        fraction = ((self.value() - self.minimum()) / span) if span > 0 else 0.0
+        handle_x = x0 + fraction * (x1 - x0)
+
+        painter.setPen(QPen(base, 3.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        painter.drawLine(QPointF(x0, y), QPointF(x1, y))
+        painter.setPen(QPen(accent, 3.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        painter.drawLine(QPointF(x0, y), QPointF(handle_x, y))
+
+        # Транспонированная засечка вертикальной QRangeSlider: ровно 4×7 px.
+        painter.setPen(QPen(edge, 0.8))
+        painter.setBrush(fill)
+        painter.drawRoundedRect(QRectF(handle_x - 2.0, y - 3.5, 4.0, 7.0), 1.1, 1.1)
+        painter.setPen(QPen(accent, 0.8))
+        painter.drawLine(QPointF(handle_x, y - 2.2), QPointF(handle_x, y + 2.2))
+        painter.end()
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() != Qt.MouseButton.LeftButton or not self.isEnabled():
+            event.ignore()
+            return
+        self.setFocus(Qt.FocusReason.MouseFocusReason)
+        self.setSliderDown(True)
+        self.setValue(self._value_at(event.position().x()))
+        event.accept()
+
+    def mouseMoveEvent(self, event) -> None:
+        if self.isSliderDown() and self.isEnabled():
+            self.setValue(self._value_at(event.position().x()))
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton and self.isSliderDown():
+            self.setValue(self._value_at(event.position().x()))
+            self.setSliderDown(False)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
 
 
@@ -171,6 +240,7 @@ class MapPlotWidget(QWidget):
         self.map_image = None
         self.roi_right_click_callback = None
         self.cax = None
+        self._divider = None
         self._cbar_multiplier = None
         
         # Панель вынесена отдельно; публичные атрибуты сохранены для совместимости.
@@ -228,7 +298,7 @@ class MapPlotWidget(QWidget):
             """Создает вертикальный разделитель ' | ' для умного заголовка."""
             lbl = QLabel("|")
             lbl.setObjectName("MapHeaderSeparator"); lbl.setFixedWidth(9); lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            lbl.setStyleSheet("font-size: 11px; font-weight: normal; color: palette(window-text); background:transparent;")
+            lbl.setStyleSheet("font-size: 10px; font-weight: normal; color: palette(window-text); background:transparent;")
             return lbl
     
         # Управление данными остаётся непосредственно над соответствующим полотном.
@@ -243,15 +313,32 @@ class MapPlotWidget(QWidget):
         self.header_layout.addWidget(self.reduction_combo)
         self.header_layout.addStretch(1)
 
-        # Строка всегда резервирует высоту; содержимое выравнивается по реальной ширине карты.
-        self.theta_row=QWidget(self); self.theta_row.setObjectName("thetaSliceRow"); self.theta_row.setFixedHeight(THETA_ROW_HEIGHT); self.theta_row.setMinimumWidth(0); self.theta_row.setSizePolicy(QSizePolicy.Policy.Expanding,QSizePolicy.Policy.Fixed)
-        theta_layout=QHBoxLayout(self.theta_row); theta_layout.setContentsMargins(0,0,0,0); theta_layout.setSpacing(THETA_ROW_INNER_GAP); self._theta_layout=theta_layout
-        self.theta_slider=_ThetaRailSlider(Qt.Orientation.Horizontal,self.theta_row); self.theta_slider.setObjectName("thetaSliceSlider"); self.theta_slider.setTickPosition(QSlider.TickPosition.NoTicks); self.theta_slider.setFixedHeight(THETA_ROW_HEIGHT-2); self.theta_slider.setTracking(True); self.theta_slider.setMinimumWidth(20); self.theta_slider.setSizePolicy(QSizePolicy.Policy.Expanding,QSizePolicy.Policy.Fixed)
-        self.theta_slider.setMinimum(0); self.theta_slider.setMaximum(0); self.theta_slider.setEnabled(False)
-        self.theta_value_label=QLabel("θ —",self.theta_row); self.theta_value_label.setObjectName("thetaSliceValue"); self.theta_value_label.setAlignment(Qt.AlignmentFlag.AlignRight|Qt.AlignmentFlag.AlignVCenter); self.theta_value_label.setFixedWidth(THETA_VALUE_LABEL_WIDTH)
-        theta_layout.addWidget(self.theta_slider,1); theta_layout.addWidget(self.theta_value_label,0)
-        self._theta_values=np.empty(0,dtype=float); self.theta_slider.valueChanged.connect(self._on_theta_slider_changed)
-        self.theta_slider.hide(); self.theta_value_label.hide()
+        # θ-рейка — overlay поверх canvas, как контрастная рейка.
+        # Отдельного layout-ряда здесь нет: он не может растянуть/оттолкнуть карту.
+        self.theta_row = QWidget(self.canvas)
+        self.theta_row.setObjectName("thetaSliceRow")
+        self.theta_row.setFixedHeight(THETA_ROW_HEIGHT)
+        self.theta_row.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.theta_slider = _ThetaRailSlider(Qt.Orientation.Horizontal, self.theta_row)
+        self.theta_slider.setObjectName("thetaSliceSlider")
+        self.theta_slider.setPalette(self.range_slider.palette())
+        self.theta_slider.setTickPosition(QSlider.TickPosition.NoTicks)
+        self.theta_slider.setFixedHeight(THETA_ROW_HEIGHT)
+        self.theta_slider.setMinimum(0); self.theta_slider.setMaximum(0)
+        self.theta_slider.setEnabled(False)
+        self.theta_value_label = QLabel("θ —", self.theta_row)
+        self.theta_value_label.setObjectName("thetaSliceValue")
+        # Подпись начинается сразу справа от конца дорожки; её ширина — остаток
+        # верхней полосы, а не часть длины самой рейки.
+        self.theta_value_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.theta_value_label.setMinimumWidth(0)
+        self.theta_value_label.setMaximumWidth(THETA_VALUE_LABEL_WIDTH)
+        self.theta_value_label.setFixedHeight(THETA_ROW_HEIGHT)
+        self.theta_value_label.hide()
+        self._theta_values = np.empty(0, dtype=float)
+        self.theta_slider.valueChanged.connect(self._on_theta_slider_changed)
+        self.theta_row.show()
+        self.theta_slider.hide()
 
         # ========================================================
         # ЭТАЖ 3: Строка координат мыши (x,y)
@@ -264,11 +351,10 @@ class MapPlotWidget(QWidget):
         # ========================================================
         # СБОРКА ГЛАВНОГО СЛОЯ (main_layout)
         # ========================================================
-        self.main_layout.addWidget(self.toolbar)
-        self.main_layout.addWidget(self.header_widget)
-        self.main_layout.addWidget(self.theta_row, 0)
+        self.main_layout.addWidget(self.toolbar, 0)
+        self.main_layout.addWidget(self.header_widget, 0)
         self.main_layout.addWidget(self.canvas, 1)
-        self.main_layout.addWidget(self.coord_label)
+        self.main_layout.addWidget(self.coord_label, 0)
         self.coord_label.setFixedHeight(18)
 
  
@@ -288,21 +374,75 @@ class MapPlotWidget(QWidget):
         self.scan_combo.currentTextChanged.connect(self.scan_changed.emit)
         self.map_combo.currentTextChanged.connect(self.map_changed.emit)
         self.reduction_combo.currentTextChanged.connect(self.reduction_changed.emit)
+        self._map_geometry_sync_pending = False
         self.apply_display_settings(self._display_settings)
+        QTimer.singleShot(0, self._sync_map_vertical_geometry)
 
-    
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
-        QTimer.singleShot(0, self.canvas.draw_idle)
-        QTimer.singleShot(0, self._sync_theta_rail_geometry)
+        if not self._map_geometry_sync_pending:
+            self._map_geometry_sync_pending = True
+            QTimer.singleShot(0, self._sync_map_vertical_geometry)
+
+    def _sync_map_vertical_geometry(self) -> None:
+        """Резервирует строго THETA_ROW_HEIGHT пикселей над осями карты."""
+        self._map_geometry_sync_pending = False
+        if not hasattr(self, "canvas") or self.canvas.height() <= 0:
+            return
+        height = max(1, self.canvas.height())
+        top = max(0.55, min(0.998, 1.0 - MAP_AXES_TOP_GAP_PX / height))
+        current_top = float(self.ax.get_position().y1)
+        # Не инициируем повторную отрисовку, если геометрия уже совпадает.
+        if abs(current_top - top) * height >= 0.5:
+            self.figure.subplots_adjust(top=top)
+            self.canvas.draw_idle()
+        self.ax.set_anchor('N')
+        if self._divider is not None: self._divider.set_anchor('N')
+        self._sync_theta_rail_geometry()
 
     def _sync_theta_rail_geometry(self, _event=None) -> None:
-        """Совмещает рейку θ с шириной axes; строки выше/ниже имеют постоянную высоту."""
-        if not hasattr(self,"_theta_layout") or not hasattr(self,"canvas"): return
-        width=max(1,self.canvas.width()); pos=self.ax.get_position()
-        left=max(0,int(round(pos.x0*width))); right=max(0,int(round((1.0-pos.x1)*width)))
-        old=self._theta_layout.contentsMargins()
-        if old.left()!=left or old.right()!=right: self._theta_layout.setContentsMargins(left,0,right,0)
+        """Синхронизирует θ-рейку с bbox карты без изменения Qt-layout.
+
+        Геометрия является горизонтальным транспонированием QRangeSlider:
+        линия 3 px, поля по 6 px, thumb 4×7 px. Widget занимает 10 px по
+        высоте; это минимальный ряд, в котором семипиксельный thumb имеет
+        одинаковый свободный отступ сверху/снизу. Координаты меняются только
+        когда реальный QRect изменился — draw_event не вызывает лишних
+        повторных resize/repaint циклов.
+        """
+        if not hasattr(self, "theta_row") or not hasattr(self, "canvas"):
+            return
+        canvas_width = self.canvas.width()
+        canvas_height = self.canvas.height()
+        if canvas_width <= 0 or canvas_height <= 0:
+            return
+
+        pos = self.ax.get_position()
+        left = max(0, min(canvas_width - 1, int(round(pos.x0 * canvas_width))))
+        axes_right = max(left + 1, min(canvas_width, int(round(pos.x1 * canvas_width))))
+        row_width = max(1, canvas_width - left)
+        slider_width = max(1, min(row_width, axes_right - left))
+
+        row_rect = QRect(left, 0, row_width, THETA_ROW_HEIGHT)
+        slider_rect = QRect(0, 0, slider_width, THETA_ROW_HEIGHT)
+        # Дорожка заканчивается за 6 px до правой границы slider. Большой
+        # отступ до надписи больше не создаётся: 1 px после края thumb.
+        label_x = max(0, slider_width - 3)
+        label_width = min(THETA_VALUE_LABEL_WIDTH, max(0, row_width - label_x))
+        label_rect = QRect(label_x, 0, label_width, THETA_ROW_HEIGHT)
+
+        if self.theta_row.geometry() != row_rect:
+            self.theta_row.setGeometry(row_rect)
+        if self.theta_slider.geometry() != slider_rect:
+            self.theta_slider.setGeometry(slider_rect)
+        if self.theta_value_label.geometry() != label_rect:
+            self.theta_value_label.setGeometry(label_rect)
+
+        want_label_visible = not self.theta_slider.isHidden()
+        label_is_hidden = self.theta_value_label.isHidden()
+        if label_is_hidden != (not want_label_visible):
+            self.theta_value_label.setVisible(want_label_visible)
+        self._update_theta_label(self.theta_slider.value())
 
     # ============================================================
     # ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ КЛАССА
@@ -393,7 +533,7 @@ class MapPlotWidget(QWidget):
         self._apply_axes_theme(); self._update_scalebar(); self.tools.apply_theme(self._theme); self._update_pool_preview()
         self.coord_label.setStyleSheet(f"QLabel#MapCoordLabel {{ font-family:monospace; font-size:10px; font-weight:600; color:{c['muted']}; padding:1px 4px; background:transparent; }}")
         self.theta_row.setStyleSheet(f"QWidget#thetaSliceRow{{background:transparent;}} QLabel#thetaSliceValue{{color:{c['text']};font-family:Segoe UI,Arial,sans-serif;font-size:9px;font-weight:600;background:transparent;padding:0 1px;}}")
-        self.theta_slider.setPalette(self.palette())
+        self.theta_slider.setPalette(self.range_slider.palette())
         self.canvas.draw_idle()
 
     def apply_display_settings(self, settings: dict | None = None) -> None:
@@ -402,7 +542,7 @@ class MapPlotWidget(QWidget):
             show_cbar = bool(self._display_settings.get("show_colorbar", True))
             if show_cbar and self.cbar is None:
                 self.figure.subplots_adjust(right=0.76)
-                divider = make_axes_locatable(self.ax)
+                divider = make_axes_locatable(self.ax); divider.set_anchor('N'); self._divider = divider
                 cbar_width = axes_size.Add(axes_size.Fraction(COLORBAR_WIDTH_FRACTION, axes_size.AxesX(self.ax)), axes_size.Fixed(COLORBAR_WIDTH_INCH))
                 cbar_pad = axes_size.Add(axes_size.Fraction(COLORBAR_GAP_FRACTION, axes_size.AxesX(self.ax)), axes_size.Fixed(COLORBAR_GAP_INCH))
                 self.cax = divider.append_axes("right", size=cbar_width, pad=cbar_pad)
@@ -469,9 +609,13 @@ class MapPlotWidget(QWidget):
         self._update_theta_label(index)
 
     def set_theta_slice_mode(self, enabled: bool) -> None:
-        enabled=bool(enabled); self.theta_slider.setVisible(enabled); self.theta_value_label.setVisible(enabled)
-        # theta_row намеренно не скрывается: эта высота всегда зарезервирована.
-        self.theta_row.show(); self._sync_theta_rail_geometry(); self.updateGeometry()
+        enabled = bool(enabled)
+        # Родительский overlay и 10 px резерва существуют всегда; видимы только
+        # засечка/рейка и значение — строго в режиме «срез по θ».
+        self.theta_row.show()
+        self.theta_slider.setVisible(enabled)
+        self.theta_value_label.setVisible(enabled)
+        self._sync_theta_rail_geometry()
 
     def _on_theta_slider_changed(self, index: int) -> None:
         self._update_theta_label(index)
@@ -479,10 +623,16 @@ class MapPlotWidget(QWidget):
 
     def _update_theta_label(self, index: int) -> None:
         if self._theta_values.size and 0 <= int(index) < self._theta_values.size:
-            self.theta_value_label.setText(f"θ {self._theta_values[int(index)]:.5g}°")
-            self.theta_slider.setToolTip(f"Срез по углу θ = {self._theta_values[int(index)]:.7g}°")
+            label_text = f"θ={self._theta_values[int(index)]:.4g}°"
+            tooltip = f"Срез по углу θ = {self._theta_values[int(index)]:.7g}°"
         else:
-            self.theta_value_label.setText("θ —"); self.theta_slider.setToolTip("Положение среза по углу θ")
+            label_text = "θ —"
+            tooltip = "Положение среза по углу θ"
+        # Не инициируем перерисовку QLabel при каждом draw_event с тем же текстом.
+        if self.theta_value_label.text() != label_text:
+            self.theta_value_label.setText(label_text)
+        if self.theta_slider.toolTip() != tooltip:
+            self.theta_slider.setToolTip(tooltip)
 
     def _apply_axes_theme(self) -> None:
         c = theme_colors(self._theme); s = self._display_settings; font = str(s.get("font_family", "Segoe UI"))
@@ -561,7 +711,7 @@ class MapPlotWidget(QWidget):
             self.ax.set_ylabel("Detector Y (source pixels)")
             self.ax.xaxis.set_major_locator(MaxNLocator(nbins=5, integer=True)); self.ax.yaxis.set_major_locator(MaxNLocator(nbins=5, integer=True))
             self.ax.set_aspect("equal", adjustable="box"); self.ax.set_anchor("N")
-            self.map_image = self.ax.imshow(img, origin="lower", cmap=cmap, interpolation="nearest",
+            self.map_image = self.ax.imshow(img, origin="lower", cmap=mpl_colormap(cmap), interpolation="nearest",
                                             extent=extent, vmin=vmin, vmax=vmax)
             self.ax.set_xlim(x_edges)
             self.ax.set_ylim(y_edges)
@@ -570,7 +720,7 @@ class MapPlotWidget(QWidget):
             old_xlim, old_ylim = self.ax.get_xlim(), self.ax.get_ylim()
             self.map_image.set_data(img)
             self.map_image.set_extent(extent)
-            self.map_image.set_cmap(cmap)
+            self.map_image.set_cmap(mpl_colormap(cmap))
             if vmin is not None and vmax is not None:
                 self.map_image.set_clim(vmin, vmax)
             else:
@@ -586,7 +736,7 @@ class MapPlotWidget(QWidget):
         if show_cbar:
             if self.cbar is None:
                 self.figure.subplots_adjust(right=0.76)
-                divider = make_axes_locatable(self.ax)
+                divider = make_axes_locatable(self.ax); divider.set_anchor('N'); self._divider = divider
                 cbar_width = axes_size.Add(axes_size.Fraction(COLORBAR_WIDTH_FRACTION, axes_size.AxesX(self.ax)), axes_size.Fixed(COLORBAR_WIDTH_INCH))
                 cbar_pad = axes_size.Add(axes_size.Fraction(COLORBAR_GAP_FRACTION, axes_size.AxesX(self.ax)), axes_size.Fixed(COLORBAR_GAP_INCH))
                 self.cax = divider.append_axes("right", size=cbar_width, pad=cbar_pad)

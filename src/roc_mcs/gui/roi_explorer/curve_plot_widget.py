@@ -1,5 +1,5 @@
 """Отображение rocking curves с компактной панелью и мышиной навигацией."""
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, pyqtSignal, QTimer
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QSizePolicy
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
@@ -39,7 +39,8 @@ class CurvePlotWidget(QWidget):
         self.header_widget = QWidget(self)
         self.header_widget.setFixedHeight(24)
         header_layout = QHBoxLayout(self.header_widget)
-        header_layout.setContentsMargins(10, 2, 10, 1)
+        header_layout.setContentsMargins(10, 0, 10, 0)
+        header_layout.setSpacing(0)
         self.header_label = QLabel("Rocking curves", self.header_widget)
         self.header_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.header_label.setStyleSheet("QLabel { color: palette(window-text); font-size: 10px; font-weight: 600; background: transparent; }")
@@ -58,7 +59,8 @@ class CurvePlotWidget(QWidget):
         self._empty_artist = None
         self._theta_guide_value = None
         self._theta_guide_artist = self.ax.axvline(0, color="#d99b25", linewidth=1.15, linestyle=(0,(3,2)), alpha=0.95, zorder=6, visible=False)
-        self.figure.subplots_adjust(left=0.17, right=0.985, bottom=0.15, top=0.89)              # отступы Figure
+        # Верх графика отделён от заголовка постоянными 4 px, а не 11% высоты Figure.
+        self.figure.subplots_adjust(left=0.17, right=0.985, bottom=0.15, top=0.985)
         self.cbar = None
         self.map_image = None
         self.coord_label = QLabel("")
@@ -66,7 +68,13 @@ class CurvePlotWidget(QWidget):
         self.coord_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self.coord_label.setStyleSheet("QLabel#MapCoordLabel { font-family: monospace; font-size: 10px; font-weight: 600; color: palette(window-text); padding: 2px 5px; background: transparent; }")
         layout.addWidget(self.canvas, 1)
-        layout.addWidget(self.coord_label)
+        layout.addWidget(self.coord_label, 0)
+        self.coord_label.setFixedHeight(18)
+        layout.setStretch(0, 0)
+        layout.setStretch(1, 0)
+        layout.setStretch(2, 1)
+        layout.setStretch(3, 0)
+        self._axes_sync_pending = False
         self.canvas.mpl_connect("button_press_event", self._on_mouse_press)
         self.canvas.mpl_connect("button_release_event", self._on_mouse_release)
         self.canvas.mpl_connect("motion_notify_event", self._on_mouse_move)
@@ -74,6 +82,23 @@ class CurvePlotWidget(QWidget):
         self.canvas.mpl_connect("axes_leave_event", self._on_axes_leave)
         self._style_axes()
         self.apply_display_settings(self._display_settings)
+        QTimer.singleShot(0, self._sync_axes_top)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if not self._axes_sync_pending:
+            self._axes_sync_pending = True
+            QTimer.singleShot(0, self._sync_axes_top)
+
+    def _sync_axes_top(self) -> None:
+        """Фиксирует верхнюю границу ROC-графика в пикселях при любом resize."""
+        self._axes_sync_pending = False
+        height = max(1, self.canvas.height())
+        top = max(0.55, min(0.998, 1.0 - 4.0 / height))
+        current_top = float(self.ax.get_position().y1)
+        if abs(current_top - top) * height >= 0.5:
+            self.figure.subplots_adjust(top=top)
+            self.canvas.draw_idle()
 
     def apply_display_settings(self, settings: dict | None = None) -> None:
         if settings is not None: self._display_settings = dict(settings)
@@ -112,12 +137,29 @@ class CurvePlotWidget(QWidget):
             return False, {}
         return artist.contains(mouseevent)
 
+    def _has_visible_curve_data(self) -> bool:
+        """Направляющая θ разрешена только при наличии хотя бы одной реальной кривой."""
+        artists=list(self._curve_artists.values())
+        if self._preview_artist is not None: artists.append(self._preview_artist)
+        if self._pixel_artist is not None: artists.append(self._pixel_artist)
+        for artist in artists:
+            if not artist.get_visible(): continue
+            x,y=artist.get_data()
+            if len(x) and len(y):
+                try:
+                    import numpy as np
+                    xa=np.asarray(x,dtype=float); ya=np.asarray(y,dtype=float)
+                    if xa.shape==ya.shape and (np.isfinite(xa)&np.isfinite(ya)).any(): return True
+                except (TypeError,ValueError):
+                    return True
+        return False
+
     def set_theta_guide(self, theta_value: float | None) -> None:
-        """Показывает вертикальную направляющую выбранного угла θ без изменения масштаба."""
+        """Показывает θ только поверх существующей pinned/preview/pixel-кривой."""
         self._theta_guide_value = float(theta_value) if theta_value is not None else None
-        if self._theta_guide_value is None: self._theta_guide_artist.set_visible(False)
-        else: self._theta_guide_artist.set_xdata([self._theta_guide_value,self._theta_guide_value]); self._theta_guide_artist.set_visible(True)
-        self.canvas.draw_idle()
+        visible=self._theta_guide_value is not None and self._has_visible_curve_data()
+        if visible: self._theta_guide_artist.set_xdata([self._theta_guide_value,self._theta_guide_value])
+        self._theta_guide_artist.set_visible(bool(visible)); self.canvas.draw_idle()
 
     def draw_curves(self, curves_data: list, preview_data: dict = None, *, pixel_data: dict = None,
                     view_label: str | None = None, fit_view: bool = False, fit_y: bool = False, theta_guide: float | None = None) -> dict:
@@ -200,8 +242,9 @@ class CurvePlotWidget(QWidget):
                 self.ax.set_xlim(previous_xlim)
                 self.ax.set_ylim(live_ylim if (fit_y and preview_data) else previous_ylim)
             self._view_initialized = True
-        if self._theta_guide_value is not None:
-            self._theta_guide_artist.set_xdata([self._theta_guide_value,self._theta_guide_value]); self._theta_guide_artist.set_visible(True)
+        guide_visible=self._theta_guide_value is not None and has_data and self._has_visible_curve_data()
+        if guide_visible:self._theta_guide_artist.set_xdata([self._theta_guide_value,self._theta_guide_value])
+        self._theta_guide_artist.set_visible(bool(guide_visible))
         self.canvas.draw_idle()
         return curve_lines
 

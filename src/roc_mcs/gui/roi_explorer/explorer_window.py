@@ -966,7 +966,7 @@ class RockingCurveExplorerWindow(QMainWindow):
         curve_values = np.asarray(curve, dtype=float)
         fit_view = self._preview_fit_pending and curve_values.size > 0 and np.isfinite(curve_values).any()
         self._preview_fit_pending = False
-        self.refresh_curves(fit_curve_view=fit_view, fit_curve_y=bool(curve_values.size and np.isfinite(curve_values).any()), update_volume=fit_view)
+        self.refresh_curves(fit_curve_view=fit_view, fit_curve_y=bool(curve_values.size and np.isfinite(curve_values).any()), update_volume=False)
         self._update_inspector()
 
     def pin_preview_roi(self, *args) -> None:

@@ -46,11 +46,18 @@ def main() -> int:
     launch_cwd = Path.cwd()
     try:
         bootstrap()
+        from roc_mcs.gui.qt_webengine_bootstrap import prepare_qt_webengine
+        webengine_bootstrap_error = prepare_qt_webengine("ROI Explorer")
         from PyQt6 import QtWidgets
         from roc_mcs.gui.components.icon_provider import set_icon_theme
         from roc_mcs.gui.roi_explorer.theme import resolve_theme, theme_colors
         from roc_mcs.gui.roi_explorer.explorer_window import RockingCurveExplorerWindow
-        app=QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv); app.setApplicationName("ROI Explorer"); app.setOrganizationName("ROC-MCS"); theme=resolve_theme(app); set_icon_theme(app, theme_colors(theme)["text"])
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
+        app.setApplicationName("ROI Explorer")
+        app.setOrganizationName("ROC-MCS")
+        app.setProperty("rocMcsWebEngineBootstrapError", webengine_bootstrap_error or "")
+        theme = resolve_theme(app)
+        set_icon_theme(app, theme_colors(theme)["text"])
         path=Path(sys.argv[1]).expanduser() if len(sys.argv)>1 else None
         if path is not None and not path.is_absolute(): path=(launch_cwd/path).resolve()
         if path is not None and not path.is_file(): raise FileNotFoundError(f"Файл не найден: {path}")

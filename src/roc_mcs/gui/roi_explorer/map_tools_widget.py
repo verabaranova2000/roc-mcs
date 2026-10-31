@@ -8,6 +8,7 @@ from PyQt6.QtCore import QSize, Qt, QRectF, QLineF, pyqtSignal, QPointF, QPoint
 from roc_mcs.gui.roi_explorer.plot_toolbar_style import ICON_DIR, COMPACT_PLOT_TOOLBAR_STYLE
 from roc_mcs.gui.components.icon_provider import svg_icon
 from roc_mcs.gui.roi_explorer.theme import apply_widget_palette, apply_popup_theme, theme_colors
+from roc_mcs.gui.roi_explorer.colormap_catalog import NAPARI_STYLE_COLORMAPS, colormap_icon
 
 
 
@@ -103,8 +104,10 @@ class MapToolsWidget(QWidget):
         self.cmap_btn = QToolButton(self.contrast_dialog); self.cmap_btn.setIcon(self._create_cmap_icon()); self.cmap_btn.setText("Цветовая карта")
         self.cmap_btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon); self.cmap_btn.setToolTip("Выбрать цветовую карту")
         self.cmap_menu = QMenu(self.cmap_btn); self._cmap_actions = {}
-        for name in ("gray", "inferno", "magma", "viridis", "cividis", "plasma"):
-            action = self.cmap_menu.addAction(name); action.setCheckable(True); action.setChecked(name == "inferno")
+        self.cmap_menu.setToolTipsVisible(True)
+        for name in NAPARI_STYLE_COLORMAPS:
+            action = self.cmap_menu.addAction(colormap_icon(name), name); action.setCheckable(True); action.setChecked(name == "inferno")
+            action.setToolTip(f"Цветовая карта {name}")
             action.triggered.connect(lambda checked=False, cmap=name: self._select_cmap(cmap)); self._cmap_actions[name] = action
         self.cmap_btn.setMenu(self.cmap_menu); self.cmap_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         dialog_layout.addWidget(self.cmap_btn, 1, 1, 1, 3)
@@ -147,6 +150,7 @@ class MapToolsWidget(QWidget):
 
     def set_current_cmap(self, name: str) -> None:
         for key, action in self._cmap_actions.items(): action.setChecked(key == name)
+        self.cmap_btn.setIcon(colormap_icon(name, 24, 14))
 
     def bind_range_slider(self, slider) -> None:
         """Связывает поля контраста с вертикальным ползунком на полотне карты."""

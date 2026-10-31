@@ -55,11 +55,24 @@ def bootstrap() -> None:
 def main() -> int:
     try:
         bootstrap()
+
+        # Критически важно: сначала QtCore + WebEngine, и только потом QtWidgets,
+        # host-модули и первый QApplication. Это выполняется в основном процессе,
+        # а не в отдельном Python subprocess из BAT.
+        from roc_mcs.gui.qt_webengine_bootstrap import prepare_qt_webengine
+        webengine_bootstrap_error = prepare_qt_webengine("TRS Apps")
+
         from PyQt6 import QtWidgets
         from roc_mcs.gui.components.icon_provider import set_icon_theme
         from roc_mcs.gui.trs_apps.app_host import TRSAppsWindow
-        app=QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv); app.setApplicationName("TRS Apps"); app.setOrganizationName("ROC-MCS"); set_icon_theme(app,"#d8e0ec")
-        window=TRSAppsWindow(); window.show(); return app.exec()
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
+        app.setApplicationName("TRS Apps")
+        app.setOrganizationName("ROC-MCS")
+        app.setProperty("rocMcsWebEngineBootstrapError", webengine_bootstrap_error or "")
+        set_icon_theme(app, "#d8e0ec")
+        window = TRSAppsWindow()
+        window.show()
+        return app.exec()
     except SystemExit: raise
     except Exception: report_error(); return 1
 if __name__=="__main__": raise SystemExit(main())

@@ -2,14 +2,15 @@
 from __future__ import annotations
 import math
 import numpy as np
-from scipy.ndimage import gaussian_filter
+from scipy.ndimage import gaussian_filter, map_coordinates
 from roc_mcs.roi.roi_types import ROIVolume
+from roc_mcs.gui.roi_explorer.colormap_catalog import plotly_colorscale
 
 LIGHT_PROJECTION_SCALE = "Greys"
 DARK_PROJECTION_SCALE = [[0.0, "#f7f7f7"], [0.55, "#dedede"], [1.0, "#ffffff"]]
 VOLUME_SCALES = ("Blues", "Magma", "Viridis", "Cividis", "Inferno", "Plasma", "Hot", "Electric")
 PROJECTION_SCALES = ("Slate", "Greys", "Cividis", "Viridis")
-MAX_RENDER_POINTS = 18_000
+MAX_RENDER_POINTS = 95_000
 MAX_PROJECTION_POINTS = 1_500_000
 MAX_CACHE_VOXELS = 1_000_000
 MAX_EXTRACTION_VOXELS = 6_000_000
@@ -60,9 +61,9 @@ def crop_raw_to_roi(raw, axis, x_coords, y_coords, roi):
     return view,x[ix0:ix1],y[iy0:iy1],(ix0,ix1,iy0,iy1)
 
 
-def effective_extraction_stride(roi, x_coords, y_coords, n_theta, requested=2, max_voxels=MAX_EXTRACTION_VOXELS):
-    """Выбирает шаг входных данных до экстракции, начиная минимум с 2."""
-    shape,_=estimate_roi_voxels(roi,x_coords,y_coords,n_theta); step=max(2,int(requested)); limit=max(100_000,int(max_voxels))
+def effective_extraction_stride(roi, x_coords, y_coords, n_theta, requested=1, max_voxels=MAX_EXTRACTION_VOXELS):
+    """Сохраняет исходное разрешение ROI; прореживает вход только при превышении лимита памяти."""
+    shape,_=estimate_roi_voxels(roi,x_coords,y_coords,n_theta); step=max(1,int(requested)); limit=max(100_000,int(max_voxels))
     def points(s): return math.prod((n+s-1)//s for n in shape)
     while points(step)>limit: step+=1
     return step,shape,points(step)
@@ -78,65 +79,188 @@ def _finite_percentile(a, q, fallback=(0.0, 1.0)):
 
 
 def _projection_scale(name: str, theme: str):
-    if str(name).lower()=="slate":return DARK_PROJECTION_SCALE if theme=="dark" else LIGHT_PROJECTION_SCALE
-    if theme=="dark" and str(name).lower()=="greys":return DARK_PROJECTION_SCALE
+    if str(name).lower() in ("slate", "greys"):
+        return "Greys_r" if theme == "dark" else "Greys"
     return name
 
 
-def prepare_volume(rv: ROIVolume, *, smooth_sigma=0.5, stride=2):
-    """Сглаживает ограниченный ROI, считает полную 2D-проекцию и прореживает только 3D."""
-    if not isinstance(rv,ROIVolume):raise TypeError("Ожидается ROIVolume")
-    source=np.asarray(rv.volume); x,y,theta=(np.asarray(v,dtype=np.float64) for v in (rv.x,rv.y,rv.theta))
-    if source.ndim!=3 or source.shape!=(len(x),len(y),len(theta)):raise ValueError("Форма ROIVolume не согласована с осями")
-    if rv.coord_system not in {"xy","uv"}:raise ValueError(f"Неизвестная система координат: {rv.coord_system}")
+def _smooth_masked(values, sigma):
+    """Нормированное сглаживание: NaN не превращаются в чёрные провалы."""
+    a=np.asarray(values,dtype=np.float32); good=np.isfinite(a)
+    if not good.any(): return np.full(a.shape,np.nan,dtype=np.float32)
+    if float(sigma)<=0: return a.copy()
+    sig=(float(sigma),)*a.ndim
+    if a.ndim==3: sig=(float(sigma),float(sigma),min(0.2,float(sigma)))
+    num=gaussian_filter(np.where(good,a,0.0),sigma=sig,output=np.float32)
+    den=gaussian_filter(good.astype(np.float32),sigma=sig,output=np.float32)
+    return np.divide(num,den,out=np.full_like(num,np.nan),where=den>1e-8)
+
+
+def prepare_volume(rv: ROIVolume, *, smooth_sigma=0.5, stride=2, max_points=MAX_RENDER_POINTS):
+    """Полная XY-проекция + сглаженный прореженный 3D-объём; исходный rv не меняется."""
+    if not isinstance(rv,ROIVolume): raise TypeError("Ожидается ROIVolume")
+    source=np.asarray(rv.volume); x,y,theta=(np.asarray(v,dtype=np.float64).reshape(-1) for v in (rv.x,rv.y,rv.theta))
+    if source.ndim!=3 or source.shape!=(len(x),len(y),len(theta)): raise ValueError("Форма ROIVolume не согласована с осями")
+    if rv.coord_system not in {"xy","uv"}: raise ValueError(f"Неизвестная система координат: {rv.coord_system}")
     sigma=float(smooth_sigma)
-    if not np.isfinite(sigma) or sigma<0:raise ValueError("smooth_sigma должен быть конечным и неотрицательным")
-    # Извлекатель ограничивает объём ROI; здесь float32 снижает память, но сохраняется полная детализация проекции.
-    full=np.asarray(source,dtype=np.float32); finite=np.isfinite(full)
-    if not finite.any():raise ValueError("В объёме нет конечных значений")
-    if sigma>0:
-        sig=(sigma,sigma,0.2); num=gaussian_filter(np.where(finite,full,0).astype(np.float32,copy=False),sigma=sig,output=np.float32); den=gaussian_filter(finite.astype(np.float32),sigma=sig,output=np.float32)
-        full=np.divide(num,den,out=np.full_like(num,np.nan),where=den>1e-8); finite=np.isfinite(full)
-    projection=np.nansum(full,axis=2,dtype=np.float64).astype(np.float32)
-    stride=effective_volume_stride(full.shape,stride)
-    sampled=np.asarray(full[::stride,::stride,::stride],dtype=np.float32); xs,ys,ts=x[::stride],y[::stride],theta[::stride]
-    finite=np.isfinite(sampled)&np.isfinite(xs)[:,None,None]&np.isfinite(ys)[None,:,None]&np.isfinite(ts)[None,None,:]
-    vals=sampled[finite]
-    if not vals.size or float(np.nanmax(vals))<=0:raise ValueError("В объёме нет положительных конечных интенсивностей")
-    xv=np.broadcast_to(xs[:,None,None],sampled.shape)[finite]; yv=np.broadcast_to(ys[None,:,None],sampled.shape)[finite]; zv=np.broadcast_to(ts[None,None,:],sampled.shape)[finite]
+    if not np.isfinite(sigma) or sigma<0: raise ValueError("smooth_sigma должен быть конечным и неотрицательным")
+    finite=np.isfinite(source)
+    if not finite.any(): raise ValueError("В объёме нет конечных значений")
+    with np.errstate(invalid="ignore",over="ignore"):
+        projection=np.nansum(source,axis=2,dtype=np.float64).astype(np.float32)
+    projection=_smooth_masked(projection,sigma)
+    step=effective_volume_stride(source.shape,stride,max_points)
+    sampled=np.asarray(source[::step,::step,::step],dtype=np.float32)
+    sampled=_smooth_masked(sampled,sigma)
+    xs=x[::step]; ys=y[::step]; ts=theta[::step]
+    if xs.size>1 and xs[0]>xs[-1]: xs=xs[::-1]; sampled=sampled[::-1,:,:]
+    if ys.size>1 and ys[0]>ys[-1]: ys=ys[::-1]; sampled=sampled[:,::-1,:]
+    if ts.size>1 and ts[0]>ts[-1]: ts=ts[::-1]; sampled=sampled[:,:,::-1]
+    if x.size>1 and x[0]>x[-1]: x=x[::-1]; projection=projection[::-1,:]
+    if y.size>1 and y[0]>y[-1]: y=y[::-1]; projection=projection[:,::-1]
+    mask=np.isfinite(sampled)
+    if not mask.any(): raise ValueError("В прореженном объёме нет конечных значений")
+    vals=np.asarray(sampled[mask],dtype=np.float32)
+    if float(np.nanmax(vals))<=0: raise ValueError("В объёме нет положительных конечных интенсивностей")
+    xv=np.broadcast_to(xs.astype(np.float32)[:,None,None],sampled.shape)[mask]
+    yv=np.broadcast_to(ys.astype(np.float32)[None,:,None],sampled.shape)[mask]
+    zv=np.broadcast_to(ts.astype(np.float32)[None,None,:],sampled.shape)[mask]
     return sampled,projection,xv,yv,zv,vals
 
-def build_volume_figure(rv: ROIVolume, settings: dict, theme="light", *, peak_catalog=None):
-    """Строит объём с полным интегральным срезом и ограниченным числом точек WebGL."""
+
+def _projection_extent(projection, x, y, max_pixels=MAX_PROJECTION_POINTS):
+    projection=np.asarray(projection,dtype=np.float32); x=np.asarray(x,dtype=np.float64).reshape(-1); y=np.asarray(y,dtype=np.float64).reshape(-1)
+    if projection.shape!=(x.size,y.size): raise ValueError(f"XY-проекция {projection.shape} не совпадает с осями {(x.size,y.size)}")
+    step=max(1,int(math.ceil(math.sqrt((x.size*y.size)/max(1,int(max_pixels))))))
+    if x.size>1 and x[0]>x[-1]: x=x[::-1]; projection=projection[::-1,:]
+    if y.size>1 and y[0]>y[-1]: y=y[::-1]; projection=projection[:,::-1]
+    px=x[::step].astype(np.float32); py=y[::step].astype(np.float32); z=projection[::step,::step]
+    return px,py,z
+
+
+def _regrid_rotated_volume_to_detector(rv: ROIVolume, roi):
+    """Regrid a rotated local u/v volume onto a regular detector x/y grid for Plotly Volume.
+
+    Plotly's volume trace is most reliable on a rectilinear Cartesian lattice.  A
+    rotated ROI is extracted on a regular local (u, v, theta) lattice; converting
+    every lattice point to detector x/y produces a skew lattice and can make the
+    WebGL volume disappear.  This function changes only the display lattice: the
+    extracted ROI values and ROI geometry stay untouched.
+    """
+    if rv.coord_system != "uv":
+        return rv
+    source=np.asarray(rv.volume,dtype=np.float32)
+    u=np.asarray(rv.x,dtype=np.float64).reshape(-1); v=np.asarray(rv.y,dtype=np.float64).reshape(-1)
+    if source.shape[:2] != (u.size,v.size) or u.size < 2 or v.size < 2:
+        return rv
+    corners=np.asarray(roi.corners(),dtype=np.float64).reshape(-1,2)
+    if corners.shape[0] < 3:
+        return rv
+    du=float(np.median(np.abs(np.diff(u)))); dv=float(np.median(np.abs(np.diff(v))))
+    step=max(1e-12,min(du,dv))
+    xmin,xmax=float(np.min(corners[:,0])),float(np.max(corners[:,0])); ymin,ymax=float(np.min(corners[:,1])),float(np.max(corners[:,1]))
+    nx=max(2,int(np.ceil((xmax-xmin)/step))+1); ny=max(2,int(np.ceil((ymax-ymin)/step))+1)
+    # Keep the display regrid bounded even for pathological settings.
+    max_xy=max(4, int(math.ceil(math.sqrt(MAX_EXTRACTION_VOXELS/max(1,source.shape[2])))))
+    if max(nx,ny)>max_xy:
+        scale=max(nx,ny)/max_xy; nx=max(2,int(math.ceil(nx/scale))); ny=max(2,int(math.ceil(ny/scale)))
+    x=np.linspace(xmin,xmax,nx,dtype=np.float64); y=np.linspace(ymin,ymax,ny,dtype=np.float64)
+    X,Y=np.meshgrid(x,y,indexing="ij"); U,V=roi.to_local(X,Y)
+    iu=np.interp(U,u,np.arange(u.size,dtype=float),left=np.nan,right=np.nan); iv=np.interp(V,v,np.arange(v.size,dtype=float),left=np.nan,right=np.nan)
+    inside=np.isfinite(iu)&np.isfinite(iv)&roi.contains(X,Y)
+    coords=[np.where(inside,iu,-1.0),np.where(inside,iv,-1.0)]
+    # IMPORTANT: Plotly Volume needs the complete Cartesian lattice.  Do not
+    # remove the bbox corners with NaN: prepare_volume() flattens only finite
+    # samples and that turns a rotated ROI into an irregular point cloud.
+    # A finite zero baseline is safe because intensity isosurfaces use a
+    # strictly positive isomin.  It preserves the rectangular x*y*theta grid
+    # while keeping everything outside the physical ROI invisible.
+    out=np.zeros((nx,ny,source.shape[2]),dtype=np.float32)
+    for k in range(source.shape[2]):
+        layer=source[:,:,k]; good=np.isfinite(layer)
+        num=map_coordinates(np.where(good,layer,0.0),coords,order=1,mode="constant",cval=0.0)
+        den=map_coordinates(good.astype(np.float32),coords,order=1,mode="constant",cval=0.0)
+        valid=(den>1e-8)&inside
+        out[:,:,k]=np.divide(num,den,out=np.zeros((nx,ny),dtype=np.float32),where=valid)
+    return ROIVolume(x,y,np.asarray(rv.theta,dtype=np.float64).copy(),out,"xy",rv.roi)
+
+
+def build_volume_figure(rv: ROIVolume, settings: dict, theme="light", *, peak_catalog=None,
+                        full_projection=None, detector_x=None, detector_y=None, overlay_roi=None):
+    """Стиль лабораторного Plotly-builder; опционально показывает ROI-объём на полном XY-детекторе."""
     import plotly.graph_objects as go
     theme="dark" if str(theme).lower()=="dark" else "light"
     requested=max(2,int(settings.get("volume_stride",2))); sigma=max(0.0,float(settings.get("smooth_sigma",0.5)))
-    sampled,projection,xv,yv,zv,vals=prepare_volume(rv,smooth_sigma=sigma,stride=requested)
-    stride=effective_volume_stride(np.asarray(rv.volume).shape,requested)
-    x,y,theta=(np.asarray(v,dtype=np.float64) for v in (rv.x,rv.y,rv.theta))
+    overlay=full_projection is not None and detector_x is not None and detector_y is not None and overlay_roi is not None
+    display_rv=_regrid_rotated_volume_to_detector(rv,overlay_roi) if overlay and rv.coord_system=="uv" else rv
+    sampled,projection,xv,yv,zv,vals=prepare_volume(display_rv,smooth_sigma=sigma,stride=requested,max_points=int(settings.get("max_render_points",MAX_RENDER_POINTS)))
+    x=np.asarray(display_rv.x,dtype=np.float64); y=np.asarray(display_rv.y,dtype=np.float64); theta=np.asarray(display_rv.theta,dtype=np.float64)
+    if overlay:
+        plane=_smooth_masked(np.asarray(full_projection,dtype=np.float32),sigma)
+        px=np.asarray(detector_x,dtype=np.float64); py=np.asarray(detector_y,dtype=np.float64)
+        px_plot,py_plot,proj=_projection_extent(plane,px,py)
+        x_label,y_label="Detector X (pixels)","Detector Y (pixels)"
+        extent_x,extent_y=px,py
+    else:
+        px_plot,py_plot,proj=_projection_extent(projection,x,y)
+        x_label,y_label=("Detector X (pixels)","Detector Y (pixels)") if rv.coord_system=="xy" else ("ROI u (pixels)","ROI v (pixels)")
+        extent_x,extent_y=x,y
+    proj_finite=proj[np.isfinite(proj)]
+    if not proj_finite.size: raise ValueError("В XY-проекции нет конечных значений")
+    pmin,pmax=np.percentile(proj_finite,[2,98]); pmin=float(pmin); pmax=float(pmax)
+    if pmin>=pmax:pmax=pmin+max(abs(pmin)*1e-9,1e-12)
+    threshold_values=vals[np.isfinite(vals)&(vals>0)]
+    if not threshold_values.size: raise ValueError("В объёме нет положительных конечных интенсивностей")
+    robust=float(np.percentile(threshold_values,99.9)); robust=max(robust,float(np.max(threshold_values))*1e-9,1e-12)
     z_min,z_max=float(np.nanmin(theta)),float(np.nanmax(theta)); z_floor=z_min-max((z_max-z_min)*0.15,1e-9)
-    p_min,p_max=_finite_percentile(projection,(2,98)); max_int=max(float(np.nanmax(vals)),1e-12)
-    max_xy=max(len(x),len(y),1); aspect=dict(x=len(x)/max_xy*2.5,y=len(y)/max_xy*2.5,z=1.8)
-    projection_stride=max(1,int(math.ceil(math.sqrt((len(x)*len(y))/MAX_PROJECTION_POINTS))))
-    x2d,y2d=np.meshgrid(x[::projection_stride],y[::projection_stride],indexing="ij"); projection_plot=projection[::projection_stride,::projection_stride]; dark=theme=="dark"
-    bg="#111316" if dark else "#ffffff"; text="#d9dde3" if dark else "#111111"; grid="#353a42" if dark else "#d8d8d8"; line="#8b929c" if dark else "#222222"; angle="#ffb300" if dark else "#9a6500"
-    font=str(settings.get("font_family","Times New Roman")); axis=dict(showbackground=False,gridcolor=grid,zeroline=False,showspikes=False,linecolor=line,linewidth=1.2,ticks="inside",tickcolor=line,title_font=dict(color=text,size=int(settings.get("label_size",12)),family=font),tickfont=dict(color=text,size=int(settings.get("tick_size",10)),family=font))
+    max_xy=max(len(extent_x),len(extent_y),1)
+    aspect=dict(x=len(extent_x)/max_xy*2.2,y=len(extent_y)/max_xy*2.2,z=1.8)
+    dark=theme=="dark"; bg="#111316" if dark else "#ffffff"; text="#e1e4e8" if dark else "#111111"
+    grid="#343941" if dark else "#e0e0e0"; axisline="#aeb5be" if dark else "#222222"
+    font=str(settings.get("font_family","Times New Roman"))
+    axis=dict(showbackground=False,gridcolor=grid,zeroline=False,showspikes=False,linecolor=axisline,linewidth=1.2,ticks="inside",ticklen=float(settings.get("axis_tick_length",3.0)),tickwidth=1,tickcolor=axisline,
+        title_font=dict(color=text,size=int(settings.get("label_size",15)),family=font),tickfont=dict(color=text,size=int(settings.get("tick_size",12)),family=font))
     fig=go.Figure()
     if bool(settings.get("show_projection",True)):
-        fig.add_trace(go.Surface(x=x2d,y=y2d,z=np.full(x2d.shape,z_floor,dtype=np.float32),surfacecolor=projection_plot,colorscale=_projection_scale(str(settings.get("projection_colorscale","Greys")),theme),cmin=p_min,cmax=p_max,showscale=False,hoverinfo="skip",opacity=float(settings.get("projection_opacity",0.75)),contours=dict(x=dict(show=True,color="rgba(130,130,130,0.12)",width=1),y=dict(show=True,color="rgba(130,130,130,0.12)",width=1)),name="Projection"))
+        # Surface: строки z соответствуют y, столбцы — x. Исходная проекция
+        # хранится как (x, y), поэтому для 1D-осей передаём транспонированную матрицу.
+        surface_shape=(len(py_plot),len(px_plot)); surface_z=np.full(surface_shape,z_floor,dtype=np.float32); surface_color=np.asarray(proj.T,dtype=np.float32)
+        fig.add_trace(go.Surface(x=px_plot,y=py_plot,z=surface_z,surfacecolor=surface_color,
+            colorscale=_projection_scale(str(settings.get("projection_colorscale","Greys")),theme),cmin=pmin,cmax=pmax,showscale=False,hoverinfo="skip",opacity=float(settings.get("projection_opacity",0.75)),connectgaps=False,
+            contours=dict(x=dict(show=True,color="rgba(110,110,110,0.16)",width=1),y=dict(show=True,color="rgba(110,110,110,0.16)",width=1)),name="Интегральная проекция"))
     surface_count=max(2,min(25,int(settings.get("surface_count",25))))
-    fig.add_trace(go.Volume(x=xv,y=yv,z=zv,value=vals,isomin=max_int*float(settings.get("isomin_fraction",0.16)),isomax=max_int*float(settings.get("isomax_fraction",0.95)),cmin=0,cmax=max_int,opacity=float(settings.get("volume_opacity",0.10)),surface=dict(count=surface_count),colorscale=str(settings.get("volume_colorscale_dark" if dark else "volume_colorscale_light","Magma" if dark else "Blues")),showscale=bool(settings.get("show_colorbar",False)),caps=dict(x_show=False,y_show=False,z_show=False),lighting=dict(ambient=0.95,diffuse=0.25,specular=0.0),name="Intensity volume",hovertemplate="x=%{x:.4g}<br>y=%{y:.4g}<br>θ=%{z:.5g}<br>I=%{value:.5g}<extra></extra>"))
+    fig.add_trace(go.Volume(x=xv,y=yv,z=zv,value=vals,isomin=robust*float(settings.get("isomin_fraction",0.16)),isomax=robust*float(settings.get("isomax_fraction",0.95)),
+        opacity=float(settings.get("volume_opacity",0.10)),surface=dict(count=surface_count),colorscale=plotly_colorscale(str(settings.get("volume_colormap", settings.get("volume_colorscale_dark" if dark else "volume_colorscale_light", "magma" if dark else "Blues")))),
+        showscale=bool(settings.get("show_colorbar",False)),caps=dict(x_show=False,y_show=False,z_show=False),lighting=dict(ambient=0.95,diffuse=0.25,specular=0.0),name="Интенсивность",
+        hovertemplate="x=%{x:.4g}<br>y=%{y:.4g}<br>θ=%{z:.5g}°<br>I=%{value:.5g}<extra></extra>"))
+    if overlay and bool(settings.get("show_projection",True)):
+        try:
+            corners=np.asarray(overlay_roi.corners(),dtype=np.float64).reshape(-1,2)
+            if corners.shape[0]>=3:
+                corners=np.vstack((corners,corners[0])); raw_color=getattr(overlay_roi,"color","#ffb347"); color=raw_color.name() if callable(getattr(raw_color,"name",None)) else str(raw_color); color=color.strip() or "#ffb347"
+                try:
+                    from plotly.colors import validate_colors
+                    validate_colors([color])
+                except Exception:
+                    color="#ffb347"
+                fig.add_trace(go.Scatter3d(x=corners[:,0],y=corners[:,1],z=np.full(len(corners),z_floor,dtype=np.float32),mode="lines",name="Граница ROI",
+                    line=dict(color=color,width=4),hoverinfo="skip",showlegend=False))
+        except (AttributeError,TypeError,ValueError):
+            pass
     if peak_catalog is not None and getattr(peak_catalog,"empty",True) is False:
         cat=peak_catalog.copy(); required={"x","y","theta"}
         if required.issubset(cat.columns):
-            px0,py0,ptheta=cat["x"].to_numpy(float),cat["y"].to_numpy(float),cat["theta"].to_numpy(float); px,py=rv.roi.to_local(px0,py0) if rv.coord_system=="uv" else (px0,py0)
-            inside=rv.roi.contains(px0,py0)&np.isfinite(px)&np.isfinite(py)&np.isfinite(ptheta)
+            px0,py0,ptheta=cat["x"].to_numpy(float),cat["y"].to_numpy(float),cat["theta"].to_numpy(float)
+            px,py=rv.roi.to_local(px0,py0) if rv.coord_system=="uv" and rv.roi is not None else (px0,py0)
+            inside=rv.roi.contains(px0,py0) if rv.roi is not None else np.ones(px0.shape,dtype=bool)
+            inside=np.asarray(inside)&np.isfinite(px)&np.isfinite(py)&np.isfinite(ptheta)
             fig.add_trace(go.Scatter3d(x=np.asarray(px)[inside],y=np.asarray(py)[inside],z=ptheta[inside],mode="markers",name="Пики",marker=dict(size=2,opacity=1,color="#ffb347")))
-    x_label,y_label=("Detector X (pixels)","Detector Y (pixels)") if rv.coord_system=="xy" else ("ROI u (pixels)","ROI v (pixels)")
     camera=settings.get("camera") if isinstance(settings.get("camera"),dict) else None
     if not camera:camera=dict(eye=dict(x=1.6,y=-1.9,z=1.25),center=dict(x=0,y=0,z=0),up=dict(x=0,y=0,z=1))
-    spatial_bg="#000000" if dark else "#f1f3f5"; angular_bg="#070707" if dark else "#fff7e8"
-    z_axis={**axis,"showbackground":True,"backgroundcolor":angular_bg,"gridcolor":"#443311" if dark else "#e5d8b5","showgrid":bool(settings.get("show_grid",True)),"showspikes":True,"spikecolor":angle,"spikethickness":2,"linewidth":2,"linecolor":angle,"title_font":dict(color=angle,size=int(settings.get("label_size",12)),family=font),"tickfont":dict(color=angle,size=int(settings.get("tick_size",10)),family=font),"range":[z_floor,z_max]}
-    xaxis={**axis,"showbackground":True,"backgroundcolor":spatial_bg,"gridcolor":"#333333" if dark else "#d5d9de","showgrid":bool(settings.get("show_grid",True)),"showspikes":True,"spikecolor":"#00bcd4" if dark else "#3a8490","spikethickness":1}; yaxis={**xaxis}
-    fig.update_layout(margin=dict(l=0,r=0,b=0,t=0),paper_bgcolor=bg,plot_bgcolor=bg,uirevision="trs-3d",scene=dict(bgcolor=bg,xaxis_title=x_label,yaxis_title=y_label,zaxis_title="Angle θ (°)",aspectmode="manual",aspectratio=aspect,xaxis=xaxis,yaxis=yaxis,zaxis=z_axis,camera=camera,dragmode=str(settings.get("dragmode","orbit")),camera_projection_type=str(settings.get("projection_type","perspective"))),legend=dict(font=dict(family=font,size=10,color=text),bgcolor="rgba(0,0,0,0)",borderwidth=0),showlegend=bool(settings.get("show_legend",False)))
+    # Сохраняем визуальную схему лабораторного Plotly-эталона: прозрачные фоны осей,
+    # нейтральная сетка и одинаковая типографика без декоративных цветных плоскостей.
+    z_axis={**axis,"range":[z_floor,z_max]}
+    fig.update_layout(margin=dict(l=0,r=0,t=8,b=0),paper_bgcolor=bg,plot_bgcolor=bg,font=dict(family=font,color=text,size=12),
+        uirevision="trs-3d",scene=dict(bgcolor=bg,xaxis_title=x_label,yaxis_title=y_label,zaxis_title="Angle θ (°)",aspectmode="manual",aspectratio=aspect,
+        xaxis=axis,yaxis=axis,zaxis=z_axis,camera=camera),showlegend=bool(settings.get("show_legend",False)))
     return fig
