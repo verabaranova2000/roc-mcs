@@ -5,6 +5,7 @@ import numpy as np
 from scipy.ndimage import gaussian_filter, map_coordinates
 from roc_mcs.roi.roi_types import ROIVolume
 from roc_mcs.gui.roi_explorer.colormap_catalog import plotly_colorscale
+from roc_mcs.gui.roi_explorer.volume_rendering_runtime import volume_opacity_scale
 
 LIGHT_PROJECTION_SCALE = "Greys"
 DARK_PROJECTION_SCALE = [[0.0, "#f7f7f7"], [0.55, "#dedede"], [1.0, "#ffffff"]]
@@ -218,22 +219,26 @@ def build_volume_figure(rv: ROIVolume, settings: dict, theme="light", *, peak_ca
     dark=theme=="dark"; bg="#111316" if dark else "#ffffff"; text="#e1e4e8" if dark else "#111111"
     grid="#343941" if dark else "#e0e0e0"; axisline="#aeb5be" if dark else "#222222"
     font=str(settings.get("font_family","Times New Roman"))
-    axis=dict(showbackground=False,gridcolor=grid,zeroline=False,showspikes=False,linecolor=axisline,linewidth=1.2,ticks="inside",ticklen=float(settings.get("axis_tick_length",3.0)),tickwidth=1,tickcolor=axisline,
+    show_grid=bool(settings.get("show_grid",True))
+    axis=dict(showbackground=False,showgrid=show_grid,gridcolor=grid if show_grid else "rgba(0,0,0,0)",zeroline=False,showspikes=False,linecolor=axisline,linewidth=1.2,ticks="inside",ticklen=float(settings.get("axis_tick_length",3.0)),tickwidth=1,tickcolor=axisline,
         title_font=dict(color=text,size=int(settings.get("label_size",15)),family=font),tickfont=dict(color=text,size=int(settings.get("tick_size",12)),family=font))
     fig=go.Figure()
-    if bool(settings.get("show_projection",True)):
-        # Surface: строки z соответствуют y, столбцы — x. Исходная проекция
-        # хранится как (x, y), поэтому для 1D-осей передаём транспонированную матрицу.
+    # Не отправляем крупную Surface-сетку в WebGL, если проекция выключена.
+    # Если пользователь включит её позднее, виджет выполнит один полный rebuild;
+    # после создания Surface дальнейшие on/off переключения делаются через restyle.
+    show_projection=bool(settings.get("show_projection",True))
+    if show_projection:
+        # Строки z соответствуют y, столбцы — x; исходная проекция имеет форму (x, y).
         surface_shape=(len(py_plot),len(px_plot)); surface_z=np.full(surface_shape,z_floor,dtype=np.float32); surface_color=np.asarray(proj.T,dtype=np.float32)
         fig.add_trace(go.Surface(x=px_plot,y=py_plot,z=surface_z,surfacecolor=surface_color,
             colorscale=_projection_scale(str(settings.get("projection_colorscale","Greys")),theme),cmin=pmin,cmax=pmax,showscale=False,hoverinfo="skip",opacity=float(settings.get("projection_opacity",0.75)),connectgaps=False,
             contours=dict(x=dict(show=True,color="rgba(110,110,110,0.16)",width=1),y=dict(show=True,color="rgba(110,110,110,0.16)",width=1)),name="Интегральная проекция"))
     surface_count=max(2,min(25,int(settings.get("surface_count",25))))
     fig.add_trace(go.Volume(x=xv,y=yv,z=zv,value=vals,isomin=robust*float(settings.get("isomin_fraction",0.16)),isomax=robust*float(settings.get("isomax_fraction",0.95)),
-        opacity=float(settings.get("volume_opacity",0.10)),surface=dict(count=surface_count),colorscale=plotly_colorscale(str(settings.get("volume_colormap", settings.get("volume_colorscale_dark" if dark else "volume_colorscale_light", "magma" if dark else "Blues")))),
+        opacity=float(settings.get("volume_opacity",0.10)),opacityscale=volume_opacity_scale(settings.get("volume_opacity_mode","uniform")),surface=dict(count=surface_count),colorscale=plotly_colorscale(str(settings.get("volume_colormap", settings.get("volume_colorscale_dark" if dark else "volume_colorscale_light", "magma" if dark else "Blues")))),
         showscale=bool(settings.get("show_colorbar",False)),caps=dict(x_show=False,y_show=False,z_show=False),lighting=dict(ambient=0.95,diffuse=0.25,specular=0.0),name="Интенсивность",
         hovertemplate="x=%{x:.4g}<br>y=%{y:.4g}<br>θ=%{z:.5g}°<br>I=%{value:.5g}<extra></extra>"))
-    if overlay and bool(settings.get("show_projection",True)):
+    if overlay and show_projection:
         try:
             corners=np.asarray(overlay_roi.corners(),dtype=np.float64).reshape(-1,2)
             if corners.shape[0]>=3:
@@ -244,7 +249,8 @@ def build_volume_figure(rv: ROIVolume, settings: dict, theme="light", *, peak_ca
                 except Exception:
                     color="#ffb347"
                 fig.add_trace(go.Scatter3d(x=corners[:,0],y=corners[:,1],z=np.full(len(corners),z_floor,dtype=np.float32),mode="lines",name="Граница ROI",
-                    line=dict(color=color,width=4),hoverinfo="skip",showlegend=False))
+                    line=dict(color=color,width=4),hoverinfo="skip",showlegend=False,
+                    visible=bool(settings.get("show_projection",True))))
         except (AttributeError,TypeError,ValueError):
             pass
     if peak_catalog is not None and getattr(peak_catalog,"empty",True) is False:
@@ -257,10 +263,13 @@ def build_volume_figure(rv: ROIVolume, settings: dict, theme="light", *, peak_ca
             fig.add_trace(go.Scatter3d(x=np.asarray(px)[inside],y=np.asarray(py)[inside],z=ptheta[inside],mode="markers",name="Пики",marker=dict(size=2,opacity=1,color="#ffb347")))
     camera=settings.get("camera") if isinstance(settings.get("camera"),dict) else None
     if not camera:camera=dict(eye=dict(x=1.6,y=-1.9,z=1.25),center=dict(x=0,y=0,z=0),up=dict(x=0,y=0,z=1))
+    else:camera=dict(camera)
+    camera["projection"]={"type":"orthographic" if settings.get("projection_type")=="orthographic" else "perspective"}
     # Сохраняем визуальную схему лабораторного Plotly-эталона: прозрачные фоны осей,
     # нейтральная сетка и одинаковая типографика без декоративных цветных плоскостей.
     z_axis={**axis,"range":[z_floor,z_max]}
-    fig.update_layout(margin=dict(l=0,r=0,t=8,b=0),paper_bgcolor=bg,plot_bgcolor=bg,font=dict(family=font,color=text,size=12),
-        uirevision="trs-3d",scene=dict(bgcolor=bg,xaxis_title=x_label,yaxis_title=y_label,zaxis_title="Angle θ (°)",aspectmode="manual",aspectratio=aspect,
+    fig.update_layout(meta={"roi3d": {"threshold_base": robust}},
+        margin=dict(l=0,r=0,t=8,b=0),paper_bgcolor=bg,plot_bgcolor=bg,font=dict(family=font,color=text,size=12),
+        uirevision="trs-3d",scene=dict(bgcolor=bg,dragmode="turntable" if settings.get("dragmode")=="turntable" else "orbit",xaxis_title=x_label,yaxis_title=y_label,zaxis_title="Angle θ (°)",aspectmode="manual",aspectratio=aspect,
         xaxis=axis,yaxis=axis,zaxis=z_axis,camera=camera),showlegend=bool(settings.get("show_legend",False)))
     return fig

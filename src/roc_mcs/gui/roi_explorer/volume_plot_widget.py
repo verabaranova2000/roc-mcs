@@ -10,7 +10,13 @@ from roc_mcs.roi.extraction import extract_roi_volume
 from roc_mcs.roi.roi_types import ROI
 from roc_mcs.gui.roi_explorer.theme import apply_popup_theme, apply_widget_palette, resolve_theme, theme_colors
 from roc_mcs.gui.roi_explorer.volume_rendering import build_volume_figure, effective_volume_stride, effective_extraction_stride, crop_raw_to_roi, MAX_CACHE_VOXELS, MAX_RENDER_POINTS
+from roc_mcs.gui.roi_explorer.volume_rendering_runtime import (
+    build_live_display_patch,
+    can_update_live_display,
+    changed_setting_keys,
+)
 from roc_mcs.gui.roi_explorer.volume_tools_widget import VolumeToolsWidget
+from roc_mcs.gui.roi_explorer.plot_display_settings import save_plot_display_settings
 
 try:
     from PyQt6 import QtCore
@@ -45,7 +51,7 @@ _HTML = r'''<!doctype html>
 <style>html,body,#plot{margin:0;width:100%;height:100%;min-height:1px;overflow:hidden;background:__BG__}html,body{padding:0;user-select:none;overscroll-behavior:none}#plot{position:absolute;inset:0;contain:strict}</style>
 <script src="qrc:///qtwebchannel/qwebchannel.js"></script><script src="plotly.min.js"></script></head>
 <body><div id="plot"></div><script>
-let bridge=null, webglOk=false, graph=document.getElementById('plot'), camera={eye:{x:1.6,y:-1.9,z:1.25},center:{x:0,y:0,z:0},up:{x:0,y:0,z:1}}, rotating=false, raf=0, lastT=0, speed=14, internalCamera=false, middle=null, pendingErrors=[], plotEventsBound=false, pendingFigure=null, renderBusy=false, renderId=0, resizeTimer=0, resizeBusy=false, resizePending=false, forceResize=false, cameraBusy=false, lastRenderedFigure=null, boundCanvases=new WeakSet(), activeTransferId=0, transferChunks=null, transferCount=0;
+let bridge=null, webglOk=false, graph=document.getElementById('plot'), camera={eye:{x:1.6,y:-1.9,z:1.25},center:{x:0,y:0,z:0},up:{x:0,y:0,z:1}}, rotating=false, raf=0, lastT=0, speed=14, internalCamera=false, middle=null, pendingErrors=[], plotEventsBound=false, pendingFigure=null, renderBusy=false, renderId=0, resizeTimer=0, resizeBusy=false, resizePending=false, forceResize=false, cameraBusy=false, lastRenderedFigure=null, boundCanvases=new WeakSet(), activeTransferId=0, transferChunks=null, transferCount=0, pendingDisplayPatch=null, displayBusy=false;
 function reportError(message){const text=String(message&&message.message||message||'Неизвестная ошибка');if(bridge){try{bridge.renderError(text);}catch(e){}}else pendingErrors.push(text);}
 window.addEventListener('error',e=>reportError((e.message||'JavaScript error')+(e.filename?' · '+e.filename.split('/').pop():'')+(e.lineno?':'+e.lineno:'')));
 window.addEventListener('unhandledrejection',e=>reportError('Ошибка отрисовки Plotly: '+(e.reason&&e.reason.message||e.reason||'отклонён Promise')));
@@ -53,25 +59,139 @@ function webglAvailable(){try{const c=document.createElement('canvas'),gl=c.getC
 function norm(v){const n=Math.hypot(v.x,v.y,v.z)||1;return {x:v.x/n,y:v.y/n,z:v.z/n};}
 function cross(a,b){return {x:a.y*b.z-a.z*b.y,y:a.z*b.x-a.x*b.z,z:a.x*b.y-a.y*b.x};}
 function emitCamera(){if(bridge)bridge.cameraChanged(JSON.stringify(camera));}
-function bindPlotEvents(){if(plotEventsBound)return true;if(typeof graph.on!=='function')return false;graph.on('plotly_relayout',function(e){const c=e['scene.camera']||e.scene?.camera;if(c){camera=c;if(!internalCamera&&bridge){setRotating(false);bridge.autoRotateStopped();emitCamera();}}});plotEventsBound=true;return true;}
+function cloneCamera(value){return JSON.parse(JSON.stringify(value||{}));}
+function mergeCamera(base,patch){const out=cloneCamera(base);for(const key of ['eye','center','up','projection']){if(patch&&patch[key]&&typeof patch[key]==='object')out[key]=Object.assign({},out[key]||{},patch[key]);}return out;}
+let cameraApplyBusy=false,pendingCameraApply=null,cameraEmitPending=false,cameraApplyRaf=0,plotGeneration=0;
+function schedulePlotWork(){
+    if(renderBusy||resizeBusy||displayBusy||cameraApplyBusy)return;
+    if(pendingFigure!==null){requestAnimationFrame(flushRender);return;}
+    if(pendingDisplayPatch!==null){requestAnimationFrame(flushDisplayPatch);return;}
+    if(resizePending){resizePending=false;requestAnimationFrame(flushResize);return;}
+    if(pendingCameraApply!==null&&!cameraApplyRaf){
+        cameraApplyRaf=requestAnimationFrame(()=>{cameraApplyRaf=0;flushCameraApply();});
+    }
+}
+function flushCameraApply(){
+    if(cameraApplyBusy||renderBusy||resizeBusy||displayBusy||!pendingCameraApply||!graph._fullLayout||!window.Plotly)return;
+    const next=pendingCameraApply,generation=plotGeneration;pendingCameraApply=null;cameraApplyBusy=true;internalCamera=true;
+    Plotly.relayout(graph,{'scene.camera':next}).catch(e=>reportError(e)).finally(()=>{
+        cameraApplyBusy=false;internalCamera=false;
+        if(generation!==plotGeneration)cameraEmitPending=false;
+        if(pendingCameraApply===null&&cameraEmitPending){cameraEmitPending=false;emitCamera();}
+        schedulePlotWork();
+    });
+}
+function setCamera(c,emit=true){
+    if(!c)return;camera=mergeCamera(camera,c);
+    if(emit)cameraEmitPending=true;
+    pendingCameraApply=cloneCamera(camera);
+    schedulePlotWork();
+}
+function bindPlotEvents(){if(plotEventsBound)return true;if(typeof graph.on!=='function')return false;graph.on('plotly_relayout',function(e){const c=e['scene.camera']||e.scene?.camera;if(c&&!internalCamera){camera=mergeCamera(camera,c);setRotating(false);if(bridge){bridge.autoRotateStopped();emitCamera();}}});plotEventsBound=true;return true;}
 function bindCanvasEvents(){graph.querySelectorAll('canvas').forEach(c=>{if(boundCanvases.has(c))return;boundCanvases.add(c);c.addEventListener('webglcontextlost',e=>{e.preventDefault();reportError('Потерян контекст WebGL; выполняется восстановление 3D-сцены.');});c.addEventListener('webglcontextrestored',()=>{if(lastRenderedFigure){pendingFigure=JSON.stringify(lastRenderedFigure);requestAnimationFrame(flushRender);}else scheduleResize(120);});});}
 function recoverAfterShow(){if(graph._fullLayout){forceResize=true;scheduleResize(120);}else if(pendingFigure!==null)requestAnimationFrame(flushRender);}
 function abortTransfer(){activeTransferId=-1;transferChunks=null;transferCount=0;pendingFigure=null;renderId++;}
-function purgePlot(){abortTransfer();if(window.Plotly)Plotly.purge(graph);plotEventsBound=false;lastPlotSize='';lastRenderedFigure=null;}
-function setCamera(c,emit=true){if(!c||!window.Plotly||!graph._fullLayout)return;camera=Object.assign({},camera,c);internalCamera=true;Plotly.relayout(graph,{'scene.camera':camera}).then(()=>{internalCamera=false;if(emit)emitCamera();}).catch(e=>{internalCamera=false;reportError(e);});}
-function fitView(){if(!graph._fullLayout)return;let d={x:camera.eye.x-camera.center.x,y:camera.eye.y-camera.center.y,z:camera.eye.z-camera.center.z};d=norm(d);const r=Math.hypot(1.6,1.9,1.25);setCamera({eye:{x:camera.center.x+d.x*r,y:camera.center.y+d.y*r,z:camera.center.z+d.z*r}});}
-function tick(t){if(!rotating)return;if(!lastT)lastT=t;if(t-lastT<40){raf=requestAnimationFrame(tick);return;}const a=(t-lastT)*speed*Math.PI/180000;lastT=t;const dx=camera.eye.x-camera.center.x,dy=camera.eye.y-camera.center.y,c=Math.cos(a),s=Math.sin(a);camera.eye={x:camera.center.x+dx*c-dy*s,y:camera.center.y+dx*s+dy*c,z:camera.eye.z};if(!cameraBusy&&graph._fullLayout){cameraBusy=true;internalCamera=true;Plotly.relayout(graph,{'scene.camera':camera}).catch(reportError).finally(()=>{cameraBusy=false;internalCamera=false;});}raf=requestAnimationFrame(tick);}
+function purgePlot(){plotGeneration++;abortTransfer();if(window.Plotly)Plotly.purge(graph);plotEventsBound=false;lastPlotSize='';lastRenderedFigure=null;pendingCameraApply=null;cameraEmitPending=false;if(cameraApplyRaf){cancelAnimationFrame(cameraApplyRaf);cameraApplyRaf=0;}}
+function fitView(){
+    if(!graph._fullLayout)return;
+    const eye=camera.eye||{x:1.6,y:-1.9,z:1.25},ctr=camera.center||{x:0,y:0,z:0};
+    const delta={x:Number(eye.x)-Number(ctr.x),y:Number(eye.y)-Number(ctr.y),z:Number(eye.z)-Number(ctr.z)};
+    const distance=Math.hypot(delta.x,delta.y,delta.z);
+    const d=Number.isFinite(distance)&&distance>1e-8?norm(delta):norm({x:1.6,y:-1.9,z:1.25});
+    const r=Math.hypot(1.6,1.9,1.25),center={x:0,y:0,z:0};
+    setCamera({center:center,eye:{x:d.x*r,y:d.y*r,z:d.z*r}});
+}
+function tick(t){if(!rotating)return;if(!lastT)lastT=t;if(t-lastT<40){raf=requestAnimationFrame(tick);return;}const a=(t-lastT)*speed*Math.PI/180000;lastT=t;const ctr=camera.center||{x:0,y:0,z:0};const dx=camera.eye.x-ctr.x,dy=camera.eye.y-ctr.y,c=Math.cos(a),s=Math.sin(a);setCamera({eye:{x:ctr.x+dx*c-dy*s,y:ctr.y+dx*s+dy*c,z:camera.eye.z}},false);raf=requestAnimationFrame(tick);}
 function setRotating(on){rotating=!!on;lastT=0;cancelAnimationFrame(raf);if(rotating)raf=requestAnimationFrame(tick);}
 function alignView(axis){if(!graph._fullLayout)return;const ctr=camera.center||{x:0,y:0,z:0},dist=Math.max(0.2,Math.hypot(camera.eye.x-ctr.x,camera.eye.y-ctr.y,camera.eye.z-ctr.z)||2.1);let eye,up={x:0,y:0,z:1};if(axis==='x')eye={x:ctr.x+dist,y:ctr.y,z:ctr.z};else if(axis==='y')eye={x:ctr.x,y:ctr.y+dist,z:ctr.z};else if(axis==='z'){eye={x:ctr.x,y:ctr.y,z:ctr.z+dist};up={x:0,y:1,z:0};}else{eye={x:ctr.x+dist*0.625,y:ctr.y+dist*0.78,z:ctr.z+dist*0.08};up={x:0,y:0,z:1};}setCamera({eye:eye,center:ctr,up:up});}
-let lastPlotSize='';async function flushResize(){if(!window.Plotly||!graph._fullLayout||renderBusy)return;const r=graph.getBoundingClientRect(),key=Math.round(r.width)+'x'+Math.round(r.height),forced=forceResize;forceResize=false;if(key===lastPlotSize&&!forced)return;if(resizeBusy){resizePending=true;return;}resizeBusy=true;try{await Plotly.Plots.resize(graph);lastPlotSize=key;}catch(e){reportError(e);}finally{resizeBusy=false;if(resizePending){resizePending=false;scheduleResize(45);}if(pendingFigure!==null)requestAnimationFrame(flushRender);}}function scheduleResize(delay=45){clearTimeout(resizeTimer);resizeTimer=setTimeout(flushResize,delay);}
-async function flushRender(){if(renderBusy||resizeBusy||pendingFigure===null)return;const payload=pendingFigure;pendingFigure=null;renderBusy=true;const id=++renderId;try{const f=JSON.parse(payload);if(!webglOk){reportError('WebGL недоступен в Qt WebEngine. Проверьте драйвер видеокарты и аппаратное ускорение.');return;}if(!window.Plotly||typeof Plotly.react!=='function'){reportError('Локальный Plotly.js не загрузился.');return;}const bg=(f.layout&&f.layout.paper_bgcolor)||'#fff',rect=graph.getBoundingClientRect(),renderSize=Math.round(rect.width)+'x'+Math.round(rect.height);document.documentElement.style.background=bg;document.body.style.background=bg;graph.style.background=bg;await Plotly.react(graph,f.data,f.layout,{responsive:false,displayModeBar:false,scrollZoom:true,doubleClick:false,showTips:false});if(id!==renderId){Plotly.purge(graph);return;}lastPlotSize=renderSize;lastRenderedFigure=f;bindCanvasEvents();if(!bindPlotEvents())throw new Error('Plotly не предоставил API событий после создания графика');camera=(f.layout.scene&&f.layout.scene.camera)||camera;if(pendingFigure===null&&id===renderId){emitCamera();if(bridge)bridge.rendered();}}catch(e){reportError('Plotly не смог отрисовать сцену: '+(e&&e.message||e));}finally{renderBusy=false;if(pendingFigure!==null)requestAnimationFrame(flushRender);else scheduleResize(45);}}
+let lastPlotSize='';async function flushResize(){if(!window.Plotly||!graph._fullLayout)return;if(renderBusy||displayBusy||cameraApplyBusy||resizeBusy){resizePending=true;return;}if(pendingFigure!==null){requestAnimationFrame(flushRender);return;}const r=graph.getBoundingClientRect(),key=Math.round(r.width)+'x'+Math.round(r.height),forced=forceResize;forceResize=false;if(key===lastPlotSize&&!forced){schedulePlotWork();return;}resizeBusy=true;try{await Plotly.Plots.resize(graph);lastPlotSize=key;}catch(e){reportError(e);}finally{resizeBusy=false;schedulePlotWork();}}function scheduleResize(delay=45){clearTimeout(resizeTimer);resizeTimer=setTimeout(()=>{resizeTimer=0;resizePending=true;schedulePlotWork();},delay);}
+async function flushRender(){if(renderBusy||resizeBusy||displayBusy||cameraApplyBusy||pendingFigure===null)return;const payload=pendingFigure;pendingFigure=null;renderBusy=true;const id=++renderId;try{const f=JSON.parse(payload);if(!webglOk){reportError('WebGL недоступен в Qt WebEngine. Проверьте драйвер видеокарты и аппаратное ускорение.');return;}if(!window.Plotly||typeof Plotly.react!=='function'){reportError('Локальный Plotly.js не загрузился.');return;}const bg=(f.layout&&f.layout.paper_bgcolor)||'#fff',rect=graph.getBoundingClientRect(),renderSize=Math.round(rect.width)+'x'+Math.round(rect.height);document.documentElement.style.background=bg;document.body.style.background=bg;graph.style.background=bg;await Plotly.react(graph,f.data,f.layout,{responsive:false,displayModeBar:false,scrollZoom:true,doubleClick:false,showTips:false});if(id!==renderId){Plotly.purge(graph);return;}lastPlotSize=renderSize;lastRenderedFigure=f;bindCanvasEvents();if(!bindPlotEvents())throw new Error('Plotly не предоставил API событий после создания графика');camera=(f.layout.scene&&f.layout.scene.camera)||camera;if(pendingFigure===null&&id===renderId){emitCamera();if(bridge)bridge.rendered();}}catch(e){reportError('Plotly не смог отрисовать сцену: '+(e&&e.message||e));}finally{renderBusy=false;if(pendingFigure===null)resizePending=true;schedulePlotWork();}}
 function beginFigure(id,count){activeTransferId=id;transferCount=count;transferChunks=new Array(count);if(!count)reportError('Пустая передача 3D-сцены.');}
 function receiveFigureChunk(id,index,chunk){if(id!==activeTransferId||!transferChunks||index<0||index>=transferCount)return;transferChunks[index]=chunk;if(bridge)bridge.chunkReceived(id,index);if(index===transferCount-1&&transferChunks.every(v=>typeof v==='string')){const payload=transferChunks.join('');transferChunks=null;transferCount=0;renderFigure(payload);}}
-function renderFigure(s){pendingFigure=s;if(!renderBusy)requestAnimationFrame(flushRender);}
-function applyCommand(s){let c={};try{c=JSON.parse(s);}catch(e){reportError('Не удалось разобрать команду 3D: '+e);return;}try{if(c.type==='fit')fitView();else if(c.type==='align')alignView(c.axis||'xy');else if(c.type==='camera'){if(c.projection&&graph._fullLayout)Plotly.relayout(graph,{'scene.camera.projection.type':c.projection});setCamera(c.camera);}else if(c.type==='rotate')setRotating(c.enabled);else if(c.type==='speed')speed=Number(c.value)||14;else if(c.type==='rotationLock'&&graph._fullLayout)Plotly.relayout(graph,{'scene.dragmode':c.enabled?'turntable':'orbit'}).catch(reportError);else if(c.type==='theme'){const bg=c.theme==='dark'?'#111316':'#fff';document.documentElement.style.background=bg;document.body.style.background=bg;graph.style.background=bg;}}catch(e){reportError(e);}}
-graph.addEventListener('mousedown',function(e){if(e.button!==1)return;e.preventDefault();setRotating(false);if(bridge)bridge.autoRotateStopped();middle={x:e.clientX,y:e.clientY,camera:JSON.parse(JSON.stringify(camera))};},{capture:true});
-window.addEventListener('mousemove',function(e){if(!middle)return;e.preventDefault();const c=middle.camera,dx=e.clientX-middle.x,dy=e.clientY-middle.y,view=norm({x:c.center.x-c.eye.x,y:c.center.y-c.eye.y,z:c.center.z-c.eye.z}),right=norm(cross(view,c.up)),screenUp=norm(cross(right,view)),dist=Math.hypot(c.eye.x-c.center.x,c.eye.y-c.center.y,c.eye.z-c.center.z),scale=dist*0.0018,shift={x:(-dx*right.x+dy*screenUp.x)*scale,y:(-dx*right.y+dy*screenUp.y)*scale,z:(-dx*right.z+dy*screenUp.z)*scale};setCamera({eye:{x:c.eye.x+shift.x,y:c.eye.y+shift.y,z:c.eye.z+shift.z},center:{x:c.center.x+shift.x,y:c.center.y+shift.y,z:c.center.z+shift.z}},false);},{capture:true});
-window.addEventListener('mouseup',function(e){if(e.button===1&&middle){middle=null;emitCamera();}},{capture:true});
+function renderFigure(s){pendingFigure=s;schedulePlotWork();}
+function setObjectPath(target,path,value){const parts=path.split('.');let node=target;for(let i=0;i<parts.length-1;i++){const key=parts[i];if(!node[key]||typeof node[key]!=='object')node[key]={};node=node[key];}node[parts[parts.length-1]]=value;}
+async function applyDisplayPatchNow(p){
+    if(!lastRenderedFigure||!Array.isArray(lastRenderedFigure.data)||!graph._fullLayout)throw new Error('Нельзя применить настройки: 3D-сцена ещё не готова.');
+    const traces=lastRenderedFigure.data,vi=traces.findIndex(t=>t&&t.type==='volume'),pi=traces.findIndex(t=>t&&t.type==='surface'&&t.name==='Интегральная проекция'),ri=traces.findIndex(t=>t&&t.type==='scatter3d'&&t.name==='Граница ROI');
+    if(vi<0)throw new Error('В текущей Plotly-сцене не найден volume trace.');
+    const vu={};
+    if(p.volume_colorscale!==undefined)vu.colorscale=[p.volume_colorscale];
+    if(p.volume_opacity!==undefined)vu.opacity=[p.volume_opacity];
+    if(p.volume_opacityscale!==undefined)vu.opacityscale=[p.volume_opacityscale];
+    if(p.surface_count!==undefined)vu['surface.count']=[p.surface_count];
+    if(p.show_colorbar!==undefined)vu.showscale=[p.show_colorbar];
+    if(p.isomin_fraction!==undefined||p.isomax_fraction!==undefined){
+        const base=Number((lastRenderedFigure.layout&&lastRenderedFigure.layout.meta&&lastRenderedFigure.layout.meta.roi3d&&lastRenderedFigure.layout.meta.roi3d.threshold_base));
+        if(Number.isFinite(base)&&base>0){if(p.isomin_fraction!==undefined)vu.isomin=[base*p.isomin_fraction];if(p.isomax_fraction!==undefined)vu.isomax=[base*p.isomax_fraction];}
+    }
+    if(Object.keys(vu).length){await Plotly.restyle(graph,vu,[vi]);for(const [key,value] of Object.entries(vu)){const plain=Array.isArray(value)&&value.length===1?value[0]:value;if(key==='surface.count'){traces[vi].surface=traces[vi].surface||{};traces[vi].surface.count=plain;}else traces[vi][key]=plain;}}
+    const pu={};
+    if(p.projection_colorscale!==undefined)pu.colorscale=[p.projection_colorscale];
+    if(p.projection_opacity!==undefined)pu.opacity=[p.projection_opacity];
+    if(p.show_projection!==undefined)pu.visible=[p.show_projection];
+    if(pi>=0&&Object.keys(pu).length){await Plotly.restyle(graph,pu,[pi]);for(const [key,value] of Object.entries(pu))traces[pi][key]=Array.isArray(value)&&value.length===1?value[0]:value;}
+    if(ri>=0&&p.show_projection!==undefined){await Plotly.restyle(graph,{visible:[p.show_projection]},[ri]);traces[ri].visible=p.show_projection;}
+    const l={};
+    const put=(key,value)=>{if(value!==undefined)l[key]=value;};
+    put('paper_bgcolor',p.background);put('plot_bgcolor',p.background);put('font.family',p.font_family);put('font.color',p.foreground);put('showlegend',p.show_legend);put('scene.bgcolor',p.background);put('scene.dragmode',p.dragmode);put('scene.camera.projection.type',p.projection_type);
+    for(const axis of ['xaxis','yaxis','zaxis']){
+        if(p.show_grid!==undefined){
+            put('scene.'+axis+'.showgrid',p.show_grid);
+            put('scene.'+axis+'.gridcolor',p.show_grid?p.grid:'rgba(0,0,0,0)');
+        }
+        put('scene.'+axis+'.linecolor',p.axisline);put('scene.'+axis+'.tickcolor',p.axisline);
+        put('scene.'+axis+'.ticklen',p.axis_tick_length);
+        put('scene.'+axis+'.tickfont.color',p.foreground);put('scene.'+axis+'.tickfont.family',p.font_family);put('scene.'+axis+'.tickfont.size',p.tick_size);
+        put('scene.'+axis+'.title.font.color',p.foreground);put('scene.'+axis+'.title.font.family',p.font_family);put('scene.'+axis+'.title.font.size',p.label_size);
+    }
+    if(Object.keys(l).length){await Plotly.relayout(graph,l);for(const [key,value] of Object.entries(l))setObjectPath(lastRenderedFigure.layout,key,value);}
+    if(p.rotation_speed!==undefined)speed=Number(p.rotation_speed)||14;
+    const bg=p.background;if(bg){document.documentElement.style.background=bg;document.body.style.background=bg;graph.style.background=bg;}
+}
+async function flushDisplayPatch(){
+    if(displayBusy||renderBusy||resizeBusy||cameraApplyBusy||pendingFigure!==null||pendingDisplayPatch===null||!lastRenderedFigure||!graph._fullLayout)return;
+    const patch=pendingDisplayPatch;pendingDisplayPatch=null;displayBusy=true;
+    try{await applyDisplayPatchNow(patch);if(bridge)bridge.rendered();}
+    catch(e){reportError('Не удалось быстро обновить параметры 3D-сцены: '+(e&&e.message||e));}
+    finally{
+        displayBusy=false;
+        schedulePlotWork();
+    }
+}
+function queueDisplayPatch(p){if(!p||typeof p!=='object')return;pendingDisplayPatch=Object.assign(pendingDisplayPatch||{},p);schedulePlotWork();}
+function applyCommand(s){let c={};try{c=JSON.parse(s);}catch(e){reportError('Не удалось разобрать команду 3D: '+e);return;}try{if(c.type==='fit')fitView();else if(c.type==='align')alignView(c.axis||'xy');else if(c.type==='camera'){const next=Object.assign({},c.camera||{});if(c.projection)next.projection={type:c.projection};setCamera(next);}else if(c.type==='rotate')setRotating(c.enabled);else if(c.type==='speed')speed=Number(c.value)||14;else if(c.type==='rotationLock')queueDisplayPatch({dragmode:c.enabled?'turntable':'orbit'});else if(c.type==='display')queueDisplayPatch(c.patch||{});else if(c.type==='theme'){const bg=c.theme==='dark'?'#111316':'#fff';document.documentElement.style.background=bg;document.body.style.background=bg;graph.style.background=bg;}}catch(e){reportError(e);}}
+let panRaf=0;
+function flushPanFrame(){
+    panRaf=0;if(!middle||!middle.latest)return;
+    const c=middle.camera,point=middle.latest;middle.latest=null;
+    const dx=point.x-middle.x,dy=point.y-middle.y;
+    const view=norm({x:c.center.x-c.eye.x,y:c.center.y-c.eye.y,z:c.center.z-c.eye.z});
+    let rightRaw=cross(view,c.up||{x:0,y:0,z:1});
+    if(Math.hypot(rightRaw.x,rightRaw.y,rightRaw.z)<1e-8)rightRaw=cross(view,{x:0,y:1,z:0});
+    const right=norm(rightRaw),screenUp=norm(cross(right,view));
+    const dist=Math.hypot(c.eye.x-c.center.x,c.eye.y-c.center.y,c.eye.z-c.center.z),scale=dist*0.0018;
+    const shift={x:(-dx*right.x+dy*screenUp.x)*scale,y:(-dx*right.y+dy*screenUp.y)*scale,z:(-dx*right.z+dy*screenUp.z)*scale};
+    setCamera({eye:{x:c.eye.x+shift.x,y:c.eye.y+shift.y,z:c.eye.z+shift.z},center:{x:c.center.x+shift.x,y:c.center.y+shift.y,z:c.center.z+shift.z}},false);
+}
+graph.addEventListener('mousedown',function(e){
+    if(e.button!==1)return;e.preventDefault();e.stopPropagation();e.stopImmediatePropagation();
+    setRotating(false);if(bridge)bridge.autoRotateStopped();
+    middle={x:e.clientX,y:e.clientY,camera:cloneCamera(camera),latest:null};
+},{capture:true});
+window.addEventListener('mousemove',function(e){
+    if(!middle)return;e.preventDefault();e.stopPropagation();e.stopImmediatePropagation();
+    middle.latest={x:e.clientX,y:e.clientY};
+    if(!panRaf)panRaf=requestAnimationFrame(flushPanFrame);
+},{capture:true});
+window.addEventListener('mouseup',function(e){
+    if(e.button!==1||!middle)return;e.preventDefault();e.stopPropagation();e.stopImmediatePropagation();
+    if(panRaf){cancelAnimationFrame(panRaf);panRaf=0;}flushPanFrame();middle=null;
+    if(cameraApplyBusy||pendingCameraApply!==null)cameraEmitPending=true;else emitCamera();
+},{capture:true});
+window.addEventListener('blur',function(){
+    if(!middle)return;if(panRaf){cancelAnimationFrame(panRaf);panRaf=0;}flushPanFrame();middle=null;
+    if(cameraApplyBusy||pendingCameraApply!==null)cameraEmitPending=true;else emitCamera();
+});
 document.addEventListener('visibilitychange',()=>{if(!document.hidden)recoverAfterShow();});
 let resizeObserver=null, resizeRaf=0, resizeLastKey='';
 function installResizeObserver(){
@@ -151,7 +271,7 @@ class _RenderWorker(QRunnable):
             import plotly.io as pio
             payload=pio.to_json(fig,validate=False,pretty=False,remove_uids=False)
             volume_trace=next((tr for tr in fig.data if getattr(tr,"type","")=="volume"),None)
-            meta={"shape":list(volume.shape),"coord_system":rv.coord_system,"roi":self.roi.label or "Full detector","input_stride":input_stride,"stride":stride,"points":int(np.asarray(volume_trace.value).size) if volume_trace is not None else 0,"payload_bytes":len(payload.encode("utf-8")),"overlay_full_detector":bool(full_projection is not None)}
+            meta={"shape":list(volume.shape),"coord_system":rv.coord_system,"roi":self.roi.label or "Full detector","input_stride":input_stride,"stride":stride,"points":int(np.asarray(volume_trace.value).size) if volume_trace is not None else 0,"payload_bytes":len(payload.encode("utf-8")),"overlay_full_detector":bool(full_projection is not None),"has_projection":bool(settings.get("show_projection",True))}
             cached=rv if volume.size<=MAX_CACHE_VOXELS else None
             self.signals.done.emit(self.token,payload,meta,cached,self.cache_key,full_projection)
         except Exception as exc:self.signals.failed.emit(self.token,str(exc))
@@ -203,6 +323,10 @@ class VolumePlotWidget(QWidget):
         self._page_error = ""
         self._render_error = ""
         self._scene_rendered = False
+        self._display_patch_pending = False
+        # Keep the exact Plotly colorscale explicitly chosen for the 2D
+        # projection. Replaying it must not derive a new palette from the theme.
+        self._projection_colorscale_replay = None
         self._data_status = "Данные: ожидается загрузка HDF5"
         self._data_tooltip = "После загрузки HDF5 будет рассчитан 3D-объём."
         self._engine_detail = "ожидает первого показа панели"
@@ -291,6 +415,7 @@ class VolumePlotWidget(QWidget):
         self.toolbar.view_axis_requested.connect(lambda axis: self._command("align", axis=axis))
         self.toolbar.rotation_lock_toggled.connect(self._on_rotation_lock)
         self.toolbar.colormap_changed.connect(self._on_colormap_changed)
+        self.toolbar.opacity_mode_changed.connect(self._on_opacity_mode_changed)
         self.toolbar.contrast_changed.connect(self._on_contrast_changed)
         self.toolbar.contrast_auto_requested.connect(self._on_contrast_auto)
         self.toolbar.settings_requested.connect(self.settings_requested.emit)
@@ -528,7 +653,7 @@ class VolumePlotWidget(QWidget):
         self._page_error = ""
         self._render_error = ""
         self._engine_detail = "Plotly/WebGL успешно отрисовал 3D-сцену"
-        self._engine_tooltip = "Получен callback rendered() от JavaScript после Plotly.react()."
+        self._engine_tooltip = "Plotly/WebGL подтвердил обновление сцены (первичная отрисовка либо изменение параметров существующих trace)."
         if self._last_meta:
             meta = self._last_meta
             title = f"3D-объём отрисован · {meta.get('roi', 'ROI')} · {tuple(meta.get('shape', ())) }"
@@ -540,6 +665,9 @@ class VolumePlotWidget(QWidget):
             title = "3D-объём отрисован"
             details = "Plotly/WebGL подтвердил завершение отрисовки."
         self._update_status(title, details + " Колесо — масштаб, ЛКМ — вращение, СКМ — панорамирование.")
+        if self._display_patch_pending:
+            self._display_patch_pending = False
+            QTimer.singleShot(0, self._request_live_display_update)
 
     def _show_web_error(self, exc):
         message = " ".join(str(exc or "неизвестная ошибка Qt WebEngine").split())
@@ -559,6 +687,9 @@ class VolumePlotWidget(QWidget):
         self._command("speed", value=float(self._settings.get("rotation_speed", 14.0)))
         self._on_rotation_lock(self._rotation_lock)
         if self._last_payload:
+            # _last_payload is the last full-scene snapshot; style-only changes
+            # are replayed after it is restored into the new WebEngine page.
+            self._display_patch_pending = True
             self._send_figure(self._last_payload)
         elif self._raw is None:
             self._update_status("Данные: ожидается загрузка HDF5")
@@ -694,6 +825,10 @@ class VolumePlotWidget(QWidget):
             return
         self._last_payload = payload
         self._last_meta = meta
+        # A full build may have started before the last explicit display edit.
+        # Reapply an explicitly selected 2D palette once the new graph is ready.
+        if self._projection_colorscale_replay is not None:
+            self._display_patch_pending = True
         self._render_error = ""
         meta_text = (
             f"ROI={meta.get('roi')}; сетка={tuple(meta['shape'])}; входной шаг ×{meta.get('input_stride', 1)}; "
@@ -776,22 +911,77 @@ class VolumePlotWidget(QWidget):
     def _on_roi_overlay_changed(self, enabled):
         self.refresh(force=True)
 
+    def _request_live_display_update(self, changed_keys=None):
+        """Update only affected resident trace/layout properties when possible."""
+        requested_keys = set(changed_keys) if changed_keys is not None else None
+        if requested_keys and "projection_colorscale" in requested_keys:
+            explicit_projection_patch = build_live_display_patch(
+                self._settings, self._theme, {"projection_colorscale"}
+            )
+            if "projection_colorscale" in explicit_projection_patch:
+                self._projection_colorscale_replay = explicit_projection_patch["projection_colorscale"]
+        if self._raw is None:
+            return
+        if self._page_ready and self._scene_rendered:
+            projection_requested = bool(self._settings.get("show_projection", True))
+            projection_available = bool((self._last_meta or {}).get("has_projection", False))
+            if projection_requested and not projection_available:
+                # No large Surface trace was sent for a projection-off scene.
+                # Build it once on demand; subsequent toggles remain live.
+                self.refresh(force=True)
+                return
+            self._display_patch_pending = False
+            patch = build_live_display_patch(self._settings, self._theme, requested_keys)
+            if requested_keys is None and self._projection_colorscale_replay is not None:
+                # Replay the exact explicit user choice. Do not derive it from
+                # the current theme or from the volume colormap.
+                patch["projection_colorscale"] = self._projection_colorscale_replay
+            if patch:
+                self._command("display", patch=patch)
+            return
+        # A worker may still be preparing an older settings snapshot, or the
+        # WebEngine page may be loading. Apply the latest display state once the
+        # new scene has completed its first draw; do not start another worker.
+        self._display_patch_pending = True
+        render_pending = (
+            self._worker_active
+            or self._pending_render is not None
+            or self._render_timer.isActive()
+            or self._transfer_payload is not None
+            or self._awaiting_webgl_render
+            or self._last_payload is not None
+        )
+        if not render_pending and not self._page_error:
+            self.refresh(force=True)
+
     def _on_colormap_changed(self, name):
         self._settings["volume_colormap"] = str(name)
-        self.refresh(force=True)
+        self._request_live_display_update({"volume_colormap"})
+
+    def _on_opacity_mode_changed(self, enabled):
+        mode = "soft" if bool(enabled) else "uniform"
+        if self._settings.get("volume_opacity_mode", "uniform") == mode:
+            return
+        self._settings["volume_opacity_mode"] = mode
+        # One small settings write per deliberate menu toggle; no data rebuild.
+        try:
+            save_plot_display_settings({"volume": {"volume_opacity_mode": mode}})
+        except Exception:
+            logging.getLogger(__name__).exception("Не удалось сохранить режим прозрачности 3D")
+        self._request_live_display_update({"volume_opacity_mode"})
 
     def _on_contrast_changed(self, low, high):
         low=max(0.0,min(99.5,float(low))); high=max(low+0.5,min(100.0,float(high)))
         self._settings["isomin_fraction"] = low / 100.0
         self._settings["isomax_fraction"] = high / 100.0
-        self.refresh(force=True)
+        self._request_live_display_update({"isomin_fraction", "isomax_fraction"})
 
     def _on_contrast_auto(self):
-        # Auto intentionally reproduces the established default rendering thresholds.
+        # Preserve the established scientific thresholds; only restyle the live trace.
         self._settings["isomin_fraction"] = 0.16
         self._settings["isomax_fraction"] = 0.95
         self.toolbar.set_contrast(16.0, 95.0)
-        self.refresh(force=True)
+        self._request_live_display_update({"isomin_fraction", "isomax_fraction"})
 
     def _render_failed(self, token, message):
         self._worker_finished()
@@ -805,13 +995,21 @@ class VolumePlotWidget(QWidget):
     def apply_theme(self, theme=None):
         self._theme=apply_widget_palette(self,theme); self.toolbar.apply_theme(self._theme); c=theme_colors(self._theme); self.status.setStyleSheet(f"color:{c['muted']}; background:{c['canvas']}; padding:5px 8px;")
         if self.web: self.web.page().setBackgroundColor(QColor(c["canvas"])); self.web.setStyleSheet(f"background:{c['canvas']};")
-        self._command("theme",theme=self._theme); self.refresh(force=True)
+        self._command("theme",theme=self._theme)
+        self._request_live_display_update({"theme"})
     def apply_display_settings(self, settings=None):
+        previous = dict(self._settings)
         if settings is not None:self._settings=dict(settings)
         self._rotation_lock=str(self._settings.get("dragmode","orbit"))=="turntable"; self.toolbar.set_rotation_lock(self._rotation_lock)
         self.toolbar.set_colormap(str(self._settings.get("volume_colormap","magma")))
+        self.toolbar.set_soft_opacity(str(self._settings.get("volume_opacity_mode", "uniform")) == "soft")
         self.toolbar.set_contrast(100.0*float(self._settings.get("isomin_fraction",0.16)),100.0*float(self._settings.get("isomax_fraction",0.95)))
-        self._command("speed",value=float(self._settings.get("rotation_speed",14.0))); self._on_rotation_lock(self._rotation_lock); self.refresh(force=True)
+        self._command("speed",value=float(self._settings.get("rotation_speed",14.0)))
+        changed_keys = changed_setting_keys(previous, self._settings)
+        if can_update_live_display(previous, self._settings):
+            self._request_live_display_update(changed_keys)
+        else:
+            self.refresh(force=True)
 
     def _on_rotation_lock(self, enabled):
         self._rotation_lock=bool(enabled)
@@ -824,4 +1022,4 @@ class VolumePlotWidget(QWidget):
         if dialog.exec()==QDialog.DialogCode.Accepted:
             self._settings["projection_type"]=str(dialog.projection.currentData() or "perspective"); self._camera=dialog.result_camera(); self._command("camera",camera=self._camera,projection=self._settings["projection_type"])
     def _show_info(self):
-        box=QMessageBox(self); box.setWindowTitle("Управление 3D"); box.setIcon(QMessageBox.Icon.Information); box.setText("ЛКМ + перетаскивание — вращение объёма.\nСКМ + перетаскивание — панорамирование.\nКолесо мыши — приближение/отдаление.\nКнопка ориентации — выровнять плоскость XY; стрелка рядом — вид вдоль X/Y/Z и режим сохранения вертикали.\n«Вписать» возвращает весь объём в окно, сохраняя ракурс.\nАвтовращение автоматически останавливается при ручном управлении."); box.setStandardButtons(QMessageBox.StandardButton.Ok); box.button(QMessageBox.StandardButton.Ok).setText("Понятно"); apply_popup_theme(box,resolve_theme(self)); box.exec()
+        box=QMessageBox(self); box.setWindowTitle("Управление 3D"); box.setIcon(QMessageBox.Icon.Information); box.setText("ЛКМ + перетаскивание — вращение объёма.\nСКМ + перетаскивание — панорамирование.\nКолесо мыши — приближение/отдаление.\nКнопка ориентации — выровнять плоскость XY; стрелка рядом — вид вдоль X/Y/Z и режим сохранения вертикали.\n«Вписать» сбрасывает параллельный перенос и центр камеры, вписывает объём в окно, сохраняя направление взгляда и вертикаль.\nВ меню «Контраст и цветовая карта 3D» доступно мягкое затухание слабых сигналов.\nАвтовращение автоматически останавливается при ручном управлении."); box.setStandardButtons(QMessageBox.StandardButton.Ok); box.button(QMessageBox.StandardButton.Ok).setText("Понятно"); apply_popup_theme(box,resolve_theme(self)); box.exec()

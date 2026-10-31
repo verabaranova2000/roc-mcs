@@ -13,7 +13,7 @@ from roc_mcs.gui.roi_explorer.theme import apply_popup_theme,resolve_theme
 DEFAULT_PLOT_DISPLAY_SETTINGS={
     "map":{"font_family":"Segoe UI","tick_size":8,"label_size":9,"colorbar_tick_size":8,"show_colorbar":True,"show_scalebar":False,"scalebar_um":2000.0,"pixel_size_um":55.0,"scalebar_font_size":9},
     "curve":{"font_family":"Segoe UI","tick_size":8,"label_size":9,"show_grid":True},
-    "volume":{"font_family":"Times New Roman","tick_size":14,"label_size":16,"axis_tick_length":3,"show_grid":True,"show_projection":True,"show_colorbar":True,"show_legend":False,"volume_colormap":"magma","volume_colorscale_light":"Blues","volume_colorscale_dark":"Magma","projection_colorscale":"Greys","volume_opacity":0.10,"projection_opacity":0.75,"isomin_fraction":0.16,"isomax_fraction":0.95,"surface_count":25,"smooth_sigma":0.5,"volume_stride":2,"quality":"auto","dragmode":"orbit","projection_type":"perspective","rotation_speed":14.0},
+    "volume":{"font_family":"Times New Roman","tick_size":14,"label_size":16,"axis_tick_length":3,"show_grid":True,"show_projection":True,"show_colorbar":True,"show_legend":False,"volume_colormap":"magma","volume_colorscale_light":"Blues","volume_colorscale_dark":"Magma","projection_colorscale":"Greys","volume_opacity":0.10,"volume_opacity_mode":"uniform","projection_opacity":0.75,"isomin_fraction":0.16,"isomax_fraction":0.95,"surface_count":25,"smooth_sigma":0.5,"volume_stride":2,"quality":"auto","dragmode":"orbit","projection_type":"perspective","rotation_speed":14.0},
     "workspace":{"map_geometry":None,"curve_geometry":None,"volume_geometry":None,"orientation":"focus","layout_choice":"focus","layout_ratios":{"focus_left":0.52,"focus_top":0.50,"row":[1/3,1/3,1/3],"column":[0.30,0.30,0.40],"map3d_left":0.50,"map3d_top":0.56},"viewport_size":None},
 }
 _SETTINGS_KEY="roi_explorer_display"
@@ -54,7 +54,7 @@ def load_plot_display_settings()->dict:
     if isinstance(raw,dict) and isinstance(raw.get("volume"),dict) and old_defaults:
         v["isomin_fraction"],v["isomax_fraction"],v["volume_opacity"],v["projection_opacity"]=0.16,0.95,0.10,0.75
         v["font_family"],v["tick_size"],v["label_size"]="Times New Roman",14,16
-    v["volume_opacity"]=_safe_float(v.get("volume_opacity"),0.10,0.01,1);v["projection_opacity"]=_safe_float(v.get("projection_opacity"),0.75,0,1);v["isomin_fraction"]=_safe_float(v.get("isomin_fraction"),0.16,0,0.99);v["isomax_fraction"]=_safe_float(v.get("isomax_fraction"),0.95,0.01,1)
+    v["volume_opacity"]=_safe_float(v.get("volume_opacity"),0.10,0.01,1);v["volume_opacity_mode"]=v.get("volume_opacity_mode") if v.get("volume_opacity_mode") in ("uniform","soft") else "uniform";v["projection_opacity"]=_safe_float(v.get("projection_opacity"),0.75,0,1);v["isomin_fraction"]=_safe_float(v.get("isomin_fraction"),0.16,0,0.99);v["isomax_fraction"]=_safe_float(v.get("isomax_fraction"),0.95,0.01,1)
     if v["isomax_fraction"]<=v["isomin_fraction"]:v["isomax_fraction"]=min(1,v["isomin_fraction"]+0.05)
     v["surface_count"]=_safe_int(v.get("surface_count"),25,2,25);v["smooth_sigma"]=_safe_float(v.get("smooth_sigma"),0.5,0,5);v["volume_stride"]=_safe_int(v.get("volume_stride"),2,2,8);v["rotation_speed"]=_safe_float(v.get("rotation_speed"),14,1,90);v["axis_tick_length"]=_safe_int(v.get("axis_tick_length"),3,0,10)
     if v.get("volume_colormap") not in NAPARI_STYLE_COLORMAPS:v["volume_colormap"]="magma"

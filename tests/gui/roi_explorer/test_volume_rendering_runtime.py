@@ -58,7 +58,7 @@ def test_patch_is_bounded_and_handles_malformed_settings() -> None:
     assert patch["label_size"] == 18
     assert patch["isomin_fraction"] < patch["isomax_fraction"]
     assert patch["rotation_speed"] == 14.0
-    assert patch["projection_colorscale"] == "Greys_r"
+    assert "projection_colorscale" not in patch
     assert len(patch["volume_colorscale"]) == 32
 
 
@@ -79,13 +79,32 @@ def test_contrast_patch_contains_only_threshold_properties() -> None:
     assert set(patch) == {"isomin_fraction", "isomax_fraction"}
 
 
-def test_theme_patch_contains_only_theme_dependent_properties() -> None:
+def test_theme_patch_does_not_recolor_2d_projection() -> None:
     patch = build_live_display_patch(
         {"projection_colorscale": "Greys"},
         theme="dark",
         changed_settings={"theme"},
     )
-    assert set(patch) == {"background", "foreground", "grid", "axisline", "projection_colorscale"}
+    assert set(patch) == {"background", "foreground", "grid", "axisline"}
+    assert "projection_colorscale" not in patch
+
+
+def test_volume_palette_change_does_not_touch_2d_projection() -> None:
+    patch = build_live_display_patch(
+        {"volume_colormap": "viridis", "projection_colorscale": "Greys"},
+        theme="dark",
+        changed_settings={"volume_colormap"},
+    )
+    assert set(patch) == {"volume_colorscale"}
+    assert "projection_colorscale" not in patch
+
+
+def test_projection_palette_changes_only_when_its_own_setting_changes() -> None:
+    patch = build_live_display_patch(
+        {"projection_colorscale": "Greys"},
+        theme="dark",
+        changed_settings={"projection_colorscale"},
+    )
     assert patch["projection_colorscale"] == "Greys_r"
 
 

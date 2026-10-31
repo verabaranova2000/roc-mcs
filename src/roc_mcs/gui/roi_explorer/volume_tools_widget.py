@@ -20,6 +20,7 @@ class VolumeToolsWidget(QWidget):
     view_axis_requested = pyqtSignal(str)
     rotation_lock_toggled = pyqtSignal(bool)
     colormap_changed = pyqtSignal(str)
+    opacity_mode_changed = pyqtSignal(bool)
     contrast_changed = pyqtSignal(float, float)
     contrast_auto_requested = pyqtSignal()
 
@@ -28,7 +29,7 @@ class VolumeToolsWidget(QWidget):
         self.setStyleSheet(COMPACT_PLOT_TOOLBAR_STYLE + "\nQWidget#VolumeToolBar QToolButton { max-height:26px; min-height:20px; border:1px solid transparent; border-radius:2px; background:transparent; padding:0 2px; } QWidget#VolumeToolBar QToolButton:hover { background:palette(midlight); border-color:palette(mid); } QWidget#VolumeToolBar QToolButton:checked { background:palette(highlight); color:palette(highlighted-text); }")
         row = QHBoxLayout(self); row.setContentsMargins(4, 2, 4, 2); row.setSpacing(4)
         self.roi_btn = QToolButton(self); self.roi_btn.setToolTip("Источник объёма: весь детектор или выбранная ROI"); self.roi_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup); self.roi_menu = QMenu(self.roi_btn); self.roi_btn.setMenu(self.roi_menu); row.addWidget(self.roi_btn)
-        self.reset_btn = QToolButton(self); self.reset_btn.setToolTip("Вписать объём в окно, сохранив направление камеры"); self.reset_btn.clicked.connect(self.reset_view_requested.emit); row.addWidget(self.reset_btn)
+        self.reset_btn = QToolButton(self); self.reset_btn.setToolTip("Сбросить параллельный перенос и вписать объём в окно, сохранив направление камеры"); self.reset_btn.clicked.connect(self.reset_view_requested.emit); row.addWidget(self.reset_btn)
         self.camera_btn = QToolButton(self); self.camera_btn.setToolTip("Настроить ракурс камеры"); self.camera_btn.clicked.connect(self.camera_requested.emit); row.addWidget(self.camera_btn)
         self.orientation_btn=QToolButton(self); self.orientation_btn.setToolTip("Ориентация: щелчок — горизонтальная плоскость XY; стрелка — вид вдоль осей и ограничение вращения"); self.orientation_btn.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup); self.orientation_menu=QMenu(self.orientation_btn); self.orientation_btn.setMenu(self.orientation_menu); self.orientation_btn.clicked.connect(self.align_xy_requested.emit); self._axis_actions={}
         for axis,label in (("x","Вдоль оси X"),("y","Вдоль оси Y"),("z","Вдоль оси Z")):
@@ -39,7 +40,19 @@ class VolumeToolsWidget(QWidget):
         self._cmap_actions={}
         for cmap in NAPARI_STYLE_COLORMAPS:
             action=self.color_menu.addAction(colormap_icon(cmap),cmap); action.setCheckable(True); action.triggered.connect(lambda _=False,n=cmap:self._choose_colormap(n)); self._cmap_actions[cmap]=action
-        self.color_menu.addSeparator(); self.contrast_action=self.color_menu.addAction("Контраст…"); self.contrast_action.triggered.connect(self._open_contrast_dialog)
+        self.color_menu.addSeparator()
+        self.soft_opacity_action = self.color_menu.addAction("Мягкое затухание слабых сигналов")
+        self.soft_opacity_action.setCheckable(True)
+        self.soft_opacity_action.setChecked(False)
+        self.soft_opacity_action.setToolTip(
+            "Плавно уменьшает прозрачность слабых значений внутри текущего диапазона контраста. "
+            "Не меняет массив данных и не добавляет новую жёсткую отсечку; "
+            "действующие нижний и верхний пороги контраста сохраняются. "
+            "Отключение возвращает прежнюю равномерную прозрачность."
+        )
+        self.soft_opacity_action.toggled.connect(self.opacity_mode_changed.emit)
+        self.color_menu.addSeparator()
+        self.contrast_action=self.color_menu.addAction("Контраст…"); self.contrast_action.triggered.connect(self._open_contrast_dialog)
         self._contrast_dialog=QDialog(self,Qt.WindowType.Tool); self._contrast_dialog.setWindowTitle("Контраст 3D"); grid=QGridLayout(self._contrast_dialog); grid.setContentsMargins(9,8,9,8); grid.setSpacing(5)
         self._contrast_low=QDoubleSpinBox(self._contrast_dialog); self._contrast_high=QDoubleSpinBox(self._contrast_dialog)
         for spin,value in ((self._contrast_low,16.0),(self._contrast_high,95.0)):
@@ -110,6 +123,12 @@ class VolumeToolsWidget(QWidget):
         name=str(name);
         for key,action in self._cmap_actions.items(): action.setChecked(key==name)
         self.color_btn.setIcon(colormap_icon(name,24,14)); self.color_btn.setIconSize(QSize(24,14))
+
+    def set_soft_opacity(self, enabled):
+        enabled = bool(enabled)
+        self.soft_opacity_action.blockSignals(True)
+        self.soft_opacity_action.setChecked(enabled)
+        self.soft_opacity_action.blockSignals(False)
 
     def set_contrast(self,low,high):
         low=max(0.0,min(99.5,float(low))); high=max(low+0.5,min(100.0,float(high)))
