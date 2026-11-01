@@ -328,6 +328,7 @@ class RockingCurveExplorerWindow(QMainWindow):
         self.map_widget.pool_changed.connect(self._on_pool_changed)
         self.map_widget.theta_index_changed.connect(self._on_theta_index_changed)
         self.map_widget.pixel_clicked.connect(self._on_pixel_clicked)
+        self.map_widget.cursor_position_changed.connect(self.volume_widget.set_map_cursor_position)
         self.curve_widget.theta_guide_toggled.connect(self._on_theta_guide_toggled)
         
         # --- Сохранение ROI ---
@@ -612,7 +613,7 @@ class RockingCurveExplorerWindow(QMainWindow):
                 self.map_widget.map_combo.setCurrentText(selected_map)
                 self.selected_map = selected_map
                 self.refresh_map()
-                self.refresh_curves()
+                self.refresh_curves(update_volume=False)
         else:
             self.refresh_all()
         self.status.showMessage(f"Loaded session JSON: {path} ({restored} ROI(s) restored)")
@@ -677,13 +678,16 @@ class RockingCurveExplorerWindow(QMainWindow):
                 return pinned
         return None
 
-    def _set_selected_roi_id(self, roi_id: Optional[int]) -> None:
+    def _set_selected_roi_id(self, roi_id: Optional[int], *, update_volume: bool = False) -> None:
+        """Refresh selection visuals; optionally refresh 3D after a real data edit."""
         self.selected_roi_id = roi_id
         self._sync_label_box()
         self.refresh_map()
-        self.refresh_curves()
+        self.refresh_curves(update_volume=False)
         self.refresh_roi_table()
         self._update_inspector()
+        if update_volume:
+            self.refresh_volume()
 
     def _sync_label_box(self) -> None:
         saved = self._selected_pinned_roi()
@@ -819,7 +823,7 @@ class RockingCurveExplorerWindow(QMainWindow):
         if self._show_theta_guide: self.curve_widget.set_theta_guide(None)
         value = combo.currentData() or combo.currentText()
         if value:
-            self.selected_map = str(value); self.refresh_map(); self.refresh_curves()
+            self.selected_map = str(value); self.refresh_map(); self.refresh_curves(update_volume=False)
 
     def _invalidate_curve_cache(self) -> None:
         """Очищает производные профили, зависящие от view или режима редукции."""
@@ -876,7 +880,7 @@ class RockingCurveExplorerWindow(QMainWindow):
         self.status.showMessage(
             f"Pixel view=({x_index}, {y_index}); detector center=({x_coords[x_index]:.1f}, {y_coords[y_index]:.1f}); {self.repo.view}"
         )
-        self.refresh_curves()
+        self.refresh_curves(update_volume=False)
         self._update_inspector()
     
 
@@ -886,7 +890,7 @@ class RockingCurveExplorerWindow(QMainWindow):
             for saved in rois:
                 saved.roi.mode = self.reduction_mode
         self._invalidate_curve_cache()
-        self.refresh_curves()
+        self.refresh_curves(update_volume=False)
         if self.preview_roi is not None:
             self._preview_timer.start(0)        
         self._update_inspector()
@@ -923,7 +927,7 @@ class RockingCurveExplorerWindow(QMainWindow):
         self._preview_fit_pending = False
         self._sync_label_box()
         if had_preview:
-            self.refresh_curves()
+            self.refresh_curves(update_volume=False)
             self._update_inspector()
 
     def _on_selector_change(self, roi) -> None:
@@ -1002,6 +1006,7 @@ class RockingCurveExplorerWindow(QMainWindow):
         self.refresh_roi_table()                       # Полностью перестраиваем таблицу (она сама отрисует новый ROI и выделит его строку)
         
         self._set_selected_roi_id(saved.id)            # _set_selected_roi_id выделяет элемент в UI
+        self.refresh_volume()  # New ROI becomes an available volume source.
         self.status.showMessage(f"Saved {saved.roi.label}")
 
 
@@ -1016,26 +1021,30 @@ class RockingCurveExplorerWindow(QMainWindow):
         if target_pinned is None:
             return
 
-        # 2. Безопасно применяем изменения
+        # Табличный label не влияет на 3D-геометрию. Обновлять 3D нужно
+        # только после реально принятого изменения геометрического поля.
+        geometry_changed = False
         try:
             if field == "label":
                 target_pinned.roi.label = new_val_str
-            else:      
-                val = float(new_val_str)                              # Если это не имя, значит это число. Пытаемся конвертировать!
-                old_val = getattr(target_pinned.roi, field)           # ТРАНЗАКЦИЯ: Запоминаем текущее валидное значение
-                setattr(target_pinned.roi, field, val)                # Применяем новое значение               
-                if not target_pinned.roi.is_valid:                    # Спрашиваем сам объект, не нарушилась ли его геометрия?
-                    setattr(target_pinned.roi, field, old_val)        # Откатываемся к старому значению и вызываем искусственную ошибку
+            else:
+                val = float(new_val_str)
+                old_val = getattr(target_pinned.roi, field)
+                setattr(target_pinned.roi, field, val)
+                if not target_pinned.roi.is_valid:
+                    setattr(target_pinned.roi, field, old_val)
                     raise ValueError(f"Invalid geometry for {target_pinned.roi.type}")
-                target_pinned.curve = None                            # Сбрасываем кэш кривой, чтобы заставить систему пересчитать её!
+                geometry_changed = float(val) != float(old_val)
+                if geometry_changed:
+                    target_pinned.curve = None
             self.status.showMessage(f"Updated {field} for ROI {roi_id}")
-        except ValueError as e:                                       # Юзер ввел дичь (буквы вместо цифр или отрицательную ширину)
+        except (TypeError, ValueError):
             self.status.showMessage(f"Invalid input for {field}. Reverting...")
-        finally:                                                      # В любом случае (успех или ошибка) перерисовываем всё!
-            self.refresh_roi_table()                                  # Если была ошибка, таблица просто откатится к старым валидным значениям из self.current_rois()
+        finally:
+            self.refresh_roi_table()
             self.refresh_map()
-            self.refresh_curves()
-            self._update_inspector()    
+            self.refresh_curves(update_volume=geometry_changed)
+            self._update_inspector()
 
     def _on_roi_manager_edit_requested(self, roi_id: int, values: dict) -> None:
         """Применяет изменения одной ROI как единую проверяемую операцию."""
@@ -1057,19 +1066,35 @@ class RockingCurveExplorerWindow(QMainWindow):
         except (TypeError, ValueError) as exc:
             self.status.showMessage(f"ROI {roi_id} was not changed: {exc}")
             return
+        geometry_fields = ("cx", "cy", "width", "height", "angle")
+        geometry_changed = (
+            str(candidate.type) != str(target.roi.type)
+            or any(
+                float(getattr(candidate, name)) != float(getattr(target.roi, name))
+                for name in geometry_fields
+            )
+        )
+        color_changed = str(candidate.color) != str(target.roi.color)
         target.roi = candidate
-        target.curve = None
+        if geometry_changed:
+            target.curve = None
+        if color_changed:
+            self.volume_widget.update_roi_color(int(roi_id), candidate.color)
         self.status.showMessage(f"ROI {roi_id} updated")
-        self._set_selected_roi_id(int(roi_id))
+        self._set_selected_roi_id(int(roi_id), update_volume=geometry_changed)
 
     def _on_roi_manager_color_changed(self, roi_id: int, color: str) -> None:
         target = next((item for item in self.current_rois() if int(item.id) == int(roi_id)), None)
-        if target is None or not QColor(color).isValid():
+        parsed_color = QColor(str(color))
+        if target is None or not parsed_color.isValid():
             return
-        target.roi.color = color
+        normalized_color = parsed_color.name(QColor.NameFormat.HexRgb)
+        target.roi.color = normalized_color
+        # The ROI outline is display-only: patch its existing Scatter3d trace.
+        self.volume_widget.update_roi_color(int(roi_id), normalized_color)
         self.refresh_roi_table()
         self.refresh_map()
-        self.refresh_curves()
+        self.refresh_curves(update_volume=False)
         self._update_inspector()
 
     def _on_roi_manager_delete_requested(self, roi_id: int) -> None:
@@ -1095,7 +1120,7 @@ class RockingCurveExplorerWindow(QMainWindow):
         after = len(rois)
         if before == after:
             return
-        self._set_selected_roi_id(None)
+        self._set_selected_roi_id(None, update_volume=True)
         self.status.showMessage("Deleted selected ROI.")
 
     def clear_current_scan_rois(self, *args) -> None:
@@ -1112,14 +1137,14 @@ class RockingCurveExplorerWindow(QMainWindow):
         if reply != QMessageBox.StandardButton.Yes:
             return
         self.session_scans[self.selected_scan] = []
-        self._set_selected_roi_id(None)
+        self._set_selected_roi_id(None, update_volume=True)
         self.status.showMessage("Cleared all ROIs for current scan.")
 
     def _toggle_roi_selector_mode(self, _is_active: bool) -> None:
         """При смене режима убирает пиксельное превью; селектором управляет MapPlotWidget."""        
         if self.selected_pixel is not None:
             self.selected_pixel = None
-            self.refresh_curves()
+            self.refresh_curves(update_volume=False)
             self._update_inspector()
 
     # -------- Контекстное Меню (ПКМ по ROI) ----------

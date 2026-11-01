@@ -5,7 +5,7 @@ from PyQt6.QtGui import QIcon, QPixmap, QPainter, QLinearGradient, QColor, QActi
 from PyQt6.QtCore import QSize, Qt, QRectF, QLineF, pyqtSignal, QPointF, QPoint
 
 
-from roc_mcs.gui.roi_explorer.plot_toolbar_style import ICON_DIR, COMPACT_PLOT_TOOLBAR_STYLE
+from roc_mcs.gui.roi_explorer.plot_toolbar_style import (ICON_DIR, COMPACT_PLOT_TOOLBAR_STYLE, SMART_DROPDOWN_INDICATOR_RGBA, SMART_DROPDOWN_INDICATOR_SIZE)
 from roc_mcs.gui.components.icon_provider import svg_icon
 from roc_mcs.gui.roi_explorer.theme import apply_widget_palette, apply_popup_theme, theme_colors
 from roc_mcs.gui.roi_explorer.colormap_catalog import NAPARI_STYLE_COLORMAPS, colormap_icon
@@ -372,10 +372,10 @@ class SmartDropdownButton(QToolButton):
         painter = QPainter(self)     # 2. Поверх рисуем наш векторный треугольник
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(self.palette().color(QPalette.ColorRole.Highlight))
+        painter.setBrush(QColor(*SMART_DROPDOWN_INDICATOR_RGBA))
         
-        rect = self.rect()           # 3. Рассчитываем координаты четко в правом нижнем углу
-        size = 6                     # Размер уголка в пикселях (можно поменять на 5 или 7)
+        rect = self.rect()           # 3. Рассчитываем координаты в правом нижнем углу
+        size = SMART_DROPDOWN_INDICATOR_SIZE
         
         triangle = QPolygon([
             QPoint(rect.right() - size, rect.bottom()), # Нижняя грань (левее угла)

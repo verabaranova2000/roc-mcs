@@ -14,6 +14,8 @@ from roc_mcs.gui.roi_explorer.volume_rendering_runtime import (
     build_live_display_patch,
     can_update_live_display,
     changed_setting_keys,
+    DATA_RENDER_SETTINGS,
+    map_detector_cursor_to_volume_xy,
 )
 from roc_mcs.gui.roi_explorer.volume_tools_widget import VolumeToolsWidget
 from roc_mcs.gui.roi_explorer.plot_display_settings import save_plot_display_settings
@@ -51,7 +53,7 @@ _HTML = r'''<!doctype html>
 <style>html,body,#plot{margin:0;width:100%;height:100%;min-height:1px;overflow:hidden;background:__BG__}html,body{padding:0;user-select:none;overscroll-behavior:none}#plot{position:absolute;inset:0;contain:strict}</style>
 <script src="qrc:///qtwebchannel/qwebchannel.js"></script><script src="plotly.min.js"></script></head>
 <body><div id="plot"></div><script>
-let bridge=null, webglOk=false, graph=document.getElementById('plot'), camera={eye:{x:1.6,y:-1.9,z:1.25},center:{x:0,y:0,z:0},up:{x:0,y:0,z:1}}, rotating=false, raf=0, lastT=0, speed=14, internalCamera=false, middle=null, pendingErrors=[], plotEventsBound=false, pendingFigure=null, renderBusy=false, renderId=0, resizeTimer=0, resizeBusy=false, resizePending=false, forceResize=false, cameraBusy=false, lastRenderedFigure=null, boundCanvases=new WeakSet(), activeTransferId=0, transferChunks=null, transferCount=0, pendingDisplayPatch=null, displayBusy=false;
+let bridge=null, webglOk=false, graph=document.getElementById('plot'), camera={eye:{x:1.6,y:-1.9,z:1.25},center:{x:0,y:0,z:0},up:{x:0,y:0,z:1}}, rotating=false, raf=0, lastT=0, speed=14, internalCamera=false, middle=null, pendingErrors=[], plotEventsBound=false, pendingFigure=null, renderBusy=false, renderId=0, resizeTimer=0, resizeBusy=false, resizePending=false, forceResize=false, cameraBusy=false, lastRenderedFigure=null, boundCanvases=new WeakSet(), activeTransferId=0, transferChunks=null, transferCount=0, pendingDisplayPatch=null, displayBusy=false, cursorEnabled=false, cursorMapPosition=null, cursorPosition=null, cursorOrigin=null, cursorLineElement=null, cursorDrawRaf=0;
 function reportError(message){const text=String(message&&message.message||message||'Неизвестная ошибка');if(bridge){try{bridge.renderError(text);}catch(e){}}else pendingErrors.push(text);}
 window.addEventListener('error',e=>reportError((e.message||'JavaScript error')+(e.filename?' · '+e.filename.split('/').pop():'')+(e.lineno?':'+e.lineno:'')));
 window.addEventListener('unhandledrejection',e=>reportError('Ошибка отрисовки Plotly: '+(e.reason&&e.reason.message||e.reason||'отклонён Promise')));
@@ -60,6 +62,17 @@ function norm(v){const n=Math.hypot(v.x,v.y,v.z)||1;return {x:v.x/n,y:v.y/n,z:v.
 function cross(a,b){return {x:a.y*b.z-a.z*b.y,y:a.z*b.x-a.x*b.z,z:a.x*b.y-a.y*b.x};}
 function emitCamera(){if(bridge)bridge.cameraChanged(JSON.stringify(camera));}
 function cloneCamera(value){return JSON.parse(JSON.stringify(value||{}));}
+function cameraMatches(left,right){
+    if(!left||!right)return false;
+    for(const part of ['eye','center','up']){
+        if(!left[part]||!right[part])return false;
+        for(const axis of ['x','y','z']){
+            const a=Number(left[part][axis]),b=Number(right[part][axis]);
+            if(!Number.isFinite(a)||!Number.isFinite(b)||Math.abs(a-b)>1e-9)return false;
+        }
+    }
+    return true;
+}
 function mergeCamera(base,patch){const out=cloneCamera(base);for(const key of ['eye','center','up','projection']){if(patch&&patch[key]&&typeof patch[key]==='object')out[key]=Object.assign({},out[key]||{},patch[key]);}return out;}
 let cameraApplyBusy=false,pendingCameraApply=null,cameraEmitPending=false,cameraApplyRaf=0,plotGeneration=0;
 function schedulePlotWork(){
@@ -87,11 +100,55 @@ function setCamera(c,emit=true){
     pendingCameraApply=cloneCamera(camera);
     schedulePlotWork();
 }
-function bindPlotEvents(){if(plotEventsBound)return true;if(typeof graph.on!=='function')return false;graph.on('plotly_relayout',function(e){const c=e['scene.camera']||e.scene?.camera;if(c&&!internalCamera){camera=mergeCamera(camera,c);setRotating(false);if(bridge){bridge.autoRotateStopped();emitCamera();}}});plotEventsBound=true;return true;}
+function cursorHide(){if(cursorLineElement)cursorLineElement.setAttribute('visibility','hidden');}
+function cursorMatrixTransform(m,v){const out=[0,0,0,0];for(let i=0;i<4;i++)for(let j=0;j<4;j++)out[j]+=m[4*i+j]*v[i];return out;}
+function cursorProject(camera,v){return cursorMatrixTransform(camera.projection,cursorMatrixTransform(camera.view,cursorMatrixTransform(camera.model,[v[0],v[1],v[2],1])));}
+function cursorScheduleDraw(){if(!cursorEnabled||!cursorPosition){cursorHide();return;}if(cursorDrawRaf)return;cursorDrawRaf=requestAnimationFrame(()=>{cursorDrawRaf=0;cursorDrawLine();});}
+function cursorDrawLine(){
+    if(!cursorEnabled||!cursorPosition){cursorHide();return;}
+    try{
+        const fl=graph._fullLayout, scene=fl&&fl.scene&&fl.scene._scene;
+        if(!scene||!scene.glplot||!scene.glplot.cameraParams||!scene.svgContainer||!scene.fullSceneLayout||!scene.dataScale){cursorHide();return;}
+        const svg=scene.svgContainer;
+        if(!cursorLineElement||cursorLineElement.ownerSVGElement!==svg){
+            cursorLineElement=document.createElementNS('http://www.w3.org/2000/svg','line');
+            cursorLineElement.setAttribute('stroke','#ffbd55');cursorLineElement.setAttribute('stroke-width','2.2');
+            cursorLineElement.setAttribute('stroke-linecap','round');cursorLineElement.setAttribute('stroke-dasharray','5 3');
+            cursorLineElement.setAttribute('opacity','0.96');cursorLineElement.setAttribute('pointer-events','none');cursorLineElement.setAttribute('visibility','hidden');
+            svg.insertBefore(cursorLineElement,svg.firstChild);
+        }
+        const layout=scene.fullSceneLayout, axes=[layout.xaxis,layout.yaxis,layout.zaxis];
+        if(!axes.every(a=>a&&typeof a.d2l==='function')){cursorHide();return;}
+        const x=axes[0].d2l(Number(cursorPosition.x),0)*scene.dataScale[0];
+        const y=axes[1].d2l(Number(cursorPosition.y),0)*scene.dataScale[1];
+        const zr=axes[2].range;
+        if(!Number.isFinite(x)||!Number.isFinite(y)||!Array.isArray(zr)||zr.length!==2){cursorHide();return;}
+        const scale=scene.dataScale[2],cam=scene.glplot.cameraParams;
+        const a=cursorProject(cam,[x,y,Number(zr[0])*scale]);
+        const b=cursorProject(cam,[x,y,Number(zr[1])*scale]);
+        if(!a.every(Number.isFinite)||!b.every(Number.isFinite)||a[3]<=1e-8||b[3]<=1e-8){cursorHide();return;}
+        const rect=scene.container.getBoundingClientRect();
+        const width=rect.width*(fl._invScaleX||1),height=rect.height*(fl._invScaleY||1);
+        const ax=(0.5+0.5*a[0]/a[3])*width, ay=(0.5-0.5*a[1]/a[3])*height;
+        const bx=(0.5+0.5*b[0]/b[3])*width, by=(0.5-0.5*b[1]/b[3])*height;
+        if(![ax,ay,bx,by].every(Number.isFinite)){cursorHide();return;}
+        cursorLineElement.setAttribute('x1',String(ax));cursorLineElement.setAttribute('y1',String(ay));
+        cursorLineElement.setAttribute('x2',String(bx));cursorLineElement.setAttribute('y2',String(by));
+        cursorLineElement.setAttribute('visibility','visible');
+    }catch(e){cursorHide();}
+}
+function setCursorEnabled(enabled){cursorEnabled=!!enabled;if(!cursorEnabled){cursorHide();cursorPosition=cursorMapPosition?{x:cursorMapPosition.x,y:cursorMapPosition.y}:null;cursorOrigin=cursorMapPosition?'map':null;return;}cursorPosition=cursorMapPosition?{x:cursorMapPosition.x,y:cursorMapPosition.y}:null;cursorOrigin=cursorMapPosition?'map':null;cursorScheduleDraw();}
+function resetCursor(){cursorMapPosition=null;cursorPosition=null;cursorOrigin=null;cursorHide();}
+function setMapCursorPosition(position){
+    if(position&&Number.isFinite(Number(position.x))&&Number.isFinite(Number(position.y))){cursorMapPosition={x:Number(position.x),y:Number(position.y)};cursorPosition={x:cursorMapPosition.x,y:cursorMapPosition.y};cursorOrigin='map';}
+    else{cursorMapPosition=null;if(cursorOrigin!=='3d'){cursorPosition=null;cursorOrigin=null;}}
+    cursorScheduleDraw();
+}
+function bindPlotEvents(){if(plotEventsBound)return true;if(typeof graph.on!=='function')return false;graph.on('plotly_relayout',function(e){const c=e['scene.camera']||e.scene?.camera;if(c&&!internalCamera){camera=mergeCamera(camera,c);setRotating(false);if(bridge){bridge.autoRotateStopped();emitCamera();}}cursorScheduleDraw();});graph.on('plotly_relayouting',cursorScheduleDraw);graph.on('plotly_afterplot',cursorScheduleDraw);graph.on('plotly_hover',function(e){if(!cursorEnabled||!e||!Array.isArray(e.points))return;const point=e.points.find(p=>((p.fullData&&p.fullData.type)||(p.data&&p.data.type))==='volume');if(point&&Number.isFinite(Number(point.x))&&Number.isFinite(Number(point.y))){cursorPosition={x:Number(point.x),y:Number(point.y)};cursorOrigin='3d';cursorScheduleDraw();}});graph.on('plotly_unhover',function(){if(cursorOrigin==='3d'){cursorPosition=cursorMapPosition?{x:cursorMapPosition.x,y:cursorMapPosition.y}:null;cursorOrigin=cursorMapPosition?'map':null;cursorScheduleDraw();}});plotEventsBound=true;return true;}
 function bindCanvasEvents(){graph.querySelectorAll('canvas').forEach(c=>{if(boundCanvases.has(c))return;boundCanvases.add(c);c.addEventListener('webglcontextlost',e=>{e.preventDefault();reportError('Потерян контекст WebGL; выполняется восстановление 3D-сцены.');});c.addEventListener('webglcontextrestored',()=>{if(lastRenderedFigure){pendingFigure=JSON.stringify(lastRenderedFigure);requestAnimationFrame(flushRender);}else scheduleResize(120);});});}
 function recoverAfterShow(){if(graph._fullLayout){forceResize=true;scheduleResize(120);}else if(pendingFigure!==null)requestAnimationFrame(flushRender);}
 function abortTransfer(){activeTransferId=-1;transferChunks=null;transferCount=0;pendingFigure=null;renderId++;}
-function purgePlot(){plotGeneration++;abortTransfer();if(window.Plotly)Plotly.purge(graph);plotEventsBound=false;lastPlotSize='';lastRenderedFigure=null;pendingCameraApply=null;cameraEmitPending=false;if(cameraApplyRaf){cancelAnimationFrame(cameraApplyRaf);cameraApplyRaf=0;}}
+function purgePlot(){cursorHide();cursorLineElement=null;plotGeneration++;abortTransfer();if(window.Plotly)Plotly.purge(graph);plotEventsBound=false;lastPlotSize='';lastRenderedFigure=null;pendingCameraApply=null;cameraEmitPending=false;if(cameraApplyRaf){cancelAnimationFrame(cameraApplyRaf);cameraApplyRaf=0;}}
 function fitView(){
     if(!graph._fullLayout)return;
     const eye=camera.eye||{x:1.6,y:-1.9,z:1.25},ctr=camera.center||{x:0,y:0,z:0};
@@ -105,7 +162,7 @@ function tick(t){if(!rotating)return;if(!lastT)lastT=t;if(t-lastT<40){raf=reques
 function setRotating(on){rotating=!!on;lastT=0;cancelAnimationFrame(raf);if(rotating)raf=requestAnimationFrame(tick);}
 function alignView(axis){if(!graph._fullLayout)return;const ctr=camera.center||{x:0,y:0,z:0},dist=Math.max(0.2,Math.hypot(camera.eye.x-ctr.x,camera.eye.y-ctr.y,camera.eye.z-ctr.z)||2.1);let eye,up={x:0,y:0,z:1};if(axis==='x')eye={x:ctr.x+dist,y:ctr.y,z:ctr.z};else if(axis==='y')eye={x:ctr.x,y:ctr.y+dist,z:ctr.z};else if(axis==='z'){eye={x:ctr.x,y:ctr.y,z:ctr.z+dist};up={x:0,y:1,z:0};}else{eye={x:ctr.x+dist*0.625,y:ctr.y+dist*0.78,z:ctr.z+dist*0.08};up={x:0,y:0,z:1};}setCamera({eye:eye,center:ctr,up:up});}
 let lastPlotSize='';async function flushResize(){if(!window.Plotly||!graph._fullLayout)return;if(renderBusy||displayBusy||cameraApplyBusy||resizeBusy){resizePending=true;return;}if(pendingFigure!==null){requestAnimationFrame(flushRender);return;}const r=graph.getBoundingClientRect(),key=Math.round(r.width)+'x'+Math.round(r.height),forced=forceResize;forceResize=false;if(key===lastPlotSize&&!forced){schedulePlotWork();return;}resizeBusy=true;try{await Plotly.Plots.resize(graph);lastPlotSize=key;}catch(e){reportError(e);}finally{resizeBusy=false;schedulePlotWork();}}function scheduleResize(delay=45){clearTimeout(resizeTimer);resizeTimer=setTimeout(()=>{resizeTimer=0;resizePending=true;schedulePlotWork();},delay);}
-async function flushRender(){if(renderBusy||resizeBusy||displayBusy||cameraApplyBusy||pendingFigure===null)return;const payload=pendingFigure;pendingFigure=null;renderBusy=true;const id=++renderId;try{const f=JSON.parse(payload);if(!webglOk){reportError('WebGL недоступен в Qt WebEngine. Проверьте драйвер видеокарты и аппаратное ускорение.');return;}if(!window.Plotly||typeof Plotly.react!=='function'){reportError('Локальный Plotly.js не загрузился.');return;}const bg=(f.layout&&f.layout.paper_bgcolor)||'#fff',rect=graph.getBoundingClientRect(),renderSize=Math.round(rect.width)+'x'+Math.round(rect.height);document.documentElement.style.background=bg;document.body.style.background=bg;graph.style.background=bg;await Plotly.react(graph,f.data,f.layout,{responsive:false,displayModeBar:false,scrollZoom:true,doubleClick:false,showTips:false});if(id!==renderId){Plotly.purge(graph);return;}lastPlotSize=renderSize;lastRenderedFigure=f;bindCanvasEvents();if(!bindPlotEvents())throw new Error('Plotly не предоставил API событий после создания графика');camera=(f.layout.scene&&f.layout.scene.camera)||camera;if(pendingFigure===null&&id===renderId){emitCamera();if(bridge)bridge.rendered();}}catch(e){reportError('Plotly не смог отрисовать сцену: '+(e&&e.message||e));}finally{renderBusy=false;if(pendingFigure===null)resizePending=true;schedulePlotWork();}}
+async function flushRender(){if(renderBusy||resizeBusy||displayBusy||cameraApplyBusy||pendingFigure===null)return;const payload=pendingFigure;pendingFigure=null;renderBusy=true;const id=++renderId;try{const f=JSON.parse(payload);if(!webglOk){reportError('WebGL недоступен в Qt WebEngine. Проверьте драйвер видеокарты и аппаратное ускорение.');return;}if(!window.Plotly||typeof Plotly.react!=='function'){reportError('Локальный Plotly.js не загрузился.');return;}const bg=(f.layout&&f.layout.paper_bgcolor)||'#fff',rect=graph.getBoundingClientRect(),renderSize=Math.round(rect.width)+'x'+Math.round(rect.height);document.documentElement.style.background=bg;document.body.style.background=bg;graph.style.background=bg;await Plotly.react(graph,f.data,f.layout,{responsive:false,displayModeBar:false,scrollZoom:true,doubleClick:false,showTips:false});if(id!==renderId){Plotly.purge(graph);return;}lastPlotSize=renderSize;lastRenderedFigure=f;if(cursorLineElement&&cursorLineElement.parentNode)cursorLineElement.parentNode.removeChild(cursorLineElement);cursorLineElement=null;bindCanvasEvents();if(!bindPlotEvents())throw new Error('Plotly не предоставил API событий после создания графика');camera=(f.layout.scene&&f.layout.scene.camera)||camera;if(pendingFigure===null&&id===renderId){emitCamera();if(bridge)bridge.rendered();}}catch(e){reportError('Plotly не смог отрисовать сцену: '+(e&&e.message||e));}finally{renderBusy=false;if(pendingFigure===null)resizePending=true;schedulePlotWork();}}
 function beginFigure(id,count){activeTransferId=id;transferCount=count;transferChunks=new Array(count);if(!count)reportError('Пустая передача 3D-сцены.');}
 function receiveFigureChunk(id,index,chunk){if(id!==activeTransferId||!transferChunks||index<0||index>=transferCount)return;transferChunks[index]=chunk;if(bridge)bridge.chunkReceived(id,index);if(index===transferCount-1&&transferChunks.every(v=>typeof v==='string')){const payload=transferChunks.join('');transferChunks=null;transferCount=0;renderFigure(payload);}}
 function renderFigure(s){pendingFigure=s;schedulePlotWork();}
@@ -130,6 +187,24 @@ async function applyDisplayPatchNow(p){
     if(p.projection_opacity!==undefined)pu.opacity=[p.projection_opacity];
     if(p.show_projection!==undefined)pu.visible=[p.show_projection];
     if(pi>=0&&Object.keys(pu).length){await Plotly.restyle(graph,pu,[pi]);for(const [key,value] of Object.entries(pu))traces[pi][key]=Array.isArray(value)&&value.length===1?value[0]:value;}
+    // Update the 5-point ROI outline only; do not touch the Volume trace.
+    if(ri>=0&&p.roi_overlay_color!==undefined){
+        // Plotly may rebuild the WebGL scene while restyling Scatter3d. Preserve
+        // the live user camera explicitly so a color-only edit cannot snap the view.
+        const liveCamera=graph._fullLayout&&graph._fullLayout.scene&&graph._fullLayout.scene.camera;
+        const preservedCamera=cloneCamera(liveCamera||camera);
+        internalCamera=true;
+        try{
+            const line=Object.assign({},traces[ri].line||{},{color:String(p.roi_overlay_color)});
+            await Plotly.restyle(graph,{'line.color':[line.color]},[ri]);
+            traces[ri].line=line; // Keep WebGL-context restoration in sync.
+            const actualCamera=graph._fullLayout&&graph._fullLayout.scene&&graph._fullLayout.scene.camera;
+            if(!cameraMatches(actualCamera,preservedCamera)){
+                await Plotly.relayout(graph,{'scene.camera':preservedCamera});
+            }
+            camera=cloneCamera(preservedCamera);
+        }finally{internalCamera=false;}
+    }
     if(ri>=0&&p.show_projection!==undefined){await Plotly.restyle(graph,{visible:[p.show_projection]},[ri]);traces[ri].visible=p.show_projection;}
     const l={};
     const put=(key,value)=>{if(value!==undefined)l[key]=value;};
@@ -159,7 +234,7 @@ async function flushDisplayPatch(){
     }
 }
 function queueDisplayPatch(p){if(!p||typeof p!=='object')return;pendingDisplayPatch=Object.assign(pendingDisplayPatch||{},p);schedulePlotWork();}
-function applyCommand(s){let c={};try{c=JSON.parse(s);}catch(e){reportError('Не удалось разобрать команду 3D: '+e);return;}try{if(c.type==='fit')fitView();else if(c.type==='align')alignView(c.axis||'xy');else if(c.type==='camera'){const next=Object.assign({},c.camera||{});if(c.projection)next.projection={type:c.projection};setCamera(next);}else if(c.type==='rotate')setRotating(c.enabled);else if(c.type==='speed')speed=Number(c.value)||14;else if(c.type==='rotationLock')queueDisplayPatch({dragmode:c.enabled?'turntable':'orbit'});else if(c.type==='display')queueDisplayPatch(c.patch||{});else if(c.type==='theme'){const bg=c.theme==='dark'?'#111316':'#fff';document.documentElement.style.background=bg;document.body.style.background=bg;graph.style.background=bg;}}catch(e){reportError(e);}}
+function applyCommand(s){let c={};try{c=JSON.parse(s);}catch(e){reportError('Не удалось разобрать команду 3D: '+e);return;}try{if(c.type==='fit')fitView();else if(c.type==='align')alignView(c.axis||'xy');else if(c.type==='camera'){const next=Object.assign({},c.camera||{});if(c.projection)next.projection={type:c.projection};setCamera(next);}else if(c.type==='rotate')setRotating(c.enabled);else if(c.type==='speed')speed=Number(c.value)||14;else if(c.type==='rotationLock')queueDisplayPatch({dragmode:c.enabled?'turntable':'orbit'});else if(c.type==='display')queueDisplayPatch(c.patch||{});else if(c.type==='cursorEnabled')setCursorEnabled(c.enabled);else if(c.type==='cursorPosition')setMapCursorPosition(c.visible?c.position:null);else if(c.type==='cursorReset')resetCursor();else if(c.type==='theme'){const bg=c.theme==='dark'?'#111316':'#fff';document.documentElement.style.background=bg;document.body.style.background=bg;graph.style.background=bg;}}catch(e){reportError(e);}}
 let panRaf=0;
 function flushPanFrame(){
     panRaf=0;if(!middle||!middle.latest)return;
@@ -271,7 +346,7 @@ class _RenderWorker(QRunnable):
             import plotly.io as pio
             payload=pio.to_json(fig,validate=False,pretty=False,remove_uids=False)
             volume_trace=next((tr for tr in fig.data if getattr(tr,"type","")=="volume"),None)
-            meta={"shape":list(volume.shape),"coord_system":rv.coord_system,"roi":self.roi.label or "Full detector","input_stride":input_stride,"stride":stride,"points":int(np.asarray(volume_trace.value).size) if volume_trace is not None else 0,"payload_bytes":len(payload.encode("utf-8")),"overlay_full_detector":bool(full_projection is not None),"has_projection":bool(settings.get("show_projection",True))}
+            meta={"shape":list(volume.shape),"coord_system":rv.coord_system,"source_id":self.cache_key[1] if isinstance(self.cache_key, tuple) and len(self.cache_key)>1 else "full","roi":self.roi.label or "Full detector","input_stride":input_stride,"stride":stride,"points":int(np.asarray(volume_trace.value).size) if volume_trace is not None else 0,"payload_bytes":len(payload.encode("utf-8")),"overlay_full_detector":bool(full_projection is not None),"has_projection":bool(settings.get("show_projection",True))}
             cached=rv if volume.size<=MAX_CACHE_VOXELS else None
             self.signals.done.emit(self.token,payload,meta,cached,self.cache_key,full_projection)
         except Exception as exc:self.signals.failed.emit(self.token,str(exc))
@@ -317,6 +392,12 @@ class VolumePlotWidget(QWidget):
         self._last_meta = None
         self._camera = {}
         self._rotation_lock = False
+        self._cursor_line_enabled = False
+        self._last_map_cursor = None
+        self._map_cursor_timer = QTimer(self)
+        self._map_cursor_timer.setSingleShot(True)
+        self._map_cursor_timer.setInterval(16)
+        self._map_cursor_timer.timeout.connect(self._flush_map_cursor_position)
 
         # Независимые состояния: расчёт массива и запуск браузерного 3D-движка.
         self._page_ready = False
@@ -324,6 +405,7 @@ class VolumePlotWidget(QWidget):
         self._render_error = ""
         self._scene_rendered = False
         self._display_patch_pending = False
+        self._pending_roi_overlay_color = None
         # Keep the exact Plotly colorscale explicitly chosen for the 2D
         # projection. Replaying it must not derive a new palette from the theme.
         self._projection_colorscale_replay = None
@@ -418,6 +500,7 @@ class VolumePlotWidget(QWidget):
         self.toolbar.opacity_mode_changed.connect(self._on_opacity_mode_changed)
         self.toolbar.contrast_changed.connect(self._on_contrast_changed)
         self.toolbar.contrast_auto_requested.connect(self._on_contrast_auto)
+        self.toolbar.cursor_line_toggled.connect(self._on_cursor_line_toggled)
         self.toolbar.settings_requested.connect(self.settings_requested.emit)
         self.toolbar.info_requested.connect(self._show_info)
         self._update_status()
@@ -668,6 +751,12 @@ class VolumePlotWidget(QWidget):
         if self._display_patch_pending:
             self._display_patch_pending = False
             QTimer.singleShot(0, self._request_live_display_update)
+        if self._pending_roi_overlay_color is not None:
+            QTimer.singleShot(0, self._apply_pending_roi_overlay_color)
+        if self._cursor_line_enabled:
+            self._command("cursorEnabled", enabled=True)
+            if self._last_map_cursor is not None:
+                self._map_cursor_timer.start()
 
     def _show_web_error(self, exc):
         message = " ".join(str(exc or "неизвестная ошибка Qt WebEngine").split())
@@ -686,6 +775,8 @@ class VolumePlotWidget(QWidget):
         self._command("theme", theme=self._theme)
         self._command("speed", value=float(self._settings.get("rotation_speed", 14.0)))
         self._on_rotation_lock(self._rotation_lock)
+        if self._cursor_line_enabled:
+            self._command("cursorEnabled", enabled=True)
         if self._last_payload:
             # _last_payload is the last full-scene snapshot; style-only changes
             # are replayed after it is restored into the new WebEngine page.
@@ -696,6 +787,64 @@ class VolumePlotWidget(QWidget):
         else:
             self._update_status("Данные: ожидается запуск расчёта объёма")
 
+    def _on_cursor_line_toggled(self, enabled: bool) -> None:
+        self._cursor_line_enabled = bool(enabled)
+        if not self._cursor_line_enabled:
+            self._map_cursor_timer.stop()
+            self._command("cursorEnabled", enabled=False)
+            return
+        self._command("cursorEnabled", enabled=True)
+        if self._last_map_cursor is not None:
+            self._map_cursor_timer.start()
+
+    def set_map_cursor_position(self, position) -> None:
+        """Получает координаты карты; отправка в JS ограничена частотой ~60 Гц."""
+        if position is None:
+            self._last_map_cursor = None
+            self._map_cursor_timer.stop()
+            if self._cursor_line_enabled and self._page_ready:
+                self._command("cursorPosition", visible=False)
+            return
+        try:
+            x, y = float(position[0]), float(position[1])
+            if not (math.isfinite(x) and math.isfinite(y)):
+                raise ValueError("non-finite map cursor")
+        except (TypeError, ValueError, IndexError, OverflowError):
+            self.set_map_cursor_position(None)
+            return
+        self._last_map_cursor = (x, y)
+        if self._cursor_line_enabled and self._page_ready and not self._map_cursor_timer.isActive():
+            self._map_cursor_timer.start()
+
+    def _flush_map_cursor_position(self) -> None:
+        if not self._cursor_line_enabled or not self._page_ready or not self._scene_rendered:
+            return
+        point = self._last_map_cursor
+        if point is None:
+            self._command("cursorPosition", visible=False)
+            return
+        x, y = point
+        meta = self._last_meta if isinstance(self._last_meta, dict) else {}
+        roi = None
+        if meta.get("coord_system") == "uv" and not meta.get("overlay_full_detector"):
+            source_id = meta.get("source_id", self.toolbar.current_source())
+            try:
+                source_id = int(source_id)
+                saved = next((item for item in self._rois if int(item.id) == source_id), None)
+                roi = saved.roi if saved is not None else None
+            except (TypeError, ValueError, OverflowError):
+                roi = None
+        mapped = map_detector_cursor_to_volume_xy(
+            x, y,
+            coord_system=str(meta.get("coord_system", "xy")),
+            overlay_full_detector=bool(meta.get("overlay_full_detector", False)),
+            roi=roi,
+        )
+        if mapped is None:
+            self._command("cursorPosition", visible=False)
+            return
+        self._command("cursorPosition", visible=True, position={"x": mapped[0], "y": mapped[1]})
+
     def _on_camera_state(self,camera): self._camera=camera
     def _sync_autorotate_off(self):
         self.toolbar.rotate_btn.blockSignals(True); self.toolbar.rotate_btn.setChecked(False); self.toolbar.rotate_btn.blockSignals(False)
@@ -704,9 +853,19 @@ class VolumePlotWidget(QWidget):
         self.bridge.commandChanged.emit(json.dumps({"type":kind,**payload},separators=(",",":")))
 
     def set_dataset(self, raw, th, axis, x_coords, y_coords, saved_rois, *, scan_label="", view_label=""):
+        self._last_map_cursor = None; self._map_cursor_timer.stop()
+        if self._cursor_line_enabled and self._page_ready:
+            self._command("cursorReset")
         self._dataset_generation+=1; self._volume_cache_key=None; self._volume_cache=None; self._volume_cache_input_stride=1; self._projection_cache_key=None; self._projection_cache=None; self._raw=np.asarray(raw); self._th=np.asarray(th,dtype=float); self._axis=int(axis); self._x=np.asarray(x_coords,dtype=float); self._y=np.asarray(y_coords,dtype=float); self._scan_label=str(scan_label); self._view_label=str(view_label); self._rois=[r for r in (saved_rois or []) if str(r.roi.type).lower() in ("rect","rectangle","rotated_rectangle") and r.roi.normalized().is_valid]
+        pending = self._pending_roi_overlay_color
+        if pending is not None and not any(saved is pending[2] for saved in self._rois):
+            # Do not retain or apply a deferred patch belonging to another scan/session.
+            self._pending_roi_overlay_color = None
         choices=[(int(r.id),r.roi.label or f"ROI {r.id}",r.roi.color) for r in self._rois]; self.toolbar.set_roi_choices(choices,self.toolbar.current_source()); self.refresh()
     def clear_dataset(self, message="Откройте HDF5, чтобы построить 3D-объём"):
+        self._last_map_cursor = None; self._map_cursor_timer.stop()
+        if self._cursor_line_enabled and self._page_ready:
+            self._command("cursorReset")
         self._transfer_timer.stop()
         self._transfer_payload = None
         self._awaiting_webgl_render = False
@@ -722,6 +881,7 @@ class VolumePlotWidget(QWidget):
         self._pending_render = None
         self._raw = self._th = self._x = self._y = None
         self._rois = []
+        self._pending_roi_overlay_color = None
         self._last_key = None
         self._last_payload = None
         self._last_meta = None
@@ -754,11 +914,20 @@ class VolumePlotWidget(QWidget):
         if self._camera:
             settings["camera"] = self._camera
         overlay = bool(self.toolbar.show_roi_on_full_detector()) and self.toolbar.current_source() != "full"
+        # Cache identity must describe data/lattice inputs, not every visual control.
+        # Colormap, opacity, contrast, camera, labels and other display-only state are
+        # already applied through live Plotly patches; including them here made the
+        # next unrelated refresh rebuild and retransmit the full volume.
+        render_settings = {
+            key: settings.get(key)
+            for key in DATA_RENDER_SETTINGS
+            if key in settings
+        }
         key = (
             self._scan_label, self._view_label, self.toolbar.current_source(), overlay,
             round(roi.cx, 8), round(roi.cy, 8), round(roi.width, 8),
             round(roi.height, 8), round(roi.angle, 8), self._theme,
-            json.dumps(settings, sort_keys=True, default=str),
+            json.dumps(render_settings, sort_keys=True, default=str),
         )
         if not force and key == self._last_key:
             return
@@ -908,6 +1077,80 @@ class VolumePlotWidget(QWidget):
                 "не пришёл за 45 с. Проверьте WebGL, графический драйвер, видеопамять и журнал Qt WebEngine."
             )
 
+    def update_roi_color(self, roi_id, color):
+        """Update a pinned ROI's display color without rebuilding the 3D volume.
+
+        Only the selected ROI boundary on the full-detector projection needs a
+        live Plotly restyle. If a scene build is in flight, the color is queued
+        and applied after that scene's first confirmed draw.
+        """
+        try:
+            target_id = int(roi_id)
+            parsed = QColor(str(color))
+            if not parsed.isValid():
+                return False
+            normalized = parsed.name(QColor.NameFormat.HexRgb)
+        except (TypeError, ValueError, OverflowError):
+            return False
+
+        target_saved = None
+        for saved in self._rois:
+            try:
+                if int(saved.id) == target_id:
+                    target_saved = saved
+                    saved.roi.color = normalized
+                    break
+            except (AttributeError, TypeError, ValueError):
+                continue
+        if target_saved is None:
+            return False
+
+        choices = [
+            (int(saved.id), saved.roi.label or f"ROI {saved.id}", saved.roi.color)
+            for saved in self._rois
+        ]
+        self.toolbar.set_roi_choices(choices, self.toolbar.current_source())
+
+        if self.toolbar.current_source() != target_id or not self.toolbar.show_roi_on_full_detector():
+            if self._pending_roi_overlay_color and self._pending_roi_overlay_color[0] == target_id:
+                self._pending_roi_overlay_color = None
+            return True
+
+        self._pending_roi_overlay_color = (target_id, normalized, target_saved)
+        self._apply_pending_roi_overlay_color()
+        return True
+
+    def _apply_pending_roi_overlay_color(self):
+        pending = self._pending_roi_overlay_color
+        if pending is None:
+            return
+        roi_id, color, roi_object = pending
+
+        if self.toolbar.current_source() != roi_id or not self.toolbar.show_roi_on_full_detector():
+            self._pending_roi_overlay_color = None
+            return
+        current_saved = next(
+            (saved for saved in self._rois if int(saved.id) == roi_id),
+            None,
+        )
+        if current_saved is None or current_saved is not roi_object:
+            # A scan/session may have replaced the ROI list while a render was
+            # in flight. Never apply a delayed color to a different ROI reusing
+            # the same numeric ID.
+            self._pending_roi_overlay_color = None
+            return
+        if not self._page_ready or not self._scene_rendered:
+            return
+
+        meta = self._last_meta if isinstance(self._last_meta, dict) else {}
+        if not meta.get("overlay_full_detector") or not meta.get("has_projection"):
+            # No boundary trace exists while the projection/overlay is disabled.
+            # The next full scene build will already use the updated ROI color.
+            return
+
+        self._pending_roi_overlay_color = None
+        self._command("display", patch={"roi_overlay_color": color})
+
     def _on_roi_overlay_changed(self, enabled):
         self.refresh(force=True)
 
@@ -955,7 +1198,12 @@ class VolumePlotWidget(QWidget):
             self.refresh(force=True)
 
     def _on_colormap_changed(self, name):
-        self._settings["volume_colormap"] = str(name)
+        selected = str(name)
+        self._settings["volume_colormap"] = selected
+        try:
+            save_plot_display_settings({"volume": {"volume_colormap": selected}})
+        except Exception:
+            logging.getLogger(__name__).exception("Не удалось сохранить цветовую карту 3D")
         self._request_live_display_update({"volume_colormap"})
 
     def _on_opacity_mode_changed(self, enabled):

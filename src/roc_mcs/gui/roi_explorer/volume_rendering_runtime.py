@@ -59,6 +59,34 @@ _SOFT_VOLUME_OPACITY_SCALE = (
 )
 
 
+def map_detector_cursor_to_volume_xy(
+    x: float,
+    y: float,
+    *,
+    coord_system: str,
+    overlay_full_detector: bool,
+    roi: Any = None,
+) -> tuple[float, float] | None:
+    """Map detector XY cursor coordinates to the current volume XY lattice.
+
+    Rotated ROI volumes use local (u, v) coordinates unless they have been
+    regridded onto the full detector. Points outside a local ROI return None.
+    This helper only transforms two scalars; it never touches volume data.
+    """
+    xx, yy = float(x), float(y)
+    if not (isfinite(xx) and isfinite(yy)):
+        return None
+    if str(coord_system).lower() == "uv" and not bool(overlay_full_detector):
+        if roi is None or not bool(roi.contains(xx, yy)):
+            return None
+        u, v = roi.to_local(xx, yy)
+        uu, vv = float(u), float(v)
+        if not (isfinite(uu) and isfinite(vv)):
+            return None
+        return uu, vv
+    return xx, yy
+
+
 def volume_opacity_scale(mode: Any = "uniform") -> str | list[list[float]]:
     """Return a Plotly Volume opacity transfer function.
 

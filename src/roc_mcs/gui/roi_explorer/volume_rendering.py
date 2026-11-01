@@ -119,13 +119,20 @@ def prepare_volume(rv: ROIVolume, *, smooth_sigma=0.5, stride=2, max_points=MAX_
     if ts.size>1 and ts[0]>ts[-1]: ts=ts[::-1]; sampled=sampled[:,:,::-1]
     if x.size>1 and x[0]>x[-1]: x=x[::-1]; projection=projection[::-1,:]
     if y.size>1 and y[0]>y[-1]: y=y[::-1]; projection=projection[:,::-1]
-    mask=np.isfinite(sampled)
-    if not mask.any(): raise ValueError("В прореженном объёме нет конечных значений")
-    vals=np.asarray(sampled[mask],dtype=np.float32)
-    if float(np.nanmax(vals))<=0: raise ValueError("В объёме нет положительных конечных интенсивностей")
-    xv=np.broadcast_to(xs.astype(np.float32)[:,None,None],sampled.shape)[mask]
-    yv=np.broadcast_to(ys.astype(np.float32)[None,:,None],sampled.shape)[mask]
-    zv=np.broadcast_to(ts.astype(np.float32)[None,None,:],sampled.shape)[mask]
+    valid=np.isfinite(sampled)
+    if not valid.any(): raise ValueError("В прореженном объёме нет конечных значений")
+    finite_values=np.asarray(sampled[valid],dtype=np.float32)
+    if not np.any(finite_values>0): raise ValueError("В объёме нет положительных конечных интенсивностей")
+    # Plotly Volume needs a complete rectilinear lattice. Removing NaN samples
+    # creates an irregular point cloud, which can make the whole volume vanish.
+    # Keep every grid node and place missing/out-of-detector samples strictly
+    # below the non-negative isomin range. The scientific ROIVolume is untouched.
+    invalid_floor=np.float32(min(float(np.min(finite_values))-max(float(np.max(np.abs(finite_values))),1.0),-1.0))
+    render_values=np.where(valid,sampled,invalid_floor).astype(np.float32,copy=False)
+    xv=np.broadcast_to(xs.astype(np.float32)[:,None,None],sampled.shape).reshape(-1)
+    yv=np.broadcast_to(ys.astype(np.float32)[None,:,None],sampled.shape).reshape(-1)
+    zv=np.broadcast_to(ts.astype(np.float32)[None,None,:],sampled.shape).reshape(-1)
+    vals=render_values.reshape(-1)
     return sampled,projection,xv,yv,zv,vals
 
 

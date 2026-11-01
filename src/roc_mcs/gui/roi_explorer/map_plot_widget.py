@@ -173,6 +173,7 @@ class MapPlotWidget(QWidget):
     preview_roi_changed = pyqtSignal(object) # Геометрия ROI при движении селектора.
     preview_roi_finished = pyqtSignal(object) # Финальная геометрия после отпускания мыши.
     theta_index_changed = pyqtSignal(int)
+    cursor_position_changed = pyqtSignal(object)  # (x, y) в координатах детектора либо None при выходе
 
     # =========================================================================
     # РЕЕСТР ИНСТРУМЕНТОВ (Статичная конфигурация)
@@ -907,6 +908,9 @@ class MapPlotWidget(QWidget):
                     z_str = f"  |  Int: {float(z_val):.1f}"
         coord_text = f"X: {x:.1f}   Y: {y:.1f}{z_str}"
         self.coord_label.setText(coord_text)
+        # Передаём только два скалярных координатных значения; тяжёлые расчёты
+        # и обновление Plotly здесь не выполняются.
+        self.cursor_position_changed.emit((float(x), float(y)))
 
         # 2. ЛОГИКА ПЕРЕМЕЩЕНИЯ КАРТЫ (работает только если зажато колесико)
         if self._pan_active and event.x is not None and event.y is not None:
@@ -940,6 +944,7 @@ class MapPlotWidget(QWidget):
     def _on_axes_leave(self, event) -> None:
         """Метод для слушателя мыши (координаты x,y). Если мышка ушла с карты, очищаем строку координат"""
         self.coord_label.setText("")
+        self.cursor_position_changed.emit(None)
 
 
 

@@ -1,12 +1,13 @@
 """Компактная панель управления интерактивным 3D-экраном."""
 from __future__ import annotations
 from PyQt6.QtCore import QSize, Qt, pyqtSignal
-from PyQt6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap, QPalette
+from PyQt6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap, QPalette, QActionGroup
 from PyQt6.QtWidgets import QApplication, QGridLayout, QMenu, QToolButton, QWidget, QWidgetAction, QHBoxLayout, QDialog, QDoubleSpinBox, QLabel, QPushButton
 from roc_mcs.gui.components.icon_provider import svg_icon
 from roc_mcs.gui.roi_explorer.plot_toolbar_style import ICON_DIR, COMPACT_PLOT_TOOLBAR_STYLE
 from roc_mcs.gui.roi_explorer.theme import apply_popup_theme, apply_widget_palette, theme_colors
 from roc_mcs.gui.roi_explorer.colormap_catalog import NAPARI_STYLE_COLORMAPS, colormap_icon
+from roc_mcs.gui.roi_explorer.map_tools_widget import SmartDropdownButton
 
 class VolumeToolsWidget(QWidget):
     roi_source_changed = pyqtSignal(object)
@@ -23,23 +24,34 @@ class VolumeToolsWidget(QWidget):
     opacity_mode_changed = pyqtSignal(bool)
     contrast_changed = pyqtSignal(float, float)
     contrast_auto_requested = pyqtSignal()
+    cursor_line_toggled = pyqtSignal(bool)
 
     def __init__(self, parent=None):
         super().__init__(parent); self.setObjectName("VolumeToolBar"); self.setFixedHeight(max(30, self._icon_size()+10)); self._theme = "light"; self._source_key = "full"; self._choices = []; self._rotation_lock = False; self._show_roi_on_full_detector = False
-        self.setStyleSheet(COMPACT_PLOT_TOOLBAR_STYLE + "\nQWidget#VolumeToolBar QToolButton { max-height:26px; min-height:20px; border:1px solid transparent; border-radius:2px; background:transparent; padding:0 2px; } QWidget#VolumeToolBar QToolButton:hover { background:palette(midlight); border-color:palette(mid); } QWidget#VolumeToolBar QToolButton:checked { background:palette(highlight); color:palette(highlighted-text); }")
+        self.setStyleSheet(COMPACT_PLOT_TOOLBAR_STYLE + "\nQWidget#VolumeToolBar QToolButton { max-height:26px; min-height:20px; border:1px solid transparent; border-radius:2px; background:transparent; padding:0 2px; } QWidget#VolumeToolBar QToolButton:hover { background:palette(midlight); border-color:palette(mid); } QWidget#VolumeToolBar QToolButton:checked { background:palette(highlight); color:palette(highlighted-text); }\nQWidget#VolumeToolBar SmartDropdownButton::menu-indicator { image:none; }")
         row = QHBoxLayout(self); row.setContentsMargins(4, 2, 4, 2); row.setSpacing(4)
-        self.roi_btn = QToolButton(self); self.roi_btn.setToolTip("Источник объёма: весь детектор или выбранная ROI"); self.roi_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup); self.roi_menu = QMenu(self.roi_btn); self.roi_btn.setMenu(self.roi_menu); row.addWidget(self.roi_btn)
+        self.roi_btn = SmartDropdownButton(self); self.roi_btn.setToolTip("Источник объёма: весь детектор или выбранная ROI"); self.roi_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup); self.roi_menu = QMenu(self.roi_btn); self.roi_btn.setMenu(self.roi_menu); row.addWidget(self.roi_btn)
         self.reset_btn = QToolButton(self); self.reset_btn.setToolTip("Сбросить параллельный перенос и вписать объём в окно, сохранив направление камеры"); self.reset_btn.clicked.connect(self.reset_view_requested.emit); row.addWidget(self.reset_btn)
         self.camera_btn = QToolButton(self); self.camera_btn.setToolTip("Настроить ракурс камеры"); self.camera_btn.clicked.connect(self.camera_requested.emit); row.addWidget(self.camera_btn)
-        self.orientation_btn=QToolButton(self); self.orientation_btn.setToolTip("Ориентация: щелчок — горизонтальная плоскость XY; стрелка — вид вдоль осей и ограничение вращения"); self.orientation_btn.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup); self.orientation_menu=QMenu(self.orientation_btn); self.orientation_btn.setMenu(self.orientation_menu); self.orientation_btn.clicked.connect(self.align_xy_requested.emit); self._axis_actions={}
+        self.orientation_btn=SmartDropdownButton(self); self.orientation_btn.setToolTip("Ориентация: щелчок — горизонтальная плоскость XY; стрелка — вид вдоль осей и ограничение вращения"); self.orientation_btn.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup); self.orientation_menu=QMenu(self.orientation_btn); self.orientation_btn.setMenu(self.orientation_menu); self.orientation_btn.clicked.connect(self.align_xy_requested.emit); self._axis_actions={}
         for axis,label in (("x","Вдоль оси X"),("y","Вдоль оси Y"),("z","Вдоль оси Z")):
             action=self.orientation_menu.addAction(label); action.triggered.connect(lambda _=False,a=axis:self.view_axis_requested.emit(a)); self._axis_actions[axis]=action
         self.orientation_menu.addSeparator(); self.rotation_lock_action=self.orientation_menu.addAction("Сохранять вертикаль при вращении"); self.rotation_lock_action.setCheckable(True); self.rotation_lock_action.setChecked(False); self.rotation_lock_action.toggled.connect(self._on_rotation_lock); row.addWidget(self.orientation_btn)
         self.rotate_btn = QToolButton(self); self.rotate_btn.setCheckable(True); self.rotate_btn.setToolTip("Включить или остановить автоматическое вращение"); self.rotate_btn.toggled.connect(self.autorotate_toggled.emit); row.addWidget(self.rotate_btn)
-        self.color_btn = QToolButton(self); self.color_btn.setToolTip("Контраст и цветовая карта 3D"); self.color_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup); self.color_menu=QMenu(self.color_btn); self.color_btn.setMenu(self.color_menu); row.addWidget(self.color_btn)
+        self.overlays_btn = SmartDropdownButton(self); self.overlays_btn.setAutoRaise(True); self.overlays_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.overlays_btn.setIcon(svg_icon(ICON_DIR / "curve_overlay_3.svg", widget=self.overlays_btn)); self.overlays_btn.setIconSize(QSize(15, 15))
+        self.overlays_btn.setToolTip("Дополнительные объекты на 3D-сцене")
+        self.overlays_menu = QMenu(self.overlays_btn)
+        self.cursor_line_action = self.overlays_menu.addAction("Линия положения курсора 2D ↔ 3D")
+        self.cursor_line_action.setCheckable(True)
+        self.cursor_line_action.setToolTip("Показывать вертикальную линию по координатам курсора на карте или при наведении на 3D-объём")
+        self.cursor_line_action.toggled.connect(self.cursor_line_toggled.emit)
+        self.overlays_btn.setMenu(self.overlays_menu); row.addWidget(self.overlays_btn)
+        self.color_btn = SmartDropdownButton(self); self.color_btn.setToolTip("Контраст и цветовая карта 3D"); self.color_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup); self.color_menu=QMenu(self.color_btn); self.color_btn.setMenu(self.color_menu); row.addWidget(self.color_btn)
         self._cmap_actions={}
+        self._cmap_action_group=QActionGroup(self.color_menu); self._cmap_action_group.setExclusive(True)
         for cmap in NAPARI_STYLE_COLORMAPS:
-            action=self.color_menu.addAction(colormap_icon(cmap),cmap); action.setCheckable(True); action.triggered.connect(lambda _=False,n=cmap:self._choose_colormap(n)); self._cmap_actions[cmap]=action
+            action=self.color_menu.addAction(colormap_icon(cmap),cmap); action.setCheckable(True); self._cmap_action_group.addAction(action); action.triggered.connect(lambda _=False,n=cmap:self._choose_colormap(n)); self._cmap_actions[cmap]=action
         self.color_menu.addSeparator()
         self.soft_opacity_action = self.color_menu.addAction("Мягкое затухание слабых сигналов")
         self.soft_opacity_action.setCheckable(True)
@@ -120,9 +132,13 @@ class VolumeToolsWidget(QWidget):
         self.set_colormap(name); self.color_menu.close(); self.colormap_changed.emit(str(name))
 
     def set_colormap(self,name):
-        name=str(name);
+        name=str(name)
+        if name not in self._cmap_actions:
+            name=next(iter(self._cmap_actions), "magma")
         for key,action in self._cmap_actions.items(): action.setChecked(key==name)
         self.color_btn.setIcon(colormap_icon(name,24,14)); self.color_btn.setIconSize(QSize(24,14))
+        self.color_btn.setToolTip(f"Контраст и цветовая карта 3D · текущая палитра: {name}")
+        self.color_btn.setAccessibleName(f"Цветовая карта 3D: {name}")
 
     def set_soft_opacity(self, enabled):
         enabled = bool(enabled)
@@ -149,10 +165,11 @@ class VolumeToolsWidget(QWidget):
     def apply_theme(self, theme=None):
         self._theme = apply_widget_palette(self, theme); self.setFixedHeight(max(30, self._icon_size()+10)); c = theme_colors(self._theme); color = c["text"]
         self.reset_btn.setIcon(svg_icon(ICON_DIR / "zoom_out_map.svg", color=color, widget=self.reset_btn)); self.camera_btn.setIcon(svg_icon(ICON_DIR / "camera_1.svg", color=color, widget=self.camera_btn)); self.rotate_btn.setIcon(svg_icon(ICON_DIR / "refresh_variant_4_minimal.svg", color=color, widget=self.rotate_btn)); self.info_btn.setIcon(svg_icon(ICON_DIR / "info_circle_icon.svg", color=color, widget=self.info_btn)); self.settings_btn.setIcon(svg_icon(ICON_DIR / "setting_icon.svg", color=color, widget=self.settings_btn))
-        for button in (self.reset_btn, self.camera_btn, self.orientation_btn, self.rotate_btn, self.info_btn, self.settings_btn): button.setIconSize(QSize(self._icon_size(), self._icon_size()))
+        for button in (self.reset_btn, self.camera_btn, self.orientation_btn, self.rotate_btn, self.overlays_btn, self.info_btn, self.settings_btn): button.setIconSize(QSize(self._icon_size(), self._icon_size()))
         for axis,action in self._axis_actions.items(): action.setIcon(svg_icon(ICON_DIR / f"view_axis_{axis}_1.svg", color=color, widget=self.orientation_btn))
         self.orientation_btn.setIcon(svg_icon(ICON_DIR / "view_orientation.svg", color=color, widget=self.orientation_btn))
-        apply_popup_theme(self.orientation_menu,self._theme); apply_popup_theme(self.color_menu,self._theme); apply_popup_theme(self._contrast_dialog,self._theme)
+        self.overlays_btn.setIcon(svg_icon(ICON_DIR / "curve_overlay_3.svg", color=color, widget=self.overlays_btn))
+        apply_popup_theme(self.orientation_menu,self._theme); apply_popup_theme(self.color_menu,self._theme); apply_popup_theme(self.overlays_menu,self._theme); apply_popup_theme(self._contrast_dialog,self._theme)
         self._rebuild_roi_menu(); self._update_roi_button()
 
     def _on_rotation_lock(self, enabled):

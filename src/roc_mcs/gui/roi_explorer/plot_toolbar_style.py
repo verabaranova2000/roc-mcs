@@ -2,6 +2,11 @@
 from pathlib import Path
 
 ICON_DIR = Path(__file__).resolve().parents[1] / "resources" / "icons"
+
+# Единый цвет и размер треугольного индикатора SmartDropdownButton для Map/ROC/3D.
+# RGBA: полупрозрачный синий; меняется в одном месте для всех панелей.
+SMART_DROPDOWN_INDICATOR_RGBA = (91, 153, 220, 170)
+SMART_DROPDOWN_INDICATOR_SIZE = 6
 COMPACT_PLOT_TOOLBAR_STYLE = """
     QWidget#MapToolBar QToolButton, QWidget#CurveToolBar QToolButton, QWidget#VolumeToolBar QToolButton {
         max-height: 20px; min-height: 20px; padding: 0px; margin: 0px;
