@@ -369,6 +369,17 @@ class VTKVolumeScene:
         self._theta_slice_shader_installed = False
         self._theta_slice_bounds: tuple[float, float] | None = None
         self._theta_slice_transfer_range: tuple[float, float] | None = None
+        # The map cursor is an independent, narrow optical marker inside the
+        # volume ray. Unlike the previous RGB tint, it contributes its own
+        # alpha even when the scalar transfer function is fully transparent.
+        # Front-to-back volume compositing then depth-orders cloud and marker.
+        self._cursor_line_enabled = False
+        self._cursor_line_position: tuple[float, float] | None = None
+        self._cursor_line_radii: tuple[float, float] | None = None
+        # Optical density of the independent cursor marker, measured per
+        # volume-texture voxel. It contributes opacity inside the ray marcher
+        # even where the source scalar has zero transfer-function opacity.
+        self._cursor_line_density = 0.95
         self.axes_widget = None
         self.payload = None
         self.grid_info = None
@@ -714,55 +725,106 @@ class VTKVolumeScene:
     _THETA_PALETTE_UNIFORM_COUNT = 16
 
     @staticmethod
-    def _theta_slice_shader_color_code() -> str:
-        """Return stable GLSL that tints the current ray sample inside the theta slab.
+    def _theta_overlay_position_shader_code() -> str:
+        """Declare the shared detector-local position before VTK's alpha guard.
 
-        The insertion point is in VTK's COMPOSITE_BLEND sample path, immediately
-        before the sample's RGB is premultiplied by its already-computed opacity.
-        Consequently this code changes RGB only: VTK's original scalar opacity,
-        gamma, compositing and early-ray termination remain untouched.
+        VTK evaluates the volume opacity before its ``if (g_srcColor.a > 0)``
+        block. The cursor must not depend on that alpha, so its position is
+        prepared at the enclosing ray-march sample scope. The same transform
+        is reused by theta emphasis and the cursor marker.
+        """
+        return "\n".join((
+            "vec3 rocOverlayDataPos = vec3(0.0);",
+            "if (rocThetaSliceEnabled != 0 || rocCursorLineEnabled != 0) {",
+            "  vec4 rocOverlayDataPosH = in_textureDatasetMatrix[0] * vec4(g_dataPos, 1.0);",
+            "  float rocOverlayW = abs(rocOverlayDataPosH.w) > 1e-20 ? rocOverlayDataPosH.w : 1.0;",
+            "  rocOverlayDataPos = rocOverlayDataPosH.xyz / rocOverlayW;",
+            "}",
+        ))
+
+    @staticmethod
+    def _theta_slice_shader_color_code() -> str:
+        """Tint the volume sample for the selected theta frame.
+
+        This snippet is inserted at VTK's premultiplication statement, which
+        is inside the native ``g_srcColor.a > 0`` guard. That is intentional:
+        theta highlighting changes only existing, visible volume samples.
+        The independent cursor is inserted separately after the native volume
+        sample has been composited, outside that guard.
         """
         lines = [
             "if (rocThetaSliceEnabled != 0 && g_srcColor.a > 0.0) {",
-            # Use dataset-local coordinates: the ROI user matrix only maps local
-            # X/Y into detector X/Y; theta remains the grid's local Z coordinate.
-            "  vec4 rocThetaDataPosH = in_textureDatasetMatrix[0] * vec4(g_dataPos, 1.0);",
-            "  float rocThetaW = abs(rocThetaDataPosH.w) > 1e-20 ? rocThetaDataPosH.w : 1.0;",
-            "  float rocThetaDataZ = rocThetaDataPosH.z / rocThetaW;",
+            "  float rocThetaDataZ = rocOverlayDataPos.z;",
             "  if (rocThetaDataZ >= rocThetaSliceLowBound && rocThetaDataZ <= rocThetaSliceHighBound) {",
             "    float rocThetaScalarRange = in_scalarsRange[0][1] - in_scalarsRange[0][0];",
-            # VTK normalizes scalar texture samples and retains the source range
-            # separately; this is the same reconstruction used by VTK's own
-            # Average Intensity Projection shader path.
             "    float rocThetaIntensity = in_scalarsRange[0][0] + rocThetaScalarRange * scalar.x;",
             "    float rocThetaT = clamp((rocThetaIntensity - rocThetaColorLow) / max(rocThetaColorHigh - rocThetaColorLow, 1e-20), 0.0, 1.0);",
-            f"    float rocThetaPalettePos = rocThetaT * {15.0:.1f};",
-            # Use the last anchor as the default so t == 1 maps to the final
-            # palette colour instead of accidentally falling back to anchor 0.
-            "    vec3 rocThetaHighlightColor = rocThetaPalette15;",
+            f"    float rocThetaPalettePos = rocThetaT * {float(VTKVolumeScene._THETA_PALETTE_UNIFORM_COUNT - 1):.1f};",
+            f"    vec3 rocThetaHighlightColor = rocThetaPalette{VTKVolumeScene._THETA_PALETTE_UNIFORM_COUNT - 1:02d};",
         ]
-        for index in range(15):
+        for index in range(VTKVolumeScene._THETA_PALETTE_UNIFORM_COUNT - 1):
             keyword = "if" if index == 0 else "else if"
             lines.append(
                 f"    {keyword} (rocThetaPalettePos < {index + 1}.0) "
                 f"{{ rocThetaHighlightColor = mix(rocThetaPalette{index:02d}, "
                 f"rocThetaPalette{index + 1:02d}, rocThetaPalettePos - {index}.0); }}"
             )
-        lines.extend([
+        lines.extend((
             "    g_srcColor.rgb = mix(g_srcColor.rgb, rocThetaHighlightColor, clamp(rocThetaStrength, 0.0, 1.0));",
             "  }",
             "}",
-            "g_srcColor.rgb *= g_srcColor.a;",
-        ])
+        ))
+        return "\n".join(lines)
+
+    @staticmethod
+    def _cursor_line_shader_composite_code() -> str:
+        """Composite a continuous cursor tube as an independent ray-march sample.
+
+        This is inserted *after* VTK's native per-sample volume contribution
+        and after the native ``if (g_srcColor.a > 0)`` block has been closed.
+        Therefore the marker is evaluated even when the volume is empty or
+        transparent. It is not an RGB tint of cloud samples.
+
+        The cursor has a finite elliptical XY cross-section and spans the full
+        theta axis. Its alpha is Beer-Lambert integrated over the actual ray
+        step in texture-voxel units. It is composited into the same
+        front-to-back accumulator: foreground cloud attenuates it, and the
+        marker attenuates cloud samples behind it. No VTK actor or geometry is
+        created, and no physical coordinates are offset.
+        """
+        lines = [
+            "if (rocCursorLineEnabled != 0) {",
+            "  vec2 rocCursorDelta = vec2(",
+            "    (rocOverlayDataPos.x - rocCursorX) / max(rocCursorRadiusX, 1e-20),",
+            "    (rocOverlayDataPos.y - rocCursorY) / max(rocCursorRadiusY, 1e-20));",
+            "  float rocCursorDistance = length(rocCursorDelta);",
+            "  if (rocCursorDistance < 1.0) {",
+            # A broad flat core keeps the navigation marker visually continuous;
+            # a smooth edge avoids aliasing without turning it into a plane.
+            "    float rocCursorProfile = 1.0 - smoothstep(0.78, 1.0, rocCursorDistance);",
+            "    vec3 rocCursorTextureDimensions = vec3(textureSize(in_volume[0], 0));",
+            "    float rocCursorStepVoxels = length(g_dirStep * rocCursorTextureDimensions);",
+            "    float rocCursorOpticalDepth = rocCursorLineDensity * rocCursorStepVoxels * rocCursorProfile;",
+            "    float rocCursorSampleAlpha = 1.0 - exp(-clamp(rocCursorOpticalDepth, 0.0, 20.0));",
+            "    if (rocCursorSampleAlpha > 1e-6) {",
+            "      vec4 rocCursorPremultiplied = vec4(rocCursorLineColor * rocCursorSampleAlpha, rocCursorSampleAlpha);",
+            "      g_fragColor = (1.0 - g_fragColor.a) * rocCursorPremultiplied + g_fragColor;",
+            "    }",
+            "  }",
+            "}",
+        ]
         return "\n".join(lines)
 
     def _install_theta_slice_shader(self) -> None:
-        """Install one shader replacement and its mutable uniforms on this volume.
+        """Install the shared theta/cursor shader hooks and mutable uniforms.
 
         VTK's fragment custom-uniform container uploads values on every render,
         while changing an existing uniform does not change shader source or its
-        shader-build timestamp. Thus theta/palette movement does not recompile
-        the shader and does not rebuild the volume texture/mapper.
+        shader-build timestamp. Thus theta/cursor movement does not recompile
+        the shader and does not rebuild the volume texture/mapper. Three short
+        post-replacement anchors are used: shared sample coordinates, theta
+        RGB tint before native premultiplication, and the independent cursor
+        optical contribution after the volume sample's native composite.
         """
         if self.volume is None:
             raise RuntimeError("Нельзя установить theta highlight без vtkVolume.")
@@ -780,14 +842,50 @@ class VTKVolumeScene:
         uniforms.SetUniformf("rocThetaColorLow", 0.0)
         uniforms.SetUniformf("rocThetaColorHigh", 1.0)
         uniforms.SetUniformf("rocThetaStrength", float(self._theta_slice_strength))
+        uniforms.SetUniformi("rocCursorLineEnabled", 0)
+        uniforms.SetUniformf("rocCursorX", 0.0)
+        uniforms.SetUniformf("rocCursorY", 0.0)
+        uniforms.SetUniformf("rocCursorRadiusX", 1.0)
+        uniforms.SetUniformf("rocCursorRadiusY", 1.0)
+        uniforms.SetUniformf("rocCursorLineDensity", float(self._cursor_line_density))
+        # Match the Plotly viewer cursor marker: warm amber #ffbd55.
+        uniforms.SetUniform3f("rocCursorLineColor", (1.0, 0.7411765, 0.3333333))
         for index in range(self._THETA_PALETTE_UNIFORM_COUNT):
             uniforms.SetUniform3f(f"rocThetaPalette{index:02d}", (0.0, 0.0, 0.0))
 
-        replacement_anchor = "g_srcColor.rgb *= g_srcColor.a;"
+        # VTK 9.6 builds the volume shader dynamically. Its public post-
+        # replacement pass (ReplaceFirst=False) runs after the mapper has
+        # expanded //VTK::Shading::Impl, so anchor on short, stable statements
+        # rather than whitespace-sensitive multi-line fragments.
+        # 1) Prepare data-local XYZ before VTK's source-alpha guard.
         shader_property.AddFragmentShaderReplacement(
-            replacement_anchor,
-            False,  # post replacement: VTK first generates its native sample color/opacity code
-            self._theta_slice_shader_color_code(),
+            "if (g_srcColor.a > 0.0)",
+            False,
+            self._theta_overlay_position_shader_code() + "\nif (g_srcColor.a > 0.0)",
+            False,
+        )
+        # 2) Color-only theta emphasis remains inside the native alpha guard.
+        theta_anchor = "g_srcColor.rgb *= g_srcColor.a;"
+        shader_property.AddFragmentShaderReplacement(
+            theta_anchor,
+            False,
+            self._theta_slice_shader_color_code() + "\n" + theta_anchor,
+            False,
+        )
+        # 3) Add an independent optical cursor immediately after the native
+        #    volume sample has been composited. Close the alpha guard before
+        #    the cursor, then reopen a scope to consume VTK's original closing
+        #    brace. The marker now runs for zero-alpha/background samples too.
+        volume_composite_anchor = (
+            "g_fragColor = (1.0f - g_fragColor.a) * g_srcColor + g_fragColor;"
+        )
+        shader_property.AddFragmentShaderReplacement(
+            volume_composite_anchor,
+            False,
+            volume_composite_anchor
+            + "\n        }\n"
+            + self._cursor_line_shader_composite_code()
+            + "\n        {",
             False,
         )
         self._theta_slice_shader_property = shader_property
@@ -925,6 +1023,104 @@ class VTKVolumeScene:
         if render:
             self._request_render()
 
+    @property
+    def cursor_line_enabled(self) -> bool:
+        return bool(self._cursor_line_enabled)
+
+    @property
+    def cursor_line_position(self) -> tuple[float, float] | None:
+        """Current cursor location in dataset-local X/Y coordinates."""
+        return self._cursor_line_position
+
+    @property
+    def cursor_line_radii(self) -> tuple[float, float] | None:
+        return self._cursor_line_radii
+
+    def set_cursor_line_position(
+        self,
+        x: float | None,
+        y: float | None,
+        radius_x: float | None = None,
+        radius_y: float | None = None,
+        *,
+        render: bool = True,
+    ) -> None:
+        """Update/hide a detector-map cursor in dataset-local X/Y coordinates.
+
+        The detector→dataset transform and radius conversion live in
+        ``vtk_backend.cursor_link``. This method only updates already-declared
+        GPU shader uniforms; it never changes the payload, volume grid, mapper,
+        transfer functions, or renderer prop collection. ``None, None`` hides
+        the marker while leaving the requested checkbox state untouched.
+        """
+        if x is None and y is None:
+            self._cursor_line_position = None
+            self._cursor_line_radii = None
+            if self._theta_slice_uniforms is not None:
+                self._theta_slice_uniforms.SetUniformi("rocCursorLineEnabled", 0)
+            if render and self._cursor_line_enabled:
+                self._request_render()
+            return
+        if x is None or y is None or radius_x is None or radius_y is None:
+            raise ValueError("Для линии курсора нужны обе координаты X/Y и оба радиуса.")
+        values = tuple(float(value) for value in (x, y, radius_x, radius_y))
+        if not all(np.isfinite(value) for value in values):
+            raise ValueError("Координаты и радиусы линии курсора должны быть конечными.")
+        x_value, y_value, rx, ry = values
+        if rx <= 0.0 or ry <= 0.0:
+            raise ValueError("Радиусы линии курсора должны быть положительными.")
+        if self.payload is None or self._theta_slice_uniforms is None:
+            raise RuntimeError("Сначала загрузите объём для отображения линии курсора.")
+        self._cursor_line_position = (x_value, y_value)
+        self._cursor_line_radii = (rx, ry)
+        uniforms = self._theta_slice_uniforms
+        uniforms.SetUniformf("rocCursorX", x_value)
+        uniforms.SetUniformf("rocCursorY", y_value)
+        uniforms.SetUniformf("rocCursorRadiusX", rx)
+        uniforms.SetUniformf("rocCursorRadiusY", ry)
+        uniforms.SetUniformi(
+            "rocCursorLineEnabled",
+            int(self._cursor_line_enabled),
+        )
+        if render and self._cursor_line_enabled:
+            self._request_render()
+
+    def set_cursor_line_density(self, density: float, *, render: bool = True) -> None:
+        """Set the cursor marker's independent optical density (per texture voxel).
+
+        This affects only a predeclared fragment uniform. It does not change
+        the source scalar transfer functions, volume data, mapper or shader.
+        """
+        density = float(density)
+        if not np.isfinite(density) or not 0.05 <= density <= 3.0:
+            raise ValueError("Оптическая плотность линии должна лежать в [0.05, 3.0] 1/воксель.")
+        self._cursor_line_density = density
+        if self._theta_slice_uniforms is not None:
+            self._theta_slice_uniforms.SetUniformf("rocCursorLineDensity", density)
+        if render:
+            self._request_render()
+
+    def set_cursor_line_enabled(self, enabled: bool, *, render: bool = True) -> None:
+        """Enable/disable a continuous optical marker integrated into volume rays."""
+        self._cursor_line_enabled = bool(enabled)
+        if self._theta_slice_uniforms is not None:
+            self._theta_slice_uniforms.SetUniformi(
+                "rocCursorLineEnabled",
+                int(self._cursor_line_enabled and self._cursor_line_position is not None),
+            )
+        if render:
+            self._request_render()
+
+    def clear_cursor_line(self, *, render: bool = True) -> None:
+        """Clear cursor state when data are unloaded or the scan changes."""
+        self._cursor_line_enabled = False
+        self._cursor_line_position = None
+        self._cursor_line_radii = None
+        if self._theta_slice_uniforms is not None:
+            self._theta_slice_uniforms.SetUniformi("rocCursorLineEnabled", 0)
+        if render:
+            self._request_render()
+
     def set_axes_visible(self, visible: bool) -> None:
         self._axes_visible = bool(visible)
         if self.axes_widget is not None:
@@ -985,6 +1181,9 @@ class VTKVolumeScene:
         self._theta_slice_shader_installed = False
         self._theta_slice_bounds = None
         self._theta_slice_transfer_range = None
+        self._cursor_line_enabled = False
+        self._cursor_line_position = None
+        self._cursor_line_radii = None
 
         self.payload = payload
         self.grid, self.grid_info = new_grid, new_grid_info
@@ -1394,6 +1593,21 @@ class VTKVolumeScene:
                 int(self._theta_slice_shader_property.GetNumberOfShaderReplacements())
                 if self._theta_slice_shader_property is not None else 0
             ),
+            "cursor_line_requested_enabled": bool(self._cursor_line_enabled),
+            "cursor_line_enabled": bool(self._cursor_line_enabled and self._cursor_line_position is not None),
+            "cursor_line_dataset_xy": self._cursor_line_position,
+            "cursor_line_radii": self._cursor_line_radii,
+            "cursor_line_extra_actors": 0,
+            "cursor_line_highlight_mode": "continuous_embedded_ray_marched_marker",
+            "cursor_line_render_mode": "independent_marker_sample_not_volume_tint",
+            "cursor_line_compositing": "front_to_back_with_volume_opacity",
+            "cursor_line_theta_extent": (
+                (float(self._physical_theta[0]), float(self._physical_theta[-1]))
+                if self._physical_theta is not None and len(self._physical_theta) else None
+            ),
+            "cursor_line_density_per_voxel": float(self._cursor_line_density),
+            "cursor_line_source_runs_at_zero_volume_opacity": True,
+            "cursor_line_changes_volume_opacity_function": False,
             "projection_opacity": float(self.projection_actor.GetProperty().GetOpacity()) if self.projection_actor is not None else None,
             "projection_bounds": _safe_bounds(self.projection_actor),
             "projection_scalar_range": (
@@ -1477,6 +1691,9 @@ class VTKVolumeScene:
         self._theta_slice_transfer_range = None
         self._theta_slice_index = None
         self._theta_slice_enabled = False
+        self._cursor_line_enabled = False
+        self._cursor_line_position = None
+        self._cursor_line_radii = None
         self.payload = None
         self.grid = None
         self.grid_info = None

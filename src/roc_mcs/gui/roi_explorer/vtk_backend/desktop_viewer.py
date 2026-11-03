@@ -17,6 +17,7 @@ from roc_mcs.gui.app_settings import (
     save_detector_bad_pixels,
 )
 from .h5_volume_source import H5VolumeLoader, VolumePayload
+from .cursor_link import detector_cursor_bounds, map_detector_cursor_to_volume
 from .vtk_scene import TransferSettings, VTKVolumeScene
 
 
@@ -207,6 +208,10 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
             self._auto_load_enabled = True
             self._auto_load_pending = False
             self._pending_theta_slice_index: int | None = None
+            self._cursor_detector_bounds: tuple[float, float, float, float] | None = None
+            self._last_map_cursor_position: tuple[float, float] | None = None
+            self._pending_map_cursor_position: tuple[float, float] | None = None
+            self._cursor_input_source = "sliders"
             self.vtk_widget = None
             self.render_window = None
             self.interactor = None
@@ -221,6 +226,13 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
             self._theta_slice_update_timer.setSingleShot(True)
             self._theta_slice_update_timer.setInterval(25)
             self._theta_slice_update_timer.timeout.connect(self._apply_pending_theta_slice_index)
+            # Coalesce slider or future 2D-map mouse-move events. Only the most
+            # recent detector XY is transferred to existing GPU uniforms at
+            # most once per ~16 ms; no data reload or volume rebuild is involved.
+            self._cursor_line_update_timer = QtCore.QTimer(self)
+            self._cursor_line_update_timer.setSingleShot(True)
+            self._cursor_line_update_timer.setInterval(16)
+            self._cursor_line_update_timer.timeout.connect(self._apply_pending_map_cursor_position)
             # IMPORTANT: construct the QVTK child BEFORE the top-level window is
             # shown. The production-scene diagnostic that successfully rendered
             # the real H5 payload creates QVTK in this order. The previous viewer
@@ -430,6 +442,68 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
             self.theta_slice_palette_combo.currentIndexChanged.connect(self._on_theta_slice_palette_changed)
             self.theta_slice_strength.valueChanged.connect(self._on_theta_slice_strength_changed)
 
+            # The standalone viewer uses detector-coordinate sliders as a
+            # temporary input source. Embedded ROI Explorer will call the same
+            # public set_map_cursor_position((x, y)) slot from its 2D map.
+            cursor_group = QtWidgets.QGroupBox("Линия положения курсора 2D ↔ 3D")
+            self.cursor_line_group = cursor_group
+            cursor_form = QtWidgets.QFormLayout(cursor_group)
+            cursor_form.setRowWrapPolicy(QtWidgets.QFormLayout.RowWrapPolicy.WrapLongRows)
+            cursor_form.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+            self.cursor_line_check = QtWidgets.QCheckBox("Показывать линию координаты курсора")
+            self.cursor_line_check.setToolTip(
+                "Непрерывная навигационная линия проходит от одного края θ-объёма до другого "
+                "по выбранным координатам детектора. Она остаётся видимой даже в "
+                "пустых областях и композитится внутри того же GPU ray casting: "
+                "передние облака ослабляют/закрывают её по своей прозрачности, "
+                "а линия ослабляет расположенные за ней слои. Отдельного actor нет."
+            )
+            self.cursor_x_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+            self.cursor_y_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+            for slider in (self.cursor_x_slider, self.cursor_y_slider):
+                slider.setRange(0, 10000)
+                slider.setSingleStep(10)
+                slider.setPageStep(100)
+                slider.setEnabled(False)
+            self.cursor_x_value_label = QtWidgets.QLabel("X детектора = —")
+            self.cursor_y_value_label = QtWidgets.QLabel("Y детектора = —")
+            self.cursor_x_value_label.setMinimumWidth(120)
+            self.cursor_y_value_label.setMinimumWidth(120)
+            cursor_form.addRow(self.cursor_line_check)
+            cursor_form.addRow("Координата X:", self.cursor_x_slider)
+            cursor_form.addRow(self.cursor_x_value_label)
+            cursor_form.addRow("Координата Y:", self.cursor_y_slider)
+            cursor_form.addRow(self.cursor_y_value_label)
+            self.cursor_line_width = self._double_spin(0.5, 4.0, 2.0, 2, 0.1)
+            self.cursor_line_width.setToolTip(
+                "Ширина окрашиваемого цилиндрического следа в локальных шагах сетки X/Y. "
+                "Не меняет объёмные данные и глубинное перекрытие."
+            )
+            cursor_form.addRow("Ширина линии, вокселей:", self.cursor_line_width)
+            self.cursor_line_density = self._double_spin(0.05, 3.0, 0.95, 2, 0.05)
+            self.cursor_line_density.setToolTip(
+                "Оптическая плотность самостоятельной линии в единицах 1/воксель. "
+                "Линия существует и в пустом объёме; видимый перед ней объём "
+                "ослабляет её, а маркер ослабляет облако за собой. Увеличьте "
+                "значение, если линия слишком тонкая или малозаметная."
+            )
+            cursor_form.addRow("Оптическая плотность, 1/воксель:", self.cursor_line_density)
+            cursor_hint = QtWidgets.QLabel(
+                "Координаты задаются ползунками в системе детектора. "
+                "Позже сигнал мыши 2D-карты подключится к тому же входу. "
+                "Линия непрерывна по всему θ; вне текущей ROI она скрывается."
+            )
+            cursor_hint.setWordWrap(True)
+            cursor_hint.setStyleSheet("color: palette(mid); font-size: 11px;")
+            cursor_form.addRow(cursor_hint)
+            self.panel_layout.addWidget(cursor_group)
+
+            self.cursor_line_check.toggled.connect(self._on_cursor_line_toggled)
+            self.cursor_x_slider.valueChanged.connect(self._on_cursor_slider_changed)
+            self.cursor_y_slider.valueChanged.connect(self._on_cursor_slider_changed)
+            self.cursor_line_width.valueChanged.connect(self._on_cursor_line_width_changed)
+            self.cursor_line_density.valueChanged.connect(self._on_cursor_line_density_changed)
+
             self.load_button = QtWidgets.QPushButton("Загрузить / перестроить объём")
             self.load_button.setMinimumHeight(36)
             self.load_button.clicked.connect(self.load_volume)
@@ -571,6 +645,14 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
                 self.theta_slice_check.setEnabled(not busy and has_scene and has_payload)
                 self.theta_slice_palette_combo.setEnabled(not busy and has_scene and has_payload)
                 self.theta_slice_strength.setEnabled(not busy and has_scene and has_payload)
+            if hasattr(self, "cursor_line_group"):
+                cursor_ready = not busy and has_scene and has_payload and self._cursor_detector_bounds is not None
+                self.cursor_line_group.setEnabled(cursor_ready)
+                self.cursor_line_check.setEnabled(cursor_ready)
+                self.cursor_x_slider.setEnabled(cursor_ready)
+                self.cursor_y_slider.setEnabled(cursor_ready)
+                self.cursor_line_width.setEnabled(cursor_ready)
+                self.cursor_line_density.setEnabled(cursor_ready)
 
         def _theta_slice_label_text(self, index: int) -> str:
             if self.payload is None or not len(self.payload.theta):
@@ -645,6 +727,7 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
                 self._show_error("Не удалось изменить силу выделения θ", str(exc))
 
         def _reset_theta_slice_controls(self):
+            self._reset_cursor_line_controls()
             timer = getattr(self, "_theta_slice_update_timer", None)
             if timer is not None and timer.isActive():
                 timer.stop()
@@ -660,6 +743,241 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
                 self.theta_slice_slider.blockSignals(False)
             if hasattr(self, "theta_slice_value_label"):
                 self.theta_slice_value_label.setText("θ = —")
+
+        @staticmethod
+        def _slider_to_detector_coordinate(value: int, low: float, high: float) -> float:
+            fraction = float(np.clip(int(value), 0, 10000)) / 10000.0
+            return float(low + fraction * (high - low))
+
+        @staticmethod
+        def _detector_coordinate_to_slider(value: float, low: float, high: float) -> int:
+            if high <= low:
+                return 5000
+            fraction = float(np.clip((float(value) - low) / (high - low), 0.0, 1.0))
+            return int(round(fraction * 10000.0))
+
+        def _cursor_position_from_sliders(self) -> tuple[float, float] | None:
+            bounds = self._cursor_detector_bounds
+            if bounds is None:
+                return None
+            x0, x1, y0, y1 = bounds
+            return (
+                self._slider_to_detector_coordinate(self.cursor_x_slider.value(), x0, x1),
+                self._slider_to_detector_coordinate(self.cursor_y_slider.value(), y0, y1),
+            )
+
+        def _set_cursor_sliders_from_detector_position(self, x: float, y: float) -> None:
+            bounds = self._cursor_detector_bounds
+            if bounds is None:
+                return
+            x0, x1, y0, y1 = bounds
+            self.cursor_x_slider.blockSignals(True)
+            self.cursor_y_slider.blockSignals(True)
+            try:
+                self.cursor_x_slider.setValue(self._detector_coordinate_to_slider(x, x0, x1))
+                self.cursor_y_slider.setValue(self._detector_coordinate_to_slider(y, y0, y1))
+            finally:
+                self.cursor_x_slider.blockSignals(False)
+                self.cursor_y_slider.blockSignals(False)
+            self._update_cursor_coordinate_labels()
+
+        def _update_cursor_coordinate_labels(self) -> None:
+            position = self._cursor_position_from_sliders()
+            if position is None:
+                self.cursor_x_value_label.setText("X детектора = —")
+                self.cursor_y_value_label.setText("Y детектора = —")
+                return
+            self.cursor_x_value_label.setText(f"X детектора = {position[0]:.4f}")
+            self.cursor_y_value_label.setText(f"Y детектора = {position[1]:.4f}")
+
+        def _configure_cursor_controls(self, payload: VolumePayload) -> None:
+            """Reset the standalone input domain for the newly loaded payload."""
+            timer = getattr(self, "_cursor_line_update_timer", None)
+            if timer is not None and timer.isActive():
+                timer.stop()
+            self._pending_map_cursor_position = None
+            self._last_map_cursor_position = None
+            self._cursor_input_source = "sliders"
+            self._cursor_detector_bounds = detector_cursor_bounds(payload)
+            self.cursor_line_check.blockSignals(True)
+            self.cursor_line_check.setChecked(False)
+            self.cursor_line_check.blockSignals(False)
+            self.cursor_x_slider.blockSignals(True)
+            self.cursor_y_slider.blockSignals(True)
+            try:
+                self.cursor_x_slider.setValue(5000)
+                self.cursor_y_slider.setValue(5000)
+            finally:
+                self.cursor_x_slider.blockSignals(False)
+                self.cursor_y_slider.blockSignals(False)
+            self._update_cursor_coordinate_labels()
+            if self.scene is not None:
+                self.scene.clear_cursor_line(render=False)
+
+        def _reset_cursor_line_controls(self) -> None:
+            timer = getattr(self, "_cursor_line_update_timer", None)
+            if timer is not None and timer.isActive():
+                timer.stop()
+            self._pending_map_cursor_position = None
+            self._last_map_cursor_position = None
+            self._cursor_input_source = "sliders"
+            self._cursor_detector_bounds = None
+            if hasattr(self, "cursor_line_check"):
+                self.cursor_line_check.blockSignals(True)
+                self.cursor_line_check.setChecked(False)
+                self.cursor_line_check.blockSignals(False)
+            if hasattr(self, "cursor_x_slider"):
+                self.cursor_x_slider.blockSignals(True)
+                self.cursor_y_slider.blockSignals(True)
+                try:
+                    self.cursor_x_slider.setValue(5000)
+                    self.cursor_y_slider.setValue(5000)
+                finally:
+                    self.cursor_x_slider.blockSignals(False)
+                    self.cursor_y_slider.blockSignals(False)
+                self._update_cursor_coordinate_labels()
+            if self.scene is not None:
+                self.scene.clear_cursor_line(render=False)
+
+        def _on_cursor_slider_changed(self, _value: int) -> None:
+            self._update_cursor_coordinate_labels()
+            position = self._cursor_position_from_sliders()
+            if position is not None:
+                self._queue_cursor_position(position, source="sliders")
+
+        def _on_cursor_line_toggled(self, enabled: bool) -> None:
+            if self.scene is None or self.payload is None:
+                return
+            if not enabled:
+                if self._cursor_line_update_timer.isActive():
+                    self._cursor_line_update_timer.stop()
+                self._pending_map_cursor_position = None
+                try:
+                    self.scene.set_cursor_line_enabled(False, render=False)
+                    self.vtk_widget.Render()
+                except Exception as exc:
+                    self._show_error("Не удалось скрыть линию курсора", str(exc))
+                return
+            position = self._last_map_cursor_position
+            if position is None and self._cursor_input_source == "sliders":
+                position = self._cursor_position_from_sliders()
+            if position is None:
+                # A connected 2D map explicitly sent None (cursor left the
+                # map); do not resurrect a stale slider/map position.
+                return
+            self._last_map_cursor_position = position
+            try:
+                self.scene.set_cursor_line_density(float(self.cursor_line_density.value()), render=False)
+                self.scene.set_cursor_line_enabled(True, render=False)
+                self._pending_map_cursor_position = position
+                if not self._cursor_line_update_timer.isActive():
+                    self._cursor_line_update_timer.start()
+            except Exception as exc:
+                self._show_error("Не удалось включить линию курсора", str(exc))
+
+        def _on_cursor_line_width_changed(self, _value: float) -> None:
+            if self.cursor_line_check.isChecked() and self._last_map_cursor_position is not None:
+                self._pending_map_cursor_position = self._last_map_cursor_position
+                if not self._cursor_line_update_timer.isActive():
+                    self._cursor_line_update_timer.start()
+
+        def _on_cursor_line_density_changed(self, value: float) -> None:
+            """Adjust independent marker opacity without remapping coordinates."""
+            if self.scene is None or not self.cursor_line_check.isChecked():
+                return
+            try:
+                self.scene.set_cursor_line_density(float(value), render=False)
+                if self.vtk_widget is not None:
+                    self.vtk_widget.Render()
+            except Exception as exc:
+                self._show_error("Не удалось изменить оптическую плотность линии", str(exc))
+
+        def _queue_cursor_position(self, position, *, source: str) -> None:
+            self._cursor_input_source = str(source)
+            if position is None:
+                self._last_map_cursor_position = None
+                self._pending_map_cursor_position = None
+                if self._cursor_line_update_timer.isActive():
+                    self._cursor_line_update_timer.stop()
+                if self.scene is not None and self.cursor_line_check.isChecked():
+                    self.scene.set_cursor_line_position(None, None, render=False)
+                    if self.vtk_widget is not None:
+                        self.vtk_widget.Render()
+                return
+            try:
+                if isinstance(position, dict):
+                    x, y = float(position["x"]), float(position["y"])
+                else:
+                    x, y = float(position[0]), float(position[1])
+                if not (np.isfinite(x) and np.isfinite(y)):
+                    raise ValueError("Координаты курсора должны быть конечными.")
+            except Exception as exc:
+                raise ValueError("Позиция курсора должна быть парой detector X/Y или словарём {'x','y'}.") from exc
+
+            self._last_map_cursor_position = (x, y)
+            if source == "map":
+                self._set_cursor_sliders_from_detector_position(x, y)
+                # If the map is larger than the active ROI, retain the true
+                # cursor coordinates in the readout; the slider itself is
+                # bounded by the current ROI's detector-space bounding box.
+                self.cursor_x_value_label.setText(f"X детектора = {x:.4f}")
+                self.cursor_y_value_label.setText(f"Y детектора = {y:.4f}")
+            if self.cursor_line_check.isChecked() and self.payload is not None:
+                self._pending_map_cursor_position = (x, y)
+                if not self._cursor_line_update_timer.isActive():
+                    self._cursor_line_update_timer.start()
+
+        @QtCore.pyqtSlot(object)
+        def set_map_cursor_position(self, position) -> None:
+            """Public detector-XY input for a future ROI Explorer 2D→3D link.
+
+            Accepts ``(x, y)``, ``[x, y]`` or ``{"x": x, "y": y}`` in
+            detector coordinates. ``None`` means that the 2D cursor is outside
+            the map (or is not currently valid) and hides the in-volume marker.
+            A future map's Qt signal can connect to this slot; the standalone
+            X/Y sliders use the same private scheduling/mapping path.
+            """
+            self._queue_cursor_position(position, source="map")
+
+        def _apply_pending_map_cursor_position(self) -> None:
+            position = self._pending_map_cursor_position
+            self._pending_map_cursor_position = None
+            if (
+                position is None or not self.cursor_line_check.isChecked()
+                or self.payload is None or self.scene is None or self.vtk_widget is None
+            ):
+                return
+            try:
+                target = map_detector_cursor_to_volume(
+                    self.payload,
+                    position[0],
+                    position[1],
+                    line_width_voxels=float(self.cursor_line_width.value()),
+                )
+                if target is None:
+                    self.scene.set_cursor_line_position(None, None, render=False)
+                    mapped = None
+                else:
+                    self.scene.set_cursor_line_position(
+                        target.volume_x,
+                        target.volume_y,
+                        target.radius_x,
+                        target.radius_y,
+                        render=False,
+                    )
+                    mapped = (target.volume_x, target.volume_y)
+                # Render() is QVTK's non-blocking QWidget.update() path. The
+                # GPU mapper, volume texture and transfer functions are reused.
+                self.vtk_widget.Render()
+                _trace(
+                    "CURSOR_LINE_POSITION_APPLIED",
+                    detector_xy=position,
+                    volume_local_xy=mapped,
+                    radii=(target.radius_x, target.radius_y) if target is not None else None,
+                    visible=target is not None,
+                )
+            except Exception as exc:
+                self._show_error("Не удалось обновить линию курсора", str(exc))
 
         def _choose_file(self):
             # Hide an already-created QVTK/OpenGL canvas while a subsequent modal
@@ -1184,6 +1502,7 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
                     theta_scale=float(self.theta_scale_spin.value()),
                 )
                 self.payload = payload
+                self._configure_cursor_controls(payload)
                 theta_count = int(len(payload.theta))
                 theta_index = int(self.scene.theta_slice_index or 0)
                 self.theta_slice_slider.blockSignals(True)
@@ -1442,6 +1761,13 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
                 event.ignore()
                 return
             _trace_resources("before-window-close")
+            try:
+                if self._cursor_line_update_timer.isActive():
+                    self._cursor_line_update_timer.stop()
+                self._pending_map_cursor_position = None
+                self._last_map_cursor_position = None
+            except Exception:
+                pass
             try:
                 if self.scene is not None:
                     self.scene.close()

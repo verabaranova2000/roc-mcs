@@ -70,7 +70,7 @@ class ThetaShaderHighlightTests(unittest.TestCase):
             self.assertIs(scene.volume.GetShaderProperty(), scene._theta_slice_shader_property)
             self.assertIsNotNone(scene._theta_slice_uniforms)
             self.assertTrue(scene.theta_slice_shader_installed)
-            self.assertEqual(scene.diagnostics()["theta_slice_shader_replacement_count"], 1)
+            self.assertEqual(scene.diagnostics()["theta_slice_shader_replacement_count"], 3)
             self.assertEqual(scene.renderer.GetVolumes().GetNumberOfItems(), 1)
             self.assertEqual(scene.renderer.GetViewProps().GetNumberOfItems(), props_after_payload)
             self.assertEqual(scene.renderer.GetActors().GetNumberOfItems(), actors_after_payload)
@@ -155,7 +155,10 @@ class ThetaShaderHighlightTests(unittest.TestCase):
             self.assertIn("in_scalarsRange[0][1]", shader)
             self.assertIn("g_srcColor.rgb = mix", shader)
             self.assertIn("vec3 rocThetaHighlightColor = rocThetaPalette15;", shader)
-            self.assertTrue(shader.rstrip().endswith("g_srcColor.rgb *= g_srcColor.a;"))
+            # The color-only theta snippet is inserted before VTK's native
+            # premultiplication statement. It never changes source alpha.
+            self.assertIn("g_srcColor.rgb = mix", shader)
+            self.assertTrue(shader.rstrip().endswith("}"))
             self.assertNotIn("g_srcColor.a =", shader)
             self.assertNotIn("g_srcColor.a *=", shader)
             self.assertNotIn("gl_FragDepth", shader)
@@ -177,10 +180,12 @@ class ThetaShaderHighlightTests(unittest.TestCase):
             sentinel = float(scene.grid_info["invalid_sentinel"])
             self.assertEqual(scene.opacity_function.GetValue(sentinel), 0.0)
             shader = scene._theta_slice_shader_color_code()
-            # No tint is entered for a sample removed by the original opacity
-            # transfer; the source-alpha guard is deliberately the first gate.
-            self.assertLess(shader.index("g_srcColor.a > 0.0"), shader.index("rocThetaDataPosH"))
+            position_shader = scene._theta_overlay_position_shader_code()
+            # Position is available before the source-alpha guard; theta tint
+            # itself remains inside the positive-alpha source-sample branch.
+            self.assertIn("rocOverlayDataPosH", position_shader)
             self.assertLess(shader.index("g_srcColor.a > 0.0"), shader.index("g_srcColor.rgb = mix"))
+            self.assertNotIn("g_srcColor.a =", shader)
         finally:
             self._close_scene(rw, interactor, scene)
 
