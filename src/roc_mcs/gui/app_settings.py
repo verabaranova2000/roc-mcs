@@ -16,7 +16,81 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "mcs32_exe": "",
     "theme": "dark",
     "icon_size": 16,
+    # Zero-based detector coordinates (x, y).  A detector pixel is invalid
+    # for every theta sample and is excluded from all HDF5-derived views.
+    "detector_bad_pixels": [{"x": 241, "y": 26}],
 }
+
+
+def normalize_detector_bad_pixels(value: Any) -> list[dict[str, int]]:
+    """Validate global detector-pixel exclusions.
+
+    Accepted forms are ``[{"x": 241, "y": 26}]``, ``[(241, 26)]`` or a
+    compact editor string such as ``"241,26; 12,45"``. Coordinates are
+    zero-based detector indices, not physical axis values.
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        entries = []
+        for token in value.split(";"):
+            token = token.strip()
+            if not token:
+                continue
+            parts = [part.strip() for part in token.split(",")]
+            if len(parts) != 2:
+                raise ValueError(
+                    f"Некорректный битый пиксель {token!r}; используйте формат x,y."
+                )
+            entries.append(parts)
+    elif isinstance(value, (list, tuple)):
+        entries = value
+    else:
+        raise ValueError("Список битых пикселей должен быть списком координат x,y.")
+
+    result: list[dict[str, int]] = []
+    seen: set[tuple[int, int]] = set()
+    for item in entries:
+        if isinstance(item, dict):
+            raw_x, raw_y = item.get("x"), item.get("y")
+        elif isinstance(item, (list, tuple)) and len(item) == 2:
+            raw_x, raw_y = item
+        else:
+            raise ValueError(f"Некорректная запись битого пикселя: {item!r}.")
+        if isinstance(raw_x, bool) or isinstance(raw_y, bool):
+            raise ValueError("Координаты битых пикселей должны быть целыми неотрицательными числами.")
+        try:
+            x_float, y_float = float(raw_x), float(raw_y)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"Некорректные координаты пикселя: {(raw_x, raw_y)!r}.") from exc
+        if (
+            not (x_float.is_integer() and y_float.is_integer())
+            or x_float < 0 or y_float < 0
+            or x_float > 1_000_000 or y_float > 1_000_000
+        ):
+            raise ValueError(
+                f"Координаты {(raw_x, raw_y)!r} должны быть целыми числами от 0 до 1 000 000."
+            )
+        x, y = int(x_float), int(y_float)
+        if (x, y) not in seen:
+            result.append({"x": x, "y": y})
+            seen.add((x, y))
+        if len(result) > 4096:
+            raise ValueError("Список битых пикселей слишком велик (максимум 4096 записей).")
+    return result
+
+
+def load_detector_bad_pixels() -> list[tuple[int, int]]:
+    """Return the configured exclusions as immutable-friendly ``(x, y)`` pairs."""
+    entries = normalize_detector_bad_pixels(load_settings().get("detector_bad_pixels"))
+    return [(item["x"], item["y"]) for item in entries]
+
+
+def save_detector_bad_pixels(value: Any) -> Path:
+    """Persist validated detector exclusions without discarding other settings."""
+    settings = load_settings()
+    settings["detector_bad_pixels"] = normalize_detector_bad_pixels(value)
+    return save_settings(settings)
 
 
 def settings_path() -> Path:
