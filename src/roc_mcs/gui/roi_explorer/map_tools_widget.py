@@ -319,15 +319,22 @@ class MapToolsWidget(QWidget):
 class QRangeSlider(QWidget):
     """Компактный двухсторонний ползунок диапазона для горизонтальной или вертикальной установки."""
     valueChanged = pyqtSignal(float, float)
-    def __init__(self, low=1.0, high=99.0, min_val=0.0, max_val=100.0, parent=None, orientation=Qt.Orientation.Horizontal):
-        super().__init__(parent); self._min=float(min_val); self._max=float(max_val); self._low=float(low); self._high=float(high); self._active_handle=None; self._orientation=orientation
+    def __init__(self, low=1.0, high=99.0, min_val=0.0, max_val=100.0, parent=None, orientation=Qt.Orientation.Horizontal, minimum_gap=0.5):
+        super().__init__(parent); self._min=float(min_val); self._max=float(max_val); self._minimum_gap=min(max(0.0,float(minimum_gap)),max(0.0,self._max-self._min)); self._low=float(low); self._high=float(high); self._active_handle=None; self._orientation=orientation
+        self._low=max(self._min,min(self._low,self._max-self._minimum_gap)); self._high=max(self._low+self._minimum_gap,min(self._high,self._max))
         if orientation == Qt.Orientation.Vertical: self.setFixedWidth(7); self.setMinimumHeight(80); self.setMaximumWidth(7); self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
         else: self.setFixedHeight(18); self.setMinimumWidth(52); self.setMaximumWidth(92)
         self.setCursor(Qt.CursorShape.PointingHandCursor); self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
     def low(self)->float:return self._low
     def high(self)->float:return self._high
-    def setLow(self,val:float)->None:self._low=max(self._min,min(float(val),self._high-0.5));self.update()
-    def setHigh(self,val:float)->None:self._high=min(self._max,max(float(val),self._low+0.5));self.update()
+    @property
+    def minimum_gap(self)->float:return self._minimum_gap
+    def setValues(self,low:float,high:float)->None:
+        low=max(self._min,min(float(low),self._max-self._minimum_gap))
+        high=max(low+self._minimum_gap,min(float(high),self._max))
+        self._low=low;self._high=high;self.update()
+    def setLow(self,val:float)->None:self._low=max(self._min,min(float(val),self._high-self._minimum_gap));self.update()
+    def setHigh(self,val:float)->None:self._high=min(self._max,max(float(val),self._low+self._minimum_gap));self.update()
     def _val_to_pos(self,val:float)->float:
         if self._orientation==Qt.Orientation.Vertical:
             h=max(1,self.height()-12);return self.height()-6-((val-self._min)/(self._max-self._min))*h
@@ -357,6 +364,50 @@ class QRangeSlider(QWidget):
     def _set_position(self,pos):
         value=self._pos_to_val(pos);self.setLow(value) if self._active_handle=='low' else self.setHigh(value);self.valueChanged.emit(self._low,self._high)
     def mouseReleaseEvent(self,event):self._active_handle=None;event.accept()
+
+
+
+class ColorbarOptionsButton(QToolButton):
+    """Shared compact ellipsis control used below the map and volume colorbars."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._visual_width = 5
+        self.setMinimumSize(0, 0)
+        self.setText("")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setAutoRaise(True)
+        self.setMouseTracking(True)
+
+    def set_visual_width(self, width: int) -> None:
+        self._visual_width = max(4, int(width))
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        palette = self.palette()
+        hovered = self.underMouse()
+        visual_width = min(self._visual_width, max(1, self.width()))
+        visual_height = min(8, max(1, self.height()))
+        x = (self.width() - visual_width) / 2
+        y = (self.height() - visual_height) / 2
+        rect = QRectF(x, y, visual_width, visual_height)
+        painter.setPen(QPen(
+            palette.color(QPalette.ColorRole.Highlight if hovered else QPalette.ColorRole.Mid),
+            0.8,
+        ))
+        painter.setBrush(palette.color(
+            QPalette.ColorRole.Midlight if hovered else QPalette.ColorRole.Button
+        ))
+        painter.drawRoundedRect(rect, 1.5, 1.5)
+        painter.setPen(QPen(palette.color(QPalette.ColorRole.ButtonText), 1.2))
+        if visual_width >= 9:
+            for dx in (-2, 0, 2):
+                painter.drawPoint(QPointF(x + visual_width / 2 + dx, y + visual_height / 2))
+        else:
+            for dy in (-2, 0, 2):
+                painter.drawPoint(QPointF(x + visual_width / 2, y + visual_height / 2 + dy))
+        painter.end()
 
 
 

@@ -20,7 +20,9 @@ from roc_mcs.gui.components.icon_provider import svg_icon
 from roc_mcs.gui.roi_explorer.theme import apply_widget_palette, theme_colors
 from roc_mcs.gui.roi_explorer.plot_display_settings import load_plot_display_settings
 from roc_mcs.gui.roi_explorer.colormap_catalog import mpl_colormap
-from roc_mcs.gui.roi_explorer.map_tools_widget import SmartDropdownButton, QRangeSlider
+from roc_mcs.gui.roi_explorer.map_tools_widget import (
+    SmartDropdownButton, QRangeSlider, ColorbarOptionsButton as _ColorbarOptionsButton,
+)
 from roc_mcs.gui.roi_explorer.selectors import RotatedRectangleSelector
 from .selectors.line import LineSelector
 from .selectors.point import PointSelector
@@ -139,21 +141,6 @@ class _ThetaRailSlider(QSlider):
             return
         super().mouseReleaseEvent(event)
 
-
-
-class _ColorbarOptionsButton(QToolButton):
-    """Небольшая видимая кнопка с расширенной прозрачной областью нажатия."""
-    def __init__(self, parent=None):
-        super().__init__(parent); self._visual_width=5; self.setMinimumSize(0,0); self.setText(""); self.setCursor(Qt.CursorShape.PointingHandCursor); self.setAutoRaise(True); self.setMouseTracking(True)
-    def set_visual_width(self, width): self._visual_width=max(4,int(width)); self.update()
-    def paintEvent(self, event):
-        p=QPainter(self); p.setRenderHint(QPainter.RenderHint.Antialiasing,True); pal=self.palette(); hovered=self.underMouse(); visual_w=min(self._visual_width,max(1,self.width())); visual_h=min(8,max(1,self.height())); x=(self.width()-visual_w)/2; y=(self.height()-visual_h)/2; rect=QRectF(x,y,visual_w,visual_h)
-        p.setPen(QPen(pal.color(QPalette.ColorRole.Highlight if hovered else QPalette.ColorRole.Mid),0.8)); p.setBrush(pal.color(QPalette.ColorRole.Midlight if hovered else QPalette.ColorRole.Button)); p.drawRoundedRect(rect,1.5,1.5); p.setPen(QPen(pal.color(QPalette.ColorRole.ButtonText),1.2))
-        if visual_w>=9:
-            for dx in (-2,0,2):p.drawPoint(QPointF(x+visual_w/2+dx,y+visual_h/2))
-        else:
-            for dy in (-2,0,2):p.drawPoint(QPointF(x+visual_w/2,y+visual_h/2+dy))
-        p.end()
 
 
 class MapPlotWidget(QWidget):

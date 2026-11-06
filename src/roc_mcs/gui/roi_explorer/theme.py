@@ -14,7 +14,7 @@ _PALETTES = {
 
 # Эти поверхности должны явно закрашиваться: одной смены цвета текста недостаточно
 # для viewport у QScrollArea и всплывающих окон Qt.
-_SURFACE_NAMES = {"roiExplorerCentral", "leftSidebarSurface", "leftSidebarContent", "leftSidebarViewport", "leftSidebarRail", "collapsibleSection", "collapsibleSectionBody", "compactRoiManager", "roiPaletteRail", "roiPaletteViewport", "roiPaletteBody", "MapPlotWidget", "CurvePlotWidget", "PoolingPanel", "MapHeader", "roiEditorPopup", "compactColorPicker"}
+_SURFACE_NAMES = {"roiExplorerCentral", "leftSidebarSurface", "leftSidebarContent", "leftSidebarViewport", "leftSidebarRail", "collapsibleSection", "collapsibleSectionBody", "compactRoiManager", "roiPaletteRail", "roiPaletteViewport", "roiPaletteBody", "MapPlotWidget", "CurvePlotWidget", "PoolingPanel", "MapHeader", "roiEditorPopup", "compactColorPicker", "VTKToolBar", "VTKOverlayPanel", "VTKOverlaySettings"}
 
 
 def theme_colors(theme: str | None) -> dict[str, str]:

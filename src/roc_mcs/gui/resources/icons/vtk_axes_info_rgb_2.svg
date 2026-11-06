@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32">
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round" stroke-width="2.8">
+    <path d="M8 23 L25 23" stroke="#FF0000"/>
+    <path d="M8 23 L8 5" stroke="#00FF00"/>
+    <path d="M8 23 L21 10" stroke="#0000FF"/>
+  </g>
+  <g font-family="Arial,sans-serif" font-size="5.2" font-weight="700">
+    <text x="24.3" y="19.2" fill="#FF0000">X</text>
+    <text x="3.3" y="5.0" fill="#00FF00">Y</text>
+    <text x="21.4" y="9.0" fill="#0000FF">Z</text>
+  </g>
+  <circle cx="25.4" cy="25.2" r="4.4" fill="#F3F6FA" stroke="#748294" stroke-width="1"/>
+  <text x="25.4" y="27.5" text-anchor="middle" font-family="Arial,sans-serif"
+        font-size="6.4" font-weight="700" fill="#344054">i</text>
+</svg>

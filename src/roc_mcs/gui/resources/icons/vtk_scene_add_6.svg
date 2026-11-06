@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.45" stroke-linecap="round" stroke-linejoin="round">
+  <!-- C: a clean volume outline with two separate section levels; no plus glyph. -->
+  <path d="m12 2.7 8.3 4.1v10.4L12 21.3l-8.3-4.1V6.8L12 2.7Z"/>
+  <path d="m3.7 6.8 8.3 4.1 8.3-4.1M12 10.9v10.4" opacity=".58"/>
+  <path d="m5.5 10.2 6.5-3.2 6.5 3.2-6.5 3.2-6.5-3.2Z" fill="currentColor" fill-opacity=".07"/>
+  <path d="m5.5 14.2 6.5-3.2 6.5 3.2-6.5 3.2-6.5-3.2Z" fill="currentColor" fill-opacity=".13"/>
+  <path d="M5.5 10.2v4m13-4v4" opacity=".78"/>
+</svg>

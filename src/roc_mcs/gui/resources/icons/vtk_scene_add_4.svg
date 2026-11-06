@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.45" stroke-linecap="round" stroke-linejoin="round">
+  <!-- A: a volume with an internal section plane and a cursor line. -->
+  <path d="m12 2.7 8.3 4.1v10.4L12 21.3l-8.3-4.1V6.8L12 2.7Z"/>
+  <path d="m3.7 6.8 8.3 4.1 8.3-4.1M12 10.9v10.4" opacity=".68"/>
+  <path d="m5.1 13.1 6.9-3.4 6.9 3.4-6.9 3.5-6.9-3.5Z" fill="currentColor" fill-opacity=".10"/>
+  <path d="M12 3.1v8.1" stroke-width="1.65"/>
+  <circle cx="12" cy="11.2" r="1.35" fill="currentColor" stroke="none"/>
+</svg>

@@ -124,8 +124,14 @@ class CompactColorPicker(QFrame):
     """
     color_selected = pyqtSignal(str)
 
-    def __init__(self, color: str = "#1f77b4", parent=None):
-        super().__init__(parent, Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint)
+    def __init__(self, color: str = "#1f77b4", parent=None, *, popup: bool = False):
+        # Standalone callers retain the existing Tool-window behavior.  When
+        # embedded into a QMenu hierarchy, Qt.Popup keeps the picker in the
+        # same nested popup chain so palette clicks do not dismiss its parents.
+        flags = Qt.WindowType.FramelessWindowHint | (
+            Qt.WindowType.Popup if popup else Qt.WindowType.Tool
+        )
+        super().__init__(parent, flags)
         self.setObjectName("compactColorPicker"); apply_widget_palette(self, resolve_theme(parent))
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True); self._color = QColor(color if QColor(color).isValid() else "#1f77b4")
         self.setStyleSheet("""

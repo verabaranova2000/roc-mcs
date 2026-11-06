@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import faulthandler
+from dataclasses import replace
 import gc
 import sys
 import time
@@ -111,6 +112,15 @@ def _qt_modules():
 
 
 def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
+    # Import Qt toolbar only after _qt_modules() has loaded the supported PyQt6 binding.
+    from .vtk_tools_widget import VTKToolsWidget
+    from roc_mcs.gui.components.icon_provider import set_icon_theme
+    from roc_mcs.gui.roi_explorer.theme import (
+        apply_theme as apply_roi_theme,
+        resolve_theme,
+        theme_colors,
+    )
+
     class TracedQVTKRenderWindowInteractor(QVTKRenderWindowInteractor):
         """QVTK widget with completed-paint accounting for safe deferred init."""
 
@@ -205,9 +215,21 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
             self._busy = False
             self._closing = False
             self._initial_scan_key = scan_key
+            # Theme application changes QWidget palettes synchronously.  The
+            # resulting PaletteChange event must never be interpreted as a new
+            # request to apply the same theme (see changeEvent below).
+            self._applying_theme = False
+            app = QtWidgets.QApplication.instance()
+            requested_theme = str(app.property("rocMcsTheme") or "").lower() if app else ""
+            self._theme = requested_theme if requested_theme in ("dark", "light") else resolve_theme(app)
+            if app is not None:
+                if requested_theme not in ("dark", "light"):
+                    app.setProperty("rocMcsTheme", self._theme)
+                set_icon_theme(app, theme_colors(self._theme)["text"])
             self._auto_load_enabled = True
             self._auto_load_pending = False
             self._pending_theta_slice_index: int | None = None
+            self._pending_theta_display_range: tuple[int, int] | None = None
             self._cursor_detector_bounds: tuple[float, float, float, float] | None = None
             self._last_map_cursor_position: tuple[float, float] | None = None
             self._pending_map_cursor_position: tuple[float, float] | None = None
@@ -219,6 +241,7 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
             self._vtk_init_pending = False
             self._vtk_init_attempts = 0
             self._build_ui()
+            self.apply_theme(self._theme)
             # Coalesce rapid slider signals into bounded updates. The selected
             # theta cell is updated through existing GPU volume shader uniforms;
             # no overlay actor, geometry, volume texture, or HDF5 read is created.
@@ -226,6 +249,14 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
             self._theta_slice_update_timer.setSingleShot(True)
             self._theta_slice_update_timer.setInterval(25)
             self._theta_slice_update_timer.timeout.connect(self._apply_pending_theta_slice_index)
+            # GPU mapper cropping is a cheap display-only operation. Coalesce
+            # mouse-drag updates to one clipping-plane change per ~30 ms.
+            self._theta_display_range_update_timer = QtCore.QTimer(self)
+            self._theta_display_range_update_timer.setSingleShot(True)
+            self._theta_display_range_update_timer.setInterval(30)
+            self._theta_display_range_update_timer.timeout.connect(
+                self._apply_pending_theta_display_range
+            )
             # Coalesce slider or future 2D-map mouse-move events. Only the most
             # recent detector XY is transferred to existing GPU uniforms at
             # most once per ~16 ms; no data reload or volume rebuild is involved.
@@ -233,6 +264,12 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
             self._cursor_line_update_timer.setSingleShot(True)
             self._cursor_line_update_timer.setInterval(16)
             self._cursor_line_update_timer.timeout.connect(self._apply_pending_map_cursor_position)
+            # The range rail is a continuous gesture control.  Coalesce its
+            # mouse-move events before rebuilding the transfer functions.
+            self._volume_display_update_timer = QtCore.QTimer(self)
+            self._volume_display_update_timer.setSingleShot(True)
+            self._volume_display_update_timer.setInterval(55)
+            self._volume_display_update_timer.timeout.connect(self._apply_pending_volume_display)
             # IMPORTANT: construct the QVTK child BEFORE the top-level window is
             # shown. The production-scene diagnostic that successfully rendered
             # the real H5 payload creates QVTK in this order. The previous viewer
@@ -251,6 +288,7 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
 
         def _build_ui(self):
             central = QtWidgets.QWidget(self)
+            central.setObjectName("roiExplorerCentral")
             self.setCentralWidget(central)
             root = QtWidgets.QHBoxLayout(central)
             root.setContentsMargins(10, 10, 10, 10)
@@ -352,20 +390,14 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
             self.mode_combo.setCurrentIndex(self.mode_combo.findData("roi"))
             roi_group.setEnabled(True)
 
-            render_group = QtWidgets.QGroupBox("Отображение объёма")
-            self.render_group = render_group
-            render_form = QtWidgets.QFormLayout(render_group)
-            render_form.setRowWrapPolicy(QtWidgets.QFormLayout.RowWrapPolicy.WrapLongRows)
-            render_form.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
-            self.palette_combo = QtWidgets.QComboBox()
+            # Volume display controls live in the viewport-pinned colorbar HUD,
+            # not in the left data/ROI sidebar.  The existing widgets and
+            # TransferSettings path remain the single source of display state.
             from roc_mcs.gui.roi_explorer.colormap_catalog import NAPARI_STYLE_COLORMAPS
+            self.palette_combo = QtWidgets.QComboBox()
             for name in NAPARI_STYLE_COLORMAPS:
                 self.palette_combo.addItem(name, name)
-            self.theme_combo = QtWidgets.QComboBox()
-            self.theme_combo.addItem("Тёмная", "dark")
-            self.theme_combo.addItem("Светлая", "light")
-            # Match ROI_Explorer_3D_VTK_LAB: threshold controls are fractions
-            # of robust p99.9 positive intensity, not percentiles of the array.
+            self.palette_combo.setCurrentIndex(max(0, self.palette_combo.findData("gray")))
             self.low_pct = self._double_spin(0.0, 99.0, 16.0, 2, 1.0)
             self.high_pct = self._double_spin(1.0, 100.0, 95.0, 2, 1.0)
             self.low_pct.valueChanged.connect(self._on_low_threshold_changed)
@@ -375,130 +407,205 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
             self.gamma = self._double_spin(0.05, 8.0, 2.0, 2, 0.05)
             self.sample_factor = self._double_spin(0.25, 8.0, 1.0, 2, 0.1)
             self.opacity_unit_factor = self._double_spin(0.05, 20.0, 1.0, 2, 0.1)
-            self.projection_check = QtWidgets.QCheckBox("Показывать XY-проекцию объёма")
-            self.projection_check.setChecked(True)
-            self.projection_opacity = self._double_spin(0.0, 1.0, 0.75, 2, 0.05)
-            self.theta_scale_spin = self._double_spin(0.1, 10.0, 1.0, 2, 0.1)
-            render_form.addRow("Палитра:", self.palette_combo)
-            render_form.addRow("Тема:", self.theme_combo)
-            render_form.addRow("Vmin, % от p99.9:", self.low_pct)
-            render_form.addRow("Vmax, % от p99.9:", self.high_pct)
-            render_form.addRow("Макс. opacity:", self.max_opacity)
-            render_form.addRow("Gamma:", self.gamma)
-            render_form.addRow("Шаг луча ×:", self.sample_factor)
-            render_form.addRow("Opacity unit distance ×:", self.opacity_unit_factor)
-            render_form.addRow(self.projection_check)
-            render_form.addRow("Opacity XY:", self.projection_opacity)
-            render_form.addRow("Масштаб θ (только отображение) ×:", self.theta_scale_spin)
-            self.panel_layout.addWidget(render_group)
 
-            # Theta highlighting is applied inside the existing GPU ray-casting
-            # shader. It recolors only volume samples in the selected theta-cell
-            # slab, preserving the native scalar opacity and compositing path.
-            theta_slice_group = QtWidgets.QGroupBox("Выделение вклада выбранного θ в 3D-объёме")
-            self.theta_slice_group = theta_slice_group
-            theta_slice_form = QtWidgets.QFormLayout(theta_slice_group)
-            theta_slice_form.setRowWrapPolicy(QtWidgets.QFormLayout.RowWrapPolicy.WrapLongRows)
-            theta_slice_form.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
-            self.theta_slice_check = QtWidgets.QCheckBox("Подсвечивать выбранный слой θ внутри облака")
-            self.theta_slice_check.setToolTip(
-                "Меняет цвет только тех выборок исходного GPU-объёма, которые принадлежат "
-                "объёмной ячейке выбранного кадра θ и уже имеют ненулевую прозрачность "
-                "по текущим Vmin/Vmax/Gamma. Не рисует плоскость, точки поверх объёма "
-                "или отдельный actor; исходная прозрачность и композитинг VTK сохраняются."
+            self.volume_render_settings_panel = QtWidgets.QWidget()
+            self.volume_render_settings_panel.setObjectName("VTKVolumeDisplaySettingsPanel")
+            volume_settings_layout = QtWidgets.QGridLayout(self.volume_render_settings_panel)
+            volume_settings_layout.setContentsMargins(8, 7, 8, 7)
+            volume_settings_layout.setHorizontalSpacing(7)
+            volume_settings_layout.setVerticalSpacing(5)
+            volume_settings_layout.addWidget(QtWidgets.QLabel("Цветовая карта объёма"), 0, 0, 1, 2)
+            volume_settings_layout.addWidget(self.palette_combo, 1, 0, 1, 2)
+            volume_settings_layout.addWidget(QtWidgets.QLabel("Vmin, % от p99.9"), 2, 0)
+            volume_settings_layout.addWidget(self.low_pct, 2, 1)
+            volume_settings_layout.addWidget(QtWidgets.QLabel("Vmax, % от p99.9"), 3, 0)
+            volume_settings_layout.addWidget(self.high_pct, 3, 1)
+            volume_settings_layout.addWidget(QtWidgets.QLabel("Макс. opacity"), 4, 0)
+            volume_settings_layout.addWidget(self.max_opacity, 4, 1)
+            volume_settings_layout.addWidget(QtWidgets.QLabel("Gamma"), 5, 0)
+            volume_settings_layout.addWidget(self.gamma, 5, 1)
+            volume_settings_layout.addWidget(QtWidgets.QLabel("Шаг луча ×"), 6, 0)
+            volume_settings_layout.addWidget(self.sample_factor, 6, 1)
+            volume_settings_layout.addWidget(QtWidgets.QLabel("Opacity unit distance ×"), 7, 0)
+            volume_settings_layout.addWidget(self.opacity_unit_factor, 7, 1)
+            self.apply_display_button = QtWidgets.QPushButton("Применить")
+            self.apply_display_button.clicked.connect(self.apply_display)
+            volume_settings_layout.addWidget(self.apply_display_button, 8, 0, 1, 2)
+            self.palette_combo.currentIndexChanged.connect(self._on_volume_palette_preview_changed)
+
+            # The projection visibility is owned by its scene-object toolbar
+            # button.  This hidden checkbox is retained as a compatibility
+            # state holder for the existing TransferSettings builder.
+            self.projection_check = QtWidgets.QCheckBox()
+            self.projection_check.setParent(self)
+            self.projection_check.setChecked(True)
+            self.projection_check.hide()
+            self.projection_opacity = self._double_spin(0.0, 1.0, 0.75, 2, 0.05)
+            self.projection_settings_group = QtWidgets.QWidget()
+            self.projection_settings_group.setObjectName("VTKProjectionSettingsContent")
+            projection_layout = QtWidgets.QGridLayout(self.projection_settings_group)
+            projection_layout.setContentsMargins(1, 1, 1, 1)
+            projection_layout.setHorizontalSpacing(6)
+            projection_layout.setVerticalSpacing(4)
+            self.projection_palette_combo = QtWidgets.QComboBox()
+            self.projection_palette_combo.addItem("Авто · оттенки серого по теме", None)
+            for name in NAPARI_STYLE_COLORMAPS:
+                self.projection_palette_combo.addItem(name, name)
+            projection_layout.addWidget(QtWidgets.QLabel("Opacity XY"), 0, 0)
+            projection_layout.addWidget(self.projection_opacity, 0, 1)
+            projection_layout.addWidget(QtWidgets.QLabel("Палитра XY"), 1, 0)
+            projection_layout.addWidget(self.projection_palette_combo, 1, 1)
+            self.projection_apply_button = QtWidgets.QPushButton("Применить")
+            self.projection_apply_button.clicked.connect(self.apply_display)
+            projection_layout.addWidget(self.projection_apply_button, 2, 0, 1, 2)
+
+            try:
+                from roc_mcs.gui.roi_explorer.plot_display_settings import load_plot_display_settings
+                self._initial_grid_visible = bool(load_plot_display_settings()["volume"].get("show_grid", True))
+            except Exception:
+                self._initial_grid_visible = True
+
+            # Theta and cursor controls live in the Additional 3D Objects flyout,
+            # not in the left analysis sidebar. The existing GPU/shader handlers
+            # below continue to own all scene updates; only their presentation moves.
+            theta_slice_group = QtWidgets.QWidget()
+            theta_slice_group.setObjectName("VTKThetaSettings")
+            theta_slice_group.setSizePolicy(
+                QtWidgets.QSizePolicy.Policy.Expanding,
+                QtWidgets.QSizePolicy.Policy.Minimum,
             )
+            self.theta_slice_group = theta_slice_group
+            theta_layout = QtWidgets.QGridLayout(theta_slice_group)
+            theta_layout.setContentsMargins(1, 1, 1, 1)
+            theta_layout.setHorizontalSpacing(5)
+            theta_layout.setVerticalSpacing(2)
             self.theta_slice_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
             self.theta_slice_slider.setRange(0, 0)
             self.theta_slice_slider.setSingleStep(1)
             self.theta_slice_slider.setPageStep(1)
+            self.theta_slice_slider.setMinimumWidth(100)
+            self.theta_slice_slider.setMaximumHeight(16)
             self.theta_slice_slider.setEnabled(False)
             self.theta_slice_value_label = QtWidgets.QLabel("θ = —")
-            self.theta_slice_value_label.setMinimumWidth(105)
+            self.theta_slice_value_label.setFixedWidth(108)
+            self.theta_slice_value_label.setAlignment(
+                QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter
+            )
+            self.theta_slice_slider.setToolTip(
+                "Выбор физического кадра θ. Подсветка выполняется внутри существующего "
+                "GPU ray casting и не меняет исходную прозрачность/композитинг."
+            )
+            theta_label = QtWidgets.QLabel("θ")
+            theta_label.setToolTip("Индекс выбранного кадра θ")
+            theta_layout.addWidget(theta_label, 0, 0)
+            theta_layout.addWidget(self.theta_slice_slider, 0, 1, 1, 2)
+            theta_layout.addWidget(self.theta_slice_value_label, 0, 3)
+
             self.theta_slice_palette_combo = QtWidgets.QComboBox()
             for name in NAPARI_STYLE_COLORMAPS:
                 self.theta_slice_palette_combo.addItem(name, name)
             default_slice_palette = self.theta_slice_palette_combo.findData("turbo")
             if default_slice_palette >= 0:
                 self.theta_slice_palette_combo.setCurrentIndex(default_slice_palette)
+            self.theta_slice_palette_combo.setToolTip("Палитра выделения выбранной ячейки θ")
+            self.theta_slice_palette_combo.setMinimumWidth(105)
+            self.theta_slice_palette_combo.setMaximumWidth(138)
+            self.theta_slice_palette_combo.setFixedHeight(21)
             self.theta_slice_strength = self._double_spin(0.0, 1.0, 0.90, 2, 0.05)
-            theta_slice_form.addRow(self.theta_slice_check)
-            theta_slice_form.addRow("Кадр по θ:", self.theta_slice_slider)
-            theta_slice_form.addRow("Физический угол:", self.theta_slice_value_label)
-            theta_slice_form.addRow("Палитра выделения:", self.theta_slice_palette_combo)
-            theta_slice_form.addRow("Сила цветового выделения:", self.theta_slice_strength)
-            theta_slice_hint = QtWidgets.QLabel(
-                "Выделение выполняется внутри GPU ray casting: цвет меняется у вкладов "
-                "объёмных выборок выбранной ячейки θ, но их исходные Vmin/Vmax/Gamma, "
-                "прозрачность и глубинный композитинг не меняются."
+            self.theta_slice_strength.setFixedWidth(68)
+            self.theta_slice_strength.setFixedHeight(21)
+            self.theta_slice_strength.setToolTip(
+                "Сила цветового выделения вкладов объёма выбранной ячейки θ. "
+                "Исходная прозрачность и глубинный композитинг сохраняются."
             )
-            theta_slice_hint.setWordWrap(True)
-            theta_slice_hint.setStyleSheet("color: palette(mid); font-size: 11px;")
-            theta_slice_form.addRow(theta_slice_hint)
-            self.panel_layout.addWidget(theta_slice_group)
+            palette_label = QtWidgets.QLabel("Палитра")
+            strength_label = QtWidgets.QLabel("Сила")
+            palette_label.setToolTip("Цветовая схема выделения")
+            strength_label.setToolTip("Интенсивность цветового выделения, 0–1")
+            theta_layout.addWidget(palette_label, 1, 0)
+            theta_layout.addWidget(self.theta_slice_palette_combo, 1, 1)
+            theta_layout.addWidget(strength_label, 1, 2)
+            theta_layout.addWidget(self.theta_slice_strength, 1, 3)
+            theta_layout.setColumnStretch(1, 1)
+            theta_slice_group.setStyleSheet(
+                "QLabel { font-size: 9px; color: palette(mid); padding: 0; }"
+            )
 
-            self.theta_slice_check.toggled.connect(self._on_theta_slice_toggled)
             self.theta_slice_slider.valueChanged.connect(self._on_theta_slice_slider_changed)
             self.theta_slice_slider.sliderReleased.connect(self._apply_pending_theta_slice_index)
             self.theta_slice_palette_combo.currentIndexChanged.connect(self._on_theta_slice_palette_changed)
             self.theta_slice_strength.valueChanged.connect(self._on_theta_slice_strength_changed)
 
-            # The standalone viewer uses detector-coordinate sliders as a
-            # temporary input source. Embedded ROI Explorer will call the same
-            # public set_map_cursor_position((x, y)) slot from its 2D map.
-            cursor_group = QtWidgets.QGroupBox("Линия положения курсора 2D ↔ 3D")
-            self.cursor_line_group = cursor_group
-            cursor_form = QtWidgets.QFormLayout(cursor_group)
-            cursor_form.setRowWrapPolicy(QtWidgets.QFormLayout.RowWrapPolicy.WrapLongRows)
-            cursor_form.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
-            self.cursor_line_check = QtWidgets.QCheckBox("Показывать линию координаты курсора")
-            self.cursor_line_check.setToolTip(
-                "Непрерывная навигационная линия проходит от одного края θ-объёма до другого "
-                "по выбранным координатам детектора. Она остаётся видимой даже в "
-                "пустых областях и композитится внутри того же GPU ray casting: "
-                "передние облака ослабляют/закрывают её по своей прозрачности, "
-                "а линия ослабляет расположенные за ней слои. Отдельного actor нет."
+            # Detector coordinates and optical parameters are arranged in a
+            # dense three-row grid. Full explanations remain available as tips.
+            cursor_group = QtWidgets.QWidget()
+            cursor_group.setObjectName("VTKCursorLineSettings")
+            cursor_group.setSizePolicy(
+                QtWidgets.QSizePolicy.Policy.Expanding,
+                QtWidgets.QSizePolicy.Policy.Minimum,
             )
+            self.cursor_line_group = cursor_group
+            cursor_layout = QtWidgets.QGridLayout(cursor_group)
+            cursor_layout.setContentsMargins(1, 1, 1, 1)
+            cursor_layout.setHorizontalSpacing(5)
+            cursor_layout.setVerticalSpacing(2)
             self.cursor_x_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
             self.cursor_y_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
             for slider in (self.cursor_x_slider, self.cursor_y_slider):
+                slider.setMinimumWidth(100)
+                slider.setMaximumHeight(16)
                 slider.setRange(0, 10000)
                 slider.setSingleStep(10)
                 slider.setPageStep(100)
                 slider.setEnabled(False)
-            self.cursor_x_value_label = QtWidgets.QLabel("X детектора = —")
-            self.cursor_y_value_label = QtWidgets.QLabel("Y детектора = —")
-            self.cursor_x_value_label.setMinimumWidth(120)
-            self.cursor_y_value_label.setMinimumWidth(120)
-            cursor_form.addRow(self.cursor_line_check)
-            cursor_form.addRow("Координата X:", self.cursor_x_slider)
-            cursor_form.addRow(self.cursor_x_value_label)
-            cursor_form.addRow("Координата Y:", self.cursor_y_slider)
-            cursor_form.addRow(self.cursor_y_value_label)
+            self.cursor_x_value_label = QtWidgets.QLabel("—")
+            self.cursor_y_value_label = QtWidgets.QLabel("—")
+            for value_label in (self.cursor_x_value_label, self.cursor_y_value_label):
+                value_label.setFixedWidth(62)
+                value_label.setAlignment(
+                    QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter
+                )
+                value_label.setStyleSheet("font-size: 9px; color: palette(text);")
+            self.cursor_x_slider.setToolTip("Координата X в системе детектора")
+            self.cursor_y_slider.setToolTip("Координата Y в системе детектора")
+            cursor_x_label = QtWidgets.QLabel("X")
+            cursor_y_label = QtWidgets.QLabel("Y")
+            cursor_x_label.setToolTip("Координата X в системе детектора")
+            cursor_y_label.setToolTip("Координата Y в системе детектора")
+            cursor_layout.addWidget(cursor_x_label, 0, 0)
+            cursor_layout.addWidget(self.cursor_x_slider, 0, 1, 1, 2)
+            cursor_layout.addWidget(self.cursor_x_value_label, 0, 3)
+            cursor_layout.addWidget(cursor_y_label, 1, 0)
+            cursor_layout.addWidget(self.cursor_y_slider, 1, 1, 1, 2)
+            cursor_layout.addWidget(self.cursor_y_value_label, 1, 3)
+
             self.cursor_line_width = self._double_spin(0.5, 4.0, 2.0, 2, 0.1)
+            self.cursor_line_width.setFixedWidth(72)
+            self.cursor_line_width.setFixedHeight(21)
             self.cursor_line_width.setToolTip(
                 "Ширина окрашиваемого цилиндрического следа в локальных шагах сетки X/Y. "
                 "Не меняет объёмные данные и глубинное перекрытие."
             )
-            cursor_form.addRow("Ширина линии, вокселей:", self.cursor_line_width)
             self.cursor_line_density = self._double_spin(0.05, 3.0, 0.95, 2, 0.05)
+            self.cursor_line_density.setFixedWidth(72)
+            self.cursor_line_density.setFixedHeight(21)
             self.cursor_line_density.setToolTip(
                 "Оптическая плотность самостоятельной линии в единицах 1/воксель. "
-                "Линия существует и в пустом объёме; видимый перед ней объём "
-                "ослабляет её, а маркер ослабляет облако за собой. Увеличьте "
-                "значение, если линия слишком тонкая или малозаметная."
+                "Маркер сохраняет физически согласованное затухание и перекрытие объёмом."
             )
-            cursor_form.addRow("Оптическая плотность, 1/воксель:", self.cursor_line_density)
-            cursor_hint = QtWidgets.QLabel(
-                "Координаты задаются ползунками в системе детектора. "
-                "Позже сигнал мыши 2D-карты подключится к тому же входу. "
-                "Линия непрерывна по всему θ; вне текущей ROI она скрывается."
+            width_label = QtWidgets.QLabel("Ширина")
+            density_label = QtWidgets.QLabel("Плотн.")
+            width_label.setToolTip("Ширина линии, воксели")
+            density_label.setToolTip("Оптическая плотность, 1/воксель")
+            cursor_layout.addWidget(width_label, 2, 0)
+            cursor_layout.addWidget(self.cursor_line_width, 2, 1)
+            cursor_layout.addWidget(density_label, 2, 2)
+            cursor_layout.addWidget(self.cursor_line_density, 2, 3)
+            cursor_layout.setColumnStretch(1, 1)
+            cursor_group.setStyleSheet(
+                "QLabel { font-size: 9px; color: palette(mid); padding: 0; }"
             )
-            cursor_hint.setWordWrap(True)
-            cursor_hint.setStyleSheet("color: palette(mid); font-size: 11px;")
-            cursor_form.addRow(cursor_hint)
-            self.panel_layout.addWidget(cursor_group)
 
-            self.cursor_line_check.toggled.connect(self._on_cursor_line_toggled)
             self.cursor_x_slider.valueChanged.connect(self._on_cursor_slider_changed)
             self.cursor_y_slider.valueChanged.connect(self._on_cursor_slider_changed)
             self.cursor_line_width.valueChanged.connect(self._on_cursor_line_width_changed)
@@ -507,10 +614,7 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
             self.load_button = QtWidgets.QPushButton("Загрузить / перестроить объём")
             self.load_button.setMinimumHeight(36)
             self.load_button.clicked.connect(self.load_volume)
-            self.apply_display_button = QtWidgets.QPushButton("Применить отображение")
-            self.apply_display_button.clicked.connect(self.apply_display)
             self.panel_layout.addWidget(self.load_button)
-            self.panel_layout.addWidget(self.apply_display_button)
 
             self.status_label = QtWidgets.QLabel(
                 "Откройте HDF5. После выбора файла будет автоматически загружена "
@@ -520,55 +624,50 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
             self.status_label.setMinimumHeight(80)
             self.panel_layout.addWidget(self.status_label)
 
-            camera_group = QtWidgets.QGroupBox("Камера и оси")
-            self.camera_group = camera_group
-            camera_layout = QtWidgets.QVBoxLayout(camera_group)
-            camera_row = QtWidgets.QHBoxLayout()
-            self.perspective_button = QtWidgets.QPushButton("Perspective")
-            self.perspective_button.setCheckable(True)
-            self.perspective_button.setChecked(True)
-            self.perspective_button.clicked.connect(lambda checked: self._camera_perspective(checked))
-            self.axis_x_button = QtWidgets.QPushButton("X")
-            self.axis_y_button = QtWidgets.QPushButton("Y")
-            self.axis_z_button = QtWidgets.QPushButton("Z")
-            self.axis_x_button.clicked.connect(lambda: self._camera_axis("x"))
-            self.axis_y_button.clicked.connect(lambda: self._camera_axis("y"))
-            self.axis_z_button.clicked.connect(lambda: self._camera_axis("z"))
-            self.axes_button = QtWidgets.QPushButton("Оси")
-            self.axes_button.setCheckable(True)
-            self.axes_button.setChecked(True)
-            self.axes_button.clicked.connect(self._toggle_axes)
-            for widget in (self.perspective_button, self.axis_x_button, self.axis_y_button,
-                           self.axis_z_button):
-                camera_row.addWidget(widget)
-            camera_layout.addLayout(camera_row)
-            camera_row2 = QtWidgets.QHBoxLayout()
-            camera_row2.addWidget(self.axes_button)
-            try:
-                from roc_mcs.gui.roi_explorer.plot_display_settings import load_plot_display_settings
-                grid_default = bool(load_plot_display_settings()["volume"].get("show_grid", True))
-            except Exception:
-                grid_default = True
-            self.grid_check = QtWidgets.QCheckBox("Показывать сетку")
-            self.grid_check.setChecked(grid_default)
-            self.grid_check.setToolTip(
-                "Показывает или скрывает координатные линии сетки; подписи осей остаются."
-            )
-            self.grid_check.toggled.connect(self._toggle_grid)
-            camera_row2.addWidget(self.grid_check)
-            camera_layout.addLayout(camera_row2)
-            interaction_hint = QtWidgets.QLabel(
-                "Мышь: левая кнопка — вращение; средняя — сдвиг; "
-                "правая кнопка и колесо — масштабирование."
-            )
-            interaction_hint.setWordWrap(True)
-            interaction_hint.setStyleSheet("color: palette(mid); font-size: 11px;")
-            camera_layout.addWidget(interaction_hint)
-            self.panel_layout.addWidget(camera_group)
-
             self.viewer = QtWidgets.QWidget()
             self.viewer_layout = QtWidgets.QVBoxLayout(self.viewer)
             self.viewer_layout.setContentsMargins(0, 0, 0, 0)
+            self.viewer_layout.setSpacing(0)
+            self.tools_widget = VTKToolsWidget(self.viewer)
+            self.viewer_layout.addWidget(self.tools_widget, 0)
+            self.tools_widget.set_overlay_settings_widgets(
+                cursor_line=self.cursor_line_group,
+                theta_slice=self.theta_slice_group,
+                projection=self.projection_settings_group,
+            )
+            # Axis proportions are owned by the toolbar editor; initialize from
+            # the neutral display transform instead of a removed sidebar control.
+            self.tools_widget.set_axis_scales(1.0, 1.0, 1.0)
+            self.tools_widget.set_grid_visible(self._initial_grid_visible)
+            # The icon buttons are also the checkable state controls, keeping
+            # left-click enable/disable and right-click option selection distinct.
+            self.cursor_line_check = self.tools_widget.cursor_line_button
+            self.theta_slice_check = self.tools_widget.theta_slice_button
+            self.tools_widget.reset_view_requested.connect(self._reset_camera_fit)
+            self.tools_widget.axes_toggled.connect(self._toggle_axes)
+            self.tools_widget.bounding_box_toggled.connect(self._toggle_bounding_box)
+            self.tools_widget.axis_ticks_toggled.connect(self._toggle_axis_ticks)
+            self.tools_widget.grid_toggled.connect(self._toggle_grid)
+            self.tools_widget.perspective_view_requested.connect(self._camera_perspective)
+            self.tools_widget.camera_axis_direction_requested.connect(self._camera_axis)
+            self.tools_widget.axis_scales_apply_requested.connect(self._apply_axis_scales)
+            self.tools_widget.theta_display_range_changed.connect(
+                self._on_theta_display_range_changed
+            )
+            self.tools_widget.theta_boundary_planes_toggled.connect(
+                self._on_theta_boundary_planes_toggled
+            )
+            self.tools_widget.theta_boundary_plane_opacity_changed.connect(
+                self._on_theta_boundary_plane_opacity_changed
+            )
+            self.tools_widget.cursor_line_toggled.connect(self._on_cursor_line_toggled)
+            self.tools_widget.theta_slice_toggled.connect(self._on_theta_slice_toggled)
+            self.tools_widget.projection_toggled.connect(self._on_projection_toggled)
+            self.tools_widget.cursor_line_color_changed.connect(
+                self._on_cursor_line_color_changed
+            )
+            self.tools_widget.theme_changed.connect(self._on_theme_changed)
+            self.tools_widget.set_scene_available(False)
             self.placeholder_label = QtWidgets.QLabel(
                 "Выберите HDF5-файл, чтобы создать VTK/OpenGL-сцену."
             )
@@ -617,11 +716,73 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
             finally:
                 self._updating_threshold_widgets = False
 
+        def _on_volume_palette_preview_changed(self, _index: int = -1):
+            if hasattr(self, "volume_display_widget"):
+                name = self.palette_combo.currentData()
+                if name:
+                    self.volume_display_widget.set_colormap(str(name))
+
+        def _on_volume_thresholds_changed(self, low: float, high: float):
+            self._pending_volume_thresholds = (float(low), float(high))
+            timer = getattr(self, "_volume_display_update_timer", None)
+            if timer is not None and self.payload is not None and not self._busy:
+                if not timer.isActive():
+                    timer.start()
+
+        def _apply_pending_volume_display(self):
+            """Apply only the live Vmin/Vmax gesture, preserving staged options."""
+            if self.payload is None or self.scene is None or self._busy:
+                return
+            low, high = getattr(
+                self, "_pending_volume_thresholds",
+                (float(self.low_pct.value()), float(self.high_pct.value())),
+            )
+            current = self.scene.settings
+            # The viewport rail is an immediate contrast control. Do not commit
+            # palette/gamma/opacity values that may still be edited in the
+            # ellipsis panel and are intentionally waiting for Apply.
+            settings = replace(
+                current,
+                lower_fraction=float(low) / 100.0,
+                upper_fraction=float(high) / 100.0,
+                lower_percentile=None,
+                upper_percentile=None,
+            )
+            try:
+                info = self.scene.update_transfer_functions(settings, render=False)
+                self.volume_display_widget.set_thresholds(
+                    float(low), float(high),
+                    absolute_low=info.get("threshold_min"),
+                    absolute_high=info.get("threshold_max"),
+                    reference=info.get("threshold_reference"),
+                )
+                if self.vtk_widget is not None:
+                    self.vtk_widget.Render()
+                self.status_label.setText(
+                    f"Диапазон контраста обновлён: Vmin={info['threshold_min']:.5g}; "
+                    f"Vmax={info['threshold_max']:.5g} "
+                    f"(p99.9={info['threshold_reference']:.5g})."
+                )
+            except Exception as exc:
+                self._show_error("Не удалось обновить контраст объёма", str(exc))
+
+        def _on_projection_toggled(self, enabled: bool):
+            enabled = bool(enabled)
+            if self.scene is None or self.payload is None:
+                self.tools_widget.set_projection_enabled(False)
+                return
+            self.projection_check.blockSignals(True)
+            self.projection_check.setChecked(enabled)
+            self.projection_check.blockSignals(False)
+            self.apply_display()
+
         def _refresh_controls(self):
             busy = bool(self._busy)
             has_loader = self.loader is not None
             has_scene = self.scene is not None
             has_payload = self.payload is not None
+            if hasattr(self, "tools_widget"):
+                self.tools_widget.set_scene_available(has_payload and not busy)
             self.open_button.setEnabled(not busy)
             self.scan_combo.setEnabled(not busy and has_loader)
             self.mode_combo.setEnabled(not busy and has_loader)
@@ -635,24 +796,31 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
             self.load_button.setEnabled(not busy and has_loader and has_scene)
             self.apply_display_button.setEnabled(not busy and has_payload and has_scene)
             self.data_group.setEnabled(not busy)
-            self.render_group.setEnabled(not busy)
-            self.camera_group.setEnabled(not busy and has_scene)
-            if hasattr(self, "grid_check"):
-                self.grid_check.setEnabled(not busy and has_scene)
+            if hasattr(self, "volume_render_settings_panel"):
+                self.volume_render_settings_panel.setEnabled(not busy and has_payload)
+            if hasattr(self, "volume_display_widget"):
+                self.volume_display_widget.set_scene_available(not busy and has_payload)
+            theta_ready = not busy and has_scene and has_payload
+            cursor_ready = (
+                not busy and has_scene and has_payload
+                and self._cursor_detector_bounds is not None
+            )
             if hasattr(self, "theta_slice_group"):
-                self.theta_slice_group.setEnabled(not busy and has_scene and has_payload)
-                self.theta_slice_slider.setEnabled(not busy and has_scene and has_payload)
-                self.theta_slice_check.setEnabled(not busy and has_scene and has_payload)
-                self.theta_slice_palette_combo.setEnabled(not busy and has_scene and has_payload)
-                self.theta_slice_strength.setEnabled(not busy and has_scene and has_payload)
+                self.theta_slice_group.setEnabled(theta_ready)
+                self.theta_slice_slider.setEnabled(theta_ready)
+                self.theta_slice_palette_combo.setEnabled(theta_ready)
+                self.theta_slice_strength.setEnabled(theta_ready)
             if hasattr(self, "cursor_line_group"):
-                cursor_ready = not busy and has_scene and has_payload and self._cursor_detector_bounds is not None
                 self.cursor_line_group.setEnabled(cursor_ready)
-                self.cursor_line_check.setEnabled(cursor_ready)
                 self.cursor_x_slider.setEnabled(cursor_ready)
                 self.cursor_y_slider.setEnabled(cursor_ready)
                 self.cursor_line_width.setEnabled(cursor_ready)
                 self.cursor_line_density.setEnabled(cursor_ready)
+            if hasattr(self, "tools_widget"):
+                self.tools_widget.set_overlay_controls_enabled(
+                    cursor=cursor_ready, theta=theta_ready,
+                    projection=not busy and has_scene and has_payload,
+                )
 
         def _theta_slice_label_text(self, index: int) -> str:
             if self.payload is None or not len(self.payload.theta):
@@ -708,6 +876,86 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
             except Exception as exc:
                 self._show_error("Не удалось обновить срез θ", str(exc))
 
+        def _on_theta_display_range_changed(self, low_index: int, high_index: int) -> None:
+            """Queue a GPU mapper crop; no payload or renderer geometry is rebuilt."""
+            if self.payload is None or self.scene is None or self._busy:
+                return
+            self._pending_theta_display_range = (int(low_index), int(high_index))
+            # Start only when idle: restarting on every mouse-move would
+            # postpone the update until the drag stops.  A single-shot timer
+            # started once per frame window applies the latest pending range
+            # at up to ~33 Hz while the user is still dragging.
+            if not self._theta_display_range_update_timer.isActive():
+                self._theta_display_range_update_timer.start()
+
+        def _apply_pending_theta_display_range(self) -> None:
+            pending = self._pending_theta_display_range
+            self._pending_theta_display_range = None
+            if (
+                pending is None
+                or self.payload is None
+                or self.scene is None
+                or self.vtk_widget is None
+                or self._busy
+            ):
+                return
+            low_index, high_index = pending
+            try:
+                applied = self.scene.set_theta_display_range_indices(
+                    low_index, high_index, render=False
+                )
+                # Render() on QVTKRenderWindowInteractor schedules a Qt paint;
+                # it does not rebuild or re-upload the volume dataset.
+                self.vtk_widget.Render()
+                theta = np.asarray(self.payload.theta, dtype=np.float64)
+                _trace(
+                    "THETA_DISPLAY_CROP_CHANGED",
+                    low_index=int(applied[0]),
+                    high_index=int(applied[1]),
+                    theta_min=float(theta[applied[0]]),
+                    theta_max=float(theta[applied[1]]),
+                    sample_count=int(applied[1] - applied[0] + 1),
+                    mapper_cropping=bool(self.scene.mapper.GetCropping()),
+                )
+            except Exception as exc:
+                self._show_error("Не удалось изменить область предпросмотра θ", str(exc))
+
+        def _on_theta_boundary_planes_toggled(self, enabled: bool) -> None:
+            """Toggle the optional visual caps without touching the GPU crop."""
+            if self.scene is None or self.payload is None or self.vtk_widget is None:
+                return
+            try:
+                visible = self.scene.set_theta_boundary_planes_visible(
+                    bool(enabled), render=False
+                )
+                self.vtk_widget.Render()
+                _trace(
+                    "THETA_BOUNDARY_PLANES_VISIBILITY",
+                    requested=bool(enabled),
+                    visible=bool(visible),
+                    opacity=float(self.scene.theta_boundary_plane_opacity),
+                    crop_indices=self.scene.theta_display_range_indices,
+                )
+            except Exception as exc:
+                self._show_error("Не удалось изменить отображение границ θ", str(exc))
+
+        def _on_theta_boundary_plane_opacity_changed(self, opacity: float) -> None:
+            """Adjust only the alpha of the two range-marker planes."""
+            if self.scene is None or self.payload is None or self.vtk_widget is None:
+                return
+            try:
+                applied = self.scene.set_theta_boundary_plane_opacity(
+                    float(opacity), render=False
+                )
+                self.vtk_widget.Render()
+                _trace(
+                    "THETA_BOUNDARY_PLANES_OPACITY",
+                    opacity=float(applied),
+                    visible=bool(self.scene.theta_boundary_planes_visible),
+                )
+            except Exception as exc:
+                self._show_error("Не удалось изменить прозрачность граничных плоскостей θ", str(exc))
+
         def _on_theta_slice_palette_changed(self, _index: int):
             if self.scene is None or self.payload is None:
                 return
@@ -732,6 +980,17 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
             if timer is not None and timer.isActive():
                 timer.stop()
             self._pending_theta_slice_index = None
+            crop_timer = getattr(self, "_theta_display_range_update_timer", None)
+            if crop_timer is not None and crop_timer.isActive():
+                crop_timer.stop()
+            self._pending_theta_display_range = None
+            if hasattr(self, "tools_widget"):
+                try:
+                    if self.tools_widget.theta_range_menu.isVisible():
+                        self.tools_widget.theta_range_menu.close()
+                    self.tools_widget.set_theta_axis_values(None)
+                except (RuntimeError, AttributeError):
+                    pass
             if hasattr(self, "theta_slice_check"):
                 self.theta_slice_check.blockSignals(True)
                 self.theta_slice_check.setChecked(False)
@@ -784,11 +1043,11 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
         def _update_cursor_coordinate_labels(self) -> None:
             position = self._cursor_position_from_sliders()
             if position is None:
-                self.cursor_x_value_label.setText("X детектора = —")
-                self.cursor_y_value_label.setText("Y детектора = —")
+                self.cursor_x_value_label.setText("—")
+                self.cursor_y_value_label.setText("—")
                 return
-            self.cursor_x_value_label.setText(f"X детектора = {position[0]:.4f}")
-            self.cursor_y_value_label.setText(f"Y детектора = {position[1]:.4f}")
+            self.cursor_x_value_label.setText(f"{position[0]:.4f}")
+            self.cursor_y_value_label.setText(f"{position[1]:.4f}")
 
         def _configure_cursor_controls(self, payload: VolumePayload) -> None:
             """Reset the standalone input domain for the newly loaded payload."""
@@ -868,6 +1127,7 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
             self._last_map_cursor_position = position
             try:
                 self.scene.set_cursor_line_density(float(self.cursor_line_density.value()), render=False)
+                self.scene.set_cursor_line_color(self.tools_widget.cursor_line_color, render=False)
                 self.scene.set_cursor_line_enabled(True, render=False)
                 self._pending_map_cursor_position = position
                 if not self._cursor_line_update_timer.isActive():
@@ -891,6 +1151,17 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
                     self.vtk_widget.Render()
             except Exception as exc:
                 self._show_error("Не удалось изменить оптическую плотность линии", str(exc))
+
+        def _on_cursor_line_color_changed(self, color: str) -> None:
+            """Update only the already-declared cursor RGB uniform."""
+            if self.scene is None:
+                return
+            try:
+                self.scene.set_cursor_line_color(str(color), render=False)
+                if self.cursor_line_check.isChecked() and self.vtk_widget is not None:
+                    self.vtk_widget.Render()
+            except Exception as exc:
+                self._show_error("Не удалось изменить цвет линии курсора", str(exc))
 
         def _queue_cursor_position(self, position, *, source: str) -> None:
             self._cursor_input_source = str(source)
@@ -1038,6 +1309,14 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
                 return
             self.vtk_widget = TracedQVTKRenderWindowInteractor(self.viewer)
             self.render_window = self.vtk_widget.GetRenderWindow()
+            from .vtk_volume_display_widget import VTKVolumeDisplayWidget
+            self.volume_display_widget = VTKVolumeDisplayWidget(self.vtk_widget)
+            self.volume_display_widget.attach_settings_panel(self.volume_render_settings_panel)
+            self.volume_display_widget.bind_threshold_spins(self.low_pct, self.high_pct)
+            self.volume_display_widget.thresholds_changed.connect(self._on_volume_thresholds_changed)
+            self.volume_display_widget.set_colormap(str(self.palette_combo.currentData()))
+            self.volume_display_widget.apply_theme(self._theme)
+            self.volume_display_widget.set_scene_available(False)
 
             # Fail fast before Initialize()/paintEvent if the OpenGL2 object
             # factory was not registered before QVTK construction. Rendering a
@@ -1202,10 +1481,15 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
                     self.interactor,
                     render_callback=self.vtk_widget.Render,
                 )
-                if hasattr(self, "grid_check"):
-                    self.grid_check.blockSignals(True)
-                    self.grid_check.setChecked(self.scene.grid_visible)
-                    self.grid_check.blockSignals(False)
+                self.scene.set_theme(self._theme)
+                self.tools_widget.set_scene_available(True)
+                self.tools_widget.apply_theme(self._theme)
+                self.tools_widget.set_axes_visible(self.scene.axes_visible)
+                self.tools_widget.set_bounding_box_visible(self.scene.bounding_box_visible)
+                self.tools_widget.set_axis_ticks_visible(self.scene.axis_ticks_visible)
+                self.tools_widget.set_grid_visible(self.scene.grid_visible)
+                self.tools_widget.set_perspective_enabled(self.scene.perspective_enabled)
+                self.tools_widget.set_cursor_line_color(self.scene.cursor_line_color)
                 self._vtk_init_pending = False
                 _trace("VTK_SCENE_CREATED")
                 self._refresh_controls()
@@ -1499,10 +1783,30 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
                 info = self.scene.set_payload(
                     payload,
                     self._transfer_settings(),
-                    theta_scale=float(self.theta_scale_spin.value()),
+                    axis_scales=self.tools_widget.axis_scales,
                 )
                 self.payload = payload
+                # The interactive theta preview starts at the complete theta
+                # extent of this payload. It remains a VTK display-only crop.
+                self.tools_widget.set_theta_axis_values(payload.theta)
+                # Keep the toolbar editor synchronized with the actual scene
+                # transform.  No legacy theta spin-box exists in the sidebar.
+                self.tools_widget.set_axis_scales(*self.scene.axis_scales)
                 self._configure_cursor_controls(payload)
+                self.tools_widget.set_axes_visible(self.scene.axes_visible)
+                self.tools_widget.set_bounding_box_visible(self.scene.bounding_box_visible)
+                self.tools_widget.set_axis_ticks_visible(self.scene.axis_ticks_visible)
+                self.tools_widget.set_grid_visible(self.scene.grid_visible)
+                self.tools_widget.set_perspective_enabled(self.scene.perspective_enabled)
+                self.projection_check.blockSignals(True)
+                self.projection_check.setChecked(bool(self.scene.settings.show_projection))
+                self.projection_check.blockSignals(False)
+                self.tools_widget.set_projection_enabled(bool(self.scene.settings.show_projection))
+                self.tools_widget.set_overlay_tool_checked(
+                    "projection", bool(self.scene.settings.show_projection)
+                )
+                self.tools_widget.set_cursor_line_enabled(False)
+                self.tools_widget.set_cursor_line_color(self.scene.cursor_line_color)
                 theta_count = int(len(payload.theta))
                 theta_index = int(self.scene.theta_slice_index or 0)
                 self.theta_slice_slider.blockSignals(True)
@@ -1521,6 +1825,14 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
                 self.theta_slice_strength.blockSignals(True)
                 self.theta_slice_strength.setValue(float(self.scene.theta_slice_strength))
                 self.theta_slice_strength.blockSignals(False)
+                self.volume_display_widget.set_thresholds(
+                    float(self.low_pct.value()),
+                    float(self.high_pct.value()),
+                    absolute_low=info.get("threshold_min"),
+                    absolute_high=info.get("threshold_max"),
+                    reference=info.get("threshold_reference"),
+                )
+                self.volume_display_widget.set_colormap(str(self.palette_combo.currentData()))
                 self.vtk_widget.paint_stage = "payload-set"
                 _trace(
                     "SCENE_SET_PAYLOAD_DONE",
@@ -1554,7 +1866,7 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
                     f"Координаты: {payload.coord_system}; dtype={payload.scalar_dtype}; "
                     f"сетка={info['point_count']:,} узлов\n{spike_text}\n"
                     f"Исключённые пиксели: {len(payload.masked_detector_pixels)}; "
-                    f"масштаб θ: {float(self.theta_scale_spin.value()):g}×; "
+                    f"масштаб X/Y/θ: {self.scene.axis_scales[0]:g}/{self.scene.axis_scales[1]:g}/{self.scene.axis_scales[2]:g}×; "
                     f"диапазон θ: [{payload.theta[0]:g}, {payload.theta[-1]:g}]\n"
                     f"Сглаживание σ={payload.smoothing_sigma:g} (воксели); "
                     f"пороговый sample={info['threshold_sample_count']:,} "
@@ -1670,6 +1982,11 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
 
         def _set_busy(self, busy: bool, message: str = ""):
             self._busy = bool(busy)
+            if self._busy:
+                crop_timer = getattr(self, "_theta_display_range_update_timer", None)
+                if crop_timer is not None and crop_timer.isActive():
+                    crop_timer.stop()
+                self._pending_theta_display_range = None
             if message:
                 self.status_label.setText(message)
             self._refresh_controls()
@@ -1679,6 +1996,7 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
             high = float(self.high_pct.value()) / 100.0
             if not (0.0 <= low < high <= 1.0):
                 raise ValueError("Нужно 0 <= Vmin < Vmax <= 100% от p99.9.")
+            projection_palette = self.projection_palette_combo.currentData()
             return TransferSettings(
                 lower_fraction=low,
                 upper_fraction=high,
@@ -1689,19 +2007,31 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
                 opacity_unit_distance_factor=float(self.opacity_unit_factor.value()),
                 show_projection=bool(self.projection_check.isChecked()),
                 projection_opacity=float(self.projection_opacity.value()),
+                projection_palette=(str(projection_palette) if projection_palette else None),
             )
 
         def apply_display(self):
             if self.payload is None or self.scene is None:
-                self.status_label.setText("Сначала загрузите объём.")
                 return
             try:
+                if self._volume_display_update_timer.isActive():
+                    self._volume_display_update_timer.stop()
                 settings = self._transfer_settings()
-                self.scene.set_theme(str(self.theme_combo.currentData()))
-                self.scene.set_theta_scale(float(self.theta_scale_spin.value()), render=False)
-                # Recompute ray sampling/opacity distance from displayed voxel
-                # geometry after changing theta scale.
+                self.scene.set_theme(self._theme)
+                self.tools_widget.apply_theme(self._theme)
+                self.scene.set_axis_scales(*self.tools_widget.axis_scales, render=False)
+                # Recompute ray sampling/opacity distance from the committed
+                # display geometry; source coordinates and scalar data are intact.
                 info = self.scene.update_transfer_functions(settings, render=False)
+                if hasattr(self, "volume_display_widget"):
+                    self.volume_display_widget.set_colormap(settings.palette)
+                    self.volume_display_widget.set_thresholds(
+                        float(self.low_pct.value()),
+                        float(self.high_pct.value()),
+                        absolute_low=info.get("threshold_min"),
+                        absolute_high=info.get("threshold_max"),
+                        reference=info.get("threshold_reference"),
+                    )
                 # Theme/property updates are applied in the GUI thread; render is
                 # requested once after all controls have been updated.
                 self.vtk_widget.Render()
@@ -1711,9 +2041,11 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
                     f"max opacity={settings.max_opacity:g}; gamma={settings.gamma:g}; "
                     f"sample distance={info['sample_distance']:.5g}; "
                     f"opacity unit distance={info['opacity_unit_distance']:.5g}; "
-                    f"palette={settings.palette}; θ scale={float(self.theta_scale_spin.value()):g}×; "
+                    f"palette={settings.palette}; scale X/Y/θ="
+                    f"{self.scene.axis_scales[0]:g}/{self.scene.axis_scales[1]:g}/{self.scene.axis_scales[2]:g}×; "
                     f"XY projection={'on' if settings.show_projection else 'off'} "
-                    f"(opacity {settings.projection_opacity:g})."
+                    f"(opacity {settings.projection_opacity:g}; "
+                    f"palette {settings.projection_palette or 'auto'})."
                 )
                 _trace("DISPLAY_SETTINGS_APPLIED", **info, settings={
                     "lower_fraction": settings.lower_fraction,
@@ -1724,22 +2056,146 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
                     "opacity_unit_distance_factor": settings.opacity_unit_distance_factor,
                     "show_projection": settings.show_projection,
                     "projection_opacity": settings.projection_opacity,
-                    "theta_scale": float(self.theta_scale_spin.value()),
+                    "projection_palette": settings.projection_palette,
+                    "axis_scales": self.scene.axis_scales,
                 })
+                if hasattr(self, "volume_display_widget"):
+                    self.volume_display_widget.settings_menu.close()
+                projection_menu = self.tools_widget._overlay_settings_menus.get("projection")
+                if projection_menu is not None:
+                    projection_menu.close()
             except Exception as exc:
                 self._show_error("Некорректные настройки отображения", str(exc))
 
-        def _camera_axis(self, axis: str):
-            if self.payload is not None and self.scene is not None:
-                self.scene.reset_camera_axis(axis)
+        def apply_theme(self, theme: str | None = None) -> str:
+            """Apply the shared ROI Explorer theme without re-entering on Qt events.
 
-        def _camera_perspective(self, enabled: bool):
+            QWidget.setPalette() synchronously delivers PaletteChange to this
+            window.  Mark the operation active and publish the requested state
+            *before* touching any palettes so changeEvent cannot recursively
+            start another theme application.  This is the same re-entrancy
+            contract used by RockingCurveExplorerWindow.
+
+            The method is intentionally idempotent and does not recreate or
+            mutate the VTK scene data; only the renderer background and UI chrome
+            are updated.
+            """
+            if getattr(self, "_applying_theme", False):
+                return self._theme
+
+            requested = str(theme or self._theme or "light").strip().lower()
+            if requested not in ("dark", "light"):
+                requested = resolve_theme(self)
+
+            previous = self._theme
+            self._applying_theme = True
+            # Set this before apply_roi_theme(): QApplication/QWidget palette
+            # changes below can synchronously invoke changeEvent().
+            self._theme = requested
+            try:
+                active = apply_roi_theme(self, requested)
+                # Keep the canonical state in sync with the normalized theme.
+                self._theme = active
+
+                app = QtWidgets.QApplication.instance()
+                if app is not None:
+                    set_icon_theme(app, theme_colors(active)["text"])
+                if hasattr(self, "tools_widget"):
+                    self.tools_widget.apply_theme(active)
+                if hasattr(self, "volume_display_widget"):
+                    self.volume_display_widget.apply_theme(active)
+                if self.scene is not None:
+                    self.scene.set_theme(active)
+                return active
+            except Exception:
+                # Preserve a truthful state if one of the styling operations
+                # fails; do not hide the original exception.
+                self._theme = previous
+                raise
+            finally:
+                self._applying_theme = False
+
+        def _on_theme_changed(self, theme: str):
+            app = QtWidgets.QApplication.instance()
+            active = str(theme).lower()
+            if active not in ("dark", "light"):
+                return
+            if app is not None:
+                app.setProperty("rocMcsTheme", active)
+                app.setProperty("rocMcsThemeMode", active)
+            self.apply_theme(active)
+
+        def changeEvent(self, event):
+            super().changeEvent(event)
+            if event.type() in (
+                QtCore.QEvent.Type.PaletteChange,
+                QtCore.QEvent.Type.ApplicationPaletteChange,
+            ):
+                # Ignore events generated by apply_theme() itself.  In
+                # particular, setPalette() emits PaletteChange synchronously.
+                if getattr(self, "_applying_theme", False):
+                    return
+
+                app = QtWidgets.QApplication.instance()
+                requested = str(app.property("rocMcsTheme") or "").strip().lower() if app else ""
+                if requested in ("dark", "light") and requested != self._theme:
+                    self.apply_theme(requested)
+
+        def _reset_camera_fit(self):
             if self.payload is not None and self.scene is not None:
-                self.scene.set_perspective(enabled)
+                self.scene.reset_camera_fit_preserve_direction()
+
+        def _camera_axis(self, axis: str, polarity: int = 1):
+            if self.payload is not None and self.scene is not None:
+                self.scene.reset_camera_axis(axis, polarity=polarity)
+                self.tools_widget.set_perspective_enabled(self.scene.perspective_enabled)
+
+        def _apply_axis_scales(self, x_scale: float, y_scale: float, theta_scale: float):
+            """Apply the toolbar's committed display-only axis proportions."""
+            if self.payload is None or self.scene is None:
+                return
+            try:
+                self.scene.set_axis_scales(
+                    x_scale, y_scale, theta_scale, render=False
+                )
+                # VTKToolsWidget owns the committed X/Y/theta editor state;
+                # do not mirror it into a removed sidebar control.
+                self.tools_widget.set_axis_scales(
+                    float(x_scale), float(y_scale), float(theta_scale)
+                )
+                self.vtk_widget.Render()
+                self.status_label.setText(
+                    "Масштаб геометрии применён: "
+                    f"X={float(x_scale):g}×, Y={float(y_scale):g}×, "
+                    f"θ={float(theta_scale):g}×. Исходные координаты и данные не изменены."
+                )
+                _trace("AXIS_SCALES_APPLIED", axis_scales=self.scene.axis_scales)
+            except Exception as exc:
+                # Keep the editor and scene in sync if validation/render setup
+                # fails. The previous committed scene values remain authoritative.
+                self.tools_widget.set_axis_scales(*self.scene.axis_scales)
+                self._show_error("Не удалось применить масштаб осей", str(exc))
+
+        def _camera_perspective(self):
+            """Restore the standard oblique perspective view; never turn it off."""
+            if self.payload is not None and self.scene is not None:
+                self.scene.set_perspective_view()
+                self.tools_widget.set_perspective_enabled(self.scene.perspective_enabled)
 
         def _toggle_axes(self, visible: bool):
             if self.scene is not None:
                 self.scene.set_axes_visible(visible)
+                self.tools_widget.set_axes_visible(self.scene.axes_visible)
+
+        def _toggle_bounding_box(self, visible: bool):
+            if self.scene is not None:
+                self.scene.set_bounding_box_visible(visible)
+                self.tools_widget.set_bounding_box_visible(self.scene.bounding_box_visible)
+
+        def _toggle_axis_ticks(self, visible: bool):
+            if self.scene is not None:
+                self.scene.set_axis_ticks_visible(visible)
+                self.tools_widget.set_axis_ticks_visible(self.scene.axis_ticks_visible)
 
         def _toggle_grid(self, visible: bool):
             if self.scene is not None:
