@@ -15,7 +15,19 @@ from typing import Any, Mapping
 from uuid import uuid4
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+
+
+class ReviewStatus(str):
+    """User review state, separate from execution state."""
+
+    CANDIDATE = "candidate"
+    ACCEPTED = "accepted"
+    REJECTED = "rejected"
+
+    @classmethod
+    def values(cls) -> set[str]:
+        return {cls.CANDIDATE, cls.ACCEPTED, cls.REJECTED}
 
 
 class NodeStatus(str):
@@ -74,6 +86,7 @@ class ProcessingNode:
     parameter_schema_version: int = 1
     error: str | None = None
     summary: str | None = None
+    review_status: str = ReviewStatus.ACCEPTED
 
     @property
     def parameters(self) -> dict[str, Any]:
@@ -109,6 +122,7 @@ class ProcessingNode:
             "parameter_schema_version": self.parameter_schema_version,
             "error": self.error,
             "summary": self.summary,
+            "review_status": self.review_status,
         }
 
     @classmethod
@@ -116,6 +130,16 @@ class ProcessingNode:
         status = str(data.get("status", NodeStatus.PENDING))
         if status not in NodeStatus.values():
             raise ValueError(f"Неизвестный статус узла: {status!r}")
+        # Legacy manifests predate the review workflow. Their successful nodes
+        # were directly usable, so load them as accepted to preserve behavior.
+        # Manifests from before review support, and programmatically created
+        # nodes without an explicit review request, retain the old behavior:
+        # completion makes the output usable. The GUI explicitly marks new
+        # interactive runs as CANDIDATE when user approval is required.
+        default_review = ReviewStatus.ACCEPTED
+        review_status = str(data.get("review_status", default_review))
+        if review_status not in ReviewStatus.values():
+            raise ValueError(f"Неизвестный review_status: {review_status!r}")
         return cls(
             id=str(data["id"]),
             operation_id=str(data["operation_id"]),
@@ -133,6 +157,7 @@ class ProcessingNode:
             parameter_schema_version=int(data.get("parameter_schema_version", 1)),
             error=data.get("error"),
             summary=data.get("summary"),
+            review_status=review_status,
         )
 
 
@@ -171,6 +196,7 @@ class WorkflowHistory:
         software_version: str | None = None,
         parameter_schema_version: int = 1,
         summary: str | None = None,
+        review_status: str | None = None,
     ) -> ProcessingNode:
         if not operation_id.strip() or not label.strip():
             raise ValueError("operation_id и label не должны быть пустыми")
@@ -181,6 +207,11 @@ class WorkflowHistory:
             raise ValueError(f"Неизвестный статус узла: {status!r}")
         if status == NodeStatus.RUNNING:
             raise ValueError("Новый узел нельзя создавать сразу в статусе running")
+        if review_status is None:
+            review_status = ReviewStatus.ACCEPTED
+        review_status = str(review_status)
+        if review_status not in ReviewStatus.values():
+            raise ValueError(f"Неизвестный review_status: {review_status!r}")
 
         normalized_inputs: dict[str, dict[str, str]] = {}
         for port, ref in (input_refs or {}).items():
@@ -218,6 +249,7 @@ class WorkflowHistory:
             software_version=software_version,
             parameter_schema_version=parameter_schema_version,
             summary=summary,
+            review_status=review_status,
         )
         self._nodes[node.id] = node
         return node
@@ -246,6 +278,18 @@ class WorkflowHistory:
             error=error,
             summary=summary if summary is not None else node.summary,
         )
+        self._nodes[node_id] = updated
+        return updated
+
+    def set_review_status(self, node_id: str, review_status: str) -> ProcessingNode:
+        """Accept or reject a completed candidate without altering its artifact."""
+        node = self.get(node_id)
+        review_status = str(review_status)
+        if review_status not in ReviewStatus.values():
+            raise ValueError(f"Неизвестный review_status: {review_status!r}")
+        if node.status != NodeStatus.SUCCEEDED:
+            raise ValueError("Оценивать можно только успешно завершённый узел")
+        updated = replace(node, review_status=review_status)
         self._nodes[node_id] = updated
         return updated
 
@@ -310,12 +354,16 @@ class WorkflowHistory:
         with Path(path).open("r", encoding="utf-8") as stream:
             payload = json.load(stream)
         version = int(payload.get("schema_version", 1))
-        if version not in {1, SCHEMA_VERSION}:
+        if version not in {1, 2, SCHEMA_VERSION}:
             raise ValueError(f"Неподдерживаемая версия истории: {version}")
         return cls([ProcessingNode.from_dict(item) for item in payload.get("nodes", [])])
 
     def _validate_graph(self) -> None:
         for node in self._nodes.values():
+            if node.status not in NodeStatus.values():
+                raise ValueError(f"Неизвестный статус узла: {node.status!r}")
+            if node.review_status not in ReviewStatus.values():
+                raise ValueError(f"Неизвестный review_status узла: {node.review_status!r}")
             missing = [parent for parent in node.parent_ids if parent not in self._nodes]
             if missing:
                 raise ValueError(f"У узла {node.id} отсутствуют родители: {missing}")

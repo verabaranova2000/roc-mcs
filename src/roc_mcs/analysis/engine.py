@@ -131,6 +131,11 @@ class WorkflowExecutor:
         inputs: dict[str, ArtifactBundle] = {}
         for port, reference in node.input_refs.items():
             parent = self.history.get(reference["node_id"])
+            if parent.review_status != "accepted":
+                raise ValueError(
+                    f"Результат {parent.label!r} ещё не принят пользователем "
+                    f"(review_status={parent.review_status!r})."
+                )
             output_name = reference["output"]
             output_ref = parent.output_refs.get(output_name)
             if output_ref is None:
@@ -157,6 +162,8 @@ class WorkflowExecutor:
         node = self.history.get(node_id)
         if node.status != NodeStatus.RUNNING:
             raise ValueError(f"Узел должен быть running, сейчас {node.status}")
+        if any(self.history.get(parent_id).review_status != "accepted" for parent_id in node.parent_ids):
+            raise ValueError("Нельзя запускать этап: один из родительских результатов ещё не принят.")
         inputs = self.resolve_node_inputs(node)
         result: OperationResult = self.registry.execute(
             node.operation_id, inputs, node.parameters
@@ -226,11 +233,57 @@ def build_input_refs(
             )
         if node.status != NodeStatus.SUCCEEDED:
             raise ValueError(f"Входной узел {node.label!r} ещё не завершён успешно")
+        if node.review_status != "accepted":
+            raise ValueError(
+                f"Результат {node.label!r} не принят пользователем; "
+                "сначала подтвердите результат или выберите другую ветвь."
+            )
         return node
 
     selected = history.get(selected_node_id)
+    if selected.status != NodeStatus.SUCCEEDED:
+        raise ValueError("Этап можно создавать только от успешно выполненного узла.")
+    if selected.review_status != "accepted":
+        raise ValueError(
+            "Нельзя создавать этап от результата, который ещё не принят "
+            "или был отклонён."
+        )
     refs: dict[str, dict[str, str]] = {}
-    if operation_id == "preprocess.pool":
+
+    def require_detector_mask_stage() -> ProcessingNode:
+        stage = next(
+            (
+                ancestor for ancestor in history.ancestors(selected_node_id)
+                if ancestor.operation_id == "preprocess.detector_bad_pixels"
+            ),
+            None,
+        )
+        if stage is None:
+            raise ValueError(
+                "Перед pooling, spike/peak detection и Fit необходимо явно выполнить "
+                "и принять первый этап «Битые пиксели детектора». "
+                "В нём можно применить настроенные координаты или явно подтвердить "
+                "пустой список для этого скана."
+            )
+        if stage.status != NodeStatus.SUCCEEDED or stage.review_status != "accepted":
+            raise ValueError(
+                "Этап «Битые пиксели детектора» ещё не выполнен или не принят. "
+                "Проверьте его результат перед продолжением обработки."
+            )
+        return stage
+
+    if operation_id == "preprocess.detector_bad_pixels":
+        if selected.operation_id != "source.scan" or "scan" not in selected.output_refs:
+            raise ValueError(
+                "Исключение битых пикселей выполняется только непосредственно "
+                "на исходной detector-grid, до pooling и других преобразований. "
+                "Выберите узел исходного скана."
+            )
+        if history.find_ancestor_output(selected.id, "scan") is not selected:
+            raise ValueError("Не удалось подтвердить исходный detector-grid")
+        refs["scan"] = {"node_id": selected.id, "output": "scan"}
+    elif operation_id == "preprocess.pool":
+        require_detector_mask_stage()
         if "scan" not in selected.output_refs:
             raise ValueError(
                 "Pooling создаётся от узла исходного или уже pooled Scan. "
@@ -238,6 +291,7 @@ def build_input_refs(
             )
         refs["scan"] = {"node_id": selected.id, "output": "scan"}
     elif operation_id == "preprocess.spikes":
+        require_detector_mask_stage()
         if "scan" not in selected.output_refs:
             raise ValueError(
                 "Spike detection создаётся от узла Scan. "
@@ -245,6 +299,7 @@ def build_input_refs(
             )
         refs["scan"] = {"node_id": selected.id, "output": "scan"}
     elif operation_id == "peaks.detect":
+        require_detector_mask_stage()
         if not ({"scan", "spikes"} & set(selected.output_refs)):
             raise ValueError(
                 "Детектор пиков следует запускать от Scan или Spike detection. "
@@ -265,6 +320,7 @@ def build_input_refs(
             # peak detection itself is explicitly run on raw counts.
             refs["spikes"] = {"node_id": spikes.id, "output": "spikes"}
     elif operation_id == "fit.scan":
+        require_detector_mask_stage()
         if "peaks" not in selected.output_refs:
             raise ValueError(
                 "Подгонку следует запускать от завершённого каталога пиков. "
@@ -284,6 +340,9 @@ def build_input_refs(
 
 
 def make_operation_label(operation_id: str, parameters: Mapping[str, Any]) -> str:
+    if operation_id == "preprocess.detector_bad_pixels":
+        count = len(parameters.get("pixels", ()))
+        return f"Битые пиксели · {count}" if count else "Битые пиксели · без исключений"
     if operation_id == "preprocess.pool":
         return f"Pooling · {parameters['size']} / {parameters['stride']}"
     if operation_id == "preprocess.spikes":

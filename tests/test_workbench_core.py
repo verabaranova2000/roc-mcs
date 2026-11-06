@@ -47,16 +47,24 @@ class WorkflowHistoryTests(unittest.TestCase):
             "source.scan", "Scan", status=NodeStatus.SUCCEEDED,
             output_refs={"scan": "@external-hdf5-scan"},
         )
-        pool_a = history.add_node(
-            "preprocess.pool", "Pool A", parent_ids=[source.id],
+        detector_qc = history.add_node(
+            "preprocess.detector_bad_pixels", "Detector QC · none",
+            parent_ids=[source.id],
             input_refs={"scan": {"node_id": source.id, "output": "scan"}},
+            parameters={"pixels": []}, status=NodeStatus.SUCCEEDED,
+            output_refs={"scan": "d" * 32},
+            review_status="accepted",
+        )
+        pool_a = history.add_node(
+            "preprocess.pool", "Pool A", parent_ids=[detector_qc.id],
+            input_refs={"scan": {"node_id": detector_qc.id, "output": "scan"}},
             parameters={"size": 5, "stride": 1},
             status=NodeStatus.SUCCEEDED,
             output_refs={"scan": "a" * 32},
         )
         pool_b = history.add_node(
-            "preprocess.pool", "Pool B", parent_ids=[source.id],
-            input_refs={"scan": {"node_id": source.id, "output": "scan"}},
+            "preprocess.pool", "Pool B", parent_ids=[detector_qc.id],
+            input_refs={"scan": {"node_id": detector_qc.id, "output": "scan"}},
             parameters={"size": 5, "stride": 5},
         )
         spikes = history.add_node(
@@ -71,7 +79,8 @@ class WorkflowHistoryTests(unittest.TestCase):
                 "spikes": {"node_id": spikes.id, "output": "spikes"},
             },
         )
-        self.assertEqual({n.id for n in history.children(source.id)}, {pool_a.id, pool_b.id})
+        self.assertEqual({n.id for n in history.children(source.id)}, {detector_qc.id})
+        self.assertEqual({n.id for n in history.children(detector_qc.id)}, {pool_a.id, pool_b.id})
         self.assertEqual(set(peaks.parent_ids), {pool_a.id, spikes.id})
         self.assertEqual(history.find_ancestor_output(peaks.id, "scan").id, pool_a.id)
         from roc_mcs.analysis.engine import build_input_refs
@@ -568,6 +577,86 @@ class PoolOperationTests(unittest.TestCase):
                 first.bundle.metadata["grid_id"],
                 second.bundle.metadata["grid_id"],
             )
+
+
+class FitMaskPropagationTests(unittest.TestCase):
+    def test_fit_receives_strict_detector_coverage_mask_even_without_spike_mask(self):
+        import importlib.util
+        import pandas as pd
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from roc_mcs.analysis.operations import fit_backend_availability
+        from roc_mcs.fitting.registry import MODEL_SPECS
+
+        availability = fit_backend_availability()
+        backend = "jax" if availability["jax"] else ("lmfit" if availability["lmfit"] else None)
+        if backend is None:
+            self.skipTest("Для проверки Fit adapter требуется JAX или LMFit")
+
+        registry = default_registry()
+        theta = np.linspace(10.0, 14.0, 31)
+        rng = np.random.default_rng(20261106)
+        source_data = rng.poisson(4.0, size=(7, 7, theta.size)).astype(np.float64)
+        source = ArtifactBundle(
+            arrays={
+                "data_yxt": source_data,
+                "theta": theta,
+                "x_coords": np.arange(7, dtype=float),
+                "y_coords": np.arange(7, dtype=float),
+            },
+            metadata={
+                "grid_id": "fit-mask-source-grid",
+                "pool": {"size": 1, "stride": 1},
+                "pool_signature": "raw",
+            },
+        )
+        masked = registry.execute(
+            "preprocess.detector_bad_pixels", {"scan": source}, {"pixels": [(3, 3)]}
+        ).bundle
+        pooled = registry.execute(
+            "preprocess.pool", {"scan": masked}, {"size": 3, "stride": 1}
+        ).bundle
+        peaks = ArtifactBundle(
+            tables={"peak_catalog": pd.DataFrame(columns=["peak_id", "x", "y", "theta", "theta_index"])},
+            metadata={"grid_id": pooled.metadata["grid_id"]},
+        )
+        captured = {}
+        data = np.asarray(pooled.arrays["data_yxt"], dtype=float)
+
+        def fake_fit_scan(*args, **kwargs):
+            captured["valid_mask"] = np.asarray(kwargs["valid_mask"], dtype=bool).copy()
+            return SimpleNamespace(
+                theta=np.asarray(args[1]),
+                theta_valid=np.ones(np.asarray(args[1]).shape, dtype=bool),
+                fit_cube=np.zeros_like(data),
+                residual_cube=np.zeros_like(data),
+                valid_mask=captured["valid_mask"],
+                pixel_fit_catalog=pd.DataFrame(columns=["fit_status", "x", "y", "n_fitted"]),
+                peak_catalog=pd.DataFrame(),
+                fitted_peak_catalog=pd.DataFrame(),
+                image_shape=data.shape[:2],
+                model_id="pvoigt", model_version="test", backend=backend,
+                run_id="synthetic-fit-run", fit_config={},
+                component_param_names=[], pixel_param_names=[],
+            )
+
+        parameters = registry.get("fit.scan").validate({
+            "model": "pvoigt", "backend": backend, "center_window": 0.5,
+            "add_background": True, "allow_center_shift": True,
+            "use_spike_mask": False,
+        })
+        with patch("roc_mcs.fitting.pipeline.fit_scan", side_effect=fake_fit_scan):
+            result = registry.get("fit.scan").execute(
+                {"scan": pooled, "peaks": peaks}, parameters
+            ).bundle
+
+        self.assertEqual(captured["valid_mask"].shape, data.shape)
+        self.assertEqual(int(captured["valid_mask"].all(axis=-1).sum()), 16)
+        self.assertFalse(np.any(captured["valid_mask"][:, :, :][1:4, 1:4, :]))
+        self.assertEqual(result.metadata["detector_bad_pixel_count"], 1)
+        self.assertEqual(result.metadata["detector_invalid_samples"], 31)
+        self.assertEqual(result.metadata["analysis_invalid_bins"], 9)
+        self.assertEqual(result.metadata["fit_excluded_samples"], 9 * 31)
 
 
 if __name__ == "__main__":

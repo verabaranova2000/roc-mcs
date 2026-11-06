@@ -81,6 +81,164 @@ class OperationRegistry:
         return result
 
 
+def _normalise_detector_pixels(value: Any) -> list[dict[str, int]]:
+    """Normalize zero-based source detector (x,y) indices for a workflow record."""
+    if isinstance(value, str):
+        parsed = []
+        for token in value.split(";"):
+            token = token.strip()
+            if not token:
+                continue
+            parts = [part.strip() for part in token.split(",")]
+            if len(parts) != 2:
+                raise ValueError(
+                    f"Некорректная координата {token!r}; используйте формат x,y; x,y"
+                )
+            parsed.append(parts)
+        value = parsed
+    if not isinstance(value, (list, tuple)):
+        raise ValueError("pixels должен быть списком координат detector-grid (x,y)")
+    result: list[dict[str, int]] = []
+    seen: set[tuple[int, int]] = set()
+    for item in value:
+        if isinstance(item, Mapping):
+            raw_x, raw_y = item.get("x"), item.get("y")
+        elif isinstance(item, (list, tuple)) and len(item) == 2:
+            raw_x, raw_y = item
+        else:
+            raise ValueError(f"Некорректная координата битого пикселя: {item!r}")
+        if isinstance(raw_x, (bool, np.bool_)) or isinstance(raw_y, (bool, np.bool_)):
+            raise ValueError("Координаты битых пикселей должны быть целыми числами")
+        try:
+            xf, yf = float(raw_x), float(raw_y)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"Некорректная координата пикселя: {(raw_x, raw_y)!r}") from exc
+        if (
+            not np.isfinite(xf) or not np.isfinite(yf)
+            or not xf.is_integer() or not yf.is_integer()
+            or xf < 0 or yf < 0 or xf > 1_000_000 or yf > 1_000_000
+        ):
+            raise ValueError("Координаты битых пикселей должны быть целыми неотрицательными индексами")
+        coord = (int(xf), int(yf))
+        if coord not in seen:
+            result.append({"x": coord[0], "y": coord[1]})
+            seen.add(coord)
+        if len(result) > 4096:
+            raise ValueError("Допускается не более 4096 исключаемых пикселей")
+    return result
+
+
+def _validate_detector_bad_pixels(parameters: Mapping[str, Any]) -> dict[str, Any]:
+    pixels = _normalise_detector_pixels(parameters.get("pixels", ()))
+    return {
+        "pixels": pixels,
+        # An empty list is an explicit, auditable confirmation that this scan
+        # has no detector exclusions. It is not silently skipped.
+        "mode": "exclude" if pixels else "confirm_none",
+        "replacement": "preserve_measurements" if pixels else "none",
+        "coordinate_space": "source_detector_xy_zero_based",
+    }
+
+
+def _run_detector_bad_pixels(
+    inputs: Mapping[str, ArtifactBundle],
+    parameters: Mapping[str, Any],
+) -> OperationResult:
+    """Exclude configured detector defect pixels without changing measured counts.
+
+    The measured data array is carried through unchanged. Only explicit validity
+    masks and provenance metadata are added. Downstream scientific operations must
+    honor those masks; display code must render invalid sites as no-data, not zero.
+    The source HDF5 is never modified.
+    """
+    scan = inputs["scan"]
+    data = np.asarray(scan.arrays["data_yxt"])
+    if data.ndim != 3:
+        raise ValueError(f"Ожидался массив Y×X×θ, получено {data.shape}")
+    pool = dict(scan.metadata.get("pool") or {"size": 1, "stride": 1})
+    if int(pool.get("size", 1)) != 1 or int(pool.get("stride", 1)) != 1:
+        raise ValueError(
+            "Маску дефектных пикселей нужно применять на исходной detector-grid "
+            "до пространственного pooling."
+        )
+    if "detector_bad_pixel_mask_yx" in scan.arrays or scan.metadata.get("detector_bad_pixel_exclusions"):
+        raise ValueError("К этому Scan уже применена маска дефектных пикселей")
+
+    ny, nx, ntheta = data.shape
+    pixels = parameters["pixels"]
+    outside = [
+        (item["x"], item["y"]) for item in pixels
+        if item["x"] >= nx or item["y"] >= ny
+    ]
+    if outside:
+        raise ValueError(
+            f"Координаты {outside} выходят за detector-grid X=0…{nx - 1}, Y=0…{ny - 1}. "
+            "Проверьте, что индексы взяты из исходной системы координат детектора."
+        )
+
+    if pixels and len(pixels) >= ny * nx:
+        raise ValueError("Нельзя исключить все пиксели detector-grid")
+
+    # Preserve measured counts byte-for-byte. Detector exclusion is represented
+    # exclusively by validity masks; do not write synthetic zero/NaN samples into
+    # the scientific signal array.
+    existing_valid = scan.arrays.get("valid_mask_yxt")
+    valid = (
+        np.ones((ny, nx, ntheta), dtype=bool)
+        if existing_valid is None
+        else np.array(existing_valid, dtype=bool, copy=True)
+    )
+    if valid.shape != data.shape:
+        raise ValueError("Существующая valid_mask_yxt не согласована с Scan")
+
+    bad_mask = np.zeros((ny, nx), dtype=bool)
+    for item in pixels:
+        x, y = item["x"], item["y"]
+        valid[y, x, :] = False
+        bad_mask[y, x] = True
+
+    if pixels and not np.any(np.all(valid, axis=-1)):
+        raise ValueError(
+            "После исключения битых пикселей не осталось полностью валидных detector-пикселей."
+        )
+
+    arrays = dict(scan.arrays)
+    arrays.update({
+        "data_yxt": data,
+        "valid_mask_yxt": valid,
+        "detector_bad_pixel_mask_yx": bad_mask,
+        "analysis_valid_mask_yx": np.all(valid, axis=-1),
+        "valid_pixel_count_yx": np.all(valid, axis=-1).astype(np.int64),
+        "represented_detector_pixel_count_yx": np.ones((ny, nx), dtype=np.int64),
+        "valid_fraction_yx": np.all(valid, axis=-1).astype(np.float32),
+    })
+    metadata = dict(scan.metadata)
+    metadata.update({
+        "operation": "detector bad-pixel validity masking",
+        "detector_bad_pixel_exclusions": pixels,
+        "detector_bad_pixel_count": int(len(pixels)),
+        "detector_bad_pixel_stage_applied": True,
+        "detector_bad_pixel_mode": "exclude" if pixels else "confirm_none",
+        "detector_bad_pixel_replacement": "none; measured counts preserved" if pixels else "none",
+        "valid_mask_semantics": (
+            "False means excluded detector sample; data_yxt retains the original measured values unchanged"
+        ),
+        "source_hdf5_modified": False,
+    })
+    return OperationResult(
+        bundle=ArtifactBundle(arrays=arrays, tables=dict(scan.tables), metadata=metadata),
+        output_ports=("scan",),
+        summary=(
+            (
+                f"Исключено дефектных пикселей: {len(pixels)}; "
+                f"исходные ROC и counts сохранены без изменений на {ntheta} θ-отсчётах; "
+                "валидность снята маской. "
+            )
+            if pixels else "Для этого скана подтверждено отсутствие исключаемых пикселей. "
+        ) + "Validity/coverage masks сохранены отдельно; исходный HDF5 не изменён.",
+    )
+
+
 def _validate_pool(parameters: Mapping[str, Any]) -> dict[str, Any]:
     from roc_mcs.roi.spatial_pooling import PoolSpec
 
@@ -100,7 +258,69 @@ def _run_pool(inputs: Mapping[str, ArtifactBundle], parameters: Mapping[str, Any
     y_coords = np.asarray(scan.arrays["y_coords"], dtype=float)
     ny, nx, ntheta = data.shape
     spec = PoolSpec(**parameters)
-    pooled = pool_yxt(data, spec)
+    source_valid = scan.arrays.get("valid_mask_yxt")
+    coverage_metadata: dict[str, Any] = {}
+    if source_valid is not None:
+        source_valid = np.asarray(source_valid, dtype=bool)
+        if source_valid.shape != data.shape:
+            raise ValueError("valid_mask_yxt не согласована с входным Scan")
+        # A pooled bin may contain both valid detector pixels and excluded
+        # detector pixels. Preserve the sum of the valid contributions for
+        # display; never zero valid neighbours just because one site is bad.
+        # Keep strict full-coverage validity separately for scientific stages.
+        valid_per_theta = pool_yxt(source_valid.astype(np.int32), spec)
+        pooled_valid = valid_per_theta > 0
+        pooled = np.asarray(
+            pool_yxt(np.where(source_valid, data, 0), spec), dtype=np.float64
+        )
+        # A bin with no valid detector contribution is missing data, not a
+        # measured zero. Partial bins retain the valid-count sum plus coverage.
+        pooled[~pooled_valid] = np.nan
+
+        source_valid_pixel_count = scan.arrays.get("valid_pixel_count_yx")
+        if source_valid_pixel_count is None:
+            source_valid_pixel_count = np.all(source_valid, axis=-1).astype(np.int32)
+        else:
+            source_valid_pixel_count = np.asarray(source_valid_pixel_count, dtype=np.int32)
+        source_represented_count = scan.arrays.get("represented_detector_pixel_count_yx")
+        if source_represented_count is None:
+            source_represented_count = np.ones((ny, nx), dtype=np.int32)
+        else:
+            source_represented_count = np.asarray(source_represented_count, dtype=np.int32)
+        if source_valid_pixel_count.shape != (ny, nx) or source_represented_count.shape != (ny, nx):
+            raise ValueError("Detector coverage counts не согласованы с входным Scan")
+        if np.any(source_valid_pixel_count < 0) or np.any(source_represented_count <= 0):
+            raise ValueError("Detector coverage counts должны быть неотрицательными, а represented count — положительным")
+        if np.any(source_valid_pixel_count > source_represented_count):
+            raise ValueError("Число валидных detector-пикселей превышает represented count")
+
+        valid_pixel_count = pool_yxt(
+            source_valid_pixel_count.astype(np.int64, copy=False)[..., None], spec
+        )[..., 0]
+        represented_pixel_count = pool_yxt(
+            source_represented_count.astype(np.int64, copy=False)[..., None], spec
+        )[..., 0]
+        analysis_valid = valid_pixel_count == represented_pixel_count
+        valid_fraction = np.divide(
+            valid_pixel_count,
+            represented_pixel_count,
+            out=np.zeros(valid_pixel_count.shape, dtype=np.float32),
+            where=represented_pixel_count > 0,
+        )
+        coverage_metadata = {
+            "pool_coverage_policy": (
+                "valid count contributions are preserved for map display; "
+                "partial-coverage bins are excluded from downstream scientific analysis by default"
+            ),
+            "pool_partial_coverage_bins": int(np.count_nonzero(~analysis_valid)),
+            "pool_min_valid_fraction": float(np.min(valid_fraction)) if valid_fraction.size else 0.0,
+        }
+    else:
+        pooled_valid = None
+        valid_pixel_count = None
+        analysis_valid = None
+        valid_fraction = None
+        pooled = pool_yxt(data, spec)
     x_idx, y_idx = pool_centers((ny, nx), spec)
     # pool_centers returns detector-grid coordinates as float for ROI geometry;
     # here the same integer-valued centers are used as array indices.
@@ -117,22 +337,38 @@ def _run_pool(inputs: Mapping[str, ArtifactBundle], parameters: Mapping[str, Any
         "pool_signature": spec.signature,
         "operation": "spatial count-sum pooling",
         "input_shape_yxt": [int(ny), int(nx), int(ntheta)],
+        **coverage_metadata,
     })
-    bundle = ArtifactBundle(
-        arrays={
-            "data_yxt": pooled,
-            "theta": theta,
-            "x_coords": out_x,
-            "y_coords": out_y,
-        },
-        metadata=metadata,
-    )
+    arrays = {
+        "data_yxt": pooled,
+        "theta": theta,
+        "x_coords": out_x,
+        "y_coords": out_y,
+    }
+    if pooled_valid is not None:
+        arrays["valid_mask_yxt"] = pooled_valid
+        arrays["analysis_valid_mask_yx"] = analysis_valid
+        arrays["valid_pixel_count_yx"] = valid_pixel_count
+        arrays["represented_detector_pixel_count_yx"] = represented_pixel_count
+        arrays["valid_fraction_yx"] = valid_fraction
+    bad_mask = scan.arrays.get("detector_bad_pixel_mask_yx")
+    if bad_mask is not None:
+        bad_mask = np.asarray(bad_mask, dtype=bool)
+        affected = pool_yxt(bad_mask[..., None].astype(np.int8), spec)[..., 0] > 0
+        arrays["detector_bad_pixel_mask_yx"] = affected
+        metadata["detector_bad_pixel_affected_pool_bins"] = int(np.count_nonzero(affected))
+    bundle = ArtifactBundle(arrays=arrays, metadata=metadata)
     return OperationResult(
         bundle=bundle,
         output_ports=("scan",),
         summary=(
             f"Pooling size={spec.size}, stride={spec.stride}: "
             f"{ny}×{nx} → {pooled.shape[0]}×{pooled.shape[1]} pixels"
+            + (
+                f"; частично покрытых окон: {int(np.count_nonzero(~analysis_valid))} "
+                f"(валидные counts сохранены, coverage записан отдельно)"
+                if analysis_valid is not None else ""
+            )
         ),
     )
 
@@ -158,22 +394,70 @@ def _run_spikes(inputs: Mapping[str, ArtifactBundle], parameters: Mapping[str, A
     data_yxt = np.asarray(scan.arrays["data_yxt"], dtype=float)
     if data_yxt.ndim != 3 or not np.isfinite(data_yxt).any():
         raise ValueError("Spike detection требует непустой конечный массив Y×X×θ")
-    # The existing spike code expects native (theta, Y, X) layout.
+    # The existing spike algorithm acts independently along theta for each
+    # detector pixel. Excluded detector traces are removed from global
+    # background/kappa estimation (not merely zeroed before the fit).
     data_tyx = np.moveaxis(data_yxt, -1, 0)
-    result = refine_spike_mask(
-        data_tyx,
-        max_iter=parameters["max_iter"],
-        tol=parameters["tol"],
-        verbose=False,
-        collect_kappa_fits=parameters["collect_kappa_fits"],
-    )
+    scan_valid = scan.arrays.get("valid_mask_yxt")
+    if scan_valid is not None:
+        scan_valid = np.asarray(scan_valid, dtype=bool)
+        if scan_valid.shape != data_yxt.shape:
+            raise ValueError("valid_mask_yxt не согласована со spike input")
+        pixel_valid = np.all(scan_valid, axis=-1)
+    else:
+        pixel_valid = np.ones(data_yxt.shape[:2], dtype=bool)
+
+    # A pooled cell with only partial detector coverage is useful for intensity
+    # display, but is not a complete measurement area. Keep it out of the
+    # global spike/background estimator and out of the spike result by default.
+    analysis_valid = scan.arrays.get("analysis_valid_mask_yx")
+    if analysis_valid is not None:
+        analysis_valid = np.asarray(analysis_valid, dtype=bool)
+        if analysis_valid.shape != data_yxt.shape[:2]:
+            raise ValueError("analysis_valid_mask_yx не согласована со spike input")
+        pixel_valid &= analysis_valid
+
+    if not np.any(pixel_valid):
+        raise ValueError("Все detector-пиксели исключены; spike detection невозможен")
+    if np.all(pixel_valid):
+        result = refine_spike_mask(
+            data_tyx,
+            max_iter=parameters["max_iter"],
+            tol=parameters["tol"],
+            verbose=False,
+            collect_kappa_fits=parameters["collect_kappa_fits"],
+        )
+        mask_tyx = np.asarray(result.spike_mask, dtype=bool)
+        clean_tyx = np.asarray(result.clean_data, dtype=float)
+    else:
+        flat = data_tyx.reshape(data_tyx.shape[0], -1)
+        keep = pixel_valid.ravel()
+        compact = flat[:, keep][:, None, :]
+        compact_result = refine_spike_mask(
+            compact,
+            max_iter=parameters["max_iter"],
+            tol=parameters["tol"],
+            verbose=False,
+            collect_kappa_fits=parameters["collect_kappa_fits"],
+        )
+        mask_flat = np.zeros(flat.shape, dtype=bool)
+        clean_flat = flat.copy()
+        mask_flat[:, keep] = np.asarray(compact_result.spike_mask).reshape(flat.shape[0], -1)
+        clean_flat[:, keep] = np.asarray(compact_result.clean_data).reshape(flat.shape[0], -1)
+        mask_tyx = mask_flat.reshape(data_tyx.shape)
+        clean_tyx = clean_flat.reshape(data_tyx.shape)
+        result = compact_result
     if not np.isfinite(float(result.kappa)):
         raise RuntimeError("Spike detection не смог определить конечное значение κ")
-    mask_tyx = np.asarray(result.spike_mask, dtype=bool)
-    clean_tyx = np.asarray(result.clean_data, dtype=float)
+    mask_tyx = np.asarray(mask_tyx, dtype=bool)
+    clean_tyx = np.asarray(clean_tyx, dtype=float)
     if mask_tyx.shape != data_tyx.shape or clean_tyx.shape != data_tyx.shape:
         raise ValueError("refine_spike_mask вернул результат с несовместимой формой")
     valid_yxt = ~np.moveaxis(mask_tyx, 0, -1)
+    if scan_valid is not None:
+        valid_yxt &= scan_valid
+    if analysis_valid is not None:
+        valid_yxt &= analysis_valid[..., None]
     clean_yxt = np.moveaxis(clean_tyx, 0, -1)
     count_map = np.count_nonzero(mask_tyx, axis=0).astype(np.int32)
 
@@ -211,7 +495,17 @@ def _run_spikes(inputs: Mapping[str, ArtifactBundle], parameters: Mapping[str, A
         "converged": bool(result.converged),
         "iterations": int(result.iterations),
         "n_spikes": int(np.count_nonzero(mask_tyx)),
-        "spike_fraction": float(np.mean(mask_tyx)),
+        "spike_fraction": float(
+            np.count_nonzero(mask_tyx) / max(1, int(np.count_nonzero(pixel_valid)) * int(data_yxt.shape[-1]))
+        ),
+        "excluded_detector_pixels": int(
+            scan.metadata.get(
+                "detector_bad_pixel_count",
+                np.count_nonzero(scan.arrays.get("detector_bad_pixel_mask_yx", np.zeros(pixel_valid.shape, dtype=bool))),
+            )
+        ),
+        "excluded_analysis_bins": int(np.count_nonzero(~pixel_valid)),
+        "analysis_grid_shape_yx": [int(v) for v in pixel_valid.shape],
         "background_median": float(result.background.median),
         "background_sigma": float(result.background.sigma),
         "background_threshold": float(result.background.threshold),
@@ -305,6 +599,23 @@ def _run_peaks(inputs: Mapping[str, ArtifactBundle], parameters: Mapping[str, An
             f"Окно Savitzky–Golay ({parameters['smooth_window']}) больше числа θ-отсчётов ({theta.size})"
         )
     data_tyx = np.moveaxis(source_data_yxt, -1, 0)
+    scan_valid = scan.arrays.get("valid_mask_yxt")
+    pixel_valid = None
+    if scan_valid is not None:
+        scan_valid = np.asarray(scan_valid, dtype=bool)
+        if scan_valid.shape != data_yxt.shape:
+            raise ValueError("valid_mask_yxt не согласована с peak input")
+        pixel_valid = np.all(scan_valid, axis=-1)
+    else:
+        pixel_valid = np.ones(data_yxt.shape[:2], dtype=bool)
+    analysis_valid = scan.arrays.get("analysis_valid_mask_yx")
+    if analysis_valid is not None:
+        analysis_valid = np.asarray(analysis_valid, dtype=bool)
+        if analysis_valid.shape != data_yxt.shape[:2]:
+            raise ValueError("analysis_valid_mask_yx не согласована с peak input")
+        pixel_valid &= analysis_valid
+    if not np.any(pixel_valid):
+        raise ValueError("Нет полностью покрытых detector-пикселей; детектор пиков невозможен")
 
     if parameters["prominence_mode"] == "sigma":
         config = PeakDetectionConfig(
@@ -332,6 +643,7 @@ def _run_peaks(inputs: Mapping[str, ArtifactBundle], parameters: Mapping[str, An
         theta,
         window_size=parameters["window_size"],
         peak_detection_config=config,
+        pixel_valid=pixel_valid,
     )
     if not isinstance(catalog, pd.DataFrame):
         catalog = pd.DataFrame(catalog)
@@ -370,6 +682,14 @@ def _run_peaks(inputs: Mapping[str, ArtifactBundle], parameters: Mapping[str, An
     metadata = {
         "grid_id": scan.metadata["grid_id"],
         "used_interpolated_data": used_interpolated_data,
+        "excluded_detector_pixels": int(
+            scan.metadata.get(
+                "detector_bad_pixel_count",
+                np.count_nonzero(scan.arrays.get("detector_bad_pixel_mask_yx", np.zeros(data_yxt.shape[:2], dtype=bool))),
+            )
+        ),
+        "excluded_analysis_bins": int(np.count_nonzero(~pixel_valid)) if pixel_valid is not None else 0,
+        "analysis_grid_shape_yx": [int(v) for v in data_yxt.shape[:2]],
         "n_peaks": int(len(catalog)),
         "n_pixels_with_peaks": int(np.count_nonzero(peak_count)),
         "background_sigma": float(background_sigma),
@@ -472,14 +792,33 @@ def _run_fit(inputs: Mapping[str, ArtifactBundle], parameters: Mapping[str, Any]
     scan_grid = str(scan.metadata.get("grid_id", ""))
     if str(peaks.metadata.get("grid_id", "")) != scan_grid:
         raise ValueError("Каталог пиков и scan относятся к разным spatial-grid")
-    spike_bundle = inputs.get("spikes") if parameters.get("use_spike_mask", True) else None
+    scan_shape = np.asarray(scan.arrays["data_yxt"]).shape
     valid_mask = None
+    detector_valid = scan.arrays.get("valid_mask_yxt")
+    if detector_valid is not None:
+        detector_valid = np.asarray(detector_valid, dtype=bool)
+        if detector_valid.shape != scan_shape:
+            raise ValueError("Scan valid_mask_yxt имеет форму, несовместимую с data_yxt")
+        valid_mask = detector_valid.copy()
+
+    analysis_valid = scan.arrays.get("analysis_valid_mask_yx")
+    if analysis_valid is not None:
+        analysis_valid = np.asarray(analysis_valid, dtype=bool)
+        if analysis_valid.shape != scan_shape[:2]:
+            raise ValueError("Scan analysis_valid_mask_yx имеет форму, несовместимую с data_yxt")
+        if valid_mask is None:
+            valid_mask = np.broadcast_to(analysis_valid[..., None], scan_shape).copy()
+        else:
+            valid_mask &= analysis_valid[..., None]
+
+    spike_bundle = inputs.get("spikes") if parameters.get("use_spike_mask", True) else None
     if spike_bundle is not None:
         if str(spike_bundle.metadata.get("grid_id", "")) != scan_grid:
             raise ValueError("Spike mask и scan относятся к разным spatial-grid")
-        valid_mask = np.asarray(spike_bundle.arrays["valid_mask_yxt"], dtype=bool)
-        if valid_mask.shape != np.asarray(scan.arrays["data_yxt"]).shape:
+        spike_valid = np.asarray(spike_bundle.arrays["valid_mask_yxt"], dtype=bool)
+        if spike_valid.shape != scan_shape:
             raise ValueError("Spike valid_mask имеет форму, несовместимую со scan")
+        valid_mask = spike_valid.copy() if valid_mask is None else (valid_mask & spike_valid)
     spec = MODEL_SPECS.get(parameters["model"])
     if spec is None:
         raise ValueError(f"Неизвестная fit-модель {parameters['model']!r}")
@@ -533,7 +872,20 @@ def _run_fit(inputs: Mapping[str, ArtifactBundle], parameters: Mapping[str, Any]
         "model_id": result.model_id,
         "model_version": result.model_version,
         "backend": result.backend,
-        "use_spike_mask": valid_mask is not None,
+        "use_spike_mask": bool(spike_bundle is not None),
+        # Count invalid detector acquisitions on the original detector grid,
+        # not output bins after pooling. The per-bin exclusions caused by partial
+        # coverage are recorded separately below.
+        "detector_invalid_samples": int(
+            scan.metadata.get("detector_bad_pixel_count", 0)
+        ) * int(scan_shape[-1]),
+        "detector_bad_pixel_count": int(scan.metadata.get("detector_bad_pixel_count", 0)),
+        "analysis_invalid_bins": int(
+            np.count_nonzero(~analysis_valid)
+        ) if analysis_valid is not None else 0,
+        "fit_excluded_samples": int(
+            np.size(valid_mask) - np.count_nonzero(valid_mask)
+        ) if valid_mask is not None else 0,
         "run_id": result.run_id,
         "fit_config": result.fit_config,
         "component_param_names": list(result.component_param_names),
@@ -563,6 +915,17 @@ def _grid_signature(parent_grid: str, operation_signature: str) -> str:
 def default_registry() -> OperationRegistry:
     """Реестр поддерживаемых операций первой интеграционной версии."""
     registry = OperationRegistry()
+    registry.register(OperationSpec(
+        operation_id="preprocess.detector_bad_pixels",
+        label="Исключение битых пикселей детектора",
+        description=(
+            "Сохраняет исходные counts и исключает заданные detector-пиксели только "
+            "через validity mask. Выполнять на исходной сетке до pooling."
+        ),
+        output_ports=("scan",),
+        execute=_run_detector_bad_pixels,
+        validate=_validate_detector_bad_pixels,
+    ))
     registry.register(OperationSpec(
         operation_id="preprocess.pool",
         label="Пространственный pooling",

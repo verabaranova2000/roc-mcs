@@ -198,88 +198,132 @@ def build_peak_catalog(
     window_size=3,
     peak_detection_config=PIXEL_PEAK_CONFIG,
     background_stats=None,
+    pixel_valid=None,
 ):
-    """
-    Формирует каталог локальных максимумов дифракционного сигнала.
-    
-    Каждая строка соответствует одному peak event (обнаруженному пику в локальной
-    области ROC), определяемой пространственной окрестностью 3×3.
-    
-    Столбцы:
-        peak_id
-        x, y
-        theta_index
-        theta
-        prominence
-        height
-    
-    Пространственная группировка пиков (clustering) и отслеживание ветвей
-    на данном этапе не выполняются.
+    """Build a local-ROC peak catalogue with optional detector validity mask.
+
+    Parameters
+    ----------
+    data_3d : array-like
+        Three-dimensional data in either supported repository layout. ``to_yxt``
+        normalizes it to (Y, X, theta).
+    pixel_valid : array-like of bool, optional
+        Spatial (Y, X) validity mask. False pixels are treated as missing
+        observations for background estimation, candidate selection and local
+        neighbourhood averaging. Their measured values are never rewritten.
+
+    Notes
+    -----
+    The mask is applied to a private working view using NaN sentinels. This is
+    deliberately local to this calculation: the source arrays and persisted
+    scan artifacts retain their original measured counts byte-for-byte.
     """
     data_3d = np.asarray(data_3d, dtype=float)
+    theta = np.asarray(th, dtype=float)
+    if data_3d.ndim != 3:
+        raise ValueError(f"data_3d должен быть трёхмерным, получено {data_3d.shape}")
+    if theta.ndim != 1 or not np.isfinite(theta).all():
+        raise ValueError("th должен быть конечной одномерной θ-осью")
 
-    # BackgroundStats работает с каноническим layout (Ntheta, Ny, Nx).
+    # Normalize once. The peak-catalogue implementation works in Y×X×theta,
+    # while the established background estimator expects theta×Y×X.
+    data_yxt = np.asarray(to_yxt(data_3d, theta), dtype=float)
+    ny, nx, ntheta = data_yxt.shape
+    if theta.size != ntheta:
+        raise ValueError(
+            f"Размер θ ({theta.size}) не согласован с данными ({ntheta})"
+        )
+
+    if pixel_valid is None:
+        valid_yx = np.ones((ny, nx), dtype=bool)
+    else:
+        valid_yx = np.asarray(pixel_valid, dtype=bool)
+        if valid_yx.shape != (ny, nx):
+            raise ValueError(
+                f"pixel_valid должен иметь форму {(ny, nx)}, получено {valid_yx.shape}"
+            )
+    if not np.any(valid_yx):
+        raise ValueError("Нет валидных пикселей для построения каталога пиков")
+
+    # A bad detector pixel is missing, not a zero-count measurement. NaN is
+    # used only inside this temporary analysis view so neither background
+    # quantiles nor neighbourhood means can be contaminated by that trace.
+    work_yxt = np.array(data_yxt, dtype=float, copy=True)
+    work_yxt[~valid_yx, :] = np.nan
+    work_tyx = np.moveaxis(work_yxt, -1, 0)
     background = (
-        estimate_background_stats(data_3d)
+        estimate_background_stats(work_tyx)
         if background_stats is None
         else background_stats
     )
 
-    # Для локальных ROC дальше используем (Ny, Nx, Ntheta).
-    data = to_yxt(data_3d, th)
-    Ny, Nx, Ntheta = data.shape
-
-    max_map = np.max(data, axis=-1)
+    # Invalid sites remain NaN; all-NaN columns are explicitly set to -inf
+    # for candidate selection without generating all-NaN reduction warnings.
+    finite = np.isfinite(work_yxt)
+    safe = np.where(finite, work_yxt, -np.inf)
+    max_map = np.max(safe, axis=-1)
+    max_map[~valid_yx] = -np.inf
 
     print(f"background median   = {background.median:.6g}")
     print(f"noise sigma          = {background.sigma:.6g}")
     print(f"background threshold = {background.threshold:.6g}")
 
     records = []
-    half_w = window_size // 2
+    half_w = int(window_size) // 2
+    if half_w < 0:
+        raise ValueError("window_size должен быть положительным")
     peak_id = 0
-
-    for y in tqdm(range(Ny), desc="Building peak catalogue", unit="row"):
+    for y in tqdm(range(ny), desc="Building peak catalogue", unit="row"):
         y_s = max(0, y - half_w)
-        y_e = min(Ny, y + half_w + 1)
-
-        for x in range(Nx):
+        y_e = min(ny, y + half_w + 1)
+        for x in range(nx):
+            if not valid_yx[y, x] or not np.isfinite(max_map[y, x]):
+                continue
             if max_map[y, x] < background.threshold:
                 continue
 
             x_s = max(0, x - half_w)
-            x_e = min(Nx, x + half_w + 1)
-            mean_curve = np.mean(data[y_s:y_e, x_s:x_e, :], axis=(0, 1))
-            smooth, peaks, props, valid_mask = detect_peaks(
+            x_e = min(nx, x + half_w + 1)
+            neighbourhood = work_yxt[y_s:y_e, x_s:x_e, :]
+            finite_neighbourhood = np.isfinite(neighbourhood)
+            n_contributors = np.count_nonzero(finite_neighbourhood, axis=(0, 1))
+            sums = np.sum(np.where(finite_neighbourhood, neighbourhood, 0.0), axis=(0, 1))
+            mean_curve = np.divide(
+                sums,
+                n_contributors,
+                out=np.full(ntheta, np.nan, dtype=float),
+                where=n_contributors > 0,
+            )
+            # The detector's peak routine expects a complete θ trace. Do not
+            # invent/interpolate missing θ samples at this stage.
+            if not np.isfinite(mean_curve).all():
+                continue
+
+            smooth, peaks, props, valid_peaks = detect_peaks(
                 mean_curve,
                 peak_detection_config,
                 noise_sigma=background.sigma,
             )
-
-            for k, is_valid in enumerate(valid_mask):
+            for k, is_valid in enumerate(valid_peaks):
                 if not is_valid:
                     continue
-
                 peak_index = int(peaks[k])
-
                 records.append({
                     "peak_id": peak_id,
                     "x": x,
                     "y": y,
                     "theta_index": peak_index,
-                    "theta": float(th[peak_index]),
+                    "theta": float(theta[peak_index]),
                     "prominence": float(props["prominences"][k]),
                     "width_samples": float(props["widths"][k]),
-                    "width_theta": float(
-                        props["widths"][k] * np.median(np.diff(th))
-                    ),
+                    "width_theta": float(props["widths"][k] * np.median(np.diff(theta))),
                     "left_ip": float(props["left_ips"][k]),
                     "right_ip": float(props["right_ips"][k]),
                     "height": float(smooth[peak_index]),
                 })
                 peak_id += 1
-    return pd.DataFrame(records), background.sigma, background.threshold
 
+    return pd.DataFrame(records), background.sigma, background.threshold
 
 
 def enrich_peak_catalog(peak_catalog, Nx):
