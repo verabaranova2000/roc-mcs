@@ -71,12 +71,23 @@ def map_detector_cursor_to_volume(
     if not (np.isfinite(width) and 0.5 <= width <= 4.0):
         raise ValueError("Ширина линии должна находиться в диапазоне [0.5, 4.0] вокселя.")
 
+    # ROI-backed VTK payloads may use a detector-aligned display lattice even
+    # when the source ROI was rotated and sampled in local (u,v).  In that
+    # representation the cursor coordinates are already detector X/Y, but
+    # the original ROI still defines the valid footprint.  Apply that exact
+    # geometry gate before the optional UV conversion below.
+    roi = getattr(payload, "roi", None)
+    if roi is not None:
+        contains = getattr(roi, "contains", None)
+        if callable(contains) and not bool(contains(x, y)):
+            return None
+
     local = map_detector_cursor_to_volume_xy(
         x,
         y,
         coord_system=str(getattr(payload, "coord_system", "xy")),
         overlay_full_detector=False,
-        roi=getattr(payload, "roi", None),
+        roi=roi,
     )
     if local is None:
         return None

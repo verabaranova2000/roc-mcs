@@ -54,6 +54,86 @@ class _OverlayToolButton(SmartDropdownButton):
         super().mousePressEvent(event)
 
 
+class _PopupHorizontalResizeGrip(QWidget):
+    """A compact drag handle that widens its owning overlay popup only."""
+
+    def __init__(self, menu: QMenu, panel: QWidget, base_width: int, parent=None):
+        super().__init__(parent)
+        self._menu = menu
+        self._panel = panel
+        self._base_width = max(1, int(base_width))
+        self._base_panel_width = max(1, int(base_width))
+        self._menu_chrome_width = 0
+        self._drag_origin = None
+        self._start_width = 0
+        self.setFixedSize(15, 13)
+        self.setCursor(Qt.CursorShape.SizeHorCursor)
+        self.setToolTip("Потяните влево/вправо, чтобы изменить ширину окна")
+        self.setAccessibleName("Изменить ширину окна настроек")
+
+    def set_base_width(self, menu_width: int, panel_width: int) -> None:
+        self._base_width = max(1, int(menu_width))
+        self._base_panel_width = max(1, int(panel_width))
+        self._menu_chrome_width = max(0, self._base_width - self._base_panel_width)
+
+    def paintEvent(self, _event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        color = self.palette().color(QPalette.ColorRole.Mid)
+        painter.setPen(QPen(color, 1.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        # Three short diagonal strokes are a familiar, low-noise resize cue.
+        for offset in (0, 4, 8):
+            painter.drawLine(self.width() - 3 - offset, self.height() - 2,
+                             self.width() - 2, self.height() - 3 - offset)
+        painter.end()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_origin = event.globalPosition().toPoint()
+            self._start_width = int(self._menu.width())
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._drag_origin is not None and event.buttons() & Qt.MouseButton.LeftButton:
+            delta = event.globalPosition().toPoint().x() - self._drag_origin.x()
+            screen = QApplication.screenAt(self._menu.frameGeometry().topLeft()) or QApplication.primaryScreen()
+            if screen is not None:
+                available = screen.availableGeometry()
+                max_width = max(self._base_width, available.right() - self._menu.frameGeometry().left() + 1)
+            else:
+                max_width = max(self._base_width, self._start_width + 600)
+            target = max(self._base_width, min(max_width, self._start_width + int(delta)))
+            # The content widget and its dedicated slider rows are expanding;
+            # labels and compact settings remain content-sized while the user
+            # gains a longer travel rail without changing any slider values.
+            panel_target = max(
+                self._base_panel_width,
+                target - self._menu_chrome_width,
+            )
+            # Fix the live width of the panel (rather than only raising its
+            # minimum).  The popup's child layout can then allocate the extra
+            # width to its expanding slider widgets, while labels and compact
+            # controls retain their natural widths and fixed spacing.
+            self._panel.setFixedWidth(panel_target)
+            layout = self._panel.layout()
+            if layout is not None:
+                layout.activate()
+            self._menu.setFixedWidth(target)
+            self._menu.resize(target, self._menu.height())
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_origin = None
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+
 class _DirectionalAxisButton(QToolButton):
     """Deterministic camera command: LMB = +axis, RMB = -axis."""
 
@@ -162,6 +242,7 @@ class VTKToolsWidget(QWidget):
     theta_slice_toggled = pyqtSignal(bool)
     projection_toggled = pyqtSignal(bool)
     cursor_line_color_changed = pyqtSignal(str)
+    roi_preview_color_changed = pyqtSignal(str)
     axis_scales_apply_requested = pyqtSignal(float, float, float)
     # Index bounds are inclusive and refer to the currently loaded physical theta axis.
     theta_display_range_changed = pyqtSignal(int, int)
@@ -170,6 +251,7 @@ class VTKToolsWidget(QWidget):
     theme_changed = pyqtSignal(str)
 
     DEFAULT_CURSOR_LINE_COLOR = "#FFBD55"
+    DEFAULT_ROI_PREVIEW_COLOR = "#FFB547"
     # 0 = restore the exact legacy icons from the supplied project archive.
     # 1..3 = the first monochrome proposal set; 4..7 = the new concepts A..D.
     SCENE_OBJECTS_ICON_VARIANT = 0
@@ -183,16 +265,23 @@ class VTKToolsWidget(QWidget):
     AXIS_SCALE_ICON_VARIANT = 1
     # 1..3 select alternate scientific icons for the live theta-volume crop tool.
     THETA_RANGE_ICON_VARIANT = 1
+    # 1..3 are alternative compact compositions for live ROI selector preview.
+    ROI_PREVIEW_ICON_VARIANT = 2
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("VTKToolBar")
         self._theme = "light"
         self._cursor_line_color = self.DEFAULT_CURSOR_LINE_COLOR
+        self._roi_preview_color = self.DEFAULT_ROI_PREVIEW_COLOR
         self._color_picker: CompactColorPicker | None = None
+        self._active_color_picker_key: str | None = None
         self._overlay_settings: dict[str, QWidget] = {}
         self._overlay_settings_menus: dict[str, QMenu] = {}
         self._overlay_settings_panels: dict[str, QWidget] = {}
+        self._overlay_popup_base_widths: dict[str, int] = {}
+        self._overlay_popup_base_menu_widths: dict[str, int] = {}
+        self._overlay_popup_base_heights: dict[str, int] = {}
         self._overlay_buttons: dict[str, _OverlayToolButton] = {}
         self._overlay_tool_specs: dict[str, dict[str, object]] = {}
         self._active_overlay_settings: str | None = None
@@ -329,6 +418,7 @@ class VTKToolsWidget(QWidget):
         row.addWidget(self.theme_btn)
 
         self.set_cursor_line_color(self._cursor_line_color)
+        self.set_roi_preview_color(self._roi_preview_color)
         self._set_icon_sizes()
         self.apply_theme("light")
 
@@ -504,6 +594,24 @@ class VTKToolsWidget(QWidget):
             QWidget#{name} QPushButton:hover {{
                 background: {c['hover']}; border-color: {c['highlight']};
             }}
+            QWidget#{name} QCheckBox,
+            QWidget#{name} QRadioButton {{
+                color: {c['text']}; spacing: 5px;
+            }}
+            QWidget#{name} QCheckBox::indicator,
+            QWidget#{name} QRadioButton::indicator {{
+                width: 12px; height: 12px;
+                background: {c['base']}; border: 1px solid {c['border']};
+                border-radius: 3px;
+            }}
+            QWidget#{name} QCheckBox::indicator:checked,
+            QWidget#{name} QRadioButton::indicator:checked {{
+                background: {c['highlight']}; border-color: {c['highlight']};
+            }}
+            QWidget#{name} QCheckBox::indicator:disabled,
+            QWidget#{name} QRadioButton::indicator:disabled {{
+                background: {c['window']}; border-color: {c['muted']};
+            }}
             QWidget#VTKAxisScalePanel QToolButton {{
                 background: {c['button']}; color: {c['button_text']};
                 border: 1px solid {c['border']}; border-radius: 3px;
@@ -535,6 +643,46 @@ class VTKToolsWidget(QWidget):
             }}
             QWidget#VTKThetaRangePanel QSlider {{
                 min-height: 15px; max-height: 16px;
+            }}
+            QWidget#VTKROIPreviewSettings QComboBox,
+            QWidget#VTKROIPreviewSettings QDoubleSpinBox,
+            QWidget#VTKROIPreviewSettings QSpinBox {{
+                min-height: 20px; max-height: 22px; padding: 0 4px;
+                background: {c['base']}; color: {c['text']};
+                border: 1px solid {c['border']}; border-radius: 3px;
+                selection-background-color: {c['highlight']};
+                selection-color: {c['highlight_text']}; font-size: 9px;
+            }}
+            QWidget#VTKROIPreviewSettings QComboBox QAbstractItemView {{
+                background: {c['base']}; color: {c['text']};
+                border: 1px solid {c['border']};
+                selection-background-color: {c['highlight']};
+                selection-color: {c['highlight_text']}; outline: 0;
+            }}
+            QWidget#VTKROIPreviewSettings QToolButton#VTKROIPreviewColorButton {{
+                background: {c['button']}; border: 1px solid {c['border']};
+                border-radius: 3px; padding: 1px;
+            }}
+            QWidget#VTKROIPreviewSettings QToolButton#VTKROIPreviewColorButton:hover {{
+                background: {c['hover']}; border-color: {c['highlight']};
+            }}
+            QWidget#VTKROIPreviewSettings QCheckBox,
+            QWidget#VTKROIPreviewSettings QRadioButton {{
+                color: {c['text']}; spacing: 5px; font-size: 9px;
+            }}
+            QWidget#VTKROIPreviewSettings QCheckBox::indicator,
+            QWidget#VTKROIPreviewSettings QRadioButton::indicator {{
+                width: 12px; height: 12px;
+                background: {c['base']}; border: 1px solid {c['border']};
+                border-radius: 3px;
+            }}
+            QWidget#VTKROIPreviewSettings QCheckBox::indicator:checked,
+            QWidget#VTKROIPreviewSettings QRadioButton::indicator:checked {{
+                background: {c['highlight']}; border-color: {c['highlight']};
+            }}
+            QWidget#VTKROIPreviewSettings QCheckBox::indicator:disabled,
+            QWidget#VTKROIPreviewSettings QRadioButton::indicator:disabled {{
+                background: {c['window']}; border-color: {c['muted']};
             }}
         """)
 
@@ -1150,6 +1298,17 @@ class VTKToolsWidget(QWidget):
             monochrome=child_monochrome,
             icon_size=16,
         )
+        roi_icon_variant = int(self.ROI_PREVIEW_ICON_VARIANT)
+        if roi_icon_variant not in (1, 2, 3):
+            raise ValueError("ROI_PREVIEW_ICON_VARIANT должен быть 1, 2 или 3.")
+        self.roi_preview_button = self.register_overlay_tool(
+            "roi_preview",
+            f"vtk_roi_preview_{roi_icon_variant}.svg",
+            "Предпросмотр ROI и выделение соответствующей части облака · ЛКМ — показать/скрыть, ПКМ — параметры",
+            settings_title="ПРЕДПРОСМОТР ROI",
+            monochrome=True,
+            icon_size=18,
+        )
         action = QWidgetAction(self.overlays_menu)
         action.setDefaultWidget(self._overlays_panel)
         self.overlays_menu.addAction(action)
@@ -1234,33 +1393,67 @@ class VTKToolsWidget(QWidget):
         title = QLabel(str(self._overlay_tool_specs[key].get("settings_title") or "ПАРАМЕТРЫ"), panel)
         title.setStyleSheet("font-size: 9px; font-weight: 650; letter-spacing: 0.35px; color: palette(mid);")
         header.addWidget(title)
-        header.addStretch(1)
 
-        if key == "cursor":
+        if key in ("cursor", "roi_preview"):
             header.addWidget(QLabel("Цвет", panel))
-            self.cursor_color_btn = QToolButton(panel)
-            self.cursor_color_btn.setObjectName("VTKCursorColorButton")
-            self.cursor_color_btn.setAutoRaise(True)
-            self.cursor_color_btn.setFixedSize(25, 19)
-            self.cursor_color_btn.setToolTip("Цвет линии курсора")
-            self.cursor_color_btn.setAccessibleName("Цвет линии курсора")
-            self.cursor_color_btn.clicked.connect(self._open_cursor_line_picker)
-            header.addWidget(self.cursor_color_btn)
-            self.cursor_line_color_action = self.cursor_color_btn
-            self.set_cursor_line_color(self._cursor_line_color)
+            color_button = QToolButton(panel)
+            color_button.setObjectName(
+                "VTKCursorColorButton" if key == "cursor" else "VTKROIPreviewColorButton"
+            )
+            color_button.setAutoRaise(True)
+            color_button.setFixedSize(25, 19)
+            color_button.setAccessibleName(
+                "Цвет линии курсора" if key == "cursor" else "Цвет подсветки облака внутри ROI"
+            )
+            color_button.clicked.connect(
+                self._open_cursor_line_picker if key == "cursor"
+                else self._open_roi_preview_color_picker
+            )
+            header.addWidget(color_button)
+            if key == "cursor":
+                color_button.setToolTip("Цвет линии курсора")
+                self.cursor_color_btn = color_button
+                self.cursor_line_color_action = color_button
+                self.set_cursor_line_color(self._cursor_line_color)
+            else:
+                color_button.setToolTip("Цвет выделяемой части облака")
+                self.roi_preview_color_btn = color_button
+                self.set_roi_preview_color(self._roi_preview_color)
         root.addLayout(header)
 
         widget.setParent(panel)
-        widget.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
+        widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
         widget.setMinimumSize(0, 0)
         apply_widget_palette(widget, self._theme)
-        root.addWidget(widget)
+        root.addWidget(widget, 1)
         widget.show()
+        if key in ("cursor", "theta"):
+            grip_row = QHBoxLayout()
+            grip_row.setContentsMargins(0, 0, 0, 0)
+            grip_row.setSpacing(0)
+            grip_row.addStretch(1)
+            grip = _PopupHorizontalResizeGrip(menu, panel, 220, panel)
+            grip_row.addWidget(grip, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignBottom)
+            root.addLayout(grip_row)
         panel.adjustSize()
-        panel.setMinimumWidth(max(220, panel.sizeHint().width()))
+        base_panel_width = max(220, panel.sizeHint().width())
+        panel.setFixedWidth(base_panel_width)
         action = QWidgetAction(menu)
         action.setDefaultWidget(panel)
         menu.addAction(action)
+        menu.adjustSize()
+        # Capture the compact, natural popup dimensions exactly once. A drag
+        # is temporary: closing the popup restores this baseline, and opening
+        # it again always starts from the original layout without stale width.
+        base_menu_width = max(base_panel_width, menu.sizeHint().width())
+        menu.setFixedWidth(base_menu_width)
+        menu.adjustSize()
+        base_menu_height = max(1, menu.sizeHint().height())
+        self._overlay_popup_base_widths[key] = base_panel_width
+        self._overlay_popup_base_menu_widths[key] = base_menu_width
+        self._overlay_popup_base_heights[key] = base_menu_height
+        if key in ("cursor", "theta"):
+            grip.set_base_width(base_menu_width, base_panel_width)
         menu.aboutToHide.connect(lambda selected_key=key: self._on_overlay_settings_hidden(selected_key))
         self._overlay_settings_panels[key] = panel
         return menu
@@ -1300,6 +1493,7 @@ class VTKToolsWidget(QWidget):
         cursor_line: QWidget | None = None,
         theta_slice: QWidget | None = None,
         projection: QWidget | None = None,
+        roi_preview: QWidget | None = None,
     ) -> None:
         if cursor_line is not None:
             self.set_overlay_settings_widget(
@@ -1312,6 +1506,10 @@ class VTKToolsWidget(QWidget):
         if projection is not None:
             self.set_overlay_settings_widget(
                 "projection", projection, settings_title="XY-ПРОЕКЦИЯ"
+            )
+        if roi_preview is not None:
+            self.set_overlay_settings_widget(
+                "roi_preview", roi_preview, settings_title="ПРЕДПРОСМОТР ROI"
             )
 
     def _popup_position_below(self, anchor: QWidget, popup_size: QSize) -> QPoint:
@@ -1327,6 +1525,27 @@ class VTKToolsWidget(QWidget):
         y = min(max(y, bounds.top()), max(bounds.top(), bounds.bottom() - popup_size.height() + 1))
         return QPoint(x, y)
 
+    def _reset_overlay_settings_popup_size(self, key: str) -> None:
+        """Restore one resizable popup to its compact opening dimensions."""
+        if key not in ("cursor", "theta"):
+            return
+        menu = self._overlay_settings_menus.get(key)
+        panel = self._overlay_settings_panels.get(key)
+        panel_width = self._overlay_popup_base_widths.get(key)
+        menu_width = self._overlay_popup_base_menu_widths.get(key)
+        if menu is None or panel is None or panel_width is None or menu_width is None:
+            return
+        # setFixedWidth also removes any larger minimum left by a previous drag.
+        panel.setFixedWidth(panel_width)
+        layout = panel.layout()
+        if layout is not None:
+            layout.activate()
+        panel.adjustSize()
+        menu.setFixedWidth(menu_width)
+        menu.resize(
+            menu_width,
+            self._overlay_popup_base_heights.get(key, menu.sizeHint().height()),
+        )
     def _show_overlay_settings(self, key: str) -> None:
         if key not in self._overlay_buttons:
             return
@@ -1350,8 +1569,18 @@ class VTKToolsWidget(QWidget):
         menu.ensurePolished()
         panel = self._overlay_settings_panels.get(key)
         if panel is not None:
-            panel.adjustSize()
+            self._reset_overlay_settings_popup_size(key)
+            layout = panel.layout()
+            if layout is not None:
+                layout.activate()
         menu.adjustSize()
+        base_menu_width = self._overlay_popup_base_menu_widths.get(key)
+        if base_menu_width is not None and key in ("cursor", "theta"):
+            menu.setFixedWidth(base_menu_width)
+            menu.resize(
+                base_menu_width,
+                self._overlay_popup_base_heights.get(key, menu.sizeHint().height()),
+            )
         menu.popup(self._popup_position_below(self._overlay_buttons[key], menu.sizeHint()))
         self.overlay_settings_requested.emit(key)
 
@@ -1359,12 +1588,13 @@ class VTKToolsWidget(QWidget):
         # A manually dismissed settings popup must not leave its nested color
         # picker visible as an orphan. Applying/closing the picker itself does
         # not hide this parent menu, so the normal Apply path is unaffected.
-        if key == "cursor" and self._color_picker is not None:
+        if key in ("cursor", "roi_preview") and self._active_color_picker_key == key and self._color_picker is not None:
             try:
                 if self._color_picker.isVisible():
                     self._color_picker.close()
             except RuntimeError:
                 self._color_picker = None
+                self._active_color_picker_key = None
         button = self._overlay_buttons.get(key)
         if button is not None:
             button.setProperty("settingsActive", False)
@@ -1372,6 +1602,7 @@ class VTKToolsWidget(QWidget):
             button.style().polish(button)
         if self._active_overlay_settings == key:
             self._active_overlay_settings = None
+        self._reset_overlay_settings_popup_size(key)
 
     def _close_overlay_settings(self) -> None:
         # Closing an options child never closes the primary two-button menu.
@@ -1440,26 +1671,56 @@ class VTKToolsWidget(QWidget):
             f"Цвет линии курсора · {self._cursor_line_color}. Нажмите, чтобы выбрать цвет."
         )
 
+    @property
+    def roi_preview_color(self) -> str:
+        return self._roi_preview_color
+
+    def set_roi_preview_color(self, color: str) -> None:
+        candidate = QColor(str(color))
+        if not candidate.isValid():
+            raise ValueError(f"Некорректный цвет подсветки ROI: {color!r}")
+        self._roi_preview_color = candidate.name(QColor.NameFormat.HexRgb).upper()
+        button = getattr(self, "roi_preview_color_btn", None)
+        if button is not None:
+            button.setIcon(self._color_swatch_icon(self._roi_preview_color))
+            button.setToolTip(
+                f"Цвет выделения облака внутри ROI · {self._roi_preview_color}. Нажмите, чтобы выбрать."
+            )
+
     def _open_cursor_line_picker(self) -> None:
+        self._open_overlay_color_picker("cursor")
+
+    def _open_roi_preview_color_picker(self) -> None:
+        self._open_overlay_color_picker("roi_preview")
+
+    def _open_overlay_color_picker(self, key: str) -> None:
         try:
             if self._color_picker is not None:
                 self._color_picker.close()
         except RuntimeError:
             pass
-        parent_menu = self._overlay_settings_menus.get("cursor", self.overlays_menu)
-        picker = CompactColorPicker(self._cursor_line_color, parent_menu, popup=True)
-        picker.color_selected.connect(self._on_cursor_color_selected)
-        # Closing an older picker can be deferred by WA_DeleteOnClose. Clear
-        # the reference only if that exact instance is still current, otherwise
-        # a delayed destroyed() from the old popup could orphan a newly opened one.
+        if key == "cursor":
+            color = self._cursor_line_color
+            button = self.cursor_color_btn
+            handler = self._on_cursor_color_selected
+        elif key == "roi_preview":
+            color = self._roi_preview_color
+            button = self.roi_preview_color_btn
+            handler = self._on_roi_preview_color_selected
+        else:
+            raise KeyError(f"Неизвестный ключ color picker: {key!r}")
+        parent_menu = self._overlay_settings_menus.get(key, self.overlays_menu)
+        picker = CompactColorPicker(color, parent_menu, popup=True)
+        picker.color_selected.connect(handler)
         picker.destroyed.connect(
             lambda *_args, selected=picker: self._clear_color_picker_reference(selected)
         )
         picker.ensurePolished()
-        point = self._popup_position_below(self.cursor_color_btn, picker.sizeHint())
+        point = self._popup_position_below(button, picker.sizeHint())
         picker.move(point)
         picker.apply_theme(self._theme)
         self._color_picker = picker
+        self._active_color_picker_key = key
         # Qt.Popup is deliberately parented to the options QMenu. Qt therefore
         # treats it as a nested popup: swatch clicks and Apply/Cancel do not
         # dismiss the two-button launcher or its settings popup.
@@ -1468,10 +1729,15 @@ class VTKToolsWidget(QWidget):
     def _clear_color_picker_reference(self, picker: CompactColorPicker) -> None:
         if self._color_picker is picker:
             self._color_picker = None
+            self._active_color_picker_key = None
 
     def _on_cursor_color_selected(self, color: str) -> None:
         self.set_cursor_line_color(color)
         self.cursor_line_color_changed.emit(self._cursor_line_color)
+
+    def _on_roi_preview_color_selected(self, color: str) -> None:
+        self.set_roi_preview_color(color)
+        self.roi_preview_color_changed.emit(self._roi_preview_color)
 
     def _toggle_theme(self) -> None:
         self.theme_changed.emit("dark" if self._theme == "light" else "light")
@@ -1559,6 +1825,7 @@ class VTKToolsWidget(QWidget):
         self.theme_btn.setToolTip(f"Переключить viewer на {target_theme} тему")
 
         self.set_cursor_line_color(self._cursor_line_color)
+        self.set_roi_preview_color(self._roi_preview_color)
         self._set_icon_sizes()
         for menu in (self.orientation_menu, self.camera_menu, self.overlays_menu,
                      self.theta_range_menu, self.axis_scale_menu, *self._overlay_settings_menus.values()):
@@ -1648,13 +1915,16 @@ class VTKToolsWidget(QWidget):
         self.theta_boundary_opacity_value.setEnabled(show_boundary_options)
 
     def set_overlay_controls_enabled(
-        self, *, cursor: bool, theta: bool, projection: bool = True
+        self, *, cursor: bool, theta: bool, projection: bool = True,
+        roi_preview: bool = True,
     ) -> None:
         self.set_overlay_tool_enabled("cursor", cursor)
         self.set_overlay_tool_enabled("theta", theta)
         self.set_overlay_tool_enabled("projection", projection)
+        self.set_overlay_tool_enabled("roi_preview", roi_preview)
         for key, available in (
-            ("cursor", cursor), ("theta", theta), ("projection", projection)
+            ("cursor", cursor), ("theta", theta), ("projection", projection),
+            ("roi_preview", roi_preview),
         ):
             widget = self._overlay_settings.get(key)
             if widget is not None:
@@ -1662,3 +1932,6 @@ class VTKToolsWidget(QWidget):
         color_button = getattr(self, "cursor_color_btn", None)
         if color_button is not None:
             color_button.setEnabled(bool(cursor))
+        roi_color_button = getattr(self, "roi_preview_color_btn", None)
+        if roi_color_button is not None:
+            roi_color_button.setEnabled(bool(roi_preview))

@@ -380,6 +380,28 @@ class VTKVolumeScene:
         self._theta_boundary_plane_append = None
         self._theta_boundary_plane_mapper = None
         self._theta_boundary_plane_actor = None
+        # Live editable selector preview. These persistent actors are created
+        # once and only their tiny polydata is replaced while the user edits.
+        self._roi_preview_roi = None
+        self._roi_preview_enabled = False
+        self._roi_preview_options = {
+            "selector_type": "rect",
+            "geometry_mode": "surface",
+            "show_fill": True,
+            "show_outline": True,
+            "show_points": False,
+            "opacity": 0.10,
+            "highlight_mode": "inside",
+            "highlight_strength": 0.92,
+            "highlight_color": "#FFB547",
+            "thickness_voxels": 1.5,
+        }
+        self._roi_preview_surface_polydata = None
+        self._roi_preview_outline_polydata = None
+        self._roi_preview_points_polydata = None
+        self._roi_preview_surface_actor = None
+        self._roi_preview_outline_actor = None
+        self._roi_preview_points_actor = None
         self._camera_observer_id = None
         self.projection_grid = None
         self.projection_mapper = None
@@ -530,6 +552,57 @@ class VTKVolumeScene:
         self._theta_boundary_plane_actor.SetVisibility(0)
         self.renderer.AddActor(self._theta_boundary_plane_actor)
 
+        # ROI selector preview is a small, display-only overlay. Separate fill,
+        # outline and sample-marker actors let users reduce visual density
+        # without touching the rendered volume or its transfer function.
+        self._roi_preview_surface_polydata = vtk.vtkPolyData()
+        self._roi_preview_outline_polydata = vtk.vtkPolyData()
+        self._roi_preview_points_polydata = vtk.vtkPolyData()
+        self._roi_preview_surface_mapper = vtk.vtkPolyDataMapper()
+        self._roi_preview_surface_mapper.SetInputData(self._roi_preview_surface_polydata)
+        self._roi_preview_outline_mapper = vtk.vtkPolyDataMapper()
+        self._roi_preview_outline_mapper.SetInputData(self._roi_preview_outline_polydata)
+        self._roi_preview_points_mapper = vtk.vtkPolyDataMapper()
+        self._roi_preview_points_mapper.SetInputData(self._roi_preview_points_polydata)
+
+        self._roi_preview_surface_actor = vtk.vtkActor()
+        self._roi_preview_surface_actor.SetMapper(self._roi_preview_surface_mapper)
+        self._roi_preview_outline_actor = vtk.vtkActor()
+        self._roi_preview_outline_actor.SetMapper(self._roi_preview_outline_mapper)
+        self._roi_preview_points_actor = vtk.vtkActor()
+        self._roi_preview_points_actor.SetMapper(self._roi_preview_points_mapper)
+        for actor in (
+            self._roi_preview_surface_actor,
+            self._roi_preview_outline_actor,
+            self._roi_preview_points_actor,
+        ):
+            actor.PickableOff()
+            if hasattr(actor, "UseBoundsOff"):
+                actor.UseBoundsOff()
+            # Keep the same shared ROI transform as the volume/frame. For the
+            # normal HDF5 path it is identity (detector-grid regridding); this
+            # also keeps direct local-(u,v) scene payloads geometrically valid.
+            actor.SetUserMatrix(self._scene_user_matrix)
+            actor.SetVisibility(0)
+            self.renderer.AddActor(actor)
+        surface_property = self._roi_preview_surface_actor.GetProperty()
+        surface_property.SetLighting(False)
+        surface_property.SetAmbient(1.0)
+        surface_property.SetDiffuse(0.0)
+        outline_property = self._roi_preview_outline_actor.GetProperty()
+        outline_property.SetLighting(False)
+        outline_property.SetAmbient(1.0)
+        outline_property.SetDiffuse(0.0)
+        outline_property.SetLineWidth(1.8)
+        points_property = self._roi_preview_points_actor.GetProperty()
+        points_property.SetLighting(False)
+        points_property.SetAmbient(1.0)
+        points_property.SetDiffuse(0.0)
+        points_property.SetPointSize(6.0)
+        if hasattr(points_property, "SetRenderPointsAsSpheres"):
+            points_property.SetRenderPointsAsSpheres(True)
+        self._style_roi_preview()
+
         # Billboard text always faces the camera. Its anchors are transformed
         # explicitly in _make_axis_text because vtkAssembly does not reliably
         # propagate transforms to vtkBillboardTextActor3D in this pipeline.
@@ -605,6 +678,518 @@ class VTKVolumeScene:
             text.SetVerticalJustificationToCentered()
             text.SetBackgroundOpacity(0.0)
         self._style_theta_boundary_planes()
+
+    def _style_roi_preview(self) -> None:
+        """Apply one restrained, theme-aware accent to all ROI preview layers."""
+        if self.theme == "dark":
+            accent = (0.20, 0.84, 0.77)
+        else:
+            accent = (0.00, 0.48, 0.44)
+        if self._roi_preview_surface_actor is not None:
+            prop = self._roi_preview_surface_actor.GetProperty()
+            prop.SetColor(*accent)
+            prop.SetOpacity(float(self._roi_preview_options.get("opacity", 0.10)))
+        if self._roi_preview_outline_actor is not None:
+            prop = self._roi_preview_outline_actor.GetProperty()
+            prop.SetColor(*accent)
+            prop.SetOpacity(0.96)
+            prop.SetLineWidth(1.8)
+        if self._roi_preview_points_actor is not None:
+            prop = self._roi_preview_points_actor.GetProperty()
+            prop.SetColor(1.0, 0.88, 0.48) if self.theme == "dark" else prop.SetColor(0.72, 0.31, 0.04)
+            prop.SetOpacity(1.0)
+            prop.SetPointSize(5.5)
+
+    @staticmethod
+    def _roi_preview_polydata(vtk: Any, coordinates, cells, cell_kind: str):
+        """Create tiny double-precision polygon/line/vertex polydata."""
+        data = vtk.vtkPolyData()
+        points = vtk.vtkPoints()
+        points.SetDataTypeToDouble()
+        for xyz in coordinates:
+            points.InsertNextPoint(float(xyz[0]), float(xyz[1]), float(xyz[2]))
+        if cell_kind == "polys":
+            cell_array = vtk.vtkCellArray()
+            for cell in cells:
+                ids = vtk.vtkIdList()
+                for index in cell:
+                    ids.InsertNextId(int(index))
+                cell_array.InsertNextCell(ids)
+            data.SetPolys(cell_array)
+        elif cell_kind == "lines":
+            cell_array = vtk.vtkCellArray()
+            for cell in cells:
+                ids = vtk.vtkIdList()
+                for index in cell:
+                    ids.InsertNextId(int(index))
+                cell_array.InsertNextCell(ids)
+            data.SetLines(cell_array)
+        elif cell_kind == "verts":
+            cell_array = vtk.vtkCellArray()
+            for index in cells:
+                cell_array.InsertNextCell(1)
+                cell_array.InsertCellPoint(int(index))
+            data.SetVerts(cell_array)
+        else:
+            raise ValueError(f"Неизвестный тип ROI preview cells: {cell_kind!r}.")
+        data.SetPoints(points)
+        data.Modified()
+        return data
+
+    @staticmethod
+    def _roi_preview_map_axis(value: float, physical_axis, display_axis) -> float:
+        if physical_axis is None or display_axis is None:
+            return float(value)
+        source = np.asarray(physical_axis, dtype=np.float64)
+        display = np.asarray(display_axis, dtype=np.float64)
+        if source.size < 2 or display.size != source.size:
+            return float(value)
+        source_center = 0.5 * (float(source[0]) + float(source[-1]))
+        display_center = 0.5 * (float(display[0]) + float(display[-1]))
+        source_span = float(source[-1] - source[0])
+        display_span = float(display[-1] - display[0])
+        if not np.isfinite(source_span) or source_span <= 0.0:
+            return float(value)
+        return display_center + (float(value) - source_center) * (display_span / source_span)
+
+    def set_roi_preview(
+        self,
+        roi: Any,
+        *,
+        selector_type: str | None = None,
+        show_fill: bool = True,
+        show_outline: bool = True,
+        show_points: bool = False,
+        opacity: float = 0.10,
+        geometry_mode: str | None = None,
+        highlight_mode: str = "inside",
+        highlight_strength: float = 0.92,
+        highlight_color: str = "#FFB547",
+        thickness_voxels: float = 1.5,
+        render: bool = True,
+    ) -> None:
+        """Set live selector geometry and GPU cloud emphasis without reloading data.
+
+        ``highlight_mode`` is one of ``off``, ``inside`` (color only the
+        intersecting volume samples), or ``context`` (also dim non-selected
+        samples). Line/point selections have zero mathematical area, so their
+        display footprint is specified separately in voxel-width units.
+        """
+        kind = str(selector_type or getattr(roi, "type", "rect")).lower()
+        if kind not in ("rect", "line", "point"):
+            raise ValueError("ROI preview поддерживает типы rect, line и point.")
+        try:
+            cx = float(roi.cx)
+            cy = float(roi.cy)
+            width = float(getattr(roi, "width", 0.0))
+            height = float(getattr(roi, "height", 0.0))
+            angle = float(getattr(roi, "angle", 0.0))
+            alpha = float(opacity)
+            strength = float(highlight_strength)
+            thickness = float(thickness_voxels)
+        except (AttributeError, TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("Для ROI preview нужны cx/cy/width/height/angle и числовые параметры отображения.") from exc
+        if not all(np.isfinite(value) for value in (cx, cy, width, height, angle, alpha, strength, thickness)):
+            raise ValueError("Параметры ROI preview должны быть конечными числами.")
+        if kind in ("rect", "line") and width <= 0.0:
+            raise ValueError("Ширина/длина ROI preview должна быть > 0.")
+        if kind == "rect" and height <= 0.0:
+            raise ValueError("Высота прямоугольной ROI preview должна быть > 0.")
+        if not 0.02 <= alpha <= 0.35:
+            raise ValueError("Opacity ROI preview должна лежать в диапазоне 0.02–0.35.")
+        if not 0.0 <= strength <= 1.0:
+            raise ValueError("Сила подсветки ROI должна лежать в диапазоне 0–1.")
+        if not 0.5 <= thickness <= 6.0:
+            raise ValueError("Ширина выделения линии/точки должна лежать в диапазоне 0.5–6 вокселей.")
+        mode = str(highlight_mode).strip().lower()
+        if mode not in ("off", "inside", "context"):
+            raise ValueError("Режим подсветки ROI должен быть off, inside или context.")
+        color_rgb = self._hex_rgb(highlight_color)
+        normalized_color = "#" + "".join(f"{round(component * 255):02X}" for component in color_rgb)
+        if geometry_mode is None:
+            geometry_mode = "surface" if show_fill else ("outline" if show_outline else "hidden")
+        geometry_mode = str(geometry_mode).strip().lower()
+        if geometry_mode not in ("surface", "outline", "hidden"):
+            raise ValueError("Режим геометрии ROI должен быть surface, outline или hidden.")
+
+        # Copy only the scalar geometry. The object supplied by the UI can be
+        # edited afterwards without mutating the committed preview state.
+        self._roi_preview_roi = roi.copy() if callable(getattr(roi, "copy", None)) else roi
+        self._roi_preview_options = {
+            "selector_type": kind,
+            "geometry_mode": geometry_mode,
+            "show_fill": geometry_mode == "surface",
+            "show_outline": geometry_mode in ("surface", "outline"),
+            "show_points": bool(show_points),
+            "opacity": alpha,
+            "highlight_mode": mode,
+            "highlight_strength": strength,
+            "highlight_color": normalized_color,
+            "thickness_voxels": thickness,
+        }
+        self._style_roi_preview()
+        self._update_roi_preview_geometry()
+        if render:
+            self._request_render()
+
+    def set_roi_preview_visible(self, visible: bool, *, render: bool = True) -> None:
+        """Toggle the geometric preview and the matching in-volume highlight."""
+        self._roi_preview_enabled = bool(visible)
+        self._apply_roi_preview_visibility()
+        self._update_roi_preview_shader_uniforms()
+        if render:
+            self._request_render()
+
+    def _apply_roi_preview_visibility(self) -> None:
+        ready = bool(self._roi_preview_enabled and self.payload is not None and self._roi_preview_roi is not None)
+        geometry_mode = str(self._roi_preview_options.get("geometry_mode", "surface"))
+        if self._roi_preview_surface_actor is not None:
+            self._roi_preview_surface_actor.SetVisibility(
+                1 if ready and geometry_mode == "surface" else 0
+            )
+        if self._roi_preview_outline_actor is not None:
+            self._roi_preview_outline_actor.SetVisibility(
+                1 if ready and geometry_mode in ("surface", "outline") else 0
+            )
+        if self._roi_preview_points_actor is not None:
+            self._roi_preview_points_actor.SetVisibility(
+                1 if ready and self._roi_preview_options.get("show_points", False) else 0
+            )
+
+    def _update_roi_preview_shader_uniforms(
+        self, kind: str | None = None, xy=None, *, coordinates_are_display: bool = False
+    ) -> None:
+        """Update ROI shader uniforms in the exact coordinate frame used by its actors.
+
+        ``xy`` is detector-local unless ``coordinates_are_display`` is true.
+        Geometry rebuilding passes its already-transformed vertices so that
+        UV-to-local conversion and axis scaling are never applied twice.
+        """
+        uniforms = self._theta_slice_uniforms
+        if uniforms is None:
+            return
+        options = self._roi_preview_options
+        mode_name = str(options.get("highlight_mode", "off"))
+        kind = str(kind or options.get("selector_type", "rect"))
+        active = bool(
+            self._roi_preview_enabled
+            and self.payload is not None
+            and self._roi_preview_roi is not None
+            and mode_name != "off"
+            and self._physical_x is not None
+            and self._physical_y is not None
+            and self._display_x is not None
+            and self._display_y is not None
+        )
+        uniforms.SetUniformi("rocRoiSelectionEnabled", int(active))
+        if not active:
+            return
+
+        if xy is None:
+            roi = self._roi_preview_roi
+            if kind == "point":
+                raw_xy = np.asarray([[float(roi.cx), float(roi.cy)]], dtype=np.float64)
+            else:
+                raw_xy = np.asarray(roi.corners(), dtype=np.float64).reshape(-1, 2)
+        else:
+            raw_xy = np.asarray(xy, dtype=np.float64).reshape(-1, 2)
+
+        if coordinates_are_display:
+            # _update_roi_preview_geometry has already applied the optional
+            # payload UV transform and the current display-axis mapping.
+            display_xy = np.array(raw_xy, dtype=np.float64, copy=True)
+        else:
+            if str(getattr(self.payload, "coord_system", "xy")).lower() == "uv":
+                base_roi = getattr(self.payload, "roi", None)
+                if base_roi is None:
+                    uniforms.SetUniformi("rocRoiSelectionEnabled", 0)
+                    return
+                local_x, local_y = base_roi.to_local(raw_xy[:, 0], raw_xy[:, 1])
+                raw_xy = np.column_stack((local_x, local_y))
+            display_xy = np.array(raw_xy, dtype=np.float64, copy=True)
+            display_xy[:, 0] = [
+                self._roi_preview_map_axis(v, self._physical_x, self._display_x)
+                for v in display_xy[:, 0]
+            ]
+            display_xy[:, 1] = [
+                self._roi_preview_map_axis(v, self._physical_y, self._display_y)
+                for v in display_xy[:, 1]
+            ]
+        if not np.all(np.isfinite(display_xy)):
+            uniforms.SetUniformi("rocRoiSelectionEnabled", 0)
+            return
+
+        type_code = {"rect": 0, "line": 1, "point": 2}.get(kind)
+        if type_code is None:
+            uniforms.SetUniformi("rocRoiSelectionEnabled", 0)
+            return
+        uniforms.SetUniformi("rocRoiSelectionType", type_code)
+        if kind == "rect":
+            if display_xy.shape != (4, 2):
+                uniforms.SetUniformi("rocRoiSelectionEnabled", 0)
+                return
+            area2 = float(np.sum(
+                display_xy[:, 0] * np.roll(display_xy[:, 1], -1)
+                - display_xy[:, 1] * np.roll(display_xy[:, 0], -1)
+            ))
+            if not np.isfinite(area2) or abs(area2) <= 1e-18:
+                uniforms.SetUniformi("rocRoiSelectionEnabled", 0)
+                return
+            for index, point in enumerate(display_xy):
+                uniforms.SetUniform2f(f"rocRoiQuad{index}", (float(point[0]), float(point[1])))
+            uniforms.SetUniformf("rocRoiQuadOrientation", 1.0 if area2 > 0 else -1.0)
+        elif kind == "line":
+            if display_xy.shape != (2, 2):
+                uniforms.SetUniformi("rocRoiSelectionEnabled", 0)
+                return
+            uniforms.SetUniform2f("rocRoiLineStart", (float(display_xy[0, 0]), float(display_xy[0, 1])))
+            uniforms.SetUniform2f("rocRoiLineEnd", (float(display_xy[1, 0]), float(display_xy[1, 1])))
+        else:
+            if display_xy.shape != (1, 2):
+                uniforms.SetUniformi("rocRoiSelectionEnabled", 0)
+                return
+            uniforms.SetUniform2f("rocRoiPoint", (float(display_xy[0, 0]), float(display_xy[0, 1])))
+
+        dx = float(np.median(np.diff(self._display_x)))
+        dy = float(np.median(np.diff(self._display_y)))
+        if not (np.isfinite(dx) and np.isfinite(dy) and dx > 0.0 and dy > 0.0):
+            uniforms.SetUniformi("rocRoiSelectionEnabled", 0)
+            return
+        half_width = 0.5 * float(options.get("thickness_voxels", 1.5))
+        uniforms.SetUniform2f(
+            "rocRoiFootprintRadius",
+            (max(dx * half_width, 1e-12), max(dy * half_width, 1e-12)),
+        )
+        uniforms.SetUniformi(
+            "rocRoiHighlightMode",
+            2 if mode_name == "context" else 1,
+        )
+        uniforms.SetUniformf(
+            "rocRoiHighlightStrength", float(options.get("highlight_strength", 0.92))
+        )
+        uniforms.SetUniform3f(
+            "rocRoiHighlightColor",
+            self._hex_rgb(str(options.get("highlight_color", "#FFB547"))),
+        )
+
+    def _update_roi_preview_geometry(self) -> None:
+        """Rebuild a handful of ROI preview primitives in the current display frame."""
+        if (
+            self.payload is None or self._roi_preview_roi is None
+            or self._roi_preview_surface_polydata is None
+        ):
+            self._apply_roi_preview_visibility()
+            if self._theta_slice_uniforms is not None:
+                self._theta_slice_uniforms.SetUniformi("rocRoiSelectionEnabled", 0)
+            return
+        theta = self._display_theta
+        if theta is None or len(theta) < 2:
+            self._apply_roi_preview_visibility()
+            return
+        low_index, high_index = self._theta_display_range_indices or (0, len(theta) - 1)
+        low_index = int(np.clip(low_index, 0, len(theta) - 1))
+        high_index = int(np.clip(high_index, 0, len(theta) - 1))
+        if high_index <= low_index:
+            low_index, high_index = 0, len(theta) - 1
+        z_low = float(theta[low_index])
+        z_high = float(theta[high_index])
+        # Separate the lower footprint very slightly from the XY projection;
+        # this avoids depth fighting without moving the marker outside the ROI.
+        z_step = float(np.median(np.diff(theta)))
+        if np.isfinite(z_step) and z_step > 0:
+            nudge = min(0.025 * z_step, 0.08 * (z_high - z_low))
+            z_low += nudge
+            z_high -= nudge
+        if not (np.isfinite(z_low) and np.isfinite(z_high) and z_low < z_high):
+            self._apply_roi_preview_visibility()
+            return
+
+        roi = self._roi_preview_roi
+        kind = str(self._roi_preview_options.get("selector_type", "rect"))
+        if kind == "rect":
+            xy = np.asarray(roi.corners(), dtype=np.float64).reshape(-1, 2)
+            if xy.shape != (4, 2):
+                raise ValueError("Для прямоугольной ROI preview ожидаются четыре угла.")
+        elif kind == "line":
+            xy = np.asarray(roi.corners(), dtype=np.float64).reshape(-1, 2)
+            if xy.shape != (2, 2):
+                raise ValueError("Для линейной ROI preview ожидаются два конца отрезка.")
+        else:
+            xy = np.asarray([[float(roi.cx), float(roi.cy)]], dtype=np.float64)
+        if not np.all(np.isfinite(xy)):
+            raise ValueError("Координаты ROI preview должны быть конечными.")
+
+        # A legacy/direct UV payload keeps the volume in its ROI-local frame
+        # and relies on _scene_user_matrix for detector placement. Express the
+        # independent detector-space preview in that same local frame before
+        # scaling the axes; the persistent preview actors share the matrix.
+        if str(getattr(self.payload, "coord_system", "xy")).lower() == "uv":
+            base_roi = getattr(self.payload, "roi", None)
+            if base_roi is None:
+                raise ValueError("Для UV-объёма отсутствует ROI-трансформация предпросмотра.")
+            local_x, local_y = base_roi.to_local(xy[:, 0], xy[:, 1])
+            xy = np.column_stack((local_x, local_y))
+
+        xy[:, 0] = [self._roi_preview_map_axis(v, self._physical_x, self._display_x) for v in xy[:, 0]]
+        xy[:, 1] = [self._roi_preview_map_axis(v, self._physical_y, self._display_y) for v in xy[:, 1]]
+        # The shader receives exactly these same display-space coordinates.
+        # Thus cloud highlighting and the wireframe footprint cannot drift.
+        self._update_roi_preview_shader_uniforms(kind, xy, coordinates_are_display=True)
+        z0, z1 = z_low, z_high
+        coordinates: list[tuple[float, float, float]] = []
+        polygons: list[list[int]] = []
+        segments: list[list[int]] = []
+        marker_indices: list[int] = []
+
+        def add_point(x: float, y: float, z: float) -> int:
+            index = len(coordinates)
+            coordinates.append((float(x), float(y), float(z)))
+            return index
+
+        def add_segment(a: int, b: int) -> None:
+            segments.append([int(a), int(b)])
+
+        if kind == "rect":
+            # Each lateral face spans the complete visible theta interval.
+            lower = [add_point(x, y, z0) for x, y in xy]
+            upper = [add_point(x, y, z1) for x, y in xy]
+            for i in range(4):
+                j = (i + 1) % 4
+                polygons.append([lower[i], lower[j], upper[j], upper[i]])
+                add_segment(lower[i], lower[j])
+                add_segment(upper[i], upper[j])
+                add_segment(lower[i], upper[i])
+            marker_indices.extend(lower)
+            marker_indices.extend(upper)
+        elif kind == "line":
+            # A mathematical line has zero cross-section. Its display-only
+            # footprint is a capsule: a segment dilated by an ellipse whose
+            # radii are exactly the same X/Y voxel-step radii used by the GPU
+            # distance test. Construct it in normalized ellipse coordinates,
+            # where the shader's footprint is a unit-radius capsule.
+            direction = xy[1] - xy[0]
+            display_length = float(np.linalg.norm(direction))
+            dx = float(np.median(np.diff(self._display_x)))
+            dy = float(np.median(np.diff(self._display_y)))
+            if not np.isfinite(display_length) or display_length <= 1e-12:
+                for data in (
+                    self._roi_preview_surface_polydata,
+                    self._roi_preview_outline_polydata,
+                    self._roi_preview_points_polydata,
+                ):
+                    if data is not None:
+                        data.Initialize()
+                        data.Modified()
+                self._apply_roi_preview_visibility()
+                if self._theta_slice_uniforms is not None:
+                    self._theta_slice_uniforms.SetUniformi("rocRoiSelectionEnabled", 0)
+                return
+
+            half_voxels = 0.5 * float(self._roi_preview_options.get("thickness_voxels", 1.5))
+            radius_x = max(abs(dx) * half_voxels, 1e-12)
+            radius_y = max(abs(dy) * half_voxels, 1e-12)
+            radii = np.asarray((radius_x, radius_y), dtype=np.float64)
+            p0n = xy[0] / radii
+            p1n = xy[1] / radii
+            normalized_direction = p1n - p0n
+            normalized_length = float(np.linalg.norm(normalized_direction))
+            if not np.isfinite(normalized_length) or normalized_length <= 1e-12:
+                for data in (
+                    self._roi_preview_surface_polydata,
+                    self._roi_preview_outline_polydata,
+                    self._roi_preview_points_polydata,
+                ):
+                    if data is not None:
+                        data.Initialize()
+                        data.Modified()
+                self._apply_roi_preview_visibility()
+                if self._theta_slice_uniforms is not None:
+                    self._theta_slice_uniforms.SetUniformi("rocRoiSelectionEnabled", 0)
+                return
+
+            direction_angle = float(np.arctan2(normalized_direction[1], normalized_direction[0]))
+            end_angles = np.linspace(
+                direction_angle + 0.5 * np.pi,
+                direction_angle - 0.5 * np.pi,
+                13,
+            )
+            start_angles = np.linspace(
+                direction_angle - 0.5 * np.pi,
+                direction_angle - 1.5 * np.pi,
+                13,
+            )
+            end_cap = p1n + np.column_stack((np.cos(end_angles), np.sin(end_angles)))
+            start_cap = p0n + np.column_stack((np.cos(start_angles), np.sin(start_angles)))
+            footprint = np.vstack((end_cap, start_cap)) * radii
+            lower = [add_point(x, y, z0) for x, y in footprint]
+            upper = [add_point(x, y, z1) for x, y in footprint]
+            ring_count = len(footprint)
+            for i in range(ring_count):
+                j = (i + 1) % ring_count
+                polygons.append([lower[i], lower[j], upper[j], upper[i]])
+                add_segment(lower[i], lower[j])
+                add_segment(upper[i], upper[j])
+                if i in (0, 12, 13, 25):
+                    add_segment(lower[i], upper[i])
+            # Endpoint beads, rather than a dense lattice of markers, keep the
+            # thin selector readable without turning the preview into a cage.
+            for point in (xy[0], xy[1]):
+                marker_indices.append(add_point(float(point[0]), float(point[1]), z0))
+                marker_indices.append(add_point(float(point[0]), float(point[1]), z1))
+        else:
+            # A narrow elliptical column is the point-selector analogue of
+            # the line plane: translucent body plus sparse theta-sample dots.
+            dx = float(np.median(np.diff(self._physical_x))) if self._physical_x is not None else 1.0
+            dy = float(np.median(np.diff(self._physical_y))) if self._physical_y is not None else 1.0
+            sx = (float(self._display_x[-1] - self._display_x[0]) /
+                  float(self._physical_x[-1] - self._physical_x[0])) if self._physical_x is not None else 1.0
+            sy = (float(self._display_y[-1] - self._display_y[0]) /
+                  float(self._physical_y[-1] - self._physical_y[0])) if self._physical_y is not None else 1.0
+            # A point selector is a ray, not a zero-area mathematical line:
+            # give the ray a sub-voxel body so it remains legible at normal
+            # camera distances without visually masking adjacent samples.
+            thickness = float(self._roi_preview_options.get("thickness_voxels", 1.5))
+            rx = max(abs(dx * sx) * 0.5 * thickness, 1e-6)
+            ry = max(abs(dy * sy) * 0.5 * thickness, 1e-6)
+            cx, cy = float(xy[0, 0]), float(xy[0, 1])
+            ring_size = 24
+            lower_ring = []
+            upper_ring = []
+            for i in range(ring_size):
+                angle = 2.0 * np.pi * i / ring_size
+                ox, oy = rx * np.cos(angle), ry * np.sin(angle)
+                lower_ring.append(add_point(cx + ox, cy + oy, z0))
+                upper_ring.append(add_point(cx + ox, cy + oy, z1))
+            for i in range(ring_size):
+                j = (i + 1) % ring_size
+                polygons.append([lower_ring[i], lower_ring[j], upper_ring[j], upper_ring[i]])
+                add_segment(lower_ring[i], lower_ring[j])
+                add_segment(upper_ring[i], upper_ring[j])
+                if i % 6 == 0:
+                    add_segment(lower_ring[i], upper_ring[i])
+            # The central beam remains visible even if the translucent fill is off.
+            center_low = add_point(cx, cy, z0)
+            center_high = add_point(cx, cy, z1)
+            add_segment(center_low, center_high)
+            sample_count = min(15, max(5, int(len(theta) // 5) + 1))
+            for z in np.linspace(z0, z1, sample_count):
+                marker_indices.append(add_point(cx, cy, float(z)))
+
+        surface = self._roi_preview_polydata(self.vtk, coordinates, polygons, "polys")
+        outline = self._roi_preview_polydata(self.vtk, coordinates, segments, "lines")
+        marker_points = self._roi_preview_polydata(
+            self.vtk, coordinates, marker_indices, "verts"
+        )
+        self._roi_preview_surface_polydata.DeepCopy(surface)
+        self._roi_preview_outline_polydata.DeepCopy(outline)
+        self._roi_preview_points_polydata.DeepCopy(marker_points)
+        for data in (
+            self._roi_preview_surface_polydata,
+            self._roi_preview_outline_polydata,
+            self._roi_preview_points_polydata,
+        ):
+            data.Modified()
+        self._apply_roi_preview_visibility()
 
     def _style_theta_boundary_planes(self) -> None:
         """Use a restrained theme-aware accent for the optional theta caps."""
@@ -858,6 +1443,7 @@ class VTKVolumeScene:
         else:
             self.renderer.SetBackground(1.0, 1.0, 1.0)
         self._style_geometry_axes()
+        self._style_roi_preview()
         self._update_projection_palette()
 
     def _update_projection_palette(self) -> None:
@@ -903,7 +1489,7 @@ class VTKVolumeScene:
         """
         return "\n".join((
             "vec3 rocOverlayDataPos = vec3(0.0);",
-            "if (rocThetaSliceEnabled != 0 || rocCursorLineEnabled != 0) {",
+            "if (rocThetaSliceEnabled != 0 || rocCursorLineEnabled != 0 || rocRoiSelectionEnabled != 0) {",
             "  vec4 rocOverlayDataPosH = in_textureDatasetMatrix[0] * vec4(g_dataPos, 1.0);",
             "  float rocOverlayW = abs(rocOverlayDataPosH.w) > 1e-20 ? rocOverlayDataPosH.w : 1.0;",
             "  rocOverlayDataPos = rocOverlayDataPosH.xyz / rocOverlayW;",
@@ -943,6 +1529,47 @@ class VTKVolumeScene:
             "}",
         ))
         return "\n".join(lines)
+
+    @staticmethod
+    def _roi_selection_shader_color_code() -> str:
+        """Color only ray-marched volume samples belonging to the live ROI.
+
+        This code runs inside VTK's native ``g_srcColor.a > 0`` guard. It is
+        deliberately color-only: transfer-function opacity, ray integration,
+        depth ordering and the source scalar data remain untouched. Rectangles
+        use the exact four display-space corners (a convex-quad test), while
+        line/point selections use a small elliptical footprint expressed in
+        displayed grid-step units.
+        """
+        return "\n".join((
+            "if (rocRoiSelectionEnabled != 0) {",
+            "  vec2 rocRoiSampleXY = rocOverlayDataPos.xy;",
+            "  bool rocRoiInside = false;",
+            "  if (rocRoiSelectionType == 0) {",
+            "    float rocRoiCross0 = (rocRoiQuad1.x - rocRoiQuad0.x) * (rocRoiSampleXY.y - rocRoiQuad0.y) - (rocRoiQuad1.y - rocRoiQuad0.y) * (rocRoiSampleXY.x - rocRoiQuad0.x);",
+            "    float rocRoiCross1 = (rocRoiQuad2.x - rocRoiQuad1.x) * (rocRoiSampleXY.y - rocRoiQuad1.y) - (rocRoiQuad2.y - rocRoiQuad1.y) * (rocRoiSampleXY.x - rocRoiQuad1.x);",
+            "    float rocRoiCross2 = (rocRoiQuad3.x - rocRoiQuad2.x) * (rocRoiSampleXY.y - rocRoiQuad2.y) - (rocRoiQuad3.y - rocRoiQuad2.y) * (rocRoiSampleXY.x - rocRoiQuad2.x);",
+            "    float rocRoiCross3 = (rocRoiQuad0.x - rocRoiQuad3.x) * (rocRoiSampleXY.y - rocRoiQuad3.y) - (rocRoiQuad0.y - rocRoiQuad3.y) * (rocRoiSampleXY.x - rocRoiQuad3.x);",
+            "    float rocRoiOrientation = rocRoiQuadOrientation;",
+            "    rocRoiInside = rocRoiOrientation * rocRoiCross0 >= -1e-6 && rocRoiOrientation * rocRoiCross1 >= -1e-6 && rocRoiOrientation * rocRoiCross2 >= -1e-6 && rocRoiOrientation * rocRoiCross3 >= -1e-6;",
+            "  } else if (rocRoiSelectionType == 1) {",
+            "    vec2 rocRoiSegment = rocRoiLineEnd - rocRoiLineStart;",
+            "    float rocRoiSegmentLength2 = max(dot(rocRoiSegment, rocRoiSegment), 1e-20);",
+            "    float rocRoiT = clamp(dot(rocRoiSampleXY - rocRoiLineStart, rocRoiSegment) / rocRoiSegmentLength2, 0.0, 1.0);",
+            "    vec2 rocRoiDelta = rocRoiSampleXY - (rocRoiLineStart + rocRoiT * rocRoiSegment);",
+            "    vec2 rocRoiNormalizedDelta = rocRoiDelta / max(rocRoiFootprintRadius, vec2(1e-12));",
+            "    rocRoiInside = dot(rocRoiNormalizedDelta, rocRoiNormalizedDelta) <= 1.0;",
+            "  } else {",
+            "    vec2 rocRoiDelta = (rocRoiSampleXY - rocRoiPoint) / max(rocRoiFootprintRadius, vec2(1e-12));",
+            "    rocRoiInside = dot(rocRoiDelta, rocRoiDelta) <= 1.0;",
+            "  }",
+            "  if (rocRoiInside) {",
+            "    g_srcColor.rgb = mix(g_srcColor.rgb, rocRoiHighlightColor, clamp(rocRoiHighlightStrength, 0.0, 1.0));",
+            "  } else if (rocRoiHighlightMode == 2) {",
+            "    g_srcColor.rgb *= mix(1.0, 0.32, clamp(rocRoiHighlightStrength, 0.0, 1.0));",
+            "  }",
+            "}",
+        ))
 
     @staticmethod
     def _cursor_line_shader_composite_code() -> str:
@@ -1020,6 +1647,23 @@ class VTKVolumeScene:
             "rocCursorLineColor",
             self._hex_rgb(self._cursor_line_color),
         )
+        # ROI emphasis is a color annotation inside the current GPU ray march.
+        # All uniforms exist from the first shader build; selector edits only
+        # update their values and never trigger another shader compilation.
+        uniforms.SetUniformi("rocRoiSelectionEnabled", 0)
+        uniforms.SetUniformi("rocRoiHighlightMode", 1)
+        uniforms.SetUniformi("rocRoiSelectionType", 0)
+        uniforms.SetUniform2f("rocRoiQuad0", (0.0, 0.0))
+        uniforms.SetUniform2f("rocRoiQuad1", (0.0, 0.0))
+        uniforms.SetUniform2f("rocRoiQuad2", (0.0, 0.0))
+        uniforms.SetUniform2f("rocRoiQuad3", (0.0, 0.0))
+        uniforms.SetUniformf("rocRoiQuadOrientation", 1.0)
+        uniforms.SetUniform2f("rocRoiLineStart", (0.0, 0.0))
+        uniforms.SetUniform2f("rocRoiLineEnd", (0.0, 0.0))
+        uniforms.SetUniform2f("rocRoiPoint", (0.0, 0.0))
+        uniforms.SetUniform2f("rocRoiFootprintRadius", (1.0, 1.0))
+        uniforms.SetUniform3f("rocRoiHighlightColor", self._hex_rgb("#FFB547"))
+        uniforms.SetUniformf("rocRoiHighlightStrength", 0.92)
         for index in range(self._THETA_PALETTE_UNIFORM_COUNT):
             uniforms.SetUniform3f(f"rocThetaPalette{index:02d}", (0.0, 0.0, 0.0))
 
@@ -1039,7 +1683,9 @@ class VTKVolumeScene:
         shader_property.AddFragmentShaderReplacement(
             theta_anchor,
             False,
-            self._theta_slice_shader_color_code() + "\n" + theta_anchor,
+            self._theta_slice_shader_color_code()
+            + "\n" + self._roi_selection_shader_color_code()
+            + "\n" + theta_anchor,
             False,
         )
         # 3) Add an independent optical cursor immediately after the native
@@ -1198,11 +1844,30 @@ class VTKVolumeScene:
         """Parse a strict #RRGGBB color without introducing a Qt dependency."""
         value = str(color).strip()
         if len(value) != 7 or value[0] != "#":
-            raise ValueError("Цвет линии должен быть задан в формате #RRGGBB.")
+            raise ValueError("Цвет должен быть задан в формате #RRGGBB.")
         try:
             return tuple(int(value[index:index + 2], 16) / 255.0 for index in (1, 3, 5))
         except ValueError as exc:
-            raise ValueError("Цвет линии должен быть задан в формате #RRGGBB.") from exc
+            raise ValueError("Цвет должен быть задан в формате #RRGGBB.") from exc
+
+    @property
+    def roi_preview_color(self) -> str:
+        """Current ROI cloud-highlight color in normalized #RRGGBB form."""
+        return str(self._roi_preview_options.get("highlight_color", "#FFB547"))
+
+    def set_roi_preview_color(self, color: str, *, render: bool = True) -> None:
+        """Update only the ROI highlight color, preserving geometry and volume state."""
+        rgb = self._hex_rgb(color)
+        normalized = "#" + "".join(f"{round(component * 255):02X}" for component in rgb)
+        self._roi_preview_options["highlight_color"] = normalized
+        if self._theta_slice_uniforms is not None:
+            self._theta_slice_uniforms.SetUniform3f("rocRoiHighlightColor", rgb)
+        if (
+            render
+            and self._roi_preview_enabled
+            and str(self._roi_preview_options.get("highlight_mode", "off")) != "off"
+        ):
+            self._request_render()
 
     @property
     def cursor_line_color(self) -> str:
@@ -1440,6 +2105,7 @@ class VTKVolumeScene:
         self._cursor_line_radii = None
         self._theta_boundary_planes_visible = False
         self._theta_boundary_plane_opacity = 0.12
+        self._apply_roi_preview_visibility()
         if self._theta_boundary_plane_actor is not None:
             self._theta_boundary_plane_actor.SetVisibility(0)
             self._theta_boundary_plane_actor.GetProperty().SetOpacity(
@@ -1563,6 +2229,7 @@ class VTKVolumeScene:
         self._theta_scale = 1.0
         self.set_axis_scales(*requested_scales, render=False)
         self._update_theta_boundary_planes()
+        self._update_roi_preview_geometry()
         # Actor transforms contain only the ROI-to-detector transform.
         # Display scale lives in the rectilinear-grid coordinate arrays.
         for prop in (self.outline_actor, self.axis_tick_actor, self.grid_actor):
@@ -1862,6 +2529,7 @@ class VTKVolumeScene:
                 pass
             raise
 
+        self._update_roi_preview_geometry()
         if render:
             self._request_render()
         return (low, high)
@@ -2076,6 +2744,7 @@ class VTKVolumeScene:
                 self._request_render()
             raise
 
+        self._update_roi_preview_geometry()
         if render:
             self._request_render()
 
@@ -2305,6 +2974,16 @@ class VTKVolumeScene:
             "cursor_line_density_per_voxel": float(self._cursor_line_density),
             "cursor_line_source_runs_at_zero_volume_opacity": True,
             "cursor_line_changes_volume_opacity_function": False,
+            "roi_preview_highlight_mode": str(self._roi_preview_options.get("highlight_mode", "off")),
+            "roi_preview_highlight_enabled": bool(
+                self._roi_preview_enabled
+                and self._roi_preview_options.get("highlight_mode", "off") != "off"
+                and self._theta_slice_uniforms is not None
+            ),
+            "roi_preview_highlight_strength": float(self._roi_preview_options.get("highlight_strength", 0.0)),
+            "roi_preview_highlight_color": str(self._roi_preview_options.get("highlight_color", "#FFB547")),
+            "roi_preview_thickness_voxels": float(self._roi_preview_options.get("thickness_voxels", 1.5)),
+            "roi_preview_highlight_mode_description": "in_volume_ray_sample_rgb_preserving_source_alpha",
             "projection_opacity": float(self.projection_actor.GetProperty().GetOpacity()) if self.projection_actor is not None else None,
             "projection_bounds": _safe_bounds(self.projection_actor),
             "projection_scalar_range": (
@@ -2521,6 +3200,7 @@ class VTKVolumeScene:
         self._cursor_line_position = None
         self._cursor_line_radii = None
         self.payload = None
+        self._apply_roi_preview_visibility()
         self.grid = None
         self.grid_info = None
         self.mapper = None

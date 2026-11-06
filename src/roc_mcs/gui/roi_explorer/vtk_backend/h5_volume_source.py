@@ -162,6 +162,105 @@ def _sum_projection_chunked(volume: np.ndarray, chunk_x: int = 32) -> np.ndarray
     return projection
 
 
+def _regrid_rotated_roi_to_detector(
+    roi_volume: Any,
+    roi: Any,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Convert a local ``(u, v, theta)`` ROI grid to an axis-aligned detector grid.
+
+    ``vtkGPUVolumeRayCastMapper`` is reliable for rectilinear datasets, but a
+    rotated ``vtkVolume.SetUserMatrix`` makes its ray-sampling coordinates
+    disagree with the rectilinear texture coordinates on some VTK/OpenGL
+    builds.  The result is especially misleading for sparse/high-contrast
+    data: the XY plane remains visible while the volume is reduced to a fuzzy
+    sheet.  Regridding the *display copy* to detector X/Y avoids that failure
+    mode without changing the source HDF5 data or the ROI extraction result.
+
+    The ROI is sampled once onto a regular detector-aligned lattice.  Its
+    exact rotated footprint is retained by ``roi.contains``; points outside
+    that polygon remain NaN and are made transparent by the VTK adapter.  The
+    local extraction remains the single authoritative interpolation from the
+    detector measurements, so this function is only a coordinate/display
+    conversion.  Float precision is preserved from the input array.
+    """
+    source = np.asarray(roi_volume.volume)
+    u_axis = np.asarray(roi_volume.x, dtype=np.float64)
+    v_axis = np.asarray(roi_volume.y, dtype=np.float64)
+    theta = np.asarray(roi_volume.theta)
+    if source.ndim != 3 or source.shape != (u_axis.size, v_axis.size, theta.size):
+        raise ValueError(
+            "Нельзя перестроить повернутую ROI-сетку: volume и оси (u,v,theta) не согласованы."
+        )
+    if u_axis.size < 2 or v_axis.size < 2 or theta.size < 2:
+        raise ValueError("Для 3D-перестройки повернутой ROI нужны минимум два узла по каждой оси.")
+    for name, axis in (("u", u_axis), ("v", v_axis)):
+        if not np.all(np.isfinite(axis)) or not np.all(np.diff(axis) > 0.0):
+            raise ValueError(f"Локальная ось {name} должна быть конечной и строго возрастающей.")
+
+    corners = np.asarray(roi.corners(), dtype=np.float64).reshape(-1, 2)
+    if corners.shape[0] != 4 or not np.all(np.isfinite(corners)):
+        raise ValueError("Для перестройки ожидаются четыре конечные вершины прямоугольной ROI.")
+    x_min, x_max = float(corners[:, 0].min()), float(corners[:, 0].max())
+    y_min, y_max = float(corners[:, 1].min()), float(corners[:, 1].max())
+    du = float(np.median(np.diff(u_axis)))
+    dv = float(np.median(np.diff(v_axis)))
+    step = min(abs(du), abs(dv))
+    if not np.isfinite(step) or step <= 0.0:
+        raise ValueError("Не удалось определить положительный шаг локальной ROI-сетки.")
+
+    # Use the detector-space AABB only as the rectangular storage lattice.
+    # The validity mask below keeps the true rotated rectangle, not this box.
+    nx = max(2, int(np.ceil((x_max - x_min) / step)) + 1)
+    ny = max(2, int(np.ceil((y_max - y_min) / step)) + 1)
+    # Rotation expands the axis-aligned bounding box. Bound the display-only
+    # resampling work using the same six-million-voxel budget as ROI extraction.
+    # Keep theta resolution exact; reduce only the two display-plane dimensions.
+    max_xy = max(4, int(np.ceil(np.sqrt(6_000_000 / max(1, theta.size)))))
+    if max(nx, ny) > max_xy:
+        reduction = max(nx, ny) / max_xy
+        # Match the Plotly ROI display lattice exactly: both renderers then
+        # use the same detector-space bounds and the same bounded dimensions.
+        nx = max(2, int(np.ceil(nx / reduction)))
+        ny = max(2, int(np.ceil(ny / reduction)))
+    x_axis = np.linspace(x_min, x_max, nx, dtype=np.float64)
+    y_axis = np.linspace(y_min, y_max, ny, dtype=np.float64)
+    detector_x, detector_y = np.meshgrid(x_axis, y_axis, indexing="ij")
+    local_u, local_v = roi.to_local(detector_x, detector_y)
+    iu = np.interp(local_u, u_axis, np.arange(u_axis.size, dtype=np.float64), left=np.nan, right=np.nan)
+    iv = np.interp(local_v, v_axis, np.arange(v_axis.size, dtype=np.float64), left=np.nan, right=np.nan)
+    inside = np.asarray(roi.contains(detector_x, detector_y), dtype=bool)
+    inside &= np.isfinite(iu) & np.isfinite(iv)
+    sample_coordinates = [np.where(inside, iu, -1.0), np.where(inside, iv, -1.0)]
+
+    try:
+        from scipy.ndimage import map_coordinates
+    except ImportError as exc:
+        raise ImportError("Для отображения повернутой ROI в VTK требуется scipy.") from exc
+
+    output_dtype = source.dtype if np.issubdtype(source.dtype, np.floating) else np.dtype(np.float64)
+    output = np.full((nx, ny, theta.size), np.nan, dtype=output_dtype)
+    for index in range(theta.size):
+        layer = np.asarray(source[:, :, index], dtype=output_dtype)
+        valid = np.isfinite(layer)
+        numerator = map_coordinates(
+            np.where(valid, layer, 0.0), sample_coordinates,
+            order=1, mode="constant", cval=0.0,
+        )
+        weights = map_coordinates(
+            valid.astype(output_dtype, copy=False), sample_coordinates,
+            order=1, mode="constant", cval=0.0,
+        )
+        usable = inside & (weights > 1e-8)
+        np.divide(
+            numerator, weights,
+            out=output[:, :, index],
+            where=usable,
+        )
+        output[:, :, index][~usable] = np.nan
+
+    return x_axis, y_axis, output
+
+
 class H5VolumeLoader:
     """Loads full-detector or rectangular ROI volumes directly from HDF5.
 
@@ -360,6 +459,14 @@ class H5VolumeLoader:
             y = np.asarray(roi_volume.y)
             theta = np.asarray(roi_volume.theta)
             coord_system = str(roi_volume.coord_system)
+            if coord_system == "uv":
+                # Keep the ROI's exact rotated footprint, but hand the VTK GPU
+                # mapper an axis-aligned rectilinear grid.  Do not apply an
+                # actor rotation to vtkVolume: on affected GPU backends that
+                # leaves the bounds transformed while the scalar sampling is
+                # evaluated in a mismatched coordinate frame.
+                x, y, volume = _regrid_rotated_roi_to_detector(roi_volume, roi)
+                coord_system = "xy"
             source_shape = tuple(int(v) for v in scan.data.shape)
         else:
             # ScanData.yxt is always (y,x,theta), irrespective of native HDF5 theta axis.

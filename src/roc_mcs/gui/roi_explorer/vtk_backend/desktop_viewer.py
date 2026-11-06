@@ -12,6 +12,7 @@ from typing import Any
 
 import numpy as np
 
+from roc_mcs.roi.roi_types import ROI
 from roc_mcs.gui.app_settings import (
     load_detector_bad_pixels,
     normalize_detector_bad_pixels,
@@ -207,6 +208,7 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
             self.loader: H5VolumeLoader | None = None
             self.payload: VolumePayload | None = None
             self._roi_geometry_initialized = False
+            self._roi_preview_initialized = False
             self._roi_by_scan: dict[str, tuple[float, float, float, float, float]] = {}
             self._active_roi_scan_key: str | None = None
             self._thread = None
@@ -264,6 +266,12 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
             self._cursor_line_update_timer.setSingleShot(True)
             self._cursor_line_update_timer.setInterval(16)
             self._cursor_line_update_timer.timeout.connect(self._apply_pending_map_cursor_position)
+            # Live ROI preview edits only replace a handful of VTK primitives
+            # and shader uniforms. Coalesce control changes into one update.
+            self._roi_preview_update_timer = QtCore.QTimer(self)
+            self._roi_preview_update_timer.setSingleShot(True)
+            self._roi_preview_update_timer.setInterval(25)
+            self._roi_preview_update_timer.timeout.connect(self._apply_pending_roi_preview)
             # The range rail is a continuous gesture control.  Coalesce its
             # mouse-move events before rebuilding the transfer functions.
             self._volume_display_update_timer = QtCore.QTimer(self)
@@ -459,6 +467,94 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
             self.projection_apply_button.clicked.connect(self.apply_display)
             projection_layout.addWidget(self.projection_apply_button, 2, 0, 1, 2)
 
+            # This popup is deliberately independent from the data-loading ROI
+            # controls in the left panel. It is a live display-only selector
+            # preview for testing rect/line/point geometry in the VTK scene.
+            self.roi_preview_group = QtWidgets.QWidget()
+            self.roi_preview_group.setObjectName("VTKROIPreviewSettings")
+            preview_layout = QtWidgets.QGridLayout(self.roi_preview_group)
+            preview_layout.setContentsMargins(1, 1, 1, 1)
+            preview_layout.setHorizontalSpacing(6)
+            preview_layout.setVerticalSpacing(4)
+            self.roi_preview_type = QtWidgets.QComboBox()
+            self.roi_preview_type.addItem("Прямоугольник", "rect")
+            self.roi_preview_type.addItem("Отрезок", "line")
+            self.roi_preview_type.addItem("Точка", "point")
+            self.roi_preview_type.setToolTip("Тип независимого отображаемого селектора")
+            self.roi_preview_cx = self._double_spin(-1e9, 1e9, 0.0, 3, 0.1)
+            self.roi_preview_cy = self._double_spin(-1e9, 1e9, 0.0, 3, 0.1)
+            self.roi_preview_width = self._double_spin(0.001, 1e9, 20.0, 3, 0.1)
+            self.roi_preview_height = self._double_spin(0.001, 1e9, 12.0, 3, 0.1)
+            self.roi_preview_angle = self._double_spin(-180.0, 180.0, 0.0, 3, 0.5)
+            self.roi_preview_opacity = self._double_spin(0.02, 0.35, 0.10, 2, 0.01)
+            self.roi_preview_strength = self._double_spin(0.0, 1.0, 0.92, 2, 0.05)
+            self.roi_preview_thickness = self._double_spin(0.5, 6.0, 1.5, 1, 0.5)
+            self.roi_preview_thickness.setSuffix(" vox")
+            for control, tip in (
+                (self.roi_preview_cx, "Центр ROI по детекторной координате X"),
+                (self.roi_preview_cy, "Центр ROI по детекторной координате Y"),
+                (self.roi_preview_width, "Ширина прямоугольника или длина отрезка, в пикселях детектора"),
+                (self.roi_preview_height, "Высота прямоугольника; для линии и точки не используется"),
+                (self.roi_preview_angle, "Поворот селектора против часовой стрелки, в градусах"),
+                (self.roi_preview_opacity, "Прозрачность геометрической оболочки ROI"),
+                (self.roi_preview_strength, "Интенсивность смешивания с выбранным цветом; прозрачность объёма не изменяется"),
+                (self.roi_preview_thickness, "Полная ширина выделяемого следа линии/точки в шагах локальной сетки; не меняет ROI-геометрию"),
+            ):
+                control.setToolTip(tip)
+                control.setFixedWidth(88)
+
+            self.roi_preview_geometry_mode = QtWidgets.QComboBox()
+            self.roi_preview_geometry_mode.addItem("Оболочка + контур", "surface")
+            self.roi_preview_geometry_mode.addItem("Только контур", "outline")
+            self.roi_preview_geometry_mode.addItem("Скрыть геометрию", "hidden")
+            self.roi_preview_geometry_mode.setToolTip(
+                "Как показывать сам геометрический селектор. Подсветка облака настраивается отдельно."
+            )
+            self.roi_preview_cloud_mode = QtWidgets.QComboBox()
+            self.roi_preview_cloud_mode.addItem("Без подсветки", "off")
+            self.roi_preview_cloud_mode.addItem("Подсветить область ROI", "inside")
+            self.roi_preview_cloud_mode.addItem("ROI + приглушённый фон", "context")
+            self.roi_preview_cloud_mode.setCurrentIndex(1)
+            self.roi_preview_cloud_mode.setToolTip(
+                "Цвет меняется только у реально видимых сэмплов облака внутри селектора. "
+                "Альфа, прозрачность и глубинное перекрытие исходного объёма сохраняются."
+            )
+
+            preview_layout.addWidget(QtWidgets.QLabel("Селектор"), 0, 0)
+            preview_layout.addWidget(self.roi_preview_type, 0, 1, 1, 3)
+            preview_layout.addWidget(QtWidgets.QLabel("Центр X"), 1, 0)
+            preview_layout.addWidget(self.roi_preview_cx, 1, 1)
+            preview_layout.addWidget(QtWidgets.QLabel("Центр Y"), 1, 2)
+            preview_layout.addWidget(self.roi_preview_cy, 1, 3)
+            preview_layout.addWidget(QtWidgets.QLabel("Ширина / длина"), 2, 0)
+            preview_layout.addWidget(self.roi_preview_width, 2, 1)
+            preview_layout.addWidget(QtWidgets.QLabel("Высота"), 2, 2)
+            preview_layout.addWidget(self.roi_preview_height, 2, 3)
+            preview_layout.addWidget(QtWidgets.QLabel("Угол, °"), 3, 0)
+            preview_layout.addWidget(self.roi_preview_angle, 3, 1)
+            preview_layout.addWidget(QtWidgets.QLabel("Opacity"), 3, 2)
+            preview_layout.addWidget(self.roi_preview_opacity, 3, 3)
+            preview_layout.addWidget(QtWidgets.QLabel("Геометрия"), 4, 0)
+            preview_layout.addWidget(self.roi_preview_geometry_mode, 4, 1, 1, 3)
+            preview_layout.addWidget(QtWidgets.QLabel("Облако"), 5, 0)
+            preview_layout.addWidget(self.roi_preview_cloud_mode, 5, 1, 1, 3)
+            preview_layout.addWidget(QtWidgets.QLabel("Интенс."), 6, 0)
+            preview_layout.addWidget(self.roi_preview_strength, 6, 1)
+            preview_layout.addWidget(QtWidgets.QLabel("Ширина следа"), 6, 2)
+            preview_layout.addWidget(self.roi_preview_thickness, 6, 3)
+            preview_layout.setColumnStretch(1, 1)
+            preview_layout.setColumnStretch(3, 1)
+            self.roi_preview_type.currentIndexChanged.connect(self._on_roi_preview_type_changed)
+            self.roi_preview_geometry_mode.currentIndexChanged.connect(self._queue_roi_preview_update)
+            self.roi_preview_cloud_mode.currentIndexChanged.connect(self._queue_roi_preview_update)
+            for control in (
+                self.roi_preview_cx, self.roi_preview_cy, self.roi_preview_width,
+                self.roi_preview_height, self.roi_preview_angle, self.roi_preview_opacity,
+                self.roi_preview_strength, self.roi_preview_thickness,
+            ):
+                control.valueChanged.connect(self._queue_roi_preview_update)
+            self._on_roi_preview_type_changed()
+
             try:
                 from roc_mcs.gui.roi_explorer.plot_display_settings import load_plot_display_settings
                 self._initial_grid_visible = bool(load_plot_display_settings()["volume"].get("show_grid", True))
@@ -475,16 +571,26 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
                 QtWidgets.QSizePolicy.Policy.Minimum,
             )
             self.theta_slice_group = theta_slice_group
-            theta_layout = QtWidgets.QGridLayout(theta_slice_group)
+            # Keep the two slider controls in their own expanding rows.  The
+            # compact palette/strength row below remains content-sized, so a
+            # wider popup adds usable travel to the slider rather than larger
+            # gaps between the labels and compact controls.
+            theta_layout = QtWidgets.QVBoxLayout(theta_slice_group)
             theta_layout.setContentsMargins(1, 1, 1, 1)
-            theta_layout.setHorizontalSpacing(5)
-            theta_layout.setVerticalSpacing(2)
+            theta_layout.setSpacing(4)
+            theta_slider_row = QtWidgets.QHBoxLayout()
+            theta_slider_row.setContentsMargins(0, 0, 0, 0)
+            theta_slider_row.setSpacing(5)
             self.theta_slice_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
             self.theta_slice_slider.setRange(0, 0)
             self.theta_slice_slider.setSingleStep(1)
             self.theta_slice_slider.setPageStep(1)
             self.theta_slice_slider.setMinimumWidth(100)
             self.theta_slice_slider.setMaximumHeight(16)
+            self.theta_slice_slider.setSizePolicy(
+                QtWidgets.QSizePolicy.Policy.Expanding,
+                QtWidgets.QSizePolicy.Policy.Fixed,
+            )
             self.theta_slice_slider.setEnabled(False)
             self.theta_slice_value_label = QtWidgets.QLabel("θ = —")
             self.theta_slice_value_label.setFixedWidth(108)
@@ -496,10 +602,12 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
                 "GPU ray casting и не меняет исходную прозрачность/композитинг."
             )
             theta_label = QtWidgets.QLabel("θ")
+            theta_label.setFixedWidth(10)
             theta_label.setToolTip("Индекс выбранного кадра θ")
-            theta_layout.addWidget(theta_label, 0, 0)
-            theta_layout.addWidget(self.theta_slice_slider, 0, 1, 1, 2)
-            theta_layout.addWidget(self.theta_slice_value_label, 0, 3)
+            theta_slider_row.addWidget(theta_label, 0)
+            theta_slider_row.addWidget(self.theta_slice_slider, 1)
+            theta_slider_row.addWidget(self.theta_slice_value_label, 0)
+            theta_layout.addLayout(theta_slider_row, 1)
 
             self.theta_slice_palette_combo = QtWidgets.QComboBox()
             for name in NAPARI_STYLE_COLORMAPS:
@@ -522,11 +630,14 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
             strength_label = QtWidgets.QLabel("Сила")
             palette_label.setToolTip("Цветовая схема выделения")
             strength_label.setToolTip("Интенсивность цветового выделения, 0–1")
-            theta_layout.addWidget(palette_label, 1, 0)
-            theta_layout.addWidget(self.theta_slice_palette_combo, 1, 1)
-            theta_layout.addWidget(strength_label, 1, 2)
-            theta_layout.addWidget(self.theta_slice_strength, 1, 3)
-            theta_layout.setColumnStretch(1, 1)
+            theta_options_row = QtWidgets.QHBoxLayout()
+            theta_options_row.setContentsMargins(0, 0, 0, 0)
+            theta_options_row.setSpacing(5)
+            theta_options_row.addWidget(palette_label, 0)
+            theta_options_row.addWidget(self.theta_slice_palette_combo, 0)
+            theta_options_row.addWidget(strength_label, 0)
+            theta_options_row.addWidget(self.theta_slice_strength, 0)
+            theta_layout.addLayout(theta_options_row, 0)
             theta_slice_group.setStyleSheet(
                 "QLabel { font-size: 9px; color: palette(mid); padding: 0; }"
             )
@@ -545,10 +656,9 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
                 QtWidgets.QSizePolicy.Policy.Minimum,
             )
             self.cursor_line_group = cursor_group
-            cursor_layout = QtWidgets.QGridLayout(cursor_group)
+            cursor_layout = QtWidgets.QVBoxLayout(cursor_group)
             cursor_layout.setContentsMargins(1, 1, 1, 1)
-            cursor_layout.setHorizontalSpacing(5)
-            cursor_layout.setVerticalSpacing(2)
+            cursor_layout.setSpacing(3)
             self.cursor_x_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
             self.cursor_y_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
             for slider in (self.cursor_x_slider, self.cursor_y_slider):
@@ -557,6 +667,10 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
                 slider.setRange(0, 10000)
                 slider.setSingleStep(10)
                 slider.setPageStep(100)
+                slider.setSizePolicy(
+                    QtWidgets.QSizePolicy.Policy.Expanding,
+                    QtWidgets.QSizePolicy.Policy.Fixed,
+                )
                 slider.setEnabled(False)
             self.cursor_x_value_label = QtWidgets.QLabel("—")
             self.cursor_y_value_label = QtWidgets.QLabel("—")
@@ -570,14 +684,24 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
             self.cursor_y_slider.setToolTip("Координата Y в системе детектора")
             cursor_x_label = QtWidgets.QLabel("X")
             cursor_y_label = QtWidgets.QLabel("Y")
+            cursor_x_label.setFixedWidth(10)
+            cursor_y_label.setFixedWidth(10)
             cursor_x_label.setToolTip("Координата X в системе детектора")
             cursor_y_label.setToolTip("Координата Y в системе детектора")
-            cursor_layout.addWidget(cursor_x_label, 0, 0)
-            cursor_layout.addWidget(self.cursor_x_slider, 0, 1, 1, 2)
-            cursor_layout.addWidget(self.cursor_x_value_label, 0, 3)
-            cursor_layout.addWidget(cursor_y_label, 1, 0)
-            cursor_layout.addWidget(self.cursor_y_slider, 1, 1, 1, 2)
-            cursor_layout.addWidget(self.cursor_y_value_label, 1, 3)
+            cursor_x_row = QtWidgets.QHBoxLayout()
+            cursor_x_row.setContentsMargins(0, 0, 0, 0)
+            cursor_x_row.setSpacing(5)
+            cursor_x_row.addWidget(cursor_x_label, 0)
+            cursor_x_row.addWidget(self.cursor_x_slider, 1)
+            cursor_x_row.addWidget(self.cursor_x_value_label, 0)
+            cursor_y_row = QtWidgets.QHBoxLayout()
+            cursor_y_row.setContentsMargins(0, 0, 0, 0)
+            cursor_y_row.setSpacing(5)
+            cursor_y_row.addWidget(cursor_y_label, 0)
+            cursor_y_row.addWidget(self.cursor_y_slider, 1)
+            cursor_y_row.addWidget(self.cursor_y_value_label, 0)
+            cursor_layout.addLayout(cursor_x_row, 1)
+            cursor_layout.addLayout(cursor_y_row, 1)
 
             self.cursor_line_width = self._double_spin(0.5, 4.0, 2.0, 2, 0.1)
             self.cursor_line_width.setFixedWidth(72)
@@ -597,11 +721,14 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
             density_label = QtWidgets.QLabel("Плотн.")
             width_label.setToolTip("Ширина линии, воксели")
             density_label.setToolTip("Оптическая плотность, 1/воксель")
-            cursor_layout.addWidget(width_label, 2, 0)
-            cursor_layout.addWidget(self.cursor_line_width, 2, 1)
-            cursor_layout.addWidget(density_label, 2, 2)
-            cursor_layout.addWidget(self.cursor_line_density, 2, 3)
-            cursor_layout.setColumnStretch(1, 1)
+            cursor_options_row = QtWidgets.QHBoxLayout()
+            cursor_options_row.setContentsMargins(0, 0, 0, 0)
+            cursor_options_row.setSpacing(5)
+            cursor_options_row.addWidget(width_label, 0)
+            cursor_options_row.addWidget(self.cursor_line_width, 0)
+            cursor_options_row.addWidget(density_label, 0)
+            cursor_options_row.addWidget(self.cursor_line_density, 0)
+            cursor_layout.addLayout(cursor_options_row, 0)
             cursor_group.setStyleSheet(
                 "QLabel { font-size: 9px; color: palette(mid); padding: 0; }"
             )
@@ -634,6 +761,7 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
                 cursor_line=self.cursor_line_group,
                 theta_slice=self.theta_slice_group,
                 projection=self.projection_settings_group,
+                roi_preview=self.roi_preview_group,
             )
             # Axis proportions are owned by the toolbar editor; initialize from
             # the neutral display transform instead of a removed sidebar control.
@@ -663,8 +791,12 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
             self.tools_widget.cursor_line_toggled.connect(self._on_cursor_line_toggled)
             self.tools_widget.theta_slice_toggled.connect(self._on_theta_slice_toggled)
             self.tools_widget.projection_toggled.connect(self._on_projection_toggled)
+            self.tools_widget.overlay_toggled.connect(self._on_overlay_tool_toggled)
             self.tools_widget.cursor_line_color_changed.connect(
                 self._on_cursor_line_color_changed
+            )
+            self.tools_widget.roi_preview_color_changed.connect(
+                self._on_roi_preview_color_changed
             )
             self.tools_widget.theme_changed.connect(self._on_theme_changed)
             self.tools_widget.set_scene_available(False)
@@ -816,11 +948,117 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
                 self.cursor_y_slider.setEnabled(cursor_ready)
                 self.cursor_line_width.setEnabled(cursor_ready)
                 self.cursor_line_density.setEnabled(cursor_ready)
+            roi_preview_ready = not busy and has_scene and has_payload
+            if hasattr(self, "roi_preview_group"):
+                self.roi_preview_group.setEnabled(roi_preview_ready)
             if hasattr(self, "tools_widget"):
                 self.tools_widget.set_overlay_controls_enabled(
                     cursor=cursor_ready, theta=theta_ready,
                     projection=not busy and has_scene and has_payload,
+                    roi_preview=roi_preview_ready,
                 )
+
+        def _on_roi_preview_type_changed(self, *_args):
+            kind = str(self.roi_preview_type.currentData() or "rect")
+            self.roi_preview_height.setEnabled(kind == "rect")
+            self.roi_preview_width.setEnabled(kind in ("rect", "line"))
+            self.roi_preview_angle.setEnabled(kind in ("rect", "line"))
+            self.roi_preview_thickness.setEnabled(kind in ("line", "point"))
+            self._queue_roi_preview_update()
+
+        def _on_roi_preview_color_changed(self, _color: str) -> None:
+            """Apply ROI highlight color through the existing shader uniforms."""
+            self._queue_roi_preview_update()
+
+        def _queue_roi_preview_update(self, *_args):
+            timer = getattr(self, "_roi_preview_update_timer", None)
+            if timer is not None and self.scene is not None and self.payload is not None and not self._busy:
+                timer.start()
+
+        def _apply_pending_roi_preview(self, *, render: bool = True):
+            """Commit current preview controls as lightweight VTK overlay geometry."""
+            if self.scene is None or self.payload is None or self._busy:
+                return
+            kind = str(self.roi_preview_type.currentData() or "rect")
+            height = float(self.roi_preview_height.value()) if kind == "rect" else 0.0
+            width = float(self.roi_preview_width.value()) if kind in ("rect", "line") else 0.0
+            roi = ROI(
+                cx=float(self.roi_preview_cx.value()),
+                cy=float(self.roi_preview_cy.value()),
+                width=width,
+                height=height,
+                angle=float(self.roi_preview_angle.value()) if kind in ("rect", "line") else 0.0,
+                type=kind,
+            )
+            try:
+                self.scene.set_roi_preview(
+                    roi,
+                    selector_type=kind,
+                    geometry_mode=str(self.roi_preview_geometry_mode.currentData() or "surface"),
+                    highlight_mode=str(self.roi_preview_cloud_mode.currentData() or "off"),
+                    highlight_strength=float(self.roi_preview_strength.value()),
+                    highlight_color=self.tools_widget.roi_preview_color,
+                    thickness_voxels=float(self.roi_preview_thickness.value()),
+                    opacity=float(self.roi_preview_opacity.value()),
+                    render=False,
+                )
+                self.scene.set_roi_preview_visible(
+                    bool(self.tools_widget.roi_preview_button.isChecked()),
+                    render=False,
+                )
+                if render and self.vtk_widget is not None:
+                    self.vtk_widget.Render()
+            except Exception as exc:
+                self._show_error("Ошибка предпросмотра ROI", str(exc))
+                _trace("ROI_PREVIEW_UPDATE_FAILED", error=f"{type(exc).__name__}: {exc}")
+
+        def _initialize_roi_preview_from_payload(self, payload: VolumePayload):
+            if self._roi_preview_initialized:
+                return
+            source_roi = payload.roi
+            if source_roi is None:
+                source_roi = self._current_roi()
+            source_kind = str(getattr(source_roi, "type", "rect")).lower()
+            if source_kind not in ("rect", "line", "point"):
+                source_kind = "rect"
+            # A line/point has no finite ROI height/width by definition. Keep
+            # its actual selector type initially, while storing sensible
+            # positive fallback dimensions for a later switch to rectangle.
+            x_step = (
+                float(np.median(np.diff(payload.x)))
+                if len(payload.x) > 1 else 1.0
+            )
+            y_step = (
+                float(np.median(np.diff(payload.y)))
+                if len(payload.y) > 1 else 1.0
+            )
+            fallback_width = max(abs(x_step) * 8.0, 0.001)
+            fallback_height = max(abs(y_step) * 8.0, 0.001)
+            values = (
+                float(source_roi.cx), float(source_roi.cy),
+                max(float(source_roi.width), fallback_width),
+                max(float(source_roi.height), fallback_height),
+                float(source_roi.angle),
+            )
+            controls = (
+                self.roi_preview_cx, self.roi_preview_cy, self.roi_preview_width,
+                self.roi_preview_height, self.roi_preview_angle,
+            )
+            for control, value in zip(controls, values):
+                control.blockSignals(True)
+                control.setValue(value)
+                control.blockSignals(False)
+            self.roi_preview_type.blockSignals(True)
+            self.roi_preview_type.setCurrentIndex(
+                max(0, self.roi_preview_type.findData(source_kind))
+            )
+            self.roi_preview_type.blockSignals(False)
+            self._roi_preview_initialized = True
+            self._on_roi_preview_type_changed()
+
+        def _on_overlay_tool_toggled(self, key: str, enabled: bool):
+            if key == "roi_preview" and self.scene is not None:
+                self.scene.set_roi_preview_visible(bool(enabled))
 
         def _theta_slice_label_text(self, index: int) -> str:
             if self.payload is None or not len(self.payload.theta):
@@ -1490,6 +1728,7 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
                 self.tools_widget.set_grid_visible(self.scene.grid_visible)
                 self.tools_widget.set_perspective_enabled(self.scene.perspective_enabled)
                 self.tools_widget.set_cursor_line_color(self.scene.cursor_line_color)
+                self.tools_widget.set_roi_preview_color(self.scene.roi_preview_color)
                 self._vtk_init_pending = False
                 _trace("VTK_SCENE_CREATED")
                 self._refresh_controls()
@@ -1807,6 +2046,7 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
                 )
                 self.tools_widget.set_cursor_line_enabled(False)
                 self.tools_widget.set_cursor_line_color(self.scene.cursor_line_color)
+                self.tools_widget.set_roi_preview_color(self.scene.roi_preview_color)
                 theta_count = int(len(payload.theta))
                 theta_index = int(self.scene.theta_slice_index or 0)
                 self.theta_slice_slider.blockSignals(True)
@@ -1854,6 +2094,7 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
                 _trace_resources("payload-set")
                 if not self._roi_geometry_initialized and payload.view_mode == "full":
                     self._seed_roi_from_payload(payload)
+                self._initialize_roi_preview_from_payload(payload)
                 s = payload.spike_report
                 spike_text = (
                     f"Спайки: κ={s.kappa:.3g}; удалено {s.invalid_count:,} "
@@ -1978,6 +2219,8 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
             collected = gc.collect()
             _trace("PYTHON_GC_AFTER_LOAD", collected_objects=collected)
             self._set_busy(False)
+            if self.payload is not None:
+                self._apply_pending_roi_preview(render=True)
             _trace_resources("load-thread-finished")
 
         def _set_busy(self, busy: bool, message: str = ""):
@@ -1986,6 +2229,9 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
                 crop_timer = getattr(self, "_theta_display_range_update_timer", None)
                 if crop_timer is not None and crop_timer.isActive():
                     crop_timer.stop()
+                preview_timer = getattr(self, "_roi_preview_update_timer", None)
+                if preview_timer is not None and preview_timer.isActive():
+                    preview_timer.stop()
                 self._pending_theta_display_range = None
             if message:
                 self.status_label.setText(message)
