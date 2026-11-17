@@ -9,6 +9,8 @@ from .app_rail import AppLauncherRail
 from .workspace import AppPane
 from .window_chrome import ChromeSurface, WindowTitleBar
 from .global_settings_dialog import TRSGlobalSettingsDialog
+from roc_mcs.gui.resource_monitor.service import ResourceMonitorService
+from roc_mcs.gui.resource_monitor.panel import ResourceMonitorPanel
 
 _THEME = {
     "dark": {"window": "#11151b", "surface": "#171c24", "text": "#d8e0ec", "muted": "#98a5b6", "border": "#303744", "hover": "#2a313d", "selected": "#27394d", "accent": "#8da9c7", "base": "#151c27", "tab_text": "#9eabba"},
@@ -23,8 +25,13 @@ class TRSAppsWindow(QtWidgets.QMainWindow):
         self._settings = load_settings(); self._configure_app_from_settings(self._settings)
         self._active_pane = None; self._target_pane = None; self._split = False
         self._surface = ChromeSurface(self); self.setCentralWidget(self._surface)
+        self._resource_monitor = ResourceMonitorService(self)
+        self._resource_panel = ResourceMonitorPanel(self._resource_monitor, self)
         outer = QtWidgets.QVBoxLayout(self._surface.frame); outer.setContentsMargins(0,0,0,0); outer.setSpacing(0)
-        self.title_bar = WindowTitleBar(self, lambda: self.set_split(QtCore.Qt.Orientation.Horizontal), lambda: self.set_split(QtCore.Qt.Orientation.Vertical), self.unsplit, self.open_global_settings, self._surface.frame); outer.addWidget(self.title_bar)
+        self.title_bar = WindowTitleBar(self, lambda: self.set_split(QtCore.Qt.Orientation.Horizontal), lambda: self.set_split(QtCore.Qt.Orientation.Vertical), self.unsplit, self.open_global_settings, self.open_resource_monitor, self._surface.frame)
+        self._resource_monitor.snapshotChanged.connect(self.title_bar.btn_resources.set_snapshot)
+        self._resource_monitor.sample_now()
+        outer.addWidget(self.title_bar)
         body = QtWidgets.QWidget(self._surface.frame); body.setObjectName("appBody"); row = QtWidgets.QHBoxLayout(body); row.setContentsMargins(0,0,0,0); row.setSpacing(0); outer.addWidget(body,1)
         self.rail = AppLauncherRail(body); row.addWidget(self.rail)
         self.pane_splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal, body); self.pane_splitter.setObjectName("workspaceSplitter"); self.pane_splitter.setChildrenCollapsible(False); self.pane_splitter.setHandleWidth(4); row.addWidget(self.pane_splitter,1)
@@ -84,6 +91,7 @@ class TRSAppsWindow(QtWidgets.QMainWindow):
         QLabel#appStatus {{ background:{c['surface']}; color:{c['muted']}; border-top:1px solid {c['border']}; padding:3px 9px; }}
         """)
         self.title_bar.apply_theme(c["text"], self._icon_size); self.rail.apply_theme(c["text"], self._icon_size)
+        self._resource_panel.apply_theme(c)
         for pane, index, page in self._all_pages():
             spec = APP_BY_KEY.get(page.property("trsAppKey"));
             if spec: pane.tabs.setTabIcon(index, resource_svg_icon(spec.icon, size=self._icon_size, color=c["text"]))
@@ -98,6 +106,18 @@ class TRSAppsWindow(QtWidgets.QMainWindow):
             if callable(method): method(settings)
             for button in page.findChildren(QtWidgets.QAbstractButton):
                 if not button.icon().isNull(): button.setIconSize(QtCore.QSize(self._icon_size, self._icon_size))
+
+    def open_resource_monitor(self) -> None:
+        panel = self._resource_panel
+        if panel.isVisible(): panel.hide(); return
+        button = self.title_bar.btn_resources; anchor = button.mapToGlobal(QtCore.QPoint(0, button.height() + 3))
+        panel.adjustSize(); screen = QtWidgets.QApplication.screenAt(anchor) or QtWidgets.QApplication.primaryScreen()
+        if screen is not None:
+            area = screen.availableGeometry(); x = min(max(area.left(), anchor.x()), max(area.left(), area.right() - panel.width() + 1))
+            y = anchor.y()
+            if y + panel.height() > area.bottom() + 1: y = button.mapToGlobal(QtCore.QPoint(0, 0)).y() - panel.height() - 3
+            y = min(max(area.top(), y), max(area.top(), area.bottom() - panel.height() + 1)); anchor = QtCore.QPoint(x, y)
+        panel.move(anchor); panel.show(); panel.raise_()
 
     def open_global_settings(self) -> None:
         dialog = TRSGlobalSettingsDialog(load_settings(), self)
@@ -212,4 +232,5 @@ class TRSAppsWindow(QtWidgets.QMainWindow):
         if app is not None:
             try: app.focusChanged.disconnect(self._on_focus_changed); app.removeEventFilter(self)
             except (TypeError, RuntimeError): pass
+        self._resource_panel.hide(); self._resource_monitor.stop()
         event.accept()

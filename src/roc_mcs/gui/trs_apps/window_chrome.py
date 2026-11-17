@@ -2,6 +2,7 @@
 from __future__ import annotations
 from PyQt6 import QtCore, QtWidgets
 from roc_mcs.gui.components.icon_provider import resource_svg_icon
+from roc_mcs.gui.resource_monitor.monitor_button import ResourceMonitorButton
 
 class ResizeHandle(QtWidgets.QWidget):
     def __init__(self, edges: QtCore.Qt.Edges, cursor: QtCore.Qt.CursorShape, parent=None):
@@ -57,7 +58,7 @@ class ChromeSurface(QtWidgets.QWidget):
     def showEvent(self, event): self._layout_handles(); super().showEvent(event)
 
 class WindowTitleBar(QtWidgets.QWidget):
-    def __init__(self, window, split_side, split_stack, unsplit, open_settings, parent=None):
+    def __init__(self, window, split_side, split_stack, unsplit, open_settings, open_resource_monitor, parent=None):
         super().__init__(parent); self._window = window; self._drag_pos = None
         self.setObjectName("trsTitleBar"); self.setFixedHeight(38)
         row = QtWidgets.QHBoxLayout(self); row.setContentsMargins(9, 0, 6, 0); row.setSpacing(5)
@@ -66,9 +67,10 @@ class WindowTitleBar(QtWidgets.QWidget):
         self.btn_split_side = self._tool("Разделить рабочую область слева направо", "app_split_horizontal.svg", split_side); row.addWidget(self.btn_split_side)
         self.btn_split_stack = self._tool("Разделить рабочую область сверху вниз", "app_split_vertical.svg", split_stack); row.addWidget(self.btn_split_stack)
         self.btn_unsplit = self._tool("Убрать разделение", "app_unsplit.svg", unsplit); row.addWidget(self.btn_unsplit)
+        self.btn_resources = ResourceMonitorButton(self); self.btn_resources.setIcon(resource_svg_icon("resource_monitor_activity.svg", widget=self.btn_resources, size=16)); self.btn_resources.setIconSize(QtCore.QSize(16,16)); self.btn_resources.clicked.connect(open_resource_monitor); row.addWidget(self.btn_resources)
         self.btn_settings = self._tool("Глобальные настройки TRS Apps", "setting_icon.svg", open_settings); row.addWidget(self.btn_settings)
         row.addStretch(1)
-        self._tool_icons = [(self.btn_split_side, "app_split_horizontal.svg"), (self.btn_split_stack, "app_split_vertical.svg"), (self.btn_unsplit, "app_unsplit.svg"), (self.btn_settings, "setting_icon.svg")]
+        self._tool_icons = [(self.btn_split_side, "app_split_horizontal.svg"), (self.btn_split_stack, "app_split_vertical.svg"), (self.btn_unsplit, "app_unsplit.svg"), (self.btn_resources, "resource_monitor_activity.svg"), (self.btn_settings, "setting_icon.svg")]
         self.btn_min = self._control("—", "Свернуть окно", window.showMinimized); row.addWidget(self.btn_min)
         self.btn_max = self._control("□", "Развернуть окно", self._toggle_maximize); row.addWidget(self.btn_max)
         self.btn_close = self._control("×", "Закрыть приложение", window.close, danger=True); row.addWidget(self.btn_close)
