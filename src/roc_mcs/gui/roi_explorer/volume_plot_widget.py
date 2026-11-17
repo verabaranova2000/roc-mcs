@@ -9,7 +9,7 @@ from PyQt6.QtWidgets import (QApplication, QComboBox, QDialog, QDialogButtonBox,
 from roc_mcs.roi.extraction import extract_roi_volume
 from roc_mcs.roi.roi_types import ROI
 from roc_mcs.gui.roi_explorer.theme import apply_popup_theme, apply_widget_palette, resolve_theme, theme_colors
-from roc_mcs.gui.roi_explorer.volume_rendering import build_volume_figure, effective_volume_stride, effective_extraction_stride, crop_raw_to_roi, MAX_CACHE_VOXELS, MAX_RENDER_POINTS
+from roc_mcs.gui.roi_explorer.volume_rendering import build_volume_figure, effective_volume_stride, effective_extraction_stride, crop_raw_to_roi, masked_detector_projection, MAX_CACHE_VOXELS, MAX_RENDER_POINTS
 from roc_mcs.gui.roi_explorer.volume_rendering_runtime import (
     build_live_display_patch,
     can_update_live_display,
@@ -321,35 +321,66 @@ class _WorkerSignals(QObject):
     done = pyqtSignal(int, str, object, object, object, object); failed = pyqtSignal(int, str)
 
 class _RenderWorker(QRunnable):
-    def __init__(self, token, raw, th, axis, x, y, roi, settings, theme, cache_key, cached_volume=None, cached_input_stride=1, overlay_full_detector=False, cached_projection=None):
-        super().__init__(); self.token=token; self.raw=raw; self.th=th; self.axis=axis; self.x=x; self.y=y; self.roi=roi; self.settings=settings; self.theme=theme; self.cache_key=cache_key; self.cached_volume=cached_volume; self.cached_input_stride=max(1,int(cached_input_stride)); self.overlay_full_detector=bool(overlay_full_detector); self.cached_projection=cached_projection; self.signals=_WorkerSignals()
+    def __init__(self, token, raw, th, axis, x, y, roi, settings, theme, cache_key,
+                 cached_volume=None, cached_input_stride=1, overlay_full_detector=False,
+                 cached_projection=None, valid_mask=None):
+        super().__init__(); self.token=token; self.raw=raw; self.th=th; self.axis=axis
+        self.x=x; self.y=y; self.roi=roi; self.settings=settings; self.theme=theme
+        self.cache_key=cache_key; self.cached_volume=cached_volume
+        self.cached_input_stride=max(1,int(cached_input_stride))
+        self.overlay_full_detector=bool(overlay_full_detector)
+        self.cached_projection=cached_projection; self.valid_mask=valid_mask
+        self.signals=_WorkerSignals()
+
     def run(self):
         try:
             input_stride=self.cached_input_stride
-            if self.cached_volume is not None: rv=self.cached_volume
+            if self.cached_volume is not None:
+                rv=self.cached_volume
             else:
-                cropped,crop_x,crop_y,_=crop_raw_to_roi(self.raw,self.axis,self.x,self.y,self.roi)
+                cropped,crop_x,crop_y,bounds=crop_raw_to_roi(self.raw,self.axis,self.x,self.y,self.roi)
+                valid_view=None
+                if self.valid_mask is not None:
+                    valid_crop,valid_x,valid_y,valid_bounds=crop_raw_to_roi(
+                        self.valid_mask,self.axis,self.x,self.y,self.roi
+                    )
+                    if valid_bounds!=bounds or not np.array_equal(valid_x,crop_x) or not np.array_equal(valid_y,crop_y):
+                        raise RuntimeError("ROI crop для valid_mask не совпал с crop исходного массива")
+                    valid_view=valid_crop
                 input_stride,_,_=effective_extraction_stride(self.roi,crop_x,crop_y,len(self.th),requested=1)
-                # Входной шаг обычно 1: уменьшаем массив только если оценка ROI превышает лимит памяти.
-                raw_view=cropped[::input_stride,::input_stride,::input_stride]; th_view=np.asarray(self.th)[::input_stride]; x_view=crop_x[::input_stride]; y_view=crop_y[::input_stride]
-                rv=extract_roi_volume(raw_view,th_view,self.roi,axis=self.axis,x_coords=x_view,y_coords=y_view,order=1)
-            volume=np.asarray(rv.volume); settings=dict(self.settings); requested=max(2,int(settings.get("volume_stride",2))); quality=str(settings.get("quality","auto")); point_cap={"fast":25000,"balanced":50000,"auto":MAX_RENDER_POINTS,"full":MAX_RENDER_POINTS}.get(quality,MAX_RENDER_POINTS); stride=effective_volume_stride(volume.shape,requested,point_cap); settings["volume_stride"]=stride
+                raw_view=cropped[::input_stride,::input_stride,::input_stride]
+                th_view=np.asarray(self.th)[::input_stride]
+                x_view=crop_x[::input_stride]; y_view=crop_y[::input_stride]
+                if valid_view is not None:
+                    valid_view=valid_view[::input_stride,::input_stride,::input_stride]
+                rv=extract_roi_volume(
+                    raw_view,th_view,self.roi,axis=self.axis,x_coords=x_view,
+                    y_coords=y_view,valid_mask=valid_view,order=1,
+                )
+            volume=np.asarray(rv.volume); settings=dict(self.settings)
+            requested=max(2,int(settings.get("volume_stride",2)))
+            quality=str(settings.get("quality","auto"))
+            point_cap={"fast":25000,"balanced":50000,"auto":MAX_RENDER_POINTS,"full":MAX_RENDER_POINTS}.get(quality,MAX_RENDER_POINTS)
+            stride=effective_volume_stride(volume.shape,requested,point_cap); settings["volume_stride"]=stride
             settings["dragmode"]="turntable" if settings.get("dragmode")=="turntable" else "orbit"
             full_projection=None
             if self.overlay_full_detector and self.cache_key[1] != "full":
                 full_projection=self.cached_projection
                 if full_projection is None:
-                    full_projection=np.nansum(np.asarray(self.raw),axis=self.axis,dtype=np.float64).T.astype(np.float32)
+                    full_projection=masked_detector_projection(
+                        self.raw, self.axis, self.valid_mask, chunk_rows=32,
+                    ).astype(np.float32)
             fig=build_volume_figure(rv,settings,self.theme,full_projection=full_projection,
                 detector_x=self.x if full_projection is not None else None,detector_y=self.y if full_projection is not None else None,
                 overlay_roi=self.roi if full_projection is not None else None)
             import plotly.io as pio
             payload=pio.to_json(fig,validate=False,pretty=False,remove_uids=False)
             volume_trace=next((tr for tr in fig.data if getattr(tr,"type","")=="volume"),None)
-            meta={"shape":list(volume.shape),"coord_system":rv.coord_system,"source_id":self.cache_key[1] if isinstance(self.cache_key, tuple) and len(self.cache_key)>1 else "full","roi":self.roi.label or "Full detector","input_stride":input_stride,"stride":stride,"points":int(np.asarray(volume_trace.value).size) if volume_trace is not None else 0,"payload_bytes":len(payload.encode("utf-8")),"overlay_full_detector":bool(full_projection is not None),"has_projection":bool(settings.get("show_projection",True))}
+            meta={"shape":list(volume.shape),"coord_system":rv.coord_system,"source_id":self.cache_key[1] if isinstance(self.cache_key,tuple) and len(self.cache_key)>1 else "full","roi":self.roi.label or "Full detector","input_stride":input_stride,"stride":stride,"points":int(np.asarray(volume_trace.value).size) if volume_trace is not None else 0,"payload_bytes":len(payload.encode("utf-8")),"overlay_full_detector":bool(full_projection is not None),"has_projection":bool(settings.get("show_projection",True))}
             cached=rv if volume.size<=MAX_CACHE_VOXELS else None
             self.signals.done.emit(self.token,payload,meta,cached,self.cache_key,full_projection)
-        except Exception as exc:self.signals.failed.emit(self.token,str(exc))
+        except Exception as exc:
+            self.signals.failed.emit(self.token,str(exc))
 
 class _CameraDialog(QDialog):
     def __init__(self, camera, projection_type, parent=None):
@@ -381,7 +412,7 @@ class VolumePlotWidget(QWidget):
         self.setMinimumSize(300, 260)
         self._theme = resolve_theme(self)
         self._settings = {}
-        self._raw = self._th = self._x = self._y = None
+        self._raw = self._th = self._x = self._y = self._valid_mask = None
         self._axis = 0
         self._scan_label = ""
         self._view_label = ""
@@ -852,11 +883,15 @@ class VolumePlotWidget(QWidget):
         if not self.bridge or not self._page_ready:return
         self.bridge.commandChanged.emit(json.dumps({"type":kind,**payload},separators=(",",":")))
 
-    def set_dataset(self, raw, th, axis, x_coords, y_coords, saved_rois, *, scan_label="", view_label=""):
+    def set_dataset(self, raw, th, axis, x_coords, y_coords, saved_rois, *, scan_label="", view_label="", valid_mask=None):
         self._last_map_cursor = None; self._map_cursor_timer.stop()
         if self._cursor_line_enabled and self._page_ready:
             self._command("cursorReset")
-        self._dataset_generation+=1; self._volume_cache_key=None; self._volume_cache=None; self._volume_cache_input_stride=1; self._projection_cache_key=None; self._projection_cache=None; self._raw=np.asarray(raw); self._th=np.asarray(th,dtype=float); self._axis=int(axis); self._x=np.asarray(x_coords,dtype=float); self._y=np.asarray(y_coords,dtype=float); self._scan_label=str(scan_label); self._view_label=str(view_label); self._rois=[r for r in (saved_rois or []) if str(r.roi.type).lower() in ("rect","rectangle","rotated_rectangle") and r.roi.normalized().is_valid]
+        data=np.asarray(raw)
+        mask=None if valid_mask is None else np.asarray(valid_mask,dtype=bool)
+        if mask is not None and mask.shape!=data.shape:
+            raise ValueError(f"valid_mask shape={mask.shape} не совпадает с raw shape={data.shape}")
+        self._dataset_generation+=1; self._volume_cache_key=None; self._volume_cache=None; self._volume_cache_input_stride=1; self._projection_cache_key=None; self._projection_cache=None; self._raw=data; self._valid_mask=mask; self._th=np.asarray(th,dtype=float); self._axis=int(axis); self._x=np.asarray(x_coords,dtype=float); self._y=np.asarray(y_coords,dtype=float); self._scan_label=str(scan_label); self._view_label=str(view_label); self._rois=[r for r in (saved_rois or []) if str(r.roi.type).lower() in ("rect","rectangle","rotated_rectangle") and r.roi.normalized().is_valid]
         pending = self._pending_roi_overlay_color
         if pending is not None and not any(saved is pending[2] for saved in self._rois):
             # Do not retain or apply a deferred patch belonging to another scan/session.
@@ -879,7 +914,7 @@ class VolumePlotWidget(QWidget):
         self._projection_cache = None
         self._render_timer.stop()
         self._pending_render = None
-        self._raw = self._th = self._x = self._y = None
+        self._raw = self._th = self._x = self._y = self._valid_mask = None
         self._rois = []
         self._pending_roi_overlay_color = None
         self._last_key = None
@@ -942,7 +977,7 @@ class VolumePlotWidget(QWidget):
         )
         self._pending_render = (
             token, self._raw, self._th, self._axis, self._x, self._y,
-            roi, settings, self._theme, cache_key, overlay,
+            roi, settings, self._theme, cache_key, overlay, self._valid_mask,
         )
         self._update_status(
             "Расчёт 3D-объёма: задача поставлена в очередь",
@@ -954,7 +989,7 @@ class VolumePlotWidget(QWidget):
     def _start_latest_render(self):
         if self._worker_active or self._pending_render is None:
             return
-        token, raw, th, axis, x, y, roi, settings, theme, cache_key, overlay = self._pending_render
+        token, raw, th, axis, x, y, roi, settings, theme, cache_key, overlay, valid_mask = self._pending_render
         self._pending_render = None
         self._worker_active = True
         self._render_elapsed.start()
@@ -967,7 +1002,7 @@ class VolumePlotWidget(QWidget):
         projection = self._projection_cache if self._projection_cache_key == self._dataset_generation else None
         worker = _RenderWorker(
             token, raw, th, axis, x, y, roi, settings, theme, cache_key,
-            cached, self._volume_cache_input_stride, overlay, projection,
+            cached, self._volume_cache_input_stride, overlay, projection, valid_mask,
         )
         worker.signals.done.connect(self._render_ready)
         worker.signals.failed.connect(self._render_failed)

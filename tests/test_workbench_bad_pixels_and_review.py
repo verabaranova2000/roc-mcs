@@ -347,9 +347,10 @@ class DetectorBadPixelOperationTests(unittest.TestCase):
         self.assertEqual(captured["shape"], (31, 1, 48))
         self.assertLess(captured["max"], 250_000.0)
         self.assertFalse(np.any(result.arrays["valid_mask_yxt"][2, 3, :]))
-        # The interpolation result retains the original trace at an excluded
-        # detector site; consumers must obey valid_mask_yxt and not display/use it.
-        np.testing.assert_array_equal(result.arrays["clean_data_yxt"][2, 3, :], source.arrays["data_yxt"][2, 3, :])
+        # Исключённый detector-site не должен попадать в display-артефакт.
+        self.assertTrue(np.isnan(result.arrays["clean_data_yxt"][2, 3, :]).all())
+        # При этом неизменяемый входной артефакт сохраняет измеренные counts.
+        np.testing.assert_array_equal(source.arrays["data_yxt"][2, 3, :], np.full_like(source.arrays["data_yxt"][2, 3, :], 250_000.0))
         self.assertEqual(result.metadata["excluded_detector_pixels"], 1)
 
 

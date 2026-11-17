@@ -62,6 +62,32 @@ def crop_raw_to_roi(raw, axis, x_coords, y_coords, roi):
     return view,x[ix0:ix1],y[iy0:iy1],(ix0,ix1,iy0,iy1)
 
 
+def masked_detector_projection(raw, theta_axis, valid_mask=None, *, chunk_rows=32):
+    """Chunked XY projection honoring finite samples and an optional validity mask."""
+    data = np.asarray(raw)
+    axis = int(theta_axis)
+    if data.ndim != 3 or axis not in (0, 2):
+        raise ValueError("Ожидается 3D-массив с theta_axis=0 или 2")
+    mask = None if valid_mask is None else np.asarray(valid_mask, dtype=bool)
+    if mask is not None and mask.shape != data.shape:
+        raise ValueError("valid_mask должна совпадать по форме с raw")
+    theta_y_x = np.moveaxis(data, axis, 0)
+    mask_t_y_x = None if mask is None else np.moveaxis(mask, axis, 0)
+    _, ny, nx = theta_y_x.shape
+    result = np.empty((nx, ny), dtype=np.float64)
+    rows = max(1, int(chunk_rows))
+    for y0 in range(0, ny, rows):
+        y1 = min(ny, y0 + rows)
+        block = np.asarray(theta_y_x[:, y0:y1, :])
+        good = np.isfinite(block)
+        if mask_t_y_x is not None:
+            good &= mask_t_y_x[:, y0:y1, :]
+        sums = np.sum(np.where(good, block, 0.0), axis=0, dtype=np.float64)
+        sums[~np.any(good, axis=0)] = np.nan
+        result[:, y0:y1] = sums.T
+    return result
+
+
 def effective_extraction_stride(roi, x_coords, y_coords, n_theta, requested=1, max_voxels=MAX_EXTRACTION_VOXELS):
     """Сохраняет исходное разрешение ROI; прореживает вход только при превышении лимита памяти."""
     shape,_=estimate_roi_voxels(roi,x_coords,y_coords,n_theta); step=max(1,int(requested)); limit=max(100_000,int(max_voxels))

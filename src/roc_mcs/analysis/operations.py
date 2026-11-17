@@ -391,21 +391,53 @@ def _run_spikes(inputs: Mapping[str, ArtifactBundle], parameters: Mapping[str, A
     from roc_mcs.processing.spikes import refine_spike_mask
 
     scan = inputs["scan"]
-    data_yxt = np.asarray(scan.arrays["data_yxt"], dtype=float)
-    if data_yxt.ndim != 3 or not np.isfinite(data_yxt).any():
-        raise ValueError("Spike detection требует непустой конечный массив Y×X×θ")
+    raw_yxt = np.asarray(scan.arrays["data_yxt"])
+    if not np.issubdtype(raw_yxt.dtype, np.number) or np.iscomplexobj(raw_yxt):
+        raise TypeError(f"Spike detection требует вещественный числовой HDF5-массив, получен dtype={raw_yxt.dtype}")
+    data_yxt = np.asarray(raw_yxt, dtype=np.float64)
+    if data_yxt.ndim != 3 or min(data_yxt.shape) < 1:
+        raise ValueError("Spike detection требует непустой 3D-массив Y×X×θ")
+    theta = np.asarray(scan.arrays.get("theta"), dtype=float)
+    if theta.ndim != 1 or theta.size != data_yxt.shape[-1] or theta.size < 2 or not np.isfinite(theta).all():
+        raise ValueError("Для удаления спайков нужна конечная ось theta длины data_yxt.shape[-1] минимум из двух отсчётов")
+    # Проверяем конечность и неотрицательность небольшими полосами по Y,
+    # не создавая дополнительную bool-копию всего тома.
+    finite_traces = np.empty(data_yxt.shape[:2], dtype=bool)
+    has_finite = False
+    for y0 in range(0, data_yxt.shape[0], 32):
+        block = data_yxt[y0:y0 + 32]
+        finite = np.isfinite(block)
+        has_finite |= bool(finite.any())
+        if np.any(block[finite] < 0):
+            raise ValueError("Spike detection основан на модели счётных данных и требует неотрицательные raw counts")
+        finite_traces[y0:y0 + 32] = np.all(finite, axis=-1)
+    if not has_finite:
+        raise ValueError("Spike detection требует хотя бы один конечный отсчёт")
+    theta_step = np.diff(theta)
+    if theta_step.size and not (np.all(theta_step > 0) or np.all(theta_step < 0)):
+        raise ValueError("Ось theta для удаления спайков должна быть строго монотонной")
+    step_magnitude = np.abs(theta_step)
+    nominal_step = float(np.median(step_magnitude)) if step_magnitude.size else 0.0
+    if step_magnitude.size and not np.allclose(
+        step_magnitude, nominal_step, rtol=1e-6,
+        atol=max(nominal_step * 1e-9, 1e-12),
+    ):
+        raise ValueError(
+            "Текущий алгоритм spike-интерполяции предполагает равномерный шаг theta; "
+            "неравномерная ось отклонена, чтобы не подменять физическую интерполяцию "
+            "усреднением соседних индексов."
+        )
     # The existing spike algorithm acts independently along theta for each
     # detector pixel. Excluded detector traces are removed from global
     # background/kappa estimation (not merely zeroed before the fit).
     data_tyx = np.moveaxis(data_yxt, -1, 0)
     scan_valid = scan.arrays.get("valid_mask_yxt")
+    pixel_valid = finite_traces.copy()
     if scan_valid is not None:
         scan_valid = np.asarray(scan_valid, dtype=bool)
         if scan_valid.shape != data_yxt.shape:
             raise ValueError("valid_mask_yxt не согласована со spike input")
-        pixel_valid = np.all(scan_valid, axis=-1)
-    else:
-        pixel_valid = np.ones(data_yxt.shape[:2], dtype=bool)
+        pixel_valid &= np.all(scan_valid, axis=-1)
 
     # A pooled cell with only partial detector coverage is useful for intensity
     # display, but is not a complete measurement area. Keep it out of the
@@ -454,21 +486,41 @@ def _run_spikes(inputs: Mapping[str, ArtifactBundle], parameters: Mapping[str, A
     if mask_tyx.shape != data_tyx.shape or clean_tyx.shape != data_tyx.shape:
         raise ValueError("refine_spike_mask вернул результат с несовместимой формой")
     valid_yxt = ~np.moveaxis(mask_tyx, 0, -1)
+    valid_yxt &= pixel_valid[..., None]
     if scan_valid is not None:
         valid_yxt &= scan_valid
     if analysis_valid is not None:
         valid_yxt &= analysis_valid[..., None]
+    # Интерполированное представление не должно показывать исключённые
+    # detector-пиксели как исходные измерения.
+    if not np.all(pixel_valid):
+        clean_tyx = np.array(clean_tyx, dtype=float, copy=True)
+        clean_tyx[:, ~pixel_valid] = np.nan
     clean_yxt = np.moveaxis(clean_tyx, 0, -1)
     count_map = np.count_nonzero(mask_tyx, axis=0).astype(np.int32)
+    detector_valid_yxt = (
+        np.ones(data_yxt.shape, dtype=bool) if scan_valid is None else scan_valid
+    )
+    detector_bad_mask = np.asarray(
+        scan.arrays.get("detector_bad_pixel_mask_yx", np.zeros(data_yxt.shape[:2], dtype=bool)),
+        dtype=bool,
+    )
+    if detector_bad_mask.shape != data_yxt.shape[:2]:
+        raise ValueError("detector_bad_pixel_mask_yx не согласована со spike input")
 
     arrays = {
         "spike_mask_tyx": mask_tyx,
         "valid_mask_yxt": valid_yxt,
+        "detector_valid_mask_yxt": detector_valid_yxt,
+        "detector_bad_pixel_mask_yx": detector_bad_mask,
         "clean_data_yxt": clean_yxt,
         "spike_count_map": count_map,
         "kappa_history": np.asarray([row["kappa"] for row in result.history], dtype=float),
         "spike_count_history": np.asarray([row["n_spikes"] for row in result.history], dtype=np.int64),
     }
+    for coordinate_name in ("theta", "x_coords", "y_coords"):
+        if coordinate_name in scan.arrays:
+            arrays[coordinate_name] = np.asarray(scan.arrays[coordinate_name])
     import pandas as pd
     iteration_table = pd.DataFrame(result.history)
     kappa_rows: list[dict[str, Any]] = []
@@ -505,7 +557,10 @@ def _run_spikes(inputs: Mapping[str, ArtifactBundle], parameters: Mapping[str, A
             )
         ),
         "excluded_analysis_bins": int(np.count_nonzero(~pixel_valid)),
+        "excluded_nonfinite_traces": int(np.count_nonzero(~finite_traces)),
         "analysis_grid_shape_yx": [int(v) for v in pixel_valid.shape],
+        "theta_sampling": "uniform" if theta_step.size else "single_sample",
+        "theta_step_abs": nominal_step,
         "background_median": float(result.background.median),
         "background_sigma": float(result.background.sigma),
         "background_threshold": float(result.background.threshold),

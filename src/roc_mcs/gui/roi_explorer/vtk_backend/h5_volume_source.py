@@ -322,63 +322,57 @@ class H5VolumeLoader:
 
         return H5ScanRepository(self.h5_path, pool=PoolSpec(size=1, stride=1))
 
-    def _make_spike_valid_mask(self, repository: Any, scan_key: str) -> tuple[np.ndarray, SpikeReport]:
-        """Use exactly the spike-analysis sequence from Palette_Transparency_Lab_v2."""
-        try:
-            from roc_mcs.processing.background import estimate_background_stats
-            from roc_mcs.processing.spikes import find_kappa_threshold, build_spike_mask
-        except ImportError as exc:
-            raise ImportError(
-                "В checkout не найдены roc_mcs.processing.background / spikes. "
-                "Режим удаления спайков отключён до установки этих штатных модулей."
-            ) from exc
+    def _make_spike_processed_data(self, repository: Any, scan_key: str) -> tuple[np.ndarray, np.ndarray, SpikeReport]:
+        """Run the Workbench QC and spike operations on this source scan."""
+        from roc_mcs.analysis.artifacts import ArtifactBundle
+        from roc_mcs.analysis.operations import default_registry
 
-        formal_tyx = np.asarray(repository.data_tyx(scan_key))
-        data_yxt = np.asarray(repository.data_yxt(scan_key))
-        pooled_background = estimate_background_stats(formal_tyx)
-        kappa_fit = find_kappa_threshold(
-            formal_tyx,
-            background_variance=pooled_background.sigma ** 2,
-            kappas=np.arange(0.1, 60.1, 0.1),
-            verbose=False,
+        scan = repository.load_source(scan_key)
+        data_yxt = np.asarray(scan.yxt)
+        theta = np.asarray(scan.th, dtype=float)
+        x_coords, y_coords = repository.centers_xy(scan_key)
+        if data_yxt.ndim != 3 or data_yxt.shape[-1] != theta.size:
+            raise ValueError("Исходный ScanData не согласован с осью θ")
+        pixels = [{"x": int(x), "y": int(y)} for x, y in self.bad_pixels]
+        source = ArtifactBundle(
+            arrays={
+                "data_yxt": data_yxt,
+                "theta": theta,
+                "x_coords": np.asarray(x_coords, dtype=float),
+                "y_coords": np.asarray(y_coords, dtype=float),
+            },
+            metadata={
+                "grid_id": f"vtk:{self.h5_path}:{scan_key}:{data_yxt.shape}",
+                "scan_key": str(scan_key),
+                "pool": {"size": 1, "stride": 1},
+                "pool_signature": "raw",
+                "detector_bad_pixel_count": len(pixels),
+            },
         )
-        spike_mask_tyx = np.asarray(
-            build_spike_mask(
-                formal_tyx,
-                background_variance=pooled_background.sigma ** 2,
-                kappa=kappa_fit.kappa,
-                verbose=False,
-            ),
-            dtype=bool,
-        )
-        if spike_mask_tyx.shape != formal_tyx.shape:
-            raise ValueError(
-                f"Spike-mask имеет shape={spike_mask_tyx.shape}, "
-                f"ожидалось {formal_tyx.shape} (theta,y,x)."
-            )
-        valid_yxt = ~np.moveaxis(spike_mask_tyx, 0, -1)
-        if valid_yxt.shape != data_yxt.shape:
-            raise ValueError(
-                f"valid mask shape={valid_yxt.shape} не совпадает с Y×X×theta "
-                f"данными {data_yxt.shape}."
-            )
-        invalid_count = int(np.count_nonzero(spike_mask_tyx))
-        total = int(spike_mask_tyx.size)
-        sigma = float(pooled_background.sigma)
-        kappa = float(kappa_fit.kappa)
-        if not np.isfinite(sigma) or sigma < 0:
-            raise ValueError(f"Оценка фонового sigma некорректна: {sigma!r}.")
-        if not np.isfinite(kappa) or kappa <= 0:
-            raise ValueError(f"Оценка spike kappa некорректна: {kappa!r}.")
+        registry = default_registry()
+        qc = registry.execute(
+            "preprocess.detector_bad_pixels", {"scan": source}, {"pixels": pixels}
+        ).bundle
+        result = registry.execute(
+            "preprocess.spikes", {"scan": qc},
+            {"max_iter": 5, "tol": 1e-3, "collect_kappa_fits": True},
+        ).bundle
+        detector_valid = np.asarray(qc.arrays["valid_mask_yxt"], dtype=bool)
+        clean = np.asarray(result.arrays["clean_data_yxt"])
+        if clean.shape != data_yxt.shape or detector_valid.shape != data_yxt.shape:
+            raise ValueError("WorkBench spike output не согласован с исходным Y×X×θ")
+        metadata = result.metadata
+        invalid_count = int(metadata.get("n_spikes", 0))
         report = SpikeReport(
             enabled=True,
-            kappa=kappa,
-            sigma=sigma,
+            kappa=float(metadata["kappa"]),
+            sigma=float(metadata["background_sigma"]),
             invalid_count=invalid_count,
-            invalid_fraction=(invalid_count / total) if total else 0.0,
-            note="Штатный estimate_background_stats → find_kappa_threshold → build_spike_mask.",
+            invalid_fraction=float(metadata.get("spike_fraction", 0.0)),
+            note=("Общий Workbench pipeline: detector_bad_pixels → "
+                  "refine_spike_mask → интерполяция по θ."),
         )
-        return valid_yxt, report
+        return clean, detector_valid, report
 
     @tracked_activity("HDF5 · чтение и подготовка объёма")
     def load(
@@ -421,8 +415,9 @@ class H5VolumeLoader:
         scan = repository.load_scan(scan_key)
         x_axis, y_axis = repository.centers_xy(scan_key)
         valid_yxt = None
+        processed_yxt = None
         if remove_spikes:
-            valid_yxt, spike_report = self._make_spike_valid_mask(repository, scan_key)
+            processed_yxt, valid_yxt, spike_report = self._make_spike_processed_data(repository, scan_key)
         else:
             spike_report = SpikeReport(enabled=False, note="Данные загружены без удаления спайков.")
 
@@ -436,7 +431,7 @@ class H5VolumeLoader:
             for xi, yi in self.bad_pixels
             if 0 <= int(xi) < nx_source and 0 <= int(yi) < ny_source
         )
-        if applicable_bad_pixels:
+        if applicable_bad_pixels and not remove_spikes:
             expected_yxt_shape = tuple(int(v) for v in scan.yxt.shape)
             if valid_yxt is None:
                 valid_yxt = np.ones(expected_yxt_shape, dtype=bool)
@@ -451,12 +446,17 @@ class H5VolumeLoader:
                 valid_yxt[pixel_y, pixel_x, :] = False
 
         if mode == "roi":
-            roi_volume = repository.volume_from_roi(
-                scan_key,
-                roi,
-                valid_mask=valid_yxt,
-                order=1,
-            )
+            if processed_yxt is not None:
+                from roc_mcs.roi.extraction import extract_roi_volume
+                roi_volume = extract_roi_volume(
+                    processed_yxt, scan.th, roi, axis=2,
+                    x_coords=x_axis, y_coords=y_axis,
+                    valid_mask=valid_yxt, order=1,
+                )
+            else:
+                roi_volume = repository.volume_from_roi(
+                    scan_key, roi, valid_mask=valid_yxt, order=1,
+                )
             volume = np.asarray(roi_volume.volume)
             x = np.asarray(roi_volume.x)
             y = np.asarray(roi_volume.y)
@@ -473,7 +473,7 @@ class H5VolumeLoader:
             source_shape = tuple(int(v) for v in scan.data.shape)
         else:
             # ScanData.yxt is always (y,x,theta), irrespective of native HDF5 theta axis.
-            data_yxt = np.asarray(scan.yxt)
+            data_yxt = np.asarray(processed_yxt if processed_yxt is not None else scan.yxt)
             if data_yxt.ndim != 3 or data_yxt.shape[:2] != (len(y_axis), len(x_axis)):
                 raise ValueError(
                     f"ScanData Y×X×theta={data_yxt.shape} не согласован с "

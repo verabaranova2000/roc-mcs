@@ -349,7 +349,11 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
                 "Полный детектор временно игнорирует ROI, но не изменяет её геометрию. "
                 "Возврат в режим ROI использует тот же прямоугольник."
             )
-            self.spikes_check = QtWidgets.QCheckBox("Удалять спайки (штатный алгоритм)")
+            self.spikes_check = QtWidgets.QCheckBox("Интерполировать спайки (алгоритм Workbench)")
+            self.spikes_check.setToolTip(
+                "Запускает общий preprocess.spikes → refine_spike_mask. "
+                "Обнаруженные точки интерполируются по θ; дефекты детектора остаются исключёнными."
+            )
             self.smoothing_spin = self._double_spin(0.0, 3.0, 0.0, 2, 0.1)
             self.theta_crop_check = QtWidgets.QCheckBox("Ограничить диапазон θ при загрузке")
             self.theta_min_spin = self._double_spin(-1e12, 1e12, 0.0, 6, 0.1)

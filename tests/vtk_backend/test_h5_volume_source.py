@@ -113,19 +113,60 @@ class TestH5VolumeLoader:
         with pytest.raises(KeyError):
             loader.load("entry999")
 
-    def test_spike_validity_mask_is_applied_before_theta_crop_and_projection(self, tmp_path, monkeypatch):
+    def test_workbench_interpolation_and_detector_mask_are_applied_before_theta_crop(self, tmp_path, monkeypatch):
         raw = np.full((4, 2, 5), 3., dtype=np.float32)
         loader = _loader(_write_scan(tmp_path / "scan.h5", raw, np.arange(4.)), monkeypatch)
-        valid_yxt = np.ones((2, 5, 4), dtype=bool)
-        valid_yxt[1, 2, 1] = False
+        clean_yxt = np.full((2, 5, 4), 3., dtype=np.float32)
+        clean_yxt[0, 1, 1] = 8.  # уже интерполированное значение спайка
+        detector_valid = np.ones((2, 5, 4), dtype=bool)
+        detector_valid[1, 2, :] = False  # один дефектный пиксель детектора
+        clean_yxt[1, 2, :] = np.nan
         report = SpikeReport(True, kappa=3., sigma=1., invalid_count=1, invalid_fraction=1 / raw.size)
-        monkeypatch.setattr(loader, "_make_spike_valid_mask", lambda _repo, _key: (valid_yxt, report))
+        monkeypatch.setattr(loader, "_make_spike_processed_data", lambda _repo, _key: (clean_yxt, detector_valid, report))
         payload = loader.load("entry001", remove_spikes=True, theta_range=(0., 2.))
         assert payload.spike_report is report
-        assert np.isnan(payload.volume[2, 1, 1])
-        np.testing.assert_array_equal(payload.volume[2, 1, [0, 2]], [3., 3.])
-        assert payload.projection[2, 1] == 6.
-        assert payload.invalid_count == 1
+        # Спайк остаётся интерполированным конечным отсчётом, а не маскируется.
+        assert payload.volume[1, 0, 1] == 8.
+        # Дефектный detector-пиксель исключён на всех углах.
+        assert np.isnan(payload.volume[2, 1, :]).all()
+        assert payload.projection[1, 0] == 14.
+        assert payload.invalid_count == 3
+
+    def test_remove_spikes_uses_workbench_operation_and_keeps_interpolated_values(self, tmp_path, monkeypatch):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        raw = np.full((5, 2, 3), 2.0, dtype=np.float32)
+        path = _write_scan(tmp_path / "scan.h5", raw, np.arange(5.0))
+        loader = _loader(path, monkeypatch)
+        loader.set_bad_pixels([(2, 1)])
+        captured = {}
+
+        def fake_refine(data, **kwargs):
+            values = np.asarray(data, dtype=float)
+            captured["shape"] = values.shape
+            mask = np.zeros(values.shape, dtype=bool)
+            mask[2, 0, 0] = True
+            clean = values.copy()
+            clean[2, 0, 0] = 7.5
+            return SimpleNamespace(
+                spike_mask=mask, clean_data=clean, kappa=3.0, converged=True,
+                iterations=1, history=[{"iteration": 0, "kappa": 3.0, "n_spikes": 1}],
+                kappa_fits=[],
+                background=SimpleNamespace(median=2.0, sigma=1.0, threshold=8.0),
+            )
+
+        with patch("roc_mcs.processing.spikes.refine_spike_mask", side_effect=fake_refine):
+            payload = loader.load("entry001", remove_spikes=True)
+
+        # One configured detector defect is excluded before the shared Workbench estimator.
+        assert captured["shape"] == (5, 1, 5)
+        # Renderer volume order is X×Y×theta; the interpolated value remains visible.
+        assert payload.volume[0, 0, 2] == 7.5
+        # The configured detector defect is absent in all theta samples.
+        assert np.isnan(payload.volume[2, 1, :]).all()
+        assert payload.spike_report.invalid_count == 1
+        assert "Workbench pipeline" in payload.spike_report.note
 
     def test_malformed_hdf5_theta_layout_is_rejected_as_ambiguous(self, tmp_path, monkeypatch):
         raw = np.ones((3, 2, 3), dtype=np.float32)

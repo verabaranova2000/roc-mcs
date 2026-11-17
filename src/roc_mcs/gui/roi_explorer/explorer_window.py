@@ -73,6 +73,8 @@ from roc_mcs.gui.roi_explorer.theme import apply_theme as apply_roi_theme, apply
 from roc_mcs.gui.roi_explorer.plot_workspace_widget import PlotWorkspaceWidget
 from roc_mcs.gui.roi_explorer.plot_display_settings import PlotDisplaySettingsDialog, load_plot_display_settings, save_plot_display_settings
 from roc_mcs.roi.roi_types import ROI, SavedROI
+from roc_mcs.roi.extraction import extract_from_roi
+from roc_mcs.gui.processing_workbench.roi_workflow_panel import ProcessingStepsPanel
 
 
 class RockingCurveExplorerWindow(QMainWindow):
@@ -106,6 +108,9 @@ class RockingCurveExplorerWindow(QMainWindow):
         self.reduction_mode = "mean"
         self.current_file: Optional[Path] = None
         self._theta_slice_mode = False; self._theta_index = 0; self._theta_scan_cache_key = None; self._theta_scan_cache = None; self._theta_levels_cache = {}; self._show_theta_guide = False
+        self._analysis_view = None
+        self._analysis_previous_pool = None
+        self._analysis_curve_cache = {}
 
         self._theta_render_timer = QTimer(self); self._theta_render_timer.setSingleShot(True); self._theta_render_timer.setInterval(35); self._theta_render_timer.timeout.connect(self.refresh_map)
         self._preview_timer = QTimer(self)
@@ -179,12 +184,18 @@ class RockingCurveExplorerWindow(QMainWindow):
         self.label_edit = QLineEdit()
         self.label_edit.setPlaceholderText("ROI label")
 
-        # Inspector использует общий раскрываемый компонент из gui/components.
+        # Первые этапы воспроизводимого Workbench-пайплайна.
+        self.processing_section = CollapsibleSection("Обработка", expanded=True)
+        self.processing_panel = ProcessingStepsPanel(self.processing_section.body)
+        self.processing_section.content_layout.addWidget(self.processing_panel)
+        left_layout.addWidget(self.processing_section)
+
+        # Inspector закреплён сверху; свободное место остаётся после секций,
+        # как в боковой панели Live Scans.
         self.inspector_section = CollapsibleSection("Inspector", expanded=True)
         self.stats_text = QPlainTextEdit(self.inspector_section.body); self.stats_text.setReadOnly(True); self.stats_text.setMaximumBlockCount(1000)
-        self.inspector_section.content_layout.addWidget(self.stats_text); left_layout.addWidget(self.inspector_section, 1)
-
-        left_layout.addStretch(0)
+        self.inspector_section.content_layout.addWidget(self.stats_text); left_layout.addWidget(self.inspector_section)
+        left_layout.addStretch(1)
 
        
         # Правая рабочая область: ROI Manager, карта и кривая.
@@ -330,7 +341,11 @@ class RockingCurveExplorerWindow(QMainWindow):
         self.map_widget.pixel_clicked.connect(self._on_pixel_clicked)
         self.map_widget.cursor_position_changed.connect(self.volume_widget.set_map_cursor_position)
         self.curve_widget.theta_guide_toggled.connect(self._on_theta_guide_toggled)
-        
+        self.processing_panel.preview_ready.connect(self.show_analysis_preview)
+        self.processing_panel.restore_requested.connect(self.restore_analysis_preview)
+        self.processing_panel.busy_changed.connect(self._set_processing_busy)
+        self.processing_panel.status_changed.connect(lambda text: self.status.showMessage(text, 8000))
+
         # --- Сохранение ROI ---
         self.map_widget.pin_roi_requested.connect(self.pin_preview_roi)    # От кнопки над картой (слушаем сигнал из MapPlotWidget)
         # --- Сигналы компактного ROI Manager ---
@@ -378,6 +393,12 @@ class RockingCurveExplorerWindow(QMainWindow):
                 except Exception: pass
             QMessageBox.critical(self, "Open HDF5", str(exc)); return
 
+        # The selected workflow view belongs to the previous HDF5 repository.
+        # Drop it before swapping repositories; its saved PoolSpec must not be
+        # applied to the newly opened source.
+        self._analysis_view = None
+        self._analysis_previous_pool = None
+        self._analysis_curve_cache.clear()
         old_repo = self.repo; self.repo = repo
         self.map_widget.set_pool_spec(repo.pool); self.map_widget.set_pool_enabled(True)
         self.current_file = path; self.file_path_edit.setText(str(path))
@@ -708,6 +729,8 @@ class RockingCurveExplorerWindow(QMainWindow):
     def _on_scan_changed(self, *args) -> None:
         if self.repo is None or self.map_widget.scan_combo.currentText() == "":
             return
+        if self._analysis_view is not None:
+            self.restore_analysis_preview()
         self.selected_scan = self.map_widget.scan_combo.currentText()
         self._theta_scan_cache_key = None; self._theta_scan_cache = None; self._theta_levels_cache.clear()
         source = self.repo.load_source(self.selected_scan)
@@ -741,6 +764,10 @@ class RockingCurveExplorerWindow(QMainWindow):
         self.map_widget.reset_preview_selector()
         self._populate_map_combo()
         self._set_selected_roi_id(None)
+        try:
+            self.processing_panel.set_source(self.current_file, self.selected_scan)
+        except Exception as exc:
+            self.status.showMessage(f"Processing project unavailable: {exc}", 8000)
         self.status.showMessage(pool_warning or f"Selected scan: {self.selected_scan} · {self.repo.view}")
 
 
@@ -867,22 +894,93 @@ class RockingCurveExplorerWindow(QMainWindow):
         self._update_inspector()
         self.status.showMessage(f"Spatial view: {self._pool_label(pool)}")
 
+    def _set_processing_busy(self, busy: bool) -> None:
+        # Во время исполнения нельзя переключать источник под активным workflow.
+        self.open_h5_btn.setEnabled(not busy)
+        self.refresh_scans_btn.setEnabled(not busy and self.repo is not None)
+        self.map_widget.scan_combo.setEnabled(not busy)
+        self.map_widget.pool_btn.setEnabled(not busy and self._analysis_view is None and self.repo is not None)
+
+    def show_analysis_preview(self, state) -> None:
+        """Подключает неизменяемый workflow-артефакт к Map/ROC/3D как одну версию."""
+        if self.repo is None or self.selected_scan is None:
+            return
+        metadata = state.metadata
+        if str(metadata.get("scan_key", "")) != str(self.selected_scan):
+            self.status.showMessage("Предпросмотр относится к другому скану; переключение отменено", 8000)
+            return
+        source_file = metadata.get("source_file")
+        if source_file and Path(str(source_file)).resolve() != Path(self.current_file).resolve():
+            self.status.showMessage("Предпросмотр относится к другому HDF5-файлу", 8000)
+            return
+        if self._analysis_previous_pool is None:
+            self._analysis_previous_pool = self.repo.pool
+        if self.repo.pool != PoolSpec():
+            self.repo.set_pool(PoolSpec())
+            source = self.repo.load_source(self.selected_scan)
+            self.map_widget.set_pool_spec(PoolSpec(), source_shape_yx=source.source_shape_yx)
+        self.map_widget.set_pool_enabled(False)
+        self._analysis_view = state
+        self._analysis_curve_cache.clear()
+        self.selected_pixel = None
+        self._theta_scan_cache_key = None; self._theta_scan_cache = None
+        self.refresh_map()
+        self.refresh_curves()
+        self._update_inspector()
+        self.status.showMessage(f"Workflow preview: {state.label}")
+
+    def restore_analysis_preview(self) -> None:
+        """Возвращает исходный HDF5-view и прежний spatial pooling."""
+        self._analysis_view = None
+        self._analysis_curve_cache.clear()
+        if self.repo is not None and self._analysis_previous_pool is not None:
+            previous = self._analysis_previous_pool
+            self._analysis_previous_pool = None
+            self.repo.set_pool(previous)
+            source = self.repo.load_source(self.selected_scan) if self.selected_scan else None
+            self.map_widget.set_pool_spec(previous, source_shape_yx=source.source_shape_yx if source else None)
+        self.map_widget.set_pool_enabled(self.repo is not None)
+        self._theta_scan_cache_key = None; self._theta_scan_cache = None
+        self.refresh_all()
+        self.status.showMessage("Исходный HDF5-view восстановлен")
+
+    def _analysis_curve(self, state, roi):
+        geometry = (round(float(roi.cx), 7), round(float(roi.cy), 7), round(float(roi.width), 7), round(float(roi.height), 7), round(float(roi.angle), 7), str(roi.type), self.reduction_mode)
+        key = (state.node_id, geometry)
+        cached = self._analysis_curve_cache.get(key)
+        if cached is None:
+            th, curve, count = extract_from_roi(
+                state.data_yxt, state.theta, 2, roi,
+                state.data_yxt.shape[1], state.data_yxt.shape[0],
+                reduction_mode=self.reduction_mode, x_coords=state.x_coords,
+                y_coords=state.y_coords, valid_mask=state.valid_mask_yxt,
+            )
+            cached = (np.asarray(th), np.asarray(curve), int(count))
+            if len(self._analysis_curve_cache) > 128:
+                self._analysis_curve_cache.pop(next(iter(self._analysis_curve_cache)))
+            self._analysis_curve_cache[key] = cached
+        return cached
+
     def _on_pixel_clicked(self, x_index: int, y_index: int) -> None:
-        """Обрабатывает явный запрос на пиксельный профиль, если режим доступен."""
+        """Показывает ROC выбранного пикселя из активной версии данных."""
         if self.map_widget.roi_btn.isChecked() or self.repo is None or self.selected_scan is None:
             return
-        scan = self.repo.load_scan(self.selected_scan)
-        ny, nx = scan.shape_yx
+        if self._analysis_view is not None:
+            data = self._analysis_view.data_yxt
+            ny, nx = data.shape[:2]
+            x_coords, y_coords = self._analysis_view.x_coords, self._analysis_view.y_coords
+        else:
+            scan = self.repo.load_scan(self.selected_scan)
+            ny, nx = scan.shape_yx
+            x_coords, y_coords = self.repo.centers_xy(self.selected_scan)
         if not (0 <= x_index < nx and 0 <= y_index < ny):
             return
         self.selected_pixel = (int(x_index), int(y_index))
-        x_coords, y_coords = self.repo.centers_xy(self.selected_scan)
         self.status.showMessage(
-            f"Pixel view=({x_index}, {y_index}); detector center=({x_coords[x_index]:.1f}, {y_coords[y_index]:.1f}); {self.repo.view}"
+            f"Pixel view=({x_index}, {y_index}); detector center=({x_coords[x_index]:.1f}, {y_coords[y_index]:.1f})"
         )
         self.refresh_curves(update_volume=False)
         self._update_inspector()
-    
 
     def _on_reduction_changed(self, *args) -> None:
         self.reduction_mode = self.map_widget.reduction_combo.currentText().lower()
@@ -955,11 +1053,19 @@ class RockingCurveExplorerWindow(QMainWindow):
         if self.repo is None or self.selected_scan is None or self.preview_roi is None:
             return
         try:
-            th, curve, count = self.repo.curve_from_roi(
-                self.selected_scan,
-                self.preview_roi,
-                reduction_mode=self.reduction_mode,
-            )
+            if self._analysis_view is not None:
+                state = self._analysis_view
+                th, curve, count = extract_from_roi(
+                    state.data_yxt, state.theta, 2, self.preview_roi,
+                    state.data_yxt.shape[1], state.data_yxt.shape[0],
+                    reduction_mode=self.reduction_mode, x_coords=state.x_coords,
+                    y_coords=state.y_coords, valid_mask=state.valid_mask_yxt,
+                )
+            else:
+                th, curve, count = self.repo.curve_from_roi(
+                    self.selected_scan, self.preview_roi,
+                    reduction_mode=self.reduction_mode,
+                )
         except Exception as exc:
             self.status.showMessage(f"Preview update failed: {exc}")
             return
@@ -985,8 +1091,10 @@ class RockingCurveExplorerWindow(QMainWindow):
         saved = SavedROI(
             id=new_id,
             roi=self.preview_roi.normalized(),
-            curve=self.preview_curve.copy() if self.preview_curve is not None else None,
-            count=int(self.preview_count),
+            # A preview curve belongs to the selected workflow revision. Do not
+            # persist it as the raw-session cache; recompute after restoring raw.
+            curve=(self.preview_curve.copy() if self.preview_curve is not None and self._analysis_view is None else None),
+            count=int(self.preview_count) if self._analysis_view is None else 0,
         )
         label = self._generate_unique_label("ROI")       # Мы ищем свободное имя, игнорируя то, что кто-то переименовал ROI 1 в ROI 2
         saved.roi.label = label
@@ -1243,7 +1351,28 @@ class RockingCurveExplorerWindow(QMainWindow):
         self._update_inspector()
 
     def refresh_map(self, *args) -> None:
-        """Отрисовывает обычную карту либо интенсивность среза при фиксированном θ."""
+        """Отрисовывает карту выбранной версии данных либо исходного HDF5."""
+        if self._analysis_view is not None:
+            state = self._analysis_view
+            if self._theta_slice_mode:
+                idx = max(0, min(int(self.map_widget.theta_slider.value()), state.theta.size - 1))
+                img = state.data_yxt[:, :, idx]
+                title = f"{state.label} · θ={state.theta[idx]:.6g}"
+            else:
+                img = state.map_data
+                title = f"{state.label} · {state.map_title}"
+            p_lo = float(self.map_widget.low_pct.value()); p_hi = float(self.map_widget.high_pct.value())
+            try:
+                finite = np.asarray(img)[np.isfinite(img)]
+                vmin, vmax = np.percentile(finite, [p_lo, p_hi]) if finite.size else (None, None)
+                if vmin is not None and vmax is not None and vmin >= vmax:
+                    vmax = vmin + max(abs(float(vmin)) * 1e-9, 1e-12)
+            except Exception:
+                vmin = vmax = None
+            self.map_widget.draw_map(img, title, self.map_widget.current_cmap, vmin, vmax,
+                                     x_coords=state.x_coords, y_coords=state.y_coords)
+            self._draw_pinned_rois(); self.map_widget.canvas.draw_idle()
+            return
         if self.repo is None or self.selected_scan is None or (self.selected_map is None and not self._theta_slice_mode):
             self.map_widget.ax.clear()
             self.map_widget.ax.text(0.5, 0.5, "Open an HDF5 file", ha="center", va="center", transform=self.map_widget.ax.transAxes)
@@ -1305,7 +1434,54 @@ class RockingCurveExplorerWindow(QMainWindow):
 
         
     def refresh_curves(self, *, fit_curve_view: bool = False, fit_curve_y: bool = False, update_volume: bool = True) -> None:
-        """Подготавливает профили; по запросу подгоняет график под новое preview."""
+        """Подготавливает профили из активной версии данных."""
+        if self._analysis_view is not None:
+            state = self._analysis_view
+            curves_data = []
+            for pinned in self.current_rois():
+                roi = pinned.roi.normalized()
+                if not roi.is_valid:
+                    continue
+                try:
+                    th, curve, count = self._analysis_curve(state, roi)
+                except Exception:
+                    continue
+                if np.asarray(curve).size == 0:
+                    continue
+                curves_data.append({
+                    "id": pinned.id, "th": th, "curve": curve,
+                    "color": roi.color or self._color_for_roi(pinned.id),
+                    "is_selected": pinned.id == self.selected_roi_id,
+                    "label": roi.label or f"ROI {pinned.id}",
+                })
+            preview_data = None
+            if self.preview_roi is not None and self.preview_roi.is_valid:
+                try:
+                    pth, pcurve, _ = self._analysis_curve(state, self.preview_roi)
+                    preview_data = {"th": pth, "curve": pcurve}
+                    self.preview_th, self.preview_curve = np.asarray(pth), np.asarray(pcurve)
+                except Exception:
+                    preview_data = None
+            pixel_data = None
+            if self.selected_pixel is not None:
+                ix, iy = self.selected_pixel
+                if 0 <= iy < state.data_yxt.shape[0] and 0 <= ix < state.data_yxt.shape[1]:
+                    curve = np.asarray(state.data_yxt[iy, ix, :], dtype=float).copy()
+                    if state.valid_mask_yxt is not None:
+                        curve[~state.valid_mask_yxt[iy, ix, :]] = np.nan
+                    pixel_data = {"th": state.theta, "curve": curve,
+                                  "label": f"Pixel ({ix}, {iy}) · workflow data"}
+                else:
+                    self.selected_pixel = None
+            theta_guide = self._current_theta_value() if self._show_theta_guide and self._theta_slice_mode else None
+            self._curve_lines = self.curve_widget.draw_curves(
+                curves_data, preview_data, pixel_data=pixel_data,
+                view_label=state.label, fit_view=fit_curve_view, fit_y=fit_curve_y,
+                theta_guide=theta_guide,
+            )
+            if update_volume:
+                self.refresh_volume()
+            return
         th = self.repo.load_scan(self.selected_scan)["th"] if (self.repo is not None and self.selected_scan is not None) else None
         curves_data = []
         for pinned in self.current_rois():
@@ -1366,7 +1542,18 @@ class RockingCurveExplorerWindow(QMainWindow):
 
 
     def refresh_volume(self) -> None:
-        """Передаёт 3D-экрану immutable-снимок текущего spatial-view и список ROI."""
+        """Передаёт 3D-экрану данные той же версии, что Map и ROC."""
+        if self._analysis_view is not None:
+            state = self._analysis_view
+            try:
+                self.volume_widget.set_dataset(
+                    state.data_yxt, state.theta, 2, state.x_coords, state.y_coords,
+                    self.current_rois(), scan_label=self.selected_scan or "",
+                    view_label=state.label, valid_mask=state.valid_mask_yxt,
+                )
+            except Exception as exc:
+                self.volume_widget.clear_dataset(f"3D viewer: {exc}")
+            return
         if self.repo is None or self.selected_scan is None:
             self.volume_widget.clear_dataset()
             return
@@ -1421,6 +1608,12 @@ class RockingCurveExplorerWindow(QMainWindow):
             lines.append(f"Map: {self.selected_map}")
         lines.append(f"Spatial view: {self._pool_label(self.repo.pool)}")
         lines.append(f"Reduction: {self.reduction_mode}")
+        if self._analysis_view is not None:
+            lines.append("")
+            lines.append("Активная версия обработки")
+            lines.append(f"Этап: {self._analysis_view.label}")
+            lines.append(f"Операция: {self._analysis_view.operation_id}")
+            lines.append(f"Grid: {self._analysis_view.metadata.get('grid_id', '—')}")
         if self.selected_pixel is not None:
             ix, iy = self.selected_pixel
             x_coords, y_coords = self.repo.centers_xy(self.selected_scan)

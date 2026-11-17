@@ -262,6 +262,9 @@ class SpikeOperationTests(unittest.TestCase):
         self.assertEqual(result.bundle.arrays["spike_mask_tyx"].shape, (51, 5, 7))
         self.assertEqual(result.bundle.arrays["valid_mask_yxt"].shape, data.shape)
         self.assertEqual(result.bundle.arrays["clean_data_yxt"].shape, data.shape)
+        self.assertEqual(result.bundle.arrays["detector_valid_mask_yxt"].shape, data.shape)
+        np.testing.assert_array_equal(result.bundle.arrays["theta"], theta)
+        np.testing.assert_array_equal(result.bundle.arrays["x_coords"], np.arange(7, dtype=float))
         self.assertGreater(result.bundle.metadata["n_spikes"], 0)
         self.assertIn("spike_iterations", result.bundle.tables)
         self.assertIn("kappa_thresholds", result.bundle.tables)
@@ -273,6 +276,43 @@ class SpikeOperationTests(unittest.TestCase):
             restored.arrays["spike_mask_tyx"], result.bundle.arrays["spike_mask_tyx"]
         )
         self.assertEqual(restored.metadata["grid_id"], "synthetic-grid")
+
+    def test_spike_clean_view_hides_detector_exclusions_without_masking_interpolated_spikes(self):
+        from unittest.mock import patch
+        from roc_mcs.processing.spikes import SpikeMaskResult
+        from roc_mcs.processing.background import BackgroundStats
+        from roc_mcs.analysis.operations import default_registry
+
+        theta = np.linspace(0.0, 4.0, 9)
+        data = np.full((3, 4, theta.size), 5.0, dtype=float)
+        source = ArtifactBundle(
+            arrays={"data_yxt": data, "theta": theta,
+                    "x_coords": np.arange(4, dtype=float), "y_coords": np.arange(3, dtype=float)},
+            metadata={"grid_id": "masked-grid", "pool": {"size": 1, "stride": 1}},
+        )
+        qc = default_registry().execute(
+            "preprocess.detector_bad_pixels", {"scan": source}, {"pixels": [(2, 1)]}
+        ).bundle
+        def fake_refine(compact, **_kwargs):
+            local_mask = np.zeros(compact.shape, dtype=bool)
+            local_mask[4, 0, 0] = True
+            local_clean = np.array(compact, dtype=float, copy=True)
+            local_clean[4, 0, 0] = 5.0  # точка уже заменена интерполяцией
+            return SpikeMaskResult(
+                spike_mask=local_mask, clean_data=local_clean,
+                background=BackgroundStats(median=5.0, sigma=1.0, threshold=2.0),
+                kappa=3.0, history=[{"iteration": 0, "kappa": 3.0, "n_spikes": 1}],
+                converged=True, iterations=1, kappa_fits=[],
+            )
+        with patch("roc_mcs.processing.spikes.refine_spike_mask", side_effect=fake_refine):
+            spikes = default_registry().execute(
+                "preprocess.spikes", {"scan": qc}, {"max_iter": 1, "tol": 1e-3}
+            ).bundle
+        self.assertFalse(spikes.arrays["valid_mask_yxt"][0, 0, 4])
+        self.assertTrue(spikes.arrays["detector_valid_mask_yxt"][0, 0, 4])
+        self.assertFalse(spikes.arrays["detector_valid_mask_yxt"][1, 2, :].any())
+        self.assertTrue(np.isfinite(spikes.arrays["clean_data_yxt"][0, 0, 4]))
+        self.assertTrue(np.isnan(spikes.arrays["clean_data_yxt"][1, 2, :]).all())
 
     def test_spike_adapter_without_kappa_curve_collection(self):
         theta = np.linspace(10.0, 14.0, 41)
@@ -297,6 +337,90 @@ class SpikeOperationTests(unittest.TestCase):
             artifact_id = store.write(result.bundle)
             restored = store.read(artifact_id)
         self.assertTrue(restored.tables["kappa_thresholds"].empty)
+
+
+    def test_spike_operation_excludes_nonfinite_traces_before_global_estimator(self):
+        from roc_mcs.analysis.operations import default_registry
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        theta = np.linspace(0.0, 4.0, 5)
+        data = np.full((3, 4, 5), 4.0, dtype=float)
+        data[1, 2, 2] = np.nan
+        source = ArtifactBundle(
+            arrays={"data_yxt": data, "theta": theta,
+                    "x_coords": np.arange(4, dtype=float), "y_coords": np.arange(3, dtype=float)},
+            metadata={"grid_id": "nonfinite-grid"},
+        )
+        captured = {}
+
+        def fake_refine(values, **_kwargs):
+            values = np.asarray(values, dtype=float)
+            captured["shape"] = values.shape
+            captured["finite"] = bool(np.isfinite(values).all())
+            return SimpleNamespace(
+                spike_mask=np.zeros(values.shape, dtype=bool), clean_data=values.copy(),
+                kappa=1.0, converged=True, iterations=1,
+                history=[{"iteration": 0, "kappa": 1.0, "n_spikes": 0}],
+                kappa_fits=[],
+                background=SimpleNamespace(median=4.0, sigma=1.0, threshold=9.0),
+            )
+
+        with patch("roc_mcs.processing.spikes.refine_spike_mask", side_effect=fake_refine):
+            result = default_registry().execute(
+                "preprocess.spikes", {"scan": source},
+                {"max_iter": 1, "tol": 1e-3, "collect_kappa_fits": False},
+            ).bundle
+        self.assertEqual(captured["shape"], (5, 1, 11))
+        self.assertTrue(captured["finite"])
+        self.assertTrue(np.isnan(result.arrays["clean_data_yxt"][1, 2, :]).all())
+        self.assertFalse(result.arrays["valid_mask_yxt"][1, 2, :].any())
+        self.assertEqual(result.metadata["excluded_nonfinite_traces"], 1)
+
+    def test_spike_operation_rejects_complex_input_without_lossy_cast(self):
+        from roc_mcs.analysis.operations import default_registry
+        theta = np.linspace(0.0, 4.0, 5)
+        source = ArtifactBundle(
+            arrays={"data_yxt": np.ones((3, 4, 5), dtype=np.complex128) * (1.0 + 2.0j),
+                    "theta": theta, "x_coords": np.arange(4, dtype=float),
+                    "y_coords": np.arange(3, dtype=float)},
+            metadata={"grid_id": "complex-grid"},
+        )
+        with self.assertRaisesRegex(TypeError, "вещественный числовой"):
+            default_registry().execute(
+                "preprocess.spikes", {"scan": source},
+                {"max_iter": 1, "tol": 1e-3, "collect_kappa_fits": False},
+            )
+
+    def test_spike_operation_rejects_negative_counts(self):
+        from roc_mcs.analysis.operations import default_registry
+        theta = np.linspace(0.0, 4.0, 5)
+        data = np.ones((3, 4, 5), dtype=float)
+        data[0, 0, 0] = -1.0
+        source = ArtifactBundle(
+            arrays={"data_yxt": data, "theta": theta,
+                    "x_coords": np.arange(4, dtype=float), "y_coords": np.arange(3, dtype=float)},
+            metadata={"grid_id": "negative-grid"},
+        )
+        with self.assertRaisesRegex(ValueError, "неотрицательные raw counts"):
+            default_registry().execute(
+                "preprocess.spikes", {"scan": source},
+                {"max_iter": 1, "tol": 1e-3, "collect_kappa_fits": False},
+            )
+
+    def test_spike_operation_rejects_nonuniform_theta_sampling(self):
+        from roc_mcs.analysis.operations import default_registry
+        theta = np.array([0.0, 1.0, 2.0, 4.0])
+        source = ArtifactBundle(
+            arrays={"data_yxt": np.ones((3, 4, 4), dtype=float), "theta": theta,
+                    "x_coords": np.arange(4, dtype=float), "y_coords": np.arange(3, dtype=float)},
+            metadata={"grid_id": "nonuniform-theta-grid"},
+        )
+        with self.assertRaisesRegex(ValueError, "равномерный шаг theta"):
+            default_registry().execute(
+                "preprocess.spikes", {"scan": source},
+                {"max_iter": 2, "tol": 1e-3, "collect_kappa_fits": False},
+            )
 
 
 class PeakOperationTests(unittest.TestCase):
