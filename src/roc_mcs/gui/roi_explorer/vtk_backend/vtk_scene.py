@@ -6,6 +6,8 @@ from typing import Any
 
 import numpy as np
 
+from roc_mcs.gui.resource_monitor.activity import tracked_activity
+
 
 def _vtk():
     try:
@@ -2048,6 +2050,7 @@ class VTKVolumeScene:
         if render:
             self._request_render()
 
+    @tracked_activity("VTK · построение/обновление объёмной сцены")
     def set_payload(
         self,
         payload: Any,

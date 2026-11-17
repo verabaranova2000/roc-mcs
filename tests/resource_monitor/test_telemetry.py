@@ -48,3 +48,26 @@ def test_event_loop_delay_is_zero_before_first_sample_and_never_negative():
     assert event_loop_delay_ms(10.0, None) == 0.0
     assert event_loop_delay_ms(9.0, 10.0) == 0.0
     assert event_loop_delay_ms(10.125, 10.0) == pytest.approx(125.0)
+
+
+def test_find_nvidia_smi_searches_standard_windows_driver_locations(tmp_path, monkeypatch):
+    from roc_mcs.gui.resource_monitor import telemetry
+    monkeypatch.setattr(telemetry.shutil, "which", lambda *_args, **_kwargs: None)
+    exe = tmp_path / "NVIDIA Corporation" / "NVSMI" / "nvidia-smi.exe"
+    exe.parent.mkdir(parents=True); exe.write_text("", encoding="utf-8")
+    found = telemetry.find_nvidia_smi({"PATH": "", "ProgramW6432": str(tmp_path)})
+    assert found == str(exe)
+
+
+def test_find_nvidia_smi_returns_none_when_nvidia_utility_is_absent(tmp_path, monkeypatch):
+    from roc_mcs.gui.resource_monitor import telemetry
+    monkeypatch.setattr(telemetry.shutil, "which", lambda *_args, **_kwargs: None)
+    assert telemetry.find_nvidia_smi({"PATH": "", "ProgramW6432": str(tmp_path), "SystemRoot": str(tmp_path)}) is None
+
+
+def test_find_nvidia_smi_honors_explicit_path_override(tmp_path, monkeypatch):
+    from roc_mcs.gui.resource_monitor import telemetry
+    monkeypatch.setattr(telemetry.shutil, "which", lambda *_args, **_kwargs: None)
+    exe = tmp_path / "custom" / "nvidia-smi.exe"
+    exe.parent.mkdir(); exe.write_text("", encoding="utf-8")
+    assert telemetry.find_nvidia_smi({"PATH": "", "NVIDIA_SMI_PATH": str(exe)}) == str(exe)

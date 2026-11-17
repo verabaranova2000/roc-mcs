@@ -1,8 +1,11 @@
 """Чистые модели и разбор показаний монитора ресурсов."""
 from __future__ import annotations
 import csv
+import os
+import shutil
 from dataclasses import dataclass
 from io import StringIO
+from pathlib import Path
 
 GIB = 1024 ** 3
 
@@ -73,6 +76,23 @@ def parse_nvidia_smi(output: str) -> tuple[GPUMetric, ...]:
         result.append(GPUMetric(int(index), name, util, mem_used, mem_total))
     return tuple(result)
 
+
+
+def find_nvidia_smi(environ: dict[str, str] | None = None) -> str | None:
+    """Ищет NVSMI в PATH и стандартных каталогах драйвера Windows."""
+    env = os.environ if environ is None else environ
+    override = env.get("NVIDIA_SMI_PATH")
+    if override and Path(override).is_file(): return str(Path(override))
+    found = shutil.which("nvidia-smi.exe", path=env.get("PATH")) or shutil.which("nvidia-smi", path=env.get("PATH"))
+    if found: return found
+    bases = []
+    for key in ("ProgramW6432", "ProgramFiles", "ProgramFiles(x86)"):
+        value = env.get(key)
+        if value and value not in bases: bases.append(value)
+    candidates = [Path(base) / "NVIDIA Corporation" / "NVSMI" / "nvidia-smi.exe" for base in bases]
+    if env.get("SystemRoot"):
+        candidates.append(Path(env["SystemRoot"]) / "System32" / "nvidia-smi.exe")
+    return next((str(path) for path in candidates if path.is_file()), None)
 
 def event_loop_delay_ms(now: float, expected: float | None) -> float:
     """Приблизительная задержка цикла событий Qt относительно срока таймера."""

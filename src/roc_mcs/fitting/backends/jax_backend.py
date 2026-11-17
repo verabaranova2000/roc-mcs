@@ -1,4 +1,6 @@
 import numpy as np
+
+from roc_mcs.gui.resource_monitor.activity import tracked_activity
 import pandas as pd
 import jax
 jax.config.update("jax_enable_x64", True)
@@ -343,6 +345,7 @@ JAX_SOLVER_CONFIG = {
     "jacobian_mode": "auto",
 }
 
+@tracked_activity("JAX · пакетная подгонка")
 def fit_jax(
     data_yxt,
     theta,

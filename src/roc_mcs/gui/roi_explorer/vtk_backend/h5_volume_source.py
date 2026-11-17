@@ -12,6 +12,8 @@ from typing import Any, Literal
 
 import numpy as np
 
+from roc_mcs.gui.resource_monitor.activity import tracked_activity
+
 ViewMode = Literal["full", "roi"]
 
 
@@ -378,6 +380,7 @@ class H5VolumeLoader:
         )
         return valid_yxt, report
 
+    @tracked_activity("HDF5 · чтение и подготовка объёма")
     def load(
         self,
         scan_key: str,

@@ -22,7 +22,8 @@ dependencies = [
     "plotly>=7.1,<8",
     "PyQt6-WebEngine>=6.11,<7",  
     "jax==0.11.2",
-    "jaxlib==0.11.2",    
+    "jaxlib==0.11.2",  
+    "psutil>=7.2",  
 
 ]
 

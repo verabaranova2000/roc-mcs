@@ -8,8 +8,10 @@ from roc_mcs.peaks.catalog import enrich_peak_catalog
 from roc_mcs.fitting.preparation import prepare_fit_data
 from roc_mcs.fitting.result_normalization import broadcast_valid_mask, build_fitted_peak_catalog, normalize_pixel_fit_catalog, validate_valid_mask
 from roc_mcs.fitting.results import FitScanResult
+from roc_mcs.gui.resource_monitor.activity import tracked_activity
 
 
+@tracked_activity(lambda *args, **kwargs: f"{str(kwargs.get('backend', 'jax')).upper()} · подгонка всех пикселей")
 def fit_scan(data_yxt, theta, peak_catalog, spec, *, backend="jax", valid_mask=None, allow_center_shift=True,
              center_window=40.0, add_background=True, noise_sigma=None, B=128, solver_config=None, progress=False, metadata=None):
     """Фитирует все пиксели и возвращает общий FitScanResult для JAX или LMFit."""

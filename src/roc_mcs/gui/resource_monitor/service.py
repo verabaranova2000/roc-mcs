@@ -2,12 +2,12 @@
 from __future__ import annotations
 import ctypes
 import os
-import shutil
 import subprocess
 import time
 from datetime import datetime
 from PyQt6 import QtCore
-from .telemetry import GPUSnapshot, ResourceSnapshot, classify_memory, event_loop_delay_ms, parse_nvidia_smi
+from .activity import activity_status
+from .telemetry import GPUSnapshot, ResourceSnapshot, classify_memory, event_loop_delay_ms, find_nvidia_smi, parse_nvidia_smi
 
 
 def _windows_commit_status() -> tuple[int | None, int | None]:
@@ -38,9 +38,9 @@ class _NvidiaQuery(QtCore.QRunnable):
     @QtCore.pyqtSlot()
     def run(self):
         now = datetime.now().strftime("%H:%M:%S")
-        executable = shutil.which("nvidia-smi")
+        executable = find_nvidia_smi()
         if not executable:
-            self.signals.finished.emit(GPUSnapshot(now, (), "nvidia-smi не найден; GPU не измеряется")); return
+            self.signals.finished.emit(GPUSnapshot(now, (), "nvidia-smi.exe не найден. Это только NVIDIA-провайдер: GPU может присутствовать (например, AMD/Intel или NVIDIA без NVSMI). RAM/CPU продолжают измеряться.")); return
         command = [executable, "--query-gpu=index,name,utilization.gpu,memory.used,memory.total", "--format=csv,noheader,nounits"]
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
         try:
@@ -60,6 +60,7 @@ class _NvidiaQuery(QtCore.QRunnable):
 class ResourceMonitorService(QtCore.QObject):
     snapshotChanged = QtCore.pyqtSignal(object)
     gpuChanged = QtCore.pyqtSignal(object)
+    activityChanged = QtCore.pyqtSignal(object)
 
     def __init__(self, parent=None, interval_ms: int = 2000):
         super().__init__(parent); self._psutil = None; self._process = None; self._peak_rss = 0; self._gpu_pending = False; self._gpu_worker = None; self._closing = False
@@ -82,11 +83,15 @@ class ResourceMonitorService(QtCore.QObject):
             self.snapshotChanged.emit(ResourceSnapshot(sampled_at=now, total_ram=None, available_ram=None, commit_limit=None, commit_available=None,
                 process_rss=None, process_private_commit=None, process_threads=None, process_handles=None, process_peak_rss=None,
                 system_cpu_pct=None, process_cpu_pct=None, gui_event_delay_ms=gui_delay, gui_event_delay_peak_ms=self._gui_delay_peak_ms,
-                state="unknown", error="psutil не установлен или недоступен")); return
+                state="unknown", error="psutil не установлен или недоступен")); self.activityChanged.emit(activity_status()); return
         try:
             vm = self._psutil.virtual_memory(); info = self._process.memory_info()
-            rss = int(info.rss); self._peak_rss = max(self._peak_rss, rss, int(getattr(info, "peak_wset", 0) or 0))
-            private = getattr(info, "private", None); commit_limit, commit_available = _windows_commit_status()
+            rss = int(info.rss)
+            peak_rss = getattr(info, "peak_rss", None)
+            if peak_rss is None: peak_rss = getattr(info, "peak_wset", 0)
+            self._peak_rss = max(self._peak_rss, rss, int(peak_rss or 0))
+            private = getattr(info, "private", None) if os.name == "nt" else None
+            commit_limit, commit_available = _windows_commit_status()
             threads = int(self._process.num_threads()); handles = int(self._process.num_handles()) if hasattr(self._process, "num_handles") else None
             ram_state = classify_memory(int(vm.available), int(vm.total)); commit_state = classify_memory(commit_available, commit_limit)
             severity = {"unknown": 0, "normal": 1, "warning": 2, "critical": 3}
@@ -101,7 +106,7 @@ class ResourceMonitorService(QtCore.QObject):
                 process_rss=None, process_private_commit=None, process_threads=None, process_handles=None, process_peak_rss=self._peak_rss or None,
                 system_cpu_pct=None, process_cpu_pct=None, gui_event_delay_ms=gui_delay, gui_event_delay_peak_ms=self._gui_delay_peak_ms,
                 state="unknown", error=f"Сбор RAM/CPU: {type(exc).__name__}: {exc}"[:180])
-        self.snapshotChanged.emit(snapshot)
+        self.snapshotChanged.emit(snapshot); self.activityChanged.emit(activity_status())
 
     @QtCore.pyqtSlot()
     def request_gpu_sample(self):

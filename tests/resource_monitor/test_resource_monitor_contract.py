@@ -81,3 +81,64 @@ def test_monitor_uses_lightweight_process_memory_metrics():
     service = (GUI / "resource_monitor" / "service.py").read_text(encoding="utf-8")
     assert ".memory_info()" in service
     assert ".memory_full_info()" not in service
+
+
+def test_panel_is_persistent_modeless_tool_window_with_manual_close():
+    panel = (GUI / "resource_monitor" / "panel.py").read_text(encoding="utf-8")
+    assert "WindowType.Tool | QtCore.Qt.WindowType.FramelessWindowHint" in panel
+    assert "WindowType.Popup" not in panel
+    assert "setModal(False)" in panel
+    assert "WindowModality.NonModal" in panel
+    assert "WA_DeleteOnClose, False" in panel
+    assert "WA_ShowWithoutActivating, True" in panel
+    assert 'self.close_button.clicked.connect(self.close)' in panel
+    assert "self._panel._user_moved = True" in panel
+
+
+def test_monitor_button_never_toggles_panel_closed():
+    host = (GUI / "trs_apps" / "app_host.py").read_text(encoding="utf-8")
+    tree = ast.parse(host)
+    method = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "open_resource_monitor")
+    calls = [node for node in ast.walk(method) if isinstance(node, ast.Call)]
+    names = [node.func.attr for node in calls if isinstance(node.func, ast.Attribute)]
+    assert "show" in names and "raise_" in names
+    assert "hide" not in names and "close" not in names
+    assert "panel.user_moved" in host
+
+
+def test_scientific_entry_points_are_instrumented_without_manual_call_sites():
+    files = {
+        "hdf5": GUI / "roi_explorer" / "vtk_backend" / "h5_volume_source.py",
+        "vtk": GUI / "roi_explorer" / "vtk_backend" / "vtk_scene.py",
+        "fit": ROOT / "src" / "roc_mcs" / "fitting" / "pipeline.py",
+    }
+    sources = {name: path.read_text(encoding="utf-8") for name, path in files.items()}
+    assert '@tracked_activity("HDF5 · чтение и подготовка объёма")' in sources["hdf5"]
+    assert '@tracked_activity("VTK · построение/обновление объёмной сцены")' in sources["vtk"]
+    assert "@tracked_activity(lambda *args, **kwargs:" in sources["fit"]
+    assert "JAX" in sources["fit"] and "lmfit" in sources["fit"]
+    jax = (ROOT / "src" / "roc_mcs" / "fitting" / "backends" / "jax_backend.py").read_text(encoding="utf-8")
+    assert '@tracked_activity("JAX · пакетная подгонка")' in jax
+
+
+def test_activity_updates_are_emitted_with_regular_resource_samples():
+    service = (GUI / "resource_monitor" / "service.py").read_text(encoding="utf-8")
+    assert "activityChanged = QtCore.pyqtSignal(object)" in service
+    assert "self.activityChanged.emit(activity_status())" in service
+
+
+def test_private_commit_and_peak_rss_use_current_psutil_fields_first():
+    service = (GUI / "resource_monitor" / "service.py").read_text(encoding="utf-8")
+    assert 'getattr(info, "private", None) if os.name == "nt" else None' in service
+    assert 'getattr(info, "vms", None)' not in service
+    assert 'getattr(info, "peak_rss", None)' in service
+    assert 'getattr(info, "peak_wset", 0)' in service  # совместимость со старым psutil
+
+
+def test_gpu_unavailable_is_not_reported_as_gpu_absence():
+    panel = (GUI / "resource_monitor" / "panel.py").read_text(encoding="utf-8")
+    telemetry = (GUI / "resource_monitor" / "service.py").read_text(encoding="utf-8")
+    assert "не означает отсутствие GPU" in panel
+    assert "nvidia-smi.exe не найден" in telemetry
+    assert "GPU может присутствовать" in telemetry
+    assert "find_nvidia_smi()" in telemetry

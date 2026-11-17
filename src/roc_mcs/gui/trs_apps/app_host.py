@@ -108,16 +108,14 @@ class TRSAppsWindow(QtWidgets.QMainWindow):
                 if not button.icon().isNull(): button.setIconSize(QtCore.QSize(self._icon_size, self._icon_size))
 
     def open_resource_monitor(self) -> None:
+        """Открывает закрепляемую панель; повторное нажатие только поднимает её."""
         panel = self._resource_panel
-        if panel.isVisible(): panel.hide(); return
-        button = self.title_bar.btn_resources; anchor = button.mapToGlobal(QtCore.QPoint(0, button.height() + 3))
-        panel.adjustSize(); screen = QtWidgets.QApplication.screenAt(anchor) or QtWidgets.QApplication.primaryScreen()
-        if screen is not None:
-            area = screen.availableGeometry(); x = min(max(area.left(), anchor.x()), max(area.left(), area.right() - panel.width() + 1))
-            y = anchor.y()
-            if y + panel.height() > area.bottom() + 1: y = button.mapToGlobal(QtCore.QPoint(0, 0)).y() - panel.height() - 3
-            y = min(max(area.top(), y), max(area.top(), area.bottom() - panel.height() + 1)); anchor = QtCore.QPoint(x, y)
-        panel.move(anchor); panel.show(); panel.raise_()
+        if not panel.isVisible():
+            if not panel.user_moved:
+                button = self.title_bar.btn_resources
+                panel.place_near(button.mapToGlobal(QtCore.QPoint(0, button.height() + 3)))
+            panel.show()
+        panel.raise_()
 
     def open_global_settings(self) -> None:
         dialog = TRSGlobalSettingsDialog(load_settings(), self)
