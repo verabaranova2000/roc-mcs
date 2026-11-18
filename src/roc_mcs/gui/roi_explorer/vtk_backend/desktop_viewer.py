@@ -117,6 +117,7 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
     from .vtk_tools_widget import VTKToolsWidget
     from roc_mcs.gui.components.icon_provider import set_icon_theme
     from roc_mcs.gui.roi_explorer.theme import (
+        apply_popup_theme,
         apply_theme as apply_roi_theme,
         resolve_theme,
         theme_colors,
@@ -335,7 +336,7 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
             file_row.addWidget(self.open_button)
             self.panel_layout.addLayout(file_row)
 
-            data_group = QtWidgets.QGroupBox("Источник данных")
+            data_group = QtWidgets.QGroupBox("Данные и подготовка")
             self.data_group = data_group
             data_form = QtWidgets.QFormLayout(data_group)
             data_form.setRowWrapPolicy(QtWidgets.QFormLayout.RowWrapPolicy.WrapLongRows)
@@ -368,9 +369,14 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
             )
             self.bad_pixels_button.clicked.connect(self._edit_bad_pixels)
             data_form.addRow("Scan:", self.scan_combo)
-            data_form.addRow("Область:", self.mode_combo)
             data_form.addRow("Предобработка:", self.spikes_check)
-            data_form.addRow("Сглаживание σ, воксели:", self.smoothing_spin)
+            self.mode_combo.hide()  # Единый выбор источника теперь находится в верхнем toolbar.
+            self.smoothing_spin.setToolTip(
+                "Гауссово сглаживание изменяет значения проекции и 3D-объёма: "
+                "σ по X/Y задаётся в пикселях, по θ ограничено 0,2 отсчёта. "
+                "Требует повторной загрузки/перестроения объёма; это не настройка цвета."
+            )
+            data_form.addRow("Сглаживание σXY, пиксели:", self.smoothing_spin)
             data_form.addRow(self.theta_crop_check)
             data_form.addRow("θ от:", self.theta_min_spin)
             data_form.addRow("θ до:", self.theta_max_spin)
@@ -391,11 +397,33 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
             roi_form.addRow("Ширина:", self.roi_width)
             roi_form.addRow("Высота:", self.roi_height)
             roi_form.addRow("Угол, °:", self.roi_angle)
-            self.panel_layout.addWidget(roi_group)
             self.roi_group = roi_group
-            self.mode_combo.currentIndexChanged.connect(
-                lambda *_: self.roi_group.setEnabled(self.mode_combo.currentData() == "roi")
+            self.roi_group.setTitle("Прямоугольник в координатах детектора")
+            self.roi_geometry_dialog = QtWidgets.QDialog(self, QtCore.Qt.WindowType.Dialog)
+            self.roi_geometry_dialog.setObjectName("VTKVolumeSourceGeometryDialog")
+            self.roi_geometry_dialog.setWindowTitle("Источник объёма · геометрия ROI")
+            self.roi_geometry_dialog.setModal(True)
+            self.roi_geometry_dialog.setMinimumWidth(310)
+            self.roi_geometry_dialog.setMaximumWidth(360)
+            roi_dialog_layout = QtWidgets.QVBoxLayout(self.roi_geometry_dialog)
+            roi_dialog_layout.setContentsMargins(12, 10, 12, 10)
+            roi_dialog_layout.setSpacing(8)
+            roi_dialog_hint = QtWidgets.QLabel(
+                "Координаты задаются в системе детектора. Изменения вступят в силу "
+                "после команды «Загрузить / перестроить объём»."
             )
+            roi_dialog_hint.setWordWrap(True)
+            roi_dialog_layout.addWidget(roi_dialog_hint)
+            roi_dialog_layout.addWidget(roi_group)
+            roi_dialog_buttons = QtWidgets.QDialogButtonBox(
+                QtWidgets.QDialogButtonBox.StandardButton.Ok |
+                QtWidgets.QDialogButtonBox.StandardButton.Cancel
+            )
+            roi_dialog_buttons.button(QtWidgets.QDialogButtonBox.StandardButton.Ok).setText("Применить")
+            roi_dialog_buttons.accepted.connect(self.roi_geometry_dialog.accept)
+            roi_dialog_buttons.rejected.connect(self.roi_geometry_dialog.reject)
+            roi_dialog_layout.addWidget(roi_dialog_buttons)
+            roi_group.setEnabled(True)
             # Full-detector GPU rendering can exceed shared-GPU memory or texture
             # limits on laboratory laptops. Start with a centered ROI; full detector
             # remains explicitly selectable after the user sees the dimensions.
@@ -761,6 +789,15 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
             self.viewer_layout.setSpacing(0)
             self.tools_widget = VTKToolsWidget(self.viewer)
             self.viewer_layout.addWidget(self.tools_widget, 0)
+            self.mode_combo.currentIndexChanged.connect(
+                lambda *_: self.tools_widget.set_volume_source_mode(
+                    str(self.mode_combo.currentData() or "roi")
+                )
+            )
+            self.tools_widget.set_volume_source_mode(str(self.mode_combo.currentData() or "roi"))
+            self.tools_widget.set_volume_source_available(False)
+            self.tools_widget.volume_source_mode_changed.connect(self._on_volume_source_mode_changed)
+            self.tools_widget.volume_source_geometry_requested.connect(self._edit_volume_source_geometry)
             self.tools_widget.set_overlay_settings_widgets(
                 cursor_line=self.cursor_line_group,
                 theta_slice=self.theta_slice_group,
@@ -922,6 +959,9 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
             self.open_button.setEnabled(not busy)
             self.scan_combo.setEnabled(not busy and has_loader)
             self.mode_combo.setEnabled(not busy and has_loader)
+            if hasattr(self, "tools_widget"):
+                self.tools_widget.set_volume_source_available(not busy and has_loader)
+                self.tools_widget.set_volume_source_mode(str(self.mode_combo.currentData() or "roi"))
             self.spikes_check.setEnabled(not busy and has_loader)
             self.smoothing_spin.setEnabled(not busy and has_loader)
             self.theta_crop_check.setEnabled(not busy and has_loader)
@@ -1790,6 +1830,7 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
                 f"Найдено scan: {len(keys)}. Выполняется подготовка центральной ROI; "
                 "полный детектор можно выбрать отдельно."
             )
+            self._refresh_controls()
             if self.scene is not None and self._auto_load_pending:
                 QtCore.QTimer.singleShot(0, self._run_pending_auto_load)
 
@@ -1866,6 +1907,40 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
                     "Не удалось автоматически определить размер detector-grid. "
                     "Проверьте центр и размеры ROI вручную."
                 )
+
+        def _on_volume_source_mode_changed(self, mode: str) -> None:
+            value = str(mode).lower()
+            if value not in ("full", "roi") or self._busy:
+                return
+            index = self.mode_combo.findData(value)
+            if index < 0:
+                return
+            self.mode_combo.setCurrentIndex(index)
+            self.tools_widget.set_volume_source_mode(value)
+            self.roi_group.setEnabled(value == "roi")
+            label = "полный детектор" if value == "full" else "прямоугольная ROI"
+            self.status_label.setText(
+                f"Выбран источник: {label}. Чтобы применить его, нажмите "
+                "«Загрузить / перестроить объём». Текущая сцена пока не изменена."
+            )
+            self._refresh_controls()
+
+        def _edit_volume_source_geometry(self) -> None:
+            if self._busy or self.loader is None:
+                return
+            previous = self._current_roi_geometry()
+            self.roi_group.setEnabled(True)
+            self.roi_geometry_dialog.setWindowModality(QtCore.Qt.WindowModality.WindowModal)
+            if self.roi_geometry_dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+                updated = self._current_roi_geometry()
+                if updated != previous:
+                    self.status_label.setText(
+                        "Геометрия ROI сохранена для текущего scan. "
+                        "Нажмите «Загрузить / перестроить объём», чтобы применить её."
+                    )
+            else:
+                self._set_roi_geometry(previous)
+            self._refresh_controls()
 
         def _current_roi_geometry(self) -> tuple[float, float, float, float, float]:
             """Return the exact editable rectangle in detector-grid coordinates."""
@@ -2352,6 +2427,8 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
                     set_icon_theme(app, theme_colors(active)["text"])
                 if hasattr(self, "tools_widget"):
                     self.tools_widget.apply_theme(active)
+                if hasattr(self, "roi_geometry_dialog"):
+                    apply_popup_theme(self.roi_geometry_dialog, active)
                 if hasattr(self, "volume_display_widget"):
                     self.volume_display_widget.apply_theme(active)
                 if self.scene is not None:

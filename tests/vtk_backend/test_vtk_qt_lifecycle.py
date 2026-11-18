@@ -152,6 +152,7 @@ class TestQVTKStartupLifecycle(unittest.TestCase):
         icon_provider.set_icon_theme = lambda *_args, **_kwargs: None
         theme = ModuleType("roc_mcs.gui.roi_explorer.theme")
         theme.apply_theme = lambda *_args, **_kwargs: None
+        theme.apply_popup_theme = lambda *_args, **_kwargs: None
         theme.resolve_theme = lambda *_args, **_kwargs: "dark"
         theme.theme_colors = lambda *_args, **_kwargs: {}
         with patch.dict(sys.modules, {toolbar_name: toolbar, "roc_mcs.gui.components.icon_provider": icon_provider, "roc_mcs.gui.roi_explorer.theme": theme}):

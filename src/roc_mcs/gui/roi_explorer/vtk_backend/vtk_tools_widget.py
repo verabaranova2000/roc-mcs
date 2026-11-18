@@ -159,6 +159,8 @@ class _AxisScalePreview(QWidget):
         super().__init__(parent)
         self._scales = (1.0, 1.0, 1.0)
         self._theme = "light"
+        self._volume_source_mode = "roi"
+        self._volume_source_available = False
         self._theme_palette = theme_colors(self._theme)
         self.setFixedSize(100, 72)
         self.setAccessibleName("Предпросмотр пропорций единичной ячейки")
@@ -249,6 +251,8 @@ class VTKToolsWidget(QWidget):
     theta_boundary_planes_toggled = pyqtSignal(bool)
     theta_boundary_plane_opacity_changed = pyqtSignal(float)
     theme_changed = pyqtSignal(str)
+    volume_source_mode_changed = pyqtSignal(str)
+    volume_source_geometry_requested = pyqtSignal()
 
     DEFAULT_CURSOR_LINE_COLOR = "#FFBD55"
     DEFAULT_ROI_PREVIEW_COLOR = "#FFB547"
@@ -267,11 +271,15 @@ class VTKToolsWidget(QWidget):
     THETA_RANGE_ICON_VARIANT = 1
     # 1..3 are alternative compact compositions for live ROI selector preview.
     ROI_PREVIEW_ICON_VARIANT = 2
+    # 0 = существующая иконка; 1..4 = варианты нового источника объёма.
+    VOLUME_SOURCE_ICON_VARIANT = 0
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("VTKToolBar")
         self._theme = "light"
+        self._volume_source_mode = "roi"
+        self._volume_source_available = False
         self._cursor_line_color = self.DEFAULT_CURSOR_LINE_COLOR
         self._roi_preview_color = self.DEFAULT_ROI_PREVIEW_COLOR
         self._color_picker: CompactColorPicker | None = None
@@ -326,6 +334,32 @@ class VTKToolsWidget(QWidget):
         )
         self.reset_btn.clicked.connect(self.reset_view_requested.emit)
         row.addWidget(self.reset_btn)
+
+        self.volume_source_btn = SmartDropdownButton(self)
+        self.volume_source_btn.setObjectName("vtkVolumeSourceButton")
+        self.volume_source_btn.setAutoRaise(True)
+        self.volume_source_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.volume_source_btn.setFixedSize(27, 27)
+        self.volume_source_btn.setIconSize(QSize(18, 18))
+        self.volume_source_btn.setToolTip("Источник объёма: прямоугольная ROI")
+        self.volume_source_btn.setAccessibleName("Выбор источника объёма")
+        self.volume_source_menu = QMenu(self.volume_source_btn)
+        self.volume_source_menu.setObjectName("VTKVolumeSourceMenu")
+        self.volume_source_menu.setToolTipsVisible(True)
+        self.volume_source_menu.setStyleSheet(self._popup_button_stylesheet())
+        self._volume_source_actions = {}
+        for mode, label in (("full", "Полный детектор"), ("roi", "Прямоугольная ROI")):
+            action = self.volume_source_menu.addAction(label)
+            action.setCheckable(True)
+            action.setData(mode)
+            action.triggered.connect(lambda checked=False, value=mode: self._select_volume_source(value))
+            self._volume_source_actions[mode] = action
+        self.volume_source_menu.addSeparator()
+        self.volume_source_geometry_action = self.volume_source_menu.addAction("Геометрия ROI…")
+        self.volume_source_geometry_action.triggered.connect(self.volume_source_geometry_requested.emit)
+        self.volume_source_btn.setMenu(self.volume_source_menu)
+        row.addWidget(self.volume_source_btn)
+        self.set_volume_source_mode("roi")
 
         # Standard camera orientations are grouped in their own compact flyout,
         # immediately after Fit.  The four child commands reuse the existing
@@ -421,6 +455,30 @@ class VTKToolsWidget(QWidget):
         self.set_roi_preview_color(self._roi_preview_color)
         self._set_icon_sizes()
         self.apply_theme("light")
+
+    def _select_volume_source(self, mode: str) -> None:
+        value = str(mode).lower()
+        if value not in self._volume_source_actions:
+            return
+        self.set_volume_source_mode(value)
+        self.volume_source_mode_changed.emit(value)
+
+    def set_volume_source_mode(self, mode: str) -> None:
+        value = str(mode).lower()
+        if value not in self._volume_source_actions:
+            raise ValueError(f"Неизвестный источник объёма: {mode!r}")
+        self._volume_source_mode = value
+        for key, action in self._volume_source_actions.items():
+            action.setChecked(key == value)
+        label = "полный детектор" if value == "full" else "прямоугольная ROI"
+        self.volume_source_btn.setToolTip(f"Источник объёма: {label}. Изменения применяются при следующей загрузке.")
+
+    def set_volume_source_available(self, available: bool) -> None:
+        self._volume_source_available = bool(available)
+        self.volume_source_btn.setEnabled(self._volume_source_available)
+        for action in self._volume_source_actions.values():
+            action.setEnabled(self._volume_source_available)
+        self.volume_source_geometry_action.setEnabled(self._volume_source_available)
 
     # ------------------------------------------------------------------
     # Shared toolbar primitives
@@ -1637,6 +1695,7 @@ class VTKToolsWidget(QWidget):
     def _set_icon_sizes(self) -> None:
         size = self._icon_size()
         self.reset_btn.setIconSize(QSize(size, size))
+        self.volume_source_btn.setIconSize(QSize(18, 18))
         self.camera_btn.setIconSize(QSize(18, 18))
         self.orientation_btn.setIconSize(QSize(18, 18))
         self.overlays_btn.setIconSize(QSize(18, 18))
@@ -1747,6 +1806,17 @@ class VTKToolsWidget(QWidget):
         foreground = theme_colors(self._theme)["text"]
 
         self.reset_btn.setIcon(svg_icon(ICON_DIR / "zoom_out_map.svg", color=foreground, widget=self.reset_btn))
+        source_variant = int(self.VOLUME_SOURCE_ICON_VARIANT)
+        if source_variant == 0:
+            source_icon_name, source_monochrome = "volume_source_2.svg", True
+        elif 1 <= source_variant <= 4:
+            source_icon_name, source_monochrome = f"vtk_volume_source_{source_variant}.svg", True
+        else:
+            raise ValueError("VOLUME_SOURCE_ICON_VARIANT должен быть 0..4.")
+        self.volume_source_btn.setIcon(svg_icon(
+            ICON_DIR / source_icon_name, color=foreground,
+            widget=self.volume_source_btn, monochrome=source_monochrome,
+        ))
         theta_range_icon = f"vtk_theta_range_{int(self.THETA_RANGE_ICON_VARIANT)}.svg"
         self.theta_range_btn.setIcon(
             svg_icon(ICON_DIR / theta_range_icon, color=foreground,
@@ -1826,9 +1896,12 @@ class VTKToolsWidget(QWidget):
 
         self.set_cursor_line_color(self._cursor_line_color)
         self.set_roi_preview_color(self._roi_preview_color)
+        self.set_volume_source_mode(self._volume_source_mode)
+        self.set_volume_source_available(self._volume_source_available)
         self._set_icon_sizes()
-        for menu in (self.orientation_menu, self.camera_menu, self.overlays_menu,
-                     self.theta_range_menu, self.axis_scale_menu, *self._overlay_settings_menus.values()):
+        for menu in (self.volume_source_menu, self.orientation_menu, self.camera_menu,
+                     self.overlays_menu, self.theta_range_menu, self.axis_scale_menu,
+                     *self._overlay_settings_menus.values()):
             apply_popup_theme(menu, self._theme)
         apply_popup_theme(self.axis_display_menu, self._theme)
         for menu, padding in (

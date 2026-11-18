@@ -38,6 +38,40 @@ class VTKToolsSourceContractTests(unittest.TestCase):
         for icon in ("vtk_camera_axis_x.svg", "vtk_camera_axis_y.svg", "vtk_camera_axis_z.svg", "zoom_out_map.svg"):
             self.assertTrue((ICONS / icon).is_file(), icon)
 
+    def test_volume_source_selector_uses_existing_roi_geometry_in_dialog(self):
+        toolbar = TOOLS.read_text(encoding="utf-8")
+        desktop = DESKTOP.read_text(encoding="utf-8")
+        for token in ("volume_source_mode_changed", "volume_source_geometry_requested",
+                      "set_volume_source_mode", "set_volume_source_available",
+                      "Полный детектор", "Прямоугольная ROI", "Геометрия ROI…"):
+            self.assertIn(token, toolbar)
+        self.assertIn("self.mode_combo.hide()", desktop)
+        self.assertIn("roi_dialog_layout.addWidget(roi_group)", desktop)
+        self.assertNotIn("self.panel_layout.addWidget(roi_group)", desktop)
+        self.assertIn("self.roi_cx", desktop)
+        self.assertIn("self.roi_width", desktop)
+        self.assertIn("self.roi_geometry_dialog.exec()", desktop)
+        self.assertIn("self.tools_widget.volume_source_mode_changed.connect", desktop)
+        self.assertIn("self._refresh_controls()", desktop[desktop.index("def open_h5"):desktop.index("def _run_pending_auto_load")])
+        self.assertIn("apply_popup_theme", desktop[:desktop.index("class TracedQVTKRenderWindowInteractor")])
+
+    def test_volume_source_icon_variants_exist_and_parse(self):
+        source = TOOLS.read_text(encoding="utf-8")
+        self.assertIn("VOLUME_SOURCE_ICON_VARIANT", source)
+        for index in range(1, 5):
+            name = f"vtk_volume_source_{index}.svg"
+            path = ICONS / name
+            self.assertTrue(path.is_file(), name)
+            self.assertTrue(ET.parse(path).getroot().tag.endswith("svg"), name)
+
+    def test_smoothing_is_documented_as_data_rebuild_not_render_quality(self):
+        desktop = DESKTOP.read_text(encoding="utf-8")
+        source = (GUI / "roi_explorer" / "vtk_backend" / "h5_volume_source.py").read_text(encoding="utf-8")
+        self.assertIn("Гауссово сглаживание изменяет значения", desktop)
+        self.assertIn("Требует повторной загрузки/перестроения объёма", desktop)
+        self.assertIn("_nan_aware_smooth_preserving_invalid(volume, smoothing_sigma)", source)
+        self.assertIn("min(0.2, sigma)", source)
+
     def test_viewer_connects_toolbar_signals_to_scene(self):
         source = DESKTOP.read_text(encoding="utf-8")
         for signal in ("axes_toggled", "bounding_box_toggled", "axis_ticks_toggled", "grid_toggled", "cursor_line_color_changed"):

@@ -5,7 +5,6 @@ forwards select / add / preview gestures to the owning QWidget.
 """
 from __future__ import annotations
 
-from collections import defaultdict
 from PyQt6.QtCore import Qt, QRectF, QPointF, pyqtSignal
 from PyQt6.QtGui import QColor, QBrush, QFont, QFontMetricsF, QPainter, QPainterPath, QPen, QPalette
 from PyQt6.QtWidgets import (
@@ -14,6 +13,7 @@ from PyQt6.QtWidgets import (
 )
 
 from roc_mcs.analysis.workflow_history import NodeStatus, ReviewStatus, WorkflowHistory
+from .graph_layout import vertical_dag_positions
 
 
 class _WorkflowNodeItem(QGraphicsObject):
@@ -21,8 +21,8 @@ class _WorkflowNodeItem(QGraphicsObject):
     add_requested = pyqtSignal(str)
     preview_requested = pyqtSignal(str)
 
-    WIDTH = 226.0
-    HEIGHT = 88.0
+    WIDTH = 242.0
+    HEIGHT = 78.0
 
     def __init__(
         self, node, *, can_add: bool, can_preview: bool, is_selected: bool = False
@@ -207,9 +207,8 @@ class ProcessingGraphView(QGraphicsView):
     add_stage_requested = pyqtSignal(str)
     preview_requested = pyqtSignal(str)
 
-    H_GAP = 78.0
-    V_GAP = 30.0
-    LEVEL_STEP = _WorkflowNodeItem.WIDTH + H_GAP
+    H_GAP = 34.0
+    V_GAP = 38.0
 
     def __init__(self, parent: QWidget | None = None):
         self._graph_scene = QGraphicsScene(parent)
@@ -258,47 +257,32 @@ class ProcessingGraphView(QGraphicsView):
             self._selected_id = None
             return
 
-        depths: dict[str, int] = {}
-        for node in visible_nodes:
-            parents = [parent for parent in node.parent_ids if parent in visible_ids]
-            depths[node.id] = max((depths.get(parent, 0) + 1 for parent in parents), default=0)
-
-        columns: dict[int, list] = defaultdict(list)
-        for node in visible_nodes:
-            columns[depths[node.id]].append(node)
-
-        positions: dict[str, QPointF] = {}
-        max_y = 0.0
-        max_x = 0.0
+        positions_xy = vertical_dag_positions(
+            visible_nodes, width=_WorkflowNodeItem.WIDTH,
+            height=_WorkflowNodeItem.HEIGHT, horizontal_gap=self.H_GAP,
+            vertical_gap=self.V_GAP, origin_x=22.0, origin_y=20.0,
+        )
+        positions = {key: QPointF(x, y) for key, (x, y) in positions_xy.items()}
+        max_x = max((point.x() + _WorkflowNodeItem.WIDTH for point in positions.values()), default=0.0)
+        max_y = max((point.y() + _WorkflowNodeItem.HEIGHT for point in positions.values()), default=0.0)
         selected = selected_id or self._selected_id
         palette = QApplication.palette()
         edge_color = palette.color(QPalette.ColorRole.Mid)
-        for depth in sorted(columns):
-            for row, node in enumerate(columns[depth]):
-                x = 24.0 + depth * self.LEVEL_STEP
-                y = 24.0 + row * (_WorkflowNodeItem.HEIGHT + self.V_GAP)
-                positions[node.id] = QPointF(x, y)
-                max_x = max(max_x, x + _WorkflowNodeItem.WIDTH)
-                max_y = max(max_y, y + _WorkflowNodeItem.HEIGHT)
 
-        # Connections are drawn before node cards so they remain visually quiet.
+        # Dependencies flow top-to-bottom. Curved connectors remain behind cards.
         for node in visible_nodes:
             target_pos = positions[node.id]
-            target_center = target_pos.y() + _WorkflowNodeItem.HEIGHT / 2.0
+            end = QPointF(target_pos.x() + _WorkflowNodeItem.WIDTH / 2.0, target_pos.y())
             for parent_id in node.parent_ids:
                 if parent_id not in positions:
                     continue
                 source_pos = positions[parent_id]
-                source_center = source_pos.y() + _WorkflowNodeItem.HEIGHT / 2.0
-                start = QPointF(source_pos.x() + _WorkflowNodeItem.WIDTH, source_center)
-                end = QPointF(target_pos.x(), target_center)
-                bend = max(24.0, (end.x() - start.x()) * 0.45)
+                start = QPointF(source_pos.x() + _WorkflowNodeItem.WIDTH / 2.0,
+                                source_pos.y() + _WorkflowNodeItem.HEIGHT)
+                bend = max(18.0, (end.y() - start.y()) * 0.45)
                 path = QPainterPath(start)
-                path.cubicTo(
-                    QPointF(start.x() + bend, start.y()),
-                    QPointF(end.x() - bend, end.y()),
-                    end,
-                )
+                path.cubicTo(QPointF(start.x(), start.y() + bend),
+                             QPointF(end.x(), end.y() - bend), end)
                 edge = QGraphicsPathItem(path)
                 pen_color = QColor(edge_color)
                 pen_color.setAlpha(150)
@@ -306,10 +290,9 @@ class ProcessingGraphView(QGraphicsView):
                 edge.setZValue(0)
                 self._graph_scene.addItem(edge)
 
-                # Small directional arrow: workflow dependencies flow left → right.
-                arrow_path = QPainterPath(QPointF(end.x(), end.y()))
-                arrow_path.lineTo(QPointF(end.x() - 7.0, end.y() - 4.0))
-                arrow_path.lineTo(QPointF(end.x() - 7.0, end.y() + 4.0))
+                arrow_path = QPainterPath(end)
+                arrow_path.lineTo(QPointF(end.x() - 4.0, end.y() - 7.0))
+                arrow_path.lineTo(QPointF(end.x() + 4.0, end.y() - 7.0))
                 arrow_path.closeSubpath()
                 arrow = QGraphicsPathItem(arrow_path)
                 arrow.setPen(QPen(pen_color, 0.6))
@@ -335,7 +318,7 @@ class ProcessingGraphView(QGraphicsView):
             self._graph_scene.addItem(item)
             self._items[node.id] = item
 
-        self._graph_scene.setSceneRect(QRectF(0, 0, max_x + 48.0, max_y + 48.0))
+        self._graph_scene.setSceneRect(QRectF(0, 0, max_x + 26.0, max_y + 28.0))
         if selected in self._items:
             self._selected_id = selected
             self.select_node(selected)
@@ -361,9 +344,15 @@ class ProcessingGraphView(QGraphicsView):
             self.centerOn(self._items[node_id])
 
     def fit_graph(self) -> None:
+        """Подгоняет ширину схемы; длинная история остаётся вертикально прокручиваемой."""
         rect = self._graph_scene.sceneRect()
-        if rect.isValid():
-            self.fitInView(rect, Qt.AspectRatioMode.KeepAspectRatio)
+        if not rect.isValid() or self.viewport().width() <= 0:
+            return
+        available = max(1, self.viewport().width() - 14)
+        scale = min(1.0, available / max(1.0, rect.width()))
+        self.resetTransform()
+        self.scale(scale, scale)
+        self.centerOn(rect.center().x(), self.mapToScene(self.viewport().rect().center()).y())
 
     def wheelEvent(self, event) -> None:
         if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
