@@ -159,6 +159,36 @@ def test_map_cursor_and_roi_preview_are_wired_to_embedded_vtk_widget():
     assert "preview_roi_finished.connect(self.volume_widget.set_roi_preview_geometry)" in source
 
 
+def test_embedded_theta_slider_is_bidirectionally_linked_by_physical_theta_value():
+    embedded_path = SRC / "gui/roi_explorer/vtk_backend/embedded_widget.py"
+    explorer_path = SRC / "gui/roi_explorer/explorer_window.py"
+    embedded = embedded_path.read_text(encoding="utf-8")
+    explorer = explorer_path.read_text(encoding="utf-8")
+    assert "theta_slice_value_changed = QtCore.pyqtSignal(float)" in embedded
+    assert "Связать с 2D-картой" in embedded
+    assert "def set_map_theta_context" in embedded
+    assert "def set_theta_index_from_map" in embedded
+    assert "np.sort(volume_axis), np.sort(map_axis)" in embedded
+    assert "self.volume_widget.theta_slice_value_changed.connect(self._on_vtk_theta_slice_changed)" in explorer
+    assert "self.volume_widget.set_theta_index_from_map(float(axis[self._theta_index]))" in explorer
+    assert "self.volume_widget.set_map_theta_index(self._theta_index)" in explorer
+    assert "self.volume_widget.set_map_theta_index(index)" in explorer
+    assert "self.map_widget.set_theta_index(index, emit=False)" in explorer
+    assert "def set_map_theta_index" in embedded
+
+
+def test_embedded_source_selection_is_an_icon_menu_and_vtk_colorbar_stays_pinned():
+    path = SRC / "gui/roi_explorer/vtk_backend/embedded_widget.py"
+    source = path.read_text(encoding="utf-8")
+    assert "vtkExplorerSourceButton" in source
+    assert "self.source_button.setMenu(self.source_menu)" in source
+    assert "self.source_combo.hide()" in source
+    assert 'QtWidgets.QLabel("Источник"' not in source
+    assert "VTKVolumeDisplayWidget(widget)" in source
+    apply_payload, _ = _method(path, "EmbeddedVTKVolumeWidget", "_apply_payload")
+    assert "self.display.set_scene_available(True)" in ast.unparse(apply_payload)
+
+
 def test_deferred_vtk_initialization_uses_generation_tickets_to_reject_stale_timers():
     path = SRC / "gui/roi_explorer/vtk_backend/embedded_widget.py"
     schedule, _ = _method(path, "EmbeddedVTKVolumeWidget", "_schedule_vtk_init")
@@ -224,3 +254,16 @@ def test_failed_vtk_payload_application_clears_partial_scene():
     assert "self.tools.set_scene_available(False)" in source
     assert "self.display.set_scene_available(False)" in source
     assert "self._payload = None" in source
+
+
+def test_rectangle_roi_aliases_use_shared_model_normalizer_without_cross_importing_vtk():
+    model = (SRC / "roi/roi_types.py").read_text(encoding="utf-8")
+    embedded = (SRC / "gui/roi_explorer/vtk_backend/embedded_widget.py").read_text(encoding="utf-8")
+    plotly = (SRC / "gui/roi_explorer/volume_plot_widget.py").read_text(encoding="utf-8")
+    adapter = (SRC / "gui/roi_explorer/vtk_backend/scan_view_adapter.py").read_text(encoding="utf-8")
+    assert "def normalize_rectangular_roi" in model
+    assert "normalize_rectangular_roi(item.roi)" in embedded
+    assert "normalize_rectangular_roi(saved.roi)" in plotly
+    assert "return normalize_rectangular_roi(saved.roi)" in plotly
+    assert "from roc_mcs.gui.roi_explorer.vtk_backend" not in plotly
+    assert "from roc_mcs.roi.roi_types import normalize_rectangular_roi" in adapter

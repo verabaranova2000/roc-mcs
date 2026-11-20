@@ -596,6 +596,30 @@ class MapPlotWidget(QWidget):
         slider.setValue(index); slider.blockSignals(False)
         self._update_theta_label(index)
 
+    def set_theta_index(self, index: int, *, emit: bool = True) -> int:
+        """Установить положение θ-рейки; вернуть фактически выбранный индекс.
+
+        ``emit=False`` предназначен для обратной синхронизации из 3D:
+        значение обновляется без повторного сигнала в сторону VTK.
+        """
+        maximum = max(0, int(self._theta_values.size) - 1)
+        value = max(0, min(int(index), maximum))
+        slider = self.theta_slider
+        if emit:
+            slider.setValue(value)
+        else:
+            blocked = slider.blockSignals(True)
+            try:
+                slider.setValue(value)
+            finally:
+                slider.blockSignals(blocked)
+            self._update_theta_label(value)
+        return int(slider.value())
+
+    def theta_axis_values(self) -> np.ndarray:
+        """Копия физической θ-оси, соответствующей положению 2D-слайдера."""
+        return self._theta_values.copy()
+
     def set_theta_slice_mode(self, enabled: bool) -> None:
         enabled = bool(enabled)
         # Родительский overlay и 10 px резерва существуют всегда; видимы только

@@ -89,6 +89,16 @@ class VTKToolsSourceContractTests(unittest.TestCase):
             root = ET.parse(path).getroot()
             self.assertTrue(root.tag.endswith("svg"), name)
 
+    def test_embedded_explorer_source_icon_variants_are_available(self):
+        embedded = GUI / "roi_explorer" / "vtk_backend" / "embedded_widget.py"
+        source = embedded.read_text(encoding="utf-8")
+        self.assertIn("SOURCE_ICON_VARIANT = 1", source)
+        self.assertIn("vtk_volume_source_{variant}.svg", source)
+        for index in range(1, 5):
+            path = ICONS / f"vtk_volume_source_{index}.svg"
+            self.assertTrue(path.is_file(), path.name)
+            self.assertTrue(ET.parse(path).getroot().tag.endswith("svg"), path.name)
+
     def test_scene_frame_ticks_grid_are_distinct_geometry(self):
         source = SCENE.read_text(encoding="utf-8")
         for token in ("outline_actor", "axis_tick_actor", "grid_actor", "outline_filter", "axis_tick_polydata"):

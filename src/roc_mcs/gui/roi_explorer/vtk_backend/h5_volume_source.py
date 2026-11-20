@@ -12,6 +12,7 @@ from typing import Any, Literal
 
 import numpy as np
 
+from roc_mcs.roi.roi_types import normalize_rectangular_roi
 from roc_mcs.gui.resource_monitor.activity import tracked_activity
 
 ViewMode = Literal["full", "roi"]
@@ -400,12 +401,7 @@ class H5VolumeLoader:
         if mode == "roi":
             if roi is None:
                 raise ValueError("Для режима ROI необходимо передать объект ROI.")
-            normalized = roi.normalized() if callable(getattr(roi, "normalized", None)) else roi
-            if str(getattr(normalized, "type", "")).lower() != "rect":
-                raise ValueError("3D-объём ROI поддерживает прямоугольную ROI (включая повёрнутую).")
-            if not bool(getattr(normalized, "is_valid", True)):
-                raise ValueError("Геометрия ROI невалидна.")
-            roi = normalized
+            roi = normalize_rectangular_roi(roi)
         else:
             roi = None
 

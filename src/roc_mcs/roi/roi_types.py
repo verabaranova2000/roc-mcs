@@ -283,6 +283,30 @@ class ROI:
         return False                                      # Неизвестный тип на всякий случай блокируем
 
 
+def normalize_rectangular_roi(roi: ROI) -> ROI:
+    """Return a validated canonical copy of a rectangular ROI.
+
+    Session/selector integrations historically used several names for the
+    same rectangle primitive.  The model's ``is_valid`` contract is stricter
+    and intentionally recognizes only ``rect``; normalize aliases here once
+    so every viewer/extractor applies identical geometry rules.
+    The caller-owned ROI is never modified.
+    """
+    if not isinstance(roi, ROI):
+        raise TypeError(f"Ожидается ROI, получено {type(roi).__name__}.")
+    selected = roi.normalized()
+    roi_type = str(selected.type).strip().lower()
+    if roi_type not in ("rect", "rectangle", "rotated_rect", "rotated_rectangle"):
+        raise ValueError("Поддерживаются только прямоугольные ROI.")
+    selected.type = "rect"
+    geometry = (selected.cx, selected.cy, selected.width, selected.height, selected.angle)
+    if not all(math.isfinite(float(value)) for value in geometry):
+        raise ValueError("Координаты и параметры прямоугольной ROI должны быть конечными.")
+    if selected.width <= 0.0 or selected.height <= 0.0 or not selected.is_valid:
+        raise ValueError("Ширина и высота прямоугольной ROI должны быть больше нуля.")
+    return selected
+
+
 @dataclass
 class SavedROI:
     id: int

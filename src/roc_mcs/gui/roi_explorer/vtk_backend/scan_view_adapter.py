@@ -6,10 +6,12 @@ from typing import Any
 
 import numpy as np
 
+from roc_mcs.roi.roi_types import normalize_rectangular_roi
 from .h5_volume_source import (
     SpikeReport, VolumePayload, _display_dtype, _regrid_rotated_roi_to_detector,
     _sum_projection_chunked, _nan_aware_smooth_preserving_invalid, orient_to_ascending,
 )
+
 
 
 def build_volume_payload(
@@ -77,11 +79,7 @@ def build_volume_payload(
     coord_system = "xy"
     selected_roi = None
     if roi is not None:
-        selected_roi = roi.normalized() if callable(getattr(roi, "normalized", None)) else roi
-        if str(getattr(selected_roi, "type", "")).lower() not in ("rect", "rectangle", "rotated_rectangle"):
-            raise ValueError("3D-источник поддерживает только сохранённые прямоугольные ROI.")
-        if not bool(getattr(selected_roi, "is_valid", True)):
-            raise ValueError("Выбранная ROI имеет некорректную геометрию.")
+        selected_roi = normalize_rectangular_roi(roi)
         from roc_mcs.roi.extraction import extract_roi_volume
         yxt = np.transpose(volume_xyt, (1, 0, 2))
         valid_yxt = None if mask_xyt is None else np.transpose(mask_xyt, (1, 0, 2))
@@ -95,7 +93,18 @@ def build_volume_payload(
         theta_axis = np.asarray(extracted.theta, dtype=np.float64)
         coord_system = str(extracted.coord_system).lower()
         if coord_system == "uv":
-            volume_xyt, x_axis, y_axis = _regrid_rotated_roi_to_detector(extracted, selected_roi)
+            # _regrid_rotated_roi_to_detector has a shared public contract:
+            # (x_axis, y_axis, volume_xyt).  The legacy HDF5 loader unpacks
+            # that order too.  Reversing it here silently assigned the 1-D X
+            # coordinate vector to ``volume_xyt``; orient_to_ascending then
+            # correctly rejected e.g. shape (88,) as a non-volume.
+            x_axis, y_axis, volume_xyt = _regrid_rotated_roi_to_detector(extracted, selected_roi)
+            expected_shape = (x_axis.size, y_axis.size, theta_axis.size)
+            if volume_xyt.ndim != 3 or volume_xyt.shape != expected_shape:
+                raise ValueError(
+                    "После перестройки повёрнутой ROI ожидался объём "
+                    f"(x,y,theta)={expected_shape}, получено {volume_xyt.shape}."
+                )
             coord_system = "xy"
 
     dtype = _display_dtype(np.asarray(volume_xyt))

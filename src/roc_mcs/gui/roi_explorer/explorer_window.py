@@ -347,6 +347,7 @@ class RockingCurveExplorerWindow(QMainWindow):
         self.map_widget.preview_roi_changed.connect(self.volume_widget.set_roi_preview_geometry)
         self.map_widget.preview_roi_finished.connect(self.volume_widget.set_roi_preview_geometry)
         self.volume_widget.data_rebuild_requested.connect(self._request_volume_refresh)
+        self.volume_widget.theta_slice_value_changed.connect(self._on_vtk_theta_slice_changed)
         self.plot_workspace.mdi_area.panel_visibility_changed.connect(self._on_plot_panel_visibility_changed)
         self.plot_workspace.mdi_area.panel_restored.connect(self._on_plot_panel_restored)
         self.curve_widget.theta_guide_toggled.connect(self._on_theta_guide_toggled)
@@ -823,21 +824,52 @@ class RockingCurveExplorerWindow(QMainWindow):
         self._theta_scan_cache_key = cache_key; self._theta_scan_cache = (data, theta, axis)
         return self._theta_scan_cache
 
+    def _current_map_theta_axis(self) -> np.ndarray:
+        """Return the physical θ-axis used by the currently displayed 2D view."""
+        try:
+            if self._analysis_view is not None:
+                axis = np.asarray(self._analysis_view.theta, dtype=np.float64)
+            else:
+                scan = self._get_theta_scan()
+                axis = np.asarray(scan[1], dtype=np.float64) if scan is not None else np.empty(0)
+            if axis.ndim != 1 or not np.isfinite(axis).all():
+                return np.empty(0, dtype=np.float64)
+            if axis.size > 1:
+                delta = np.diff(axis)
+                if not (np.all(delta > 0.0) or np.all(delta < 0.0)):
+                    return np.empty(0, dtype=np.float64)
+            return axis
+        except (AttributeError, TypeError, ValueError, KeyError, IndexError):
+            return np.empty(0, dtype=np.float64)
+
+    def _sync_volume_theta_context(self) -> None:
+        """Tell the 3D panel whether its theta slider can link to the 2D map."""
+        enabled = bool(self._theta_slice_mode)
+        axis = self._current_map_theta_axis() if enabled else np.empty(0, dtype=np.float64)
+        index = int(self.map_widget.theta_slider.value()) if axis.size else 0
+        self._theta_index = max(0, min(index, max(0, axis.size - 1)))
+        self.volume_widget.set_map_theta_context(enabled, axis, self._theta_index)
+
     def _set_theta_axis_for_current_scan(self):
         try:
-            scan = self._get_theta_scan()
-            if scan is None: self.map_widget.set_theta_axis([]); return
-            _, theta, _ = scan
+            theta = self._current_map_theta_axis()
+            if theta.size == 0:
+                self.map_widget.set_theta_axis([])
+                self._sync_volume_theta_context()
+                return
             self._theta_index = max(0, min(self._theta_index, len(theta)-1))
             self.map_widget.set_theta_axis(theta, self._theta_index)
+            self._sync_volume_theta_context()
         except Exception as exc:
             self.map_widget.set_theta_axis([])
+            self._sync_volume_theta_context()
             if self._theta_slice_mode: self.status.showMessage(f"Срез по θ недоступен: {exc}", 8000)
 
     def _current_theta_value(self):
         if not self._theta_slice_mode: return None
         try:
-            _,theta,_=self._get_theta_scan(); idx=max(0,min(int(self._theta_index),len(theta)-1))
+            theta = self._current_map_theta_axis()
+            idx=max(0,min(int(self.map_widget.theta_slider.value()),len(theta)-1))
             return float(theta[idx]) if len(theta) else None
         except Exception: return None
 
@@ -847,8 +879,35 @@ class RockingCurveExplorerWindow(QMainWindow):
 
     def _on_theta_index_changed(self, index: int) -> None:
         self._theta_index = int(index)
-        if self._theta_slice_mode: self._theta_render_timer.start()
+        if self._theta_slice_mode:
+            axis = self._current_map_theta_axis()
+            if 0 <= self._theta_index < axis.size:
+                self.volume_widget.set_map_theta_index(self._theta_index)
+                self.volume_widget.set_theta_index_from_map(float(axis[self._theta_index]))
+            self._theta_render_timer.start()
         if self._show_theta_guide: self.curve_widget.set_theta_guide(self._current_theta_value() if self._theta_slice_mode else None)
+
+    def _on_vtk_theta_slice_changed(self, theta_value: float) -> None:
+        """Mirror a user-driven 3D θ change back to the 2D map by value."""
+        if not self._theta_slice_mode:
+            return
+        axis = self._current_map_theta_axis()
+        if axis.size < 2:
+            return
+        try:
+            value = float(theta_value)
+        except (TypeError, ValueError, OverflowError):
+            return
+        if not np.isfinite(value):
+            return
+        index = int(np.argmin(np.abs(axis - value)))
+        self._theta_index = index
+        self.volume_widget.set_map_theta_index(index)
+        self.map_widget.set_theta_index(index, emit=False)
+        if self._show_theta_guide:
+            self.curve_widget.set_theta_guide(self._current_theta_value())
+        # Use the normal map refresh path; VTK has already updated synchronously.
+        self._theta_render_timer.start(0)
 
     def _on_map_changed(self, *args) -> None:
         combo = self.map_widget.map_combo
@@ -857,6 +916,7 @@ class RockingCurveExplorerWindow(QMainWindow):
             if self._show_theta_guide: self.curve_widget.set_theta_guide(self._current_theta_value())
             return
         self._theta_slice_mode = False; self.map_widget.set_theta_slice_mode(False)
+        self._sync_volume_theta_context()
         if self._show_theta_guide: self.curve_widget.set_theta_guide(None)
         value = combo.currentData() or combo.currentText()
         if value:
@@ -935,6 +995,7 @@ class RockingCurveExplorerWindow(QMainWindow):
         self._analysis_curve_cache.clear()
         self.selected_pixel = None
         self._theta_scan_cache_key = None; self._theta_scan_cache = None
+        self._set_theta_axis_for_current_scan()
         self.refresh_map()
         self.refresh_curves()
         self._update_inspector()
@@ -953,6 +1014,7 @@ class RockingCurveExplorerWindow(QMainWindow):
             self.map_widget.set_pool_spec(previous, source_shape_yx=source.source_shape_yx if source else None)
         self.map_widget.set_pool_enabled(self.repo is not None)
         self._theta_scan_cache_key = None; self._theta_scan_cache = None
+        self._set_theta_axis_for_current_scan()
         self.refresh_all()
         self.status.showMessage("Исходный HDF5-view восстановлен")
 

@@ -7,6 +7,7 @@ from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (QApplication, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout, QLabel,
     QMessageBox, QVBoxLayout, QWidget)
 from roc_mcs.roi.extraction import extract_roi_volume
+from roc_mcs.roi.roi_types import normalize_rectangular_roi
 from roc_mcs.roi.roi_types import ROI
 from roc_mcs.gui.roi_explorer.theme import apply_popup_theme, apply_widget_palette, resolve_theme, theme_colors
 from roc_mcs.gui.roi_explorer.volume_rendering import build_volume_figure, effective_volume_stride, effective_extraction_stride, crop_raw_to_roi, masked_detector_projection, MAX_CACHE_VOXELS, MAX_RENDER_POINTS
@@ -891,7 +892,13 @@ class VolumePlotWidget(QWidget):
         mask=None if valid_mask is None else np.asarray(valid_mask,dtype=bool)
         if mask is not None and mask.shape!=data.shape:
             raise ValueError(f"valid_mask shape={mask.shape} не совпадает с raw shape={data.shape}")
-        self._dataset_generation+=1; self._volume_cache_key=None; self._volume_cache=None; self._volume_cache_input_stride=1; self._projection_cache_key=None; self._projection_cache=None; self._raw=data; self._valid_mask=mask; self._th=np.asarray(th,dtype=float); self._axis=int(axis); self._x=np.asarray(x_coords,dtype=float); self._y=np.asarray(y_coords,dtype=float); self._scan_label=str(scan_label); self._view_label=str(view_label); self._rois=[r for r in (saved_rois or []) if str(r.roi.type).lower() in ("rect","rectangle","rotated_rectangle") and r.roi.normalized().is_valid]
+        self._dataset_generation+=1; self._volume_cache_key=None; self._volume_cache=None; self._volume_cache_input_stride=1; self._projection_cache_key=None; self._projection_cache=None; self._raw=data; self._valid_mask=mask; self._th=np.asarray(th,dtype=float); self._axis=int(axis); self._x=np.asarray(x_coords,dtype=float); self._y=np.asarray(y_coords,dtype=float); self._scan_label=str(scan_label); self._view_label=str(view_label); self._rois=[]
+        for saved in (saved_rois or []):
+            try:
+                normalize_rectangular_roi(saved.roi)
+            except (AttributeError, TypeError, ValueError, OverflowError):
+                continue
+            self._rois.append(saved)
         pending = self._pending_roi_overlay_color
         if pending is not None and not any(saved is pending[2] for saved in self._rois):
             # Do not retain or apply a deferred patch belonging to another scan/session.
@@ -933,7 +940,7 @@ class VolumePlotWidget(QWidget):
         key=self.toolbar.current_source()
         if key != "full":
             saved=next((r for r in self._rois if int(r.id)==int(key)),None)
-            if saved is not None:return saved.roi.normalized()
+            if saved is not None:return normalize_rectangular_roi(saved.roi)
             self.toolbar.set_roi_choices([(int(r.id),r.roi.label or f"ROI {r.id}",r.roi.color) for r in self._rois],"full")
         dx=abs(float(np.median(np.diff(self._x)))) if len(self._x)>1 else 1.0; dy=abs(float(np.median(np.diff(self._y)))) if len(self._y)>1 else 1.0
         return ROI(cx=float((self._x[0]+self._x[-1])/2),cy=float((self._y[0]+self._y[-1])/2),width=float(abs(self._x[-1]-self._x[0])+dx),height=float(abs(self._y[-1]-self._y[0])+dy),angle=0,label="Весь детектор",type="rect")

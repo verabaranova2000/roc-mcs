@@ -12,6 +12,7 @@ from PyQt6 import QtCore, QtGui, QtWidgets
 from roc_mcs.gui.roi_explorer.theme import resolve_theme, theme_colors
 from .cursor_link import map_detector_cursor_to_volume
 from .scan_view_adapter import build_volume_payload
+from roc_mcs.roi.roi_types import normalize_rectangular_roi
 from .vtk_scene import TransferSettings, VTKVolumeScene
 from .vtk_tools_widget import VTKToolsWidget
 from .vtk_volume_display_widget import VTKVolumeDisplayWidget
@@ -44,6 +45,14 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
     """Лёгкая оболочка; QVTK/OpenGL создаются только при первом показе окна."""
 
     data_rebuild_requested = QtCore.pyqtSignal()
+    # Physical theta coordinate (degrees) changed by the user in the 3D HUD.
+    # The explorer maps this value to its own 2D theta axis; indices are not
+    # assumed to match because either source may be stored in descending order.
+    theta_slice_value_changed = QtCore.pyqtSignal(float)
+
+    # Choose one of the four supplied scientific source symbols (1..4).
+    # 1 is the default nested-volume/cube glyph.
+    SOURCE_ICON_VARIANT = 1
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -69,6 +78,9 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
         self._rois: list = []
         self._selected_roi_id: int | None = None
         self._source_scan_key: str | None = None
+        self._map_theta_mode = False
+        self._map_theta_values = np.empty(0, dtype=np.float64)
+        self._map_theta_index = 0
         self._transfer = TransferSettings()
         self._settings = {}
         self._settings_timer = QtCore.QTimer(self)
@@ -90,14 +102,25 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
         row = QtWidgets.QHBoxLayout(self.toolbar)
         row.setContentsMargins(3, 1, 3, 1)
         row.setSpacing(4)
+        # Keep the combo as an internal selection model for API compatibility,
+        # but expose the source choice through one compact icon-only menu.
         self.source_combo = QtWidgets.QComboBox(self.toolbar)
         self.source_combo.setObjectName("vtkExplorerVolumeSource")
-        self.source_combo.setMinimumWidth(150)
-        self.source_combo.setMaximumWidth(230)
-        self.source_combo.setToolTip("Источник 3D-объёма: полный детектор или сохранённая прямоугольная ROI")
         self.source_combo.addItem("Полный детектор", "full")
-        row.addWidget(QtWidgets.QLabel("Источник", self.toolbar))
-        row.addWidget(self.source_combo)
+        self.source_combo.hide()
+        self.source_button = QtWidgets.QToolButton(self.toolbar)
+        self.source_button.setObjectName("vtkExplorerSourceButton")
+        self.source_button.setAutoRaise(True)
+        self.source_button.setPopupMode(QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.source_button.setFixedSize(28, 28)
+        self.source_button.setIconSize(QtCore.QSize(19, 19))
+        self.source_button.setToolTip("Выбрать источник 3D-объёма")
+        self.source_button.setAccessibleName("Источник 3D-объёма")
+        self.source_menu = QtWidgets.QMenu(self.source_button)
+        self.source_menu.setObjectName("vtkExplorerSourceMenu")
+        self.source_menu.setToolTipsVisible(True)
+        self.source_button.setMenu(self.source_menu)
+        row.addWidget(self.source_button, 0)
         self.tools = VTKToolsWidget(self.toolbar)
         self.tools.volume_source_btn.hide()
         self.tools.theme_btn.hide()
@@ -124,6 +147,9 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
         self._build_overlay_settings()
         self._connect_tools()
         self.source_combo.currentIndexChanged.connect(self._source_changed)
+        self._update_source_icon()
+        self._rebuild_source_menu()
+        self.source_button.setEnabled(False)
         self.tools.set_scene_available(False)
         self.tools.set_volume_source_available(False)
         self.tools.set_overlay_controls_enabled(cursor=False, theta=False, projection=False, roi_preview=False)
@@ -165,6 +191,16 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
             self.theta_palette.addItem(name, name)
         self.theta_strength = self._spin(0.0, 1.0, 0.75, 2)
         theta = self._settings_panel(("Срез", self.theta_label), ("Индекс θ", self.theta_index), ("Палитра", self.theta_palette), ("Сила", self.theta_strength))
+        self.theta_link_checkbox = QtWidgets.QCheckBox("Связать с 2D-картой")
+        self.theta_link_checkbox.setObjectName("vtkThetaSliceLinkCheckbox")
+        self.theta_link_checkbox.setChecked(True)
+        self.theta_link_checkbox.setEnabled(False)
+        self.theta_link_checkbox.setToolTip(
+            "Синхронизация доступна только в режиме 2D-карты «Срез по θ» "
+            "и при совпадающих физических θ-осях."
+        )
+        self.theta_link_checkbox.setAccessibleName("Связать срез θ в 3D с 2D-картой")
+        theta.layout().addRow(self.theta_link_checkbox)
 
         self.projection_opacity = self._spin(0.0, 1.0, 0.75, 2)
         self.projection_palette = QtWidgets.QComboBox()
@@ -183,6 +219,7 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
         self.cursor_width.valueChanged.connect(self._update_cursor)
         self.cursor_density.valueChanged.connect(self._update_cursor_density)
         self.theta_index.valueChanged.connect(self._apply_theta_index)
+        self.theta_link_checkbox.toggled.connect(self._on_theta_link_toggled)
         self.theta_palette.currentIndexChanged.connect(self._apply_theta_palette)
         self.theta_strength.valueChanged.connect(self._apply_theta_strength)
         self.projection_opacity.valueChanged.connect(self._queue_transfer_settings)
@@ -212,6 +249,57 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
         for control in (self.low_threshold, self.high_threshold, self.opacity, self.gamma, self.sample_factor, self.unit_distance):
             control.valueChanged.connect(self._queue_transfer_settings)
         self.palette.currentIndexChanged.connect(self._queue_transfer_settings)
+
+    def _update_source_icon(self) -> None:
+        """Apply the selected monochrome source glyph to the compact button."""
+        from roc_mcs.gui.components.icon_provider import svg_icon
+        from roc_mcs.gui.roi_explorer.plot_toolbar_style import ICON_DIR
+
+        variant = int(self.SOURCE_ICON_VARIANT)
+        if variant not in (1, 2, 3, 4):
+            raise ValueError("SOURCE_ICON_VARIANT должен быть 1..4.")
+        foreground = theme_colors(self._theme)["text"]
+        icon_path = ICON_DIR / f"vtk_volume_source_{variant}.svg"
+        self.source_button.setIcon(svg_icon(
+            icon_path, color=foreground, widget=self.source_button, monochrome=True,
+        ))
+
+    def _rebuild_source_menu(self) -> None:
+        """Mirror the hidden selection model into a concise icon-button menu."""
+        self.source_menu.clear()
+        self._source_menu_actions = {}
+        for index in range(self.source_combo.count()):
+            key = self.source_combo.itemData(index)
+            label = self.source_combo.itemText(index)
+            action = QtGui.QAction(self.source_combo.itemIcon(index), label, self.source_menu)
+            action.setCheckable(True)
+            action.setData(key)
+            action.setChecked(index == self.source_combo.currentIndex())
+            action.triggered.connect(
+                lambda _checked=False, selected=key: self._select_source_from_menu(selected)
+            )
+            self.source_menu.addAction(action)
+            self._source_menu_actions[key] = action
+        self._sync_source_menu_state()
+
+    def _sync_source_menu_state(self) -> None:
+        selected = self.source_combo.currentData() or "full"
+        labels = []
+        for key, action in getattr(self, "_source_menu_actions", {}).items():
+            active = key == selected
+            action.setChecked(active)
+            if active:
+                labels.append(action.text())
+        detail = labels[0] if labels else "Полный детектор"
+        self.source_button.setToolTip(f"Источник 3D-объёма: {detail}")
+        self.source_button.setAccessibleDescription(f"Текущий источник: {detail}")
+
+    def _select_source_from_menu(self, key) -> None:
+        index = self.source_combo.findData(key)
+        if index < 0 or index == self.source_combo.currentIndex():
+            self._sync_source_menu_state()
+            return
+        self.source_combo.setCurrentIndex(index)
 
     @staticmethod
     def _settings_panel(*rows):
@@ -260,7 +348,13 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
             self.source_combo.setCurrentIndex(max(0, full_index))
             self.source_combo.blockSignals(False)
             self._source_scan_key = source_identity
-        self._rois = [item for item in (saved_rois or []) if str(getattr(item.roi, "type", "")).lower() in ("rect", "rectangle", "rotated_rectangle") and bool(item.roi.normalized().is_valid)]
+        self._rois = []
+        for item in (saved_rois or []):
+            try:
+                normalize_rectangular_roi(item.roi)
+            except (AttributeError, TypeError, ValueError, OverflowError):
+                continue
+            self._rois.append(item)
         self._rebuild_source_choices()
         details = dict(metadata or {})
         details.setdefault("view_label", str(view_label))
@@ -270,6 +364,8 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
             "h5_path": source_path, "operation_id": str(operation_id), "metadata": details,
             "smoothing_sigma": float(self._settings.get("smooth_sigma", 0.5)),
         }
+        self.source_button.setEnabled(True)
+        self._refresh_theta_link_control()
         self._closed = False
         if self._scene is not None:
             self._submit_payload(self._dataset_request)
@@ -298,6 +394,7 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
         self.source_combo.setEnabled(bool(self._rois))
         self.source_combo.blockSignals(False)
         self._selected_roi_id = None if target == "full" else int(target)
+        self._rebuild_source_menu()
 
     def _selected_roi(self):
         key = self.source_combo.currentData() or "full"
@@ -307,6 +404,7 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
         return item.roi.normalized() if item is not None else None
 
     def _source_changed(self, _index):
+        self._sync_source_menu_state()
         if self._dataset_request is None:
             return
         self._selected_roi_id = None if self.source_combo.currentData() == "full" else int(self.source_combo.currentData())
@@ -383,8 +481,14 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
             self.display.set_colormap(settings.palette)
             self.display.set_thresholds(self.low_threshold.value(), self.high_threshold.value(), absolute_low=info.get("threshold_min"), absolute_high=info.get("threshold_max"), reference=info.get("threshold_reference"))
             self.display.set_scene_available(True)
-        self.theta_index.setRange(0, max(0, len(payload.theta) - 1))
-        self.theta_index.setValue(int(self._scene.theta_slice_index or 0))
+        blocked = self.theta_index.blockSignals(True)
+        try:
+            self.theta_index.setRange(0, max(0, len(payload.theta) - 1))
+            self.theta_index.setValue(int(self._scene.theta_slice_index or 0))
+        finally:
+            self.theta_index.blockSignals(blocked)
+        self._set_theta_index(int(self.theta_index.value()), notify_map=False)
+        self._refresh_theta_link_control()
         if self._first_payload:
             self._scene.reset_camera_fit_preserve_direction()
             self._first_payload = False
@@ -616,6 +720,8 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
         self.setStyleSheet(f"QWidget#EmbeddedVTKVolumeWidget{{background:{colors['window']};color:{colors['text']};}} QWidget#EmbeddedVTKToolbar{{background:{colors['window']};}} QLabel#vtkEmbeddedStatus{{color:{colors['muted']};font-size:9px;padding:1px 4px;}}")
         if hasattr(self, "tools"):
             self.tools.apply_theme(self._theme)
+        if hasattr(self, "source_button"):
+            self._update_source_icon()
         if self._scene is not None:
             self._scene.set_theme(self._theme)
             self._render()
@@ -668,10 +774,113 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
             self._render()
 
     def _apply_theta_index(self, index):
+        self._set_theta_index(int(index), notify_map=True)
+
+    def _set_theta_index(self, index: int, *, notify_map: bool) -> None:
         if self._scene is not None and self._payload is not None:
             value = self._scene.set_theta_slice_index(int(index), render=False)
             self.theta_label.setText(f"θ = {float(self._payload.theta[value]):.7g}° [{value + 1}/{len(self._payload.theta)}]")
             self._render()
+            if notify_map and self.is_theta_link_active:
+                self.theta_slice_value_changed.emit(float(self._payload.theta[value]))
+
+    @property
+    def is_theta_link_active(self) -> bool:
+        """Whether bidirectional 2D↔3D theta synchronization is effective now."""
+        return bool(
+            self._map_theta_mode
+            and self.theta_link_checkbox.isEnabled()
+            and self.theta_link_checkbox.isChecked()
+        )
+
+    def set_map_theta_context(self, enabled: bool, theta_values=None, current_index: int = 0) -> None:
+        """Publish the current 2D theta-map state to the embedded volume view."""
+        axis = np.asarray(theta_values if theta_values is not None else [], dtype=np.float64)
+        if axis.ndim != 1 or not np.isfinite(axis).all():
+            axis = np.empty(0, dtype=np.float64)
+            enabled = False
+        if axis.size > 1:
+            differences = np.diff(axis)
+            if not (np.all(differences > 0.0) or np.all(differences < 0.0)):
+                axis = np.empty(0, dtype=np.float64)
+                enabled = False
+        self._map_theta_mode = bool(enabled and axis.size > 1)
+        self._map_theta_values = axis.copy()
+        self.set_map_theta_index(current_index)
+        self._refresh_theta_link_control()
+
+    def set_map_theta_index(self, index: int) -> None:
+        """Update the 2D map's current index without rebuilding its theta axis."""
+        maximum = max(0, int(self._map_theta_values.size) - 1)
+        self._map_theta_index = max(0, min(int(index), maximum))
+
+    def _volume_theta_axis(self):
+        if self._payload is not None:
+            return np.asarray(self._payload.theta, dtype=np.float64)
+        if self._dataset_request is not None:
+            try:
+                axis = np.asarray(self._dataset_request.get("theta"), dtype=np.float64)
+                if axis.ndim == 1 and np.isfinite(axis).all():
+                    return axis
+            except (TypeError, ValueError):
+                pass
+        return np.empty(0, dtype=np.float64)
+
+    def _refresh_theta_link_control(self) -> None:
+        volume_axis = self._volume_theta_axis()
+        map_axis = self._map_theta_values
+        compatible = (
+            self._map_theta_mode
+            and map_axis.size > 1
+            and volume_axis.size == map_axis.size
+            and volume_axis.size > 1
+            and np.allclose(
+                np.sort(volume_axis), np.sort(map_axis),
+                rtol=1e-10, atol=1e-12,
+            )
+        )
+        self.theta_link_checkbox.setEnabled(bool(compatible))
+        if compatible:
+            self.theta_link_checkbox.setToolTip(
+                "Связать физическое положение θ-среза в 2D-карте и 3D. "
+                "Изменение любого ползунка обновляет второй."
+            )
+            if self.is_theta_link_active and self._payload is not None:
+                map_value = float(self._map_theta_values[self._map_theta_index])
+                self.set_theta_index_from_map(map_value)
+        elif self._map_theta_mode:
+            self.theta_link_checkbox.setToolTip(
+                "Синхронизация недоступна: физические θ-оси 2D-карты и 3D-источника не совпадают."
+            )
+        else:
+            self.theta_link_checkbox.setToolTip(
+                "Доступно только в режиме 2D-карты «Срез по θ». В остальных режимах 3D-срез независимый."
+            )
+
+    def _on_theta_link_toggled(self, checked: bool) -> None:
+        if checked and self.is_theta_link_active and self._map_theta_values.size:
+            map_value = float(self._map_theta_values[self._map_theta_index])
+            self.set_theta_index_from_map(map_value)
+
+    def set_theta_index_from_map(self, theta_value: float) -> None:
+        """Synchronize the 3D slider from a physical 2D theta value, no echo."""
+        if not self.is_theta_link_active or self._payload is None:
+            return
+        try:
+            value = float(theta_value)
+        except (TypeError, ValueError, OverflowError):
+            return
+        if not np.isfinite(value) or not self._payload.theta.size:
+            return
+        axis = np.asarray(self._payload.theta, dtype=np.float64)
+        index = int(np.argmin(np.abs(axis - value)))
+        slider = self.theta_index
+        blocked = slider.blockSignals(True)
+        try:
+            slider.setValue(index)
+        finally:
+            slider.blockSignals(blocked)
+        self._set_theta_index(index, notify_map=False)
 
     def _apply_theta_palette(self, _index):
         if self._scene is not None:
@@ -793,6 +1002,7 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
         self.source_combo.setCurrentIndex(max(0, self.source_combo.findData("full")))
         self.source_combo.blockSignals(False)
         self._rebuild_source_choices()
+        self.source_button.setEnabled(False)
         if self._scene is not None:
             self._scene.clear(render=False)
             self._render()

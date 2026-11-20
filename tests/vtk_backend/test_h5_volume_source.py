@@ -60,6 +60,20 @@ class TestH5VolumeLoader:
         np.testing.assert_array_equal(payload.projection, expected.sum(axis=2))
         assert payload.coord_system == "xy"
 
+    @pytest.mark.parametrize("alias", ["rectangle", "rotated_rect", "rotated_rectangle"])
+    def test_h5_roi_loader_canonicalizes_legacy_rectangle_aliases(self, tmp_path, monkeypatch, alias):
+        from roc_mcs.roi.roi_types import ROI
+        raw = np.arange(3 * 18 * 20, dtype=np.float32).reshape(3, 18, 20)
+        loader = _loader(_write_scan(tmp_path / "scan.h5", raw, np.arange(3.)), monkeypatch)
+        roi = ROI(cx=10.0, cy=9.0, width=8.0, height=5.0, angle=21.0, type=alias)
+
+        payload = loader.load("entry001", mode="roi", roi=roi)
+
+        assert payload.volume.ndim == 3
+        assert payload.volume.shape == (payload.x.size, payload.y.size, payload.theta.size)
+        assert payload.roi.type == "rect"
+        assert roi.type == alias
+
     def test_descending_theta_reverses_samples_and_axis_together(self, tmp_path, monkeypatch):
         raw = np.arange(4 * 3 * 5, dtype=np.float32).reshape(4, 3, 5)
         theta = np.array([3., 2., 1., 0.])
