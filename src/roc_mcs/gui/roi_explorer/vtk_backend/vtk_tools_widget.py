@@ -34,6 +34,7 @@ from roc_mcs.gui.roi_explorer.plot_toolbar_style import ICON_DIR
 from roc_mcs.gui.roi_explorer.theme import (
     apply_popup_theme,
     apply_widget_palette,
+    resolve_theme,
     theme_colors,
 )
 
@@ -454,7 +455,9 @@ class VTKToolsWidget(QWidget):
         self.set_cursor_line_color(self._cursor_line_color)
         self.set_roi_preview_color(self._roi_preview_color)
         self._set_icon_sizes()
-        self.apply_theme("light")
+        # The parent EmbeddedVTKVolumeWidget already carries the application's
+        # theme property before this toolbar is constructed.
+        self.apply_theme(resolve_theme(parent if parent is not None else self))
 
     def _select_volume_source(self, mode: str) -> None:
         value = str(mode).lower()

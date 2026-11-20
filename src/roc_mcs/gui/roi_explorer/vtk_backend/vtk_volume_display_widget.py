@@ -134,6 +134,8 @@ class VTKVolumeDisplayWidget(QFrame):
         super().__init__(viewport if parent is None else parent)
         self._viewport = viewport
         self._theme = "light"
+        self._scene_available = False
+        self._show_colorbar = True
         self._low_spin = None
         self._high_spin = None
         self._syncing_thresholds = False
@@ -220,6 +222,26 @@ class VTKVolumeDisplayWidget(QFrame):
         self._apply_overlay_theme(self._theme)
         self._position_overlay()
         self.hide()
+
+    def set_viewport(self, viewport: QWidget) -> None:
+        """Перепривязать HUD к текущему QVTK, сохранив все Qt-контролы."""
+        if viewport is self._viewport and self.parentWidget() is viewport:
+            return
+        self.settings_menu.close()
+        self.hide()
+        old_viewport = self._viewport
+        if old_viewport is not None:
+            try:
+                old_viewport.removeEventFilter(self)
+            except RuntimeError:
+                pass
+        self._viewport = viewport
+        self.setParent(viewport)
+        viewport.installEventFilter(self)
+        self._position_overlay()
+        if self._scene_available and self._show_colorbar:
+            self.show()
+            self.raise_()
 
     def eventFilter(self, watched, event):
         if watched is self._viewport and event.type() in (
@@ -345,10 +367,19 @@ class VTKVolumeDisplayWidget(QFrame):
     def set_colormap(self, name: str) -> None:
         self.color_ramp.set_colormap(str(name))
 
+    def set_colorbar_visible(self, visible: bool) -> None:
+        self._show_colorbar = bool(visible)
+        self._sync_visibility()
+
     def set_scene_available(self, available: bool) -> None:
-        self.setVisible(bool(available))
-        self.setEnabled(bool(available))
-        if available:
+        self._scene_available = bool(available)
+        self._sync_visibility()
+
+    def _sync_visibility(self) -> None:
+        visible = self._scene_available and self._show_colorbar
+        self.setVisible(visible)
+        self.setEnabled(visible)
+        if visible:
             self._position_overlay()
             self.raise_()
 

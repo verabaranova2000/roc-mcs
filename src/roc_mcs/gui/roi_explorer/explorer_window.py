@@ -109,6 +109,7 @@ class RockingCurveExplorerWindow(QMainWindow):
         self.current_file: Optional[Path] = None
         self._theta_slice_mode = False; self._theta_index = 0; self._theta_scan_cache_key = None; self._theta_scan_cache = None; self._theta_levels_cache = {}; self._show_theta_guide = False
         self._analysis_view = None
+        self._volume_refresh_pending = True
         self._analysis_previous_pool = None
         self._analysis_curve_cache = {}
 
@@ -116,6 +117,9 @@ class RockingCurveExplorerWindow(QMainWindow):
         self._preview_timer = QTimer(self)
         self._preview_timer.setSingleShot(True)
         self._preview_timer.timeout.connect(self._update_preview_curve)
+        self._volume_refresh_timer = QTimer(self)
+        self._volume_refresh_timer.setSingleShot(True)
+        self._volume_refresh_timer.timeout.connect(self.refresh_volume)
 
         self._build_ui()
         self._build_actions()
@@ -340,6 +344,11 @@ class RockingCurveExplorerWindow(QMainWindow):
         self.map_widget.theta_index_changed.connect(self._on_theta_index_changed)
         self.map_widget.pixel_clicked.connect(self._on_pixel_clicked)
         self.map_widget.cursor_position_changed.connect(self.volume_widget.set_map_cursor_position)
+        self.map_widget.preview_roi_changed.connect(self.volume_widget.set_roi_preview_geometry)
+        self.map_widget.preview_roi_finished.connect(self.volume_widget.set_roi_preview_geometry)
+        self.volume_widget.data_rebuild_requested.connect(self._request_volume_refresh)
+        self.plot_workspace.mdi_area.panel_visibility_changed.connect(self._on_plot_panel_visibility_changed)
+        self.plot_workspace.mdi_area.panel_restored.connect(self._on_plot_panel_restored)
         self.curve_widget.theta_guide_toggled.connect(self._on_theta_guide_toggled)
         self.processing_panel.preview_ready.connect(self.show_analysis_preview)
         self.processing_panel.restore_requested.connect(self.restore_analysis_preview)
@@ -769,6 +778,7 @@ class RockingCurveExplorerWindow(QMainWindow):
         except Exception as exc:
             self.status.showMessage(f"Processing project unavailable: {exc}", 8000)
         self.status.showMessage(pool_warning or f"Selected scan: {self.selected_scan} · {self.repo.view}")
+        self._request_volume_refresh()
 
 
     def _populate_map_combo(self) -> None:
@@ -893,6 +903,7 @@ class RockingCurveExplorerWindow(QMainWindow):
             self._preview_timer.start(0)
         self._update_inspector()
         self.status.showMessage(f"Spatial view: {self._pool_label(pool)}")
+        self._request_volume_refresh()
 
     def _set_processing_busy(self, busy: bool) -> None:
         # Во время исполнения нельзя переключать источник под активным workflow.
@@ -927,6 +938,7 @@ class RockingCurveExplorerWindow(QMainWindow):
         self.refresh_map()
         self.refresh_curves()
         self._update_inspector()
+        self._request_volume_refresh()
         self.status.showMessage(f"Workflow preview: {state.label}")
 
     def restore_analysis_preview(self) -> None:
@@ -1349,6 +1361,7 @@ class RockingCurveExplorerWindow(QMainWindow):
         self.refresh_curves()
         self.refresh_roi_table()
         self._update_inspector()
+        self._request_volume_refresh()
 
     def refresh_map(self, *args) -> None:
         """Отрисовывает карту выбранной версии данных либо исходного HDF5."""
@@ -1541,8 +1554,26 @@ class RockingCurveExplorerWindow(QMainWindow):
         if update_volume: self.refresh_volume()
 
 
+    def _request_volume_refresh(self) -> None:
+        """Отложить обновление 3D до показа окна и объединить частые события."""
+        self._volume_refresh_pending = True
+        if self.plot_workspace.mdi_area.is_panel_visible("volume"):
+            self._volume_refresh_timer.start(0)
+
+    def _on_plot_panel_visibility_changed(self, key: str, visible: bool) -> None:
+        if key == "volume" and visible and (self._volume_refresh_pending or not self.volume_widget.has_dataset_request):
+            self._volume_refresh_timer.start(0)
+
+    def _on_plot_panel_restored(self, key: str) -> None:
+        if key == "volume" and (self._volume_refresh_pending or not self.volume_widget.has_dataset_request):
+            self._volume_refresh_timer.start(0)
+
     def refresh_volume(self) -> None:
-        """Передаёт 3D-экрану данные той же версии, что Map и ROC."""
+        """Передаёт VTK выбранный снимок только при видимом окне."""
+        if not self.plot_workspace.mdi_area.is_panel_visible("volume"):
+            self._volume_refresh_pending = True
+            return
+        self._volume_refresh_pending = False
         if self._analysis_view is not None:
             state = self._analysis_view
             try:
@@ -1550,9 +1581,11 @@ class RockingCurveExplorerWindow(QMainWindow):
                     state.data_yxt, state.theta, 2, state.x_coords, state.y_coords,
                     self.current_rois(), scan_label=self.selected_scan or "",
                     view_label=state.label, valid_mask=state.valid_mask_yxt,
+                    source_path=self.current_file, operation_id=state.operation_id,
+                    metadata=state.metadata,
                 )
             except Exception as exc:
-                self.volume_widget.clear_dataset(f"3D viewer: {exc}")
+                self.volume_widget.clear_dataset(f"3D: {type(exc).__name__}: {exc}")
             return
         if self.repo is None or self.selected_scan is None:
             self.volume_widget.clear_dataset()
@@ -1560,9 +1593,13 @@ class RockingCurveExplorerWindow(QMainWindow):
         try:
             scan = self.repo.load_scan(self.selected_scan)
             x_coords, y_coords = self.repo.centers_xy(self.selected_scan)
-            self.volume_widget.set_dataset(scan.data, scan.th, scan.axis, x_coords, y_coords, self.current_rois(), scan_label=self.selected_scan, view_label=self._pool_label(self.repo.pool))
+            self.volume_widget.set_dataset(
+                scan.data, scan.th, scan.axis, x_coords, y_coords, self.current_rois(),
+                scan_label=self.selected_scan, view_label=self._pool_label(self.repo.pool),
+                source_path=self.current_file, operation_id="source.raw", metadata={},
+            )
         except Exception as exc:
-            self.volume_widget.clear_dataset(f"3D viewer: {exc}")
+            self.volume_widget.clear_dataset(f"3D: {type(exc).__name__}: {exc}")
 
     def refresh_roi_table(self) -> None:
         """
@@ -1694,6 +1731,9 @@ class RockingCurveExplorerWindow(QMainWindow):
     def closeEvent(self, event) -> None:
         """Сохраняет расположение экранов и освобождает HDF5-дескриптор."""
         try: self.plot_workspace.mdi_area.save_geometry()
+        except Exception: pass
+        # Завершаем VTK до уничтожения native Qt/OpenGL surface.
+        try: self.volume_widget.release_vtk_scene()
         except Exception: pass
         closer = getattr(self.repo, "close", None)
         if callable(closer):

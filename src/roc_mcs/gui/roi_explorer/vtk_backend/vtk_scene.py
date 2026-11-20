@@ -7,6 +7,8 @@ from typing import Any
 import numpy as np
 
 from roc_mcs.gui.resource_monitor.activity import tracked_activity
+from .display_palette import resolve_projection_palette
+from .roi_preview_geometry import canonicalize_roi_preview
 
 
 def _vtk():
@@ -777,26 +779,15 @@ class VTKVolumeScene:
         samples). Line/point selections have zero mathematical area, so their
         display footprint is specified separately in voxel-width units.
         """
-        kind = str(selector_type or getattr(roi, "type", "rect")).lower()
-        if kind not in ("rect", "line", "point"):
-            raise ValueError("ROI preview поддерживает типы rect, line и point.")
+        canonical_roi, kind, _points = canonicalize_roi_preview(roi, selector_type)
         try:
-            cx = float(roi.cx)
-            cy = float(roi.cy)
-            width = float(getattr(roi, "width", 0.0))
-            height = float(getattr(roi, "height", 0.0))
-            angle = float(getattr(roi, "angle", 0.0))
             alpha = float(opacity)
             strength = float(highlight_strength)
             thickness = float(thickness_voxels)
-        except (AttributeError, TypeError, ValueError, OverflowError) as exc:
-            raise ValueError("Для ROI preview нужны cx/cy/width/height/angle и числовые параметры отображения.") from exc
-        if not all(np.isfinite(value) for value in (cx, cy, width, height, angle, alpha, strength, thickness)):
-            raise ValueError("Параметры ROI preview должны быть конечными числами.")
-        if kind in ("rect", "line") and width <= 0.0:
-            raise ValueError("Ширина/длина ROI preview должна быть > 0.")
-        if kind == "rect" and height <= 0.0:
-            raise ValueError("Высота прямоугольной ROI preview должна быть > 0.")
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("Параметры отображения ROI preview должны быть числами.") from exc
+        if not all(np.isfinite(value) for value in (alpha, strength, thickness)):
+            raise ValueError("Параметры отображения ROI preview должны быть конечными числами.")
         if not 0.02 <= alpha <= 0.35:
             raise ValueError("Opacity ROI preview должна лежать в диапазоне 0.02–0.35.")
         if not 0.0 <= strength <= 1.0:
@@ -816,7 +807,7 @@ class VTKVolumeScene:
 
         # Copy only the scalar geometry. The object supplied by the UI can be
         # edited afterwards without mutating the committed preview state.
-        self._roi_preview_roi = roi.copy() if callable(getattr(roi, "copy", None)) else roi
+        self._roi_preview_roi = canonical_roi
         self._roi_preview_options = {
             "selector_type": kind,
             "geometry_mode": geometry_mode,
@@ -1461,7 +1452,7 @@ class VTKVolumeScene:
         if lut is None or info is None:
             return
         configured = getattr(self.settings, "projection_palette", None)
-        name = str(configured) if configured else ("Greys_r" if self.theme == "dark" else "Greys")
+        name = resolve_projection_palette(configured, self.theme)
         colors = _palette_samples(name, 256)
         value_min = float(info.get("display_scalar_min", info["scalar_min"]))
         value_max = float(info.get("display_scalar_max", info["scalar_max"]))
@@ -3261,23 +3252,113 @@ class VTKVolumeScene:
         if had_content and render:
             self._request_render()
 
+    @staticmethod
+    def _release_renderer_resources(renderer: Any, render_window: Any, errors: list[str], label: str, *, remove_props: bool = True) -> None:
+        """Free GPU state while props remain attached; optionally detach props."""
+        if renderer is None:
+            return
+        if render_window is not None:
+            try:
+                renderer.ReleaseGraphicsResources(render_window)
+            except Exception as exc:
+                errors.append(f"{label}.ReleaseGraphicsResources: {type(exc).__name__}: {exc}")
+        if remove_props:
+            try:
+                renderer.RemoveAllViewProps()
+            except Exception as exc:
+                errors.append(f"{label}.RemoveAllViewProps: {type(exc).__name__}: {exc}")
+
     def close(self) -> None:
-        """Release scene props before QVTK finalizes its native GL window."""
+        """Release VTK props and GPU resources before QVTK finalizes its window."""
         if self._closed:
             return
-        # Remove props while the QVTK render window and its GL context still
-        # exist. vtkRenderer owns the single ReleaseGraphicsResources call.
-        self.clear(render=False)
         self._closed = True
+        errors: list[str] = []
+        render_window, renderer, interactor = self.render_window, self.renderer, self.interactor
         try:
-            if self._camera_observer_id is not None and self.interactor is not None:
-                self.interactor.RemoveObserver(self._camera_observer_id)
-                self._camera_observer_id = None
-        except Exception:
-            pass
-        try:
-            if self.axes_widget is not None:
-                self.axes_widget.SetEnabled(0)
-        except Exception:
-            pass
+            if render_window is not None:
+                render_window.MakeCurrent()
+        except Exception as exc:
+            errors.append(f"RenderWindow.MakeCurrent: {type(exc).__name__}: {exc}")
+
+        # The orientation widget owns a second renderer on the same window.
+        # Release it while enabled, then let the widget detach its own marker.
+        axes_widget = self.axes_widget
+        marker_renderer = None
+        if axes_widget is not None:
+            try:
+                marker_renderer = axes_widget.GetRenderer()
+            except Exception:
+                pass
+            if marker_renderer is not None and marker_renderer is not renderer:
+                self._release_renderer_resources(marker_renderer, render_window, errors, "orientation renderer", remove_props=False)
+            try:
+                axes_widget.SetEnabled(0)
+            except Exception as exc:
+                errors.append(f"orientation widget disable: {type(exc).__name__}: {exc}")
+            try:
+                axes_widget.SetInteractor(None)
+            except Exception as exc:
+                errors.append(f"orientation widget interactor detach: {type(exc).__name__}: {exc}")
+            try:
+                axes_widget.SetOrientationMarker(None)
+            except Exception as exc:
+                errors.append(f"orientation marker detach: {type(exc).__name__}: {exc}")
+            try:
+                axes_widget.SetRenderer(None)
+            except Exception as exc:
+                errors.append(f"orientation renderer detach: {type(exc).__name__}: {exc}")
+        if marker_renderer is not None and marker_renderer is not renderer:
+            try:
+                marker_renderer.RemoveAllViewProps()
+            except Exception as exc:
+                errors.append(f"orientation renderer.RemoveAllViewProps: {type(exc).__name__}: {exc}")
+        self.axes_widget = None
+
+        if self._camera_observer_id is not None and interactor is not None:
+            try:
+                interactor.RemoveObserver(self._camera_observer_id)
+            except Exception as exc:
+                errors.append(f"camera observer removal: {type(exc).__name__}: {exc}")
+        self._camera_observer_id = None
+
+        # Break the interactor-style -> default-renderer reference before removing
+        # the renderer from the window. QVTK still owns the interactor until its
+        # closeEvent calls Finalize().
+        style = getattr(self, "interactor_style", None)
+        if style is not None:
+            try:
+                style.SetDefaultRenderer(None)
+            except Exception as exc:
+                errors.append(f"interactor style renderer detach: {type(exc).__name__}: {exc}")
+        if interactor is not None:
+            try:
+                interactor.SetInteractorStyle(None)
+            except Exception as exc:
+                errors.append(f"interactor style detach: {type(exc).__name__}: {exc}")
+        self.interactor_style = None
+
+        # Release before RemoveAllViewProps: removing a prop only detaches it;
+        # it is not a substitute for the renderer's OpenGL-resource release.
+        self._release_renderer_resources(renderer, render_window, errors, "main renderer")
+        if render_window is not None and renderer is not None:
+            try:
+                render_window.RemoveRenderer(renderer)
+            except Exception as exc:
+                errors.append(f"RenderWindow.RemoveRenderer: {type(exc).__name__}: {exc}")
+
         self._render_callback = None
+        self.renderer = None
+        self.render_window = None
+        self.interactor = None
+        self.payload = None
+        self.grid = self.mapper = self.volume = self.volume_property = None
+        self.projection_grid = self.projection_mapper = self.projection_actor = self.projection_lut = None
+        self.outline_filter = self.outline_mapper = self.outline_actor = None
+        self.axis_tick_polydata = self.axis_tick_mapper = self.axis_tick_actor = None
+        self.grid_polydata = self.grid_mapper = self.grid_actor = None
+        self._axis_label_actors.clear()
+        self._axis_label_title_flags.clear()
+        if errors:
+            raise RuntimeError("; ".join(errors))
+

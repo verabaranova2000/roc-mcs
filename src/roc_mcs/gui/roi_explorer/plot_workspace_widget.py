@@ -7,13 +7,13 @@ from PyQt6.QtGui import QPainter,QPen,QColor,QPainterPath
 from roc_mcs.gui.roi_explorer.roi_manager_widget import RoiManagerWidget
 from roc_mcs.gui.roi_explorer.map_plot_widget import MapPlotWidget
 from roc_mcs.gui.roi_explorer.curve_plot_widget import CurvePlotWidget
-from roc_mcs.gui.roi_explorer.volume_plot_widget import VolumePlotWidget
+from roc_mcs.gui.roi_explorer.vtk_backend.embedded_widget import EmbeddedVTKVolumeWidget
 from roc_mcs.gui.roi_explorer.plot_display_settings import load_plot_display_settings,save_plot_display_settings
 from roc_mcs.gui.roi_explorer.theme import apply_widget_palette,resolve_theme,theme_colors
 
 _LAYOUTS = ("focus", "row", "column", "map3d-top")
-_LAYOUT_VERSION = 7
-DEFAULT_VISIBLE_PANELS = ("map", "curve", "volume")  # Для старта только с картой и ROC укажи ("map", "curve").
+_LAYOUT_VERSION = 8
+DEFAULT_VISIBLE_PANELS = ("map", "curve")
 LAYOUT_PREVIEW_STYLE = "A"  # A/B/C — варианты рисунка раскладок; см. PNG-лист.
 FOCUS_LEFT_RATIO = 0.50  # Доля ширины карты в стартовой раскладке.
 FOCUS_TOP_RATIO = 0.50  # Доля высоты верхнего окна ROC справа.
@@ -22,23 +22,43 @@ ROI_RAIL_EXPANDED_WIDTH = 282
 
 class _PlotSubWindow(QMdiSubWindow):
     """Закрытие скрывает экран и сохраняет его состояние."""
-    def __init__(self,area,key,title):
-        super().__init__();self._area=area;self.plot_key=key;self.setWindowTitle(title);self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose,False);self.setOption(QMdiSubWindow.SubWindowOption.RubberBandMove,True);self.setOption(QMdiSubWindow.SubWindowOption.RubberBandResize,True)
-    def closeEvent(self,event):event.accept();self.hide();self._area.panel_visibility_changed.emit(self.plot_key,False)
+    def __init__(self,area,key,title,on_close=None):
+        super().__init__();self._area=area;self.plot_key=key;self._on_explicit_close=on_close;self.setWindowTitle(title);self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose,False);self.setOption(QMdiSubWindow.SubWindowOption.RubberBandMove,True);self.setOption(QMdiSubWindow.SubWindowOption.RubberBandResize,True)
+    def closeEvent(self,event):
+        # X = уничтожить ресурсы конкретного backend; hide/minimize этого не вызывает.
+        if callable(self._on_explicit_close):
+            try:self._on_explicit_close()
+            except Exception:pass
+        event.accept();self.hide();self._area.panel_visibility_changed.emit(self.plot_key,False)
 
 class _PlotMdiArea(QMdiArea):
     """Раскладывает окна только по явной команде; ручной resize соседей не затрагивает."""
     panel_visibility_changed=pyqtSignal(str,bool)
+    panel_restored=pyqtSignal(str)
     def __init__(self,parent=None):
         super().__init__(parent);self.setObjectName("plotMdiArea");self.setViewMode(QMdiArea.ViewMode.SubWindowView);self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff);self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff);self.setActivationOrder(QMdiArea.WindowOrder.ActivationHistoryOrder);self.setOption(QMdiArea.AreaOption.DontMaximizeSubWindowOnActivation,True);self.setSizePolicy(QSizePolicy.Policy.Expanding,QSizePolicy.Policy.Expanding);self.setMinimumSize(340,300);self._keys={};self._layout_choice="focus";self._viewport_size=QSize();self._area_size=QSize();self._resize_pending=False;self._save_timer=QTimer(self);self._save_timer.setSingleShot(True);self._save_timer.setInterval(500);self._save_timer.timeout.connect(self.save_geometry);self._viewport_timer=QTimer(self);self._viewport_timer.setSingleShot(True);self._viewport_timer.setInterval(180);self._viewport_timer.timeout.connect(self._fit_after_viewport_resize);self.panel_visibility_changed.connect(self._schedule_save);self.panel_visibility_changed.connect(lambda *_:QTimer.singleShot(100,lambda:self._apply_layout(self._layout_choice)))
-    def add_plot(self,key,title,widget):
-        win=_PlotSubWindow(self,key,title);win.setWindowFlags(Qt.WindowType.SubWindow|Qt.WindowType.CustomizeWindowHint|Qt.WindowType.WindowTitleHint|Qt.WindowType.WindowCloseButtonHint|Qt.WindowType.WindowMinMaxButtonsHint);win.setWidget(widget);m=widget.minimumSize();h=widget.minimumSizeHint();win.setMinimumSize(QSize(max(250,m.width(),h.width())+2,max(190,m.height(),h.height())+24));self.addSubWindow(win);self._keys[key]=win;win.installEventFilter(self);win.show();return win
+    def add_plot(self,key,title,widget,*,initial_visible=True,on_close=None):
+        win=_PlotSubWindow(self,key,title,on_close=on_close);win.setWindowFlags(Qt.WindowType.SubWindow|Qt.WindowType.CustomizeWindowHint|Qt.WindowType.WindowTitleHint|Qt.WindowType.WindowCloseButtonHint|Qt.WindowType.WindowMinMaxButtonsHint);win.setWidget(widget);m=widget.minimumSize();h=widget.minimumSizeHint();win.setMinimumSize(QSize(max(250,m.width(),h.width())+2,max(190,m.height(),h.height())+24));self.addSubWindow(win);self._keys[key]=win;win.installEventFilter(self)
+        win.windowStateChanged.connect(lambda old,new,k=key:self._on_window_state_changed(k,old,new))
+        if initial_visible:win.show()
+        else:win.hide()
+        return win
+    def _on_window_state_changed(self, key, old_state, new_state):
+        minimized = Qt.WindowState.WindowMinimized
+        if bool(old_state & minimized) and not bool(new_state & minimized):
+            QTimer.singleShot(0, lambda k=key: self.panel_restored.emit(k) if self.is_panel_visible(k) else None)
+
     def show_panel(self,key,visible):
         win=self._keys.get(key)
         if win is None:return
-        if visible:win.show();win.raise_();self.setActiveSubWindow(win)
+        if visible:
+            if win.isMinimized():win.showNormal()
+            win.show();win.raise_();self.setActiveSubWindow(win)
         else:win.hide()
         self.panel_visibility_changed.emit(key,bool(visible))
+    def is_panel_visible(self,key):
+        win=self._keys.get(key)
+        return bool(win is not None and not win.isHidden() and not win.isMinimized())
     def _bounds(self):return self.viewport().rect().adjusted(2,2,-2,-2)
     def _visible(self):return [w for w in self._keys.values() if not w.isHidden() and not w.isMinimized()]
     def _layout_initial(self):
@@ -169,7 +189,7 @@ class _LayoutPreviewButton(QToolButton):
 class PlotWorkspaceWidget(QSplitter):
     """Слева менеджер ROI; справа три независимых MDI-экрана."""
     def __init__(self,parent=None):
-        super().__init__(Qt.Orientation.Horizontal,parent);self.setObjectName("PlotWorkspaceWidget");self.roi_manager=RoiManagerWidget();self.roi_table=self.roi_manager.table;self.map_widget=MapPlotWidget();self.curve_widget=CurvePlotWidget();self.volume_widget=VolumePlotWidget();self._map_ratio=.53
+        super().__init__(Qt.Orientation.Horizontal,parent);self.setObjectName("PlotWorkspaceWidget");self.roi_manager=RoiManagerWidget();self.roi_table=self.roi_manager.table;self.map_widget=MapPlotWidget();self.curve_widget=CurvePlotWidget();self.volume_widget=EmbeddedVTKVolumeWidget();self._map_ratio=.53
         self.plot_area=QWidget(self);self.plot_area.setObjectName("PlotScreensArea");self.plot_area.setMinimumSize(340,300);layout=QVBoxLayout(self.plot_area);layout.setContentsMargins(0,0,0,0);layout.setSpacing(2)
         controls=QWidget(self.plot_area);controls.setObjectName("PlotScreensToolbar");row=QHBoxLayout(controls);row.setContentsMargins(2,0,2,0);row.setSpacing(4);self._buttons={}
         for key,text,tip in (("map","Карта","Показать или скрыть окно карты"),("curve","ROC-кривые","Показать или скрыть окно ROC-кривых"),("volume","3D","Показать или скрыть 3D-объём")):
@@ -178,7 +198,7 @@ class PlotWorkspaceWidget(QSplitter):
         self.layout_btn=QToolButton(controls);self.layout_btn.setText("Раскладка ▦");self.layout_btn.setToolTip("Выбрать схему размещения окон");self.layout_btn.setAutoRaise(True);self.layout_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup);self.layout_menu=QMenu(self.layout_btn);self.layout_btn.setMenu(self.layout_menu);self._layout_preview_buttons={}
         self.arrange_btn=QToolButton(controls);self.arrange_btn.setText("Выровнять");self.arrange_btn.setToolTip("Применить выбранную схему к видимым окнам");self.arrange_btn.setAutoRaise(True);self.arrange_btn.setFixedHeight(23);row.addStretch(1);row.addWidget(self.layout_btn);row.addWidget(self.arrange_btn)
         self.mdi_area=_PlotMdiArea(self.plot_area);layout.addWidget(controls);layout.addWidget(self.mdi_area,1)
-        self.map_subwindow=self.mdi_area.add_plot("map","2D MAP · Детектор",self.map_widget);self.curve_subwindow=self.mdi_area.add_plot("curve","ROC CURVES · Rocking curves",self.curve_widget);self.volume_subwindow=self.mdi_area.add_plot("volume","3D VOLUME · Diffraction",self.volume_widget)
+        self.map_subwindow=self.mdi_area.add_plot("map","2D MAP · Детектор",self.map_widget);self.curve_subwindow=self.mdi_area.add_plot("curve","ROC CURVES · Rocking curves",self.curve_widget);self.volume_subwindow=self.mdi_area.add_plot("volume","3D VOLUME · Diffraction",self.volume_widget,initial_visible=False,on_close=self.volume_widget.release_vtk_scene)
         for key,b in self._buttons.items():
             b.toggled.connect(lambda visible,k=key:self.mdi_area.show_panel(k,visible))
             if key not in DEFAULT_VISIBLE_PANELS:self.mdi_area.show_panel(key,False)
