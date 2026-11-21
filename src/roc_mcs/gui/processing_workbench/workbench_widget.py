@@ -7,13 +7,13 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from PyQt6.QtCore import Qt, QObject, QRunnable, QThreadPool, pyqtSignal
-from PyQt6.QtGui import QCursor
+from PyQt6.QtCore import Qt, QObject, QRunnable, QThreadPool, pyqtSignal, QEvent, QSize
+from PyQt6.QtGui import QCursor, QPalette
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QSplitter, QFormLayout, QComboBox,
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QSplitter, QFormLayout, QComboBox,
     QSpinBox, QDoubleSpinBox, QCheckBox, QLineEdit, QPushButton, QLabel,
     QPlainTextEdit, QTabWidget, QStackedWidget, QProgressBar, QMessageBox,
-    QSizePolicy, QFrame, QMenu, QDialog, QDialogButtonBox, QScrollArea,
+    QSizePolicy, QFrame, QMenu, QScrollArea, QToolButton, QWidgetAction,
 )
 
 from matplotlib.figure import Figure
@@ -28,6 +28,10 @@ from roc_mcs.analysis.project import WorkflowProject
 from roc_mcs.analysis.workflow_history import NodeStatus, ReviewStatus, WorkflowHistory
 from .presenter import ArtifactPreviewRequest
 from .graph_canvas import ProcessingGraphView
+from roc_mcs.gui.components.icon_provider import svg_icon
+from roc_mcs.gui.roi_explorer.plot_toolbar_style import ICON_DIR
+from roc_mcs.gui.roi_explorer.map_tools_widget import pooling_preview_pixmap
+from roc_mcs.gui.roi_explorer.theme import apply_widget_palette, apply_popup_theme, resolve_theme, theme_colors
 
 
 class _WorkerSignals(QObject):
@@ -95,10 +99,26 @@ class _PreviewNodeTask(QRunnable):
             else:
                 inputs = executor.resolve_node_inputs(node)
                 stage_output = executor.load_output(node, next(iter(node.output_refs)))
+                spike_context = (
+                    stage_output if node.operation_id == "preprocess.spikes"
+                    else inputs.get("spikes")
+                )
+                spike_diagnostic_warning = None
+                if spike_context is None and node.operation_id in {"peaks.detect", "fit.scan"}:
+                    # QC overlay is not an algorithm input. Resolve it from branch
+                    # ancestry only for display when the operation does not consume
+                    # the spike artifact (raw peak search / fit without spike mask).
+                    spike_node = self.history_snapshot.find_ancestor_output(self.node_id, "spikes")
+                    if spike_node is not None and spike_node.status == NodeStatus.SUCCEEDED:
+                        try:
+                            spike_context = executor.load_output(spike_node, "spikes")
+                        except Exception as exc:
+                            spike_diagnostic_warning = str(exc)
                 context = {
                     "node": node,
                     "scan": inputs.get("scan"),
-                    "spikes": stage_output if node.operation_id == "preprocess.spikes" else inputs.get("spikes"),
+                    "spikes": spike_context,
+                    "spike_diagnostic_warning": spike_diagnostic_warning,
                     "peaks": stage_output if node.operation_id == "peaks.detect" else inputs.get("peaks"),
                     "fit": stage_output if node.operation_id == "fit.scan" else None,
                 }
@@ -130,7 +150,10 @@ class ProcessingWorkbenchWidget(QWidget):
         self._preview_context: dict[str, Any] | None = None
         self._map_click_connection = None
         self._branch_parent_id: str | None = None
+        self._theme = resolve_theme(parent if parent is not None else self)
+        self._applying_theme = False
         self._build_ui()
+        self._apply_theme(self._theme)
         self._rebuild_graph()
         if self.project.history.nodes:
             self.graph.select_node(self.project.history.nodes[-1].id)
@@ -150,6 +173,15 @@ class ProcessingWorkbenchWidget(QWidget):
         )
         self.source_label.setTextFormat(Qt.TextFormat.RichText)
         header.addWidget(self.source_label, 1)
+        self.theme_button = QToolButton(self)
+        self.theme_button.setObjectName("processingWorkbenchThemeToggle")
+        self.theme_button.setAutoRaise(True)
+        self.theme_button.setIconSize(QSize(16, 16))
+        self.theme_button.setFixedSize(28, 28)
+        self.theme_button.setToolTip("Переключить тему Workbench")
+        self.theme_button.setAccessibleName("Переключить тему Workbench")
+        self.theme_button.clicked.connect(self._toggle_theme)
+        header.addWidget(self.theme_button)
         self.save_button = QPushButton("Сохранить историю")
         self.save_button.clicked.connect(self._save_project)
         header.addWidget(self.save_button)
@@ -183,8 +215,9 @@ class ProcessingWorkbenchWidget(QWidget):
         self.graph.preview_requested.connect(self._on_graph_preview_requested)
         left_layout.addWidget(self.graph, 1)
         self.branch_hint = QLabel(
-            "Щелчок по карточке — инспектор · глаз — просмотр результата · "
-            "+ — новая ветвь от принятого узла. Перетаскивание — панорама; Ctrl+колесо — масштаб."
+            "Щелчок — инспектор · глаз — результат · + — новая ветвь. "
+            "Сплошная стрелка — вычислительный вход; пунктир — только происхождение ветви. "
+            "Перетаскивание — панорама; Ctrl+колесо — масштаб."
         )
         self.branch_hint.setWordWrap(True)
         self.branch_hint.setStyleSheet("color: palette(placeholderText);")
@@ -335,12 +368,82 @@ class ProcessingWorkbenchWidget(QWidget):
 
         self._show_operation_form()
 
+    def _toggle_theme(self) -> None:
+        self._apply_theme("dark" if self._theme == "light" else "light")
+
+    def _apply_theme(self, theme: str | None = None) -> None:
+        """Apply the ROI Explorer palette and the same moon/sun control as VTK."""
+        active = str(theme or self._theme or "light").lower()
+        if active not in {"light", "dark"}:
+            active = "light"
+        self._applying_theme = True
+        try:
+            self._theme = apply_widget_palette(self, active)
+            app = QApplication.instance()
+            if app is not None:
+                app.setProperty("rocMcsTheme", self._theme)
+            colors = theme_colors(self._theme)
+            icon_name = "theme_moon.svg" if self._theme == "light" else "theme_sun.svg"
+            self.theme_button.setIcon(
+                svg_icon(ICON_DIR / icon_name, color=colors["text"], widget=self.theme_button)
+            )
+            target = "тёмную" if self._theme == "light" else "светлую"
+            self.theme_button.setToolTip(f"Переключить Workbench на {target} тему")
+            self.theme_button.setAccessibleName(f"Переключить Workbench на {target} тему")
+            self.graph.setBackgroundBrush(self.graph.palette().color(QPalette.ColorRole.Base))
+            self._style_matplotlib_figure(self.figure)
+            self._style_matplotlib_figure(self.diagnostic_figure)
+            pool_form = self._forms.get("preprocess.pool", {})
+            preview = pool_form.get("preview")
+            if preview is not None:
+                preview.setPixmap(
+                    pooling_preview_pixmap(
+                        pool_form["size"].value(), pool_form["stride"].value(), self.palette()
+                    )
+                )
+        finally:
+            self._applying_theme = False
+
+    def _style_matplotlib_figure(self, figure: Figure) -> None:
+        colors = theme_colors(self._theme)
+        figure.set_facecolor(colors["window"])
+        for axes in figure.axes:
+            axes.set_facecolor(colors["axes"])
+            axes.tick_params(axis="both", colors=colors["muted"])
+            axes.xaxis.label.set_color(colors["text"])
+            axes.yaxis.label.set_color(colors["text"])
+            axes.title.set_color(colors["text"])
+            for spine in axes.spines.values():
+                spine.set_color(colors["border"])
+            for text in axes.texts:
+                text.set_color(colors["text"])
+            legend = axes.get_legend()
+            if legend is not None:
+                legend.get_frame().set_facecolor(colors["base"])
+                legend.get_frame().set_edgecolor(colors["border"])
+                for label in legend.get_texts():
+                    label.set_color(colors["text"])
+        # The colourbar is its own Axes and is handled by the same loop above.
+
+    def changeEvent(self, event) -> None:
+        super().changeEvent(event)
+        if self._applying_theme or event.type() not in (
+            QEvent.Type.PaletteChange, QEvent.Type.ApplicationPaletteChange
+        ):
+            return
+        app = QApplication.instance()
+        requested = app.property("rocMcsTheme") if app is not None else None
+        if str(requested).lower() in {"light", "dark"} and str(requested).lower() != self._theme:
+            self._apply_theme(str(requested).lower())
+
     def _add_form_page(self, operation_id: str, title: str) -> QFormLayout:
         page = QWidget()
         layout = QFormLayout(page)
         layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
         layout.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        layout.setVerticalSpacing(9)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setHorizontalSpacing(8)
+        layout.setVerticalSpacing(4)
         self.form_stack.addWidget(page)
         self._forms[operation_id] = {"page": page, "layout": layout}
         return layout
@@ -398,12 +501,37 @@ class ProcessingWorkbenchWidget(QWidget):
         stride = self._int_spin(1, 101, 1, 1)
         layout.addRow("Размер окна (px):", size)
         layout.addRow("Stride (px):", stride)
-        hint = QLabel(
-            "Count-sum по X/Y; θ не агрегируется. Размер окна — нечётный: 1, 3, 5…"
-        )
+        hint = QLabel("Сумма counts по X/Y; ось θ сохраняется. Окно: нечётный размер.")
         hint.setWordWrap(True)
-        layout.addRow("", hint)
-        self._forms["preprocess.pool"].update(size=size, stride=stride)
+        hint.setToolTip(
+            "В каждом пространственном окне counts суммируются по X/Y. "
+            "Отсчёты θ не усредняются и не прореживаются. Окна с частичным "
+            "покрытием отображаются для QC, но исключаются из научного анализа."
+        )
+        preview = QLabel()
+        preview.setFixedSize(88, 66)
+        preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        preview.setAccessibleName("Геометрия окна pooling и шага")
+        preview.setToolTip(
+            "Схема двух окон: сетка — исходные пиксели, смещение — stride, "
+            "перекрытие — общие пиксели соседних окон."
+        )
+        preview.setPixmap(pooling_preview_pixmap(size.value(), stride.value(), self.palette()))
+        detail = QWidget()
+        detail_row = QHBoxLayout(detail)
+        detail_row.setContentsMargins(0, 0, 0, 0)
+        detail_row.setSpacing(7)
+        detail_text = QLabel("Геометрия окна\nи шага смещения")
+        detail_text.setWordWrap(True)
+        detail_row.addWidget(detail_text, 1)
+        detail_row.addWidget(preview)
+        layout.addRow("Схема:", detail)
+        refresh_preview = lambda *_: preview.setPixmap(
+            pooling_preview_pixmap(size.value(), stride.value(), self.palette())
+        )
+        size.valueChanged.connect(refresh_preview)
+        stride.valueChanged.connect(refresh_preview)
+        self._forms["preprocess.pool"].update(size=size, stride=stride, preview=preview)
 
     def _build_spike_form(self) -> None:
         layout = self._add_form_page("preprocess.spikes", "Spikes")
@@ -435,11 +563,15 @@ class ProcessingWorkbenchWidget(QWidget):
         mode.addItem("Доля размаха ROC", "fraction")
         prominence = self._float_spin(0.0001, 1000.0, 3.0, 4)
         relative = self._float_spin(0.0001, 1.0, 0.07, 4)
-        interpolated = QCheckBox("Использовать интерполированные данные после spike detection")
+        interpolated = QCheckBox("Вход: интерполированная ROC")
         interpolated.setChecked(False)
         interpolated.setToolTip(
-            "По умолчанию детектор работает с исходными counts. "
-            "Включайте, если выше по выбранной ветви уже выполнен Spike detection."
+            "ВЫКЛ.: поиск выполняется по измеренным counts Scan-входа (включая "
+            "отмеченные spike-точки; исходные данные не меняются). "
+            "ВКЛ.: поиск выполняется по clean_data_yxt из upstream Spike detection, "
+            "где обнаруженные точки заменены интерполированными значениями. "
+            "Это отдельное решение о входном сигнале, а не автоматическое следствие "
+            "принятия этапа Spike detection. Включение требует предшествующий spike-узел."
         )
         layout.addRow("Окрестность каталога:", window)
         layout.addRow("Окно Savitzky–Golay:", smooth)
@@ -491,7 +623,7 @@ class ProcessingWorkbenchWidget(QWidget):
         max_iter = self._int_spin(10, 10000, 200)
         background = QCheckBox("Добавлять фоновую компоненту")
         background.setChecked(True)
-        use_spikes = QCheckBox("Исключать точки из upstream spike mask")
+        use_spikes = QCheckBox("Исключать помеченные спайки")
         use_spikes.setChecked(True)
         use_spikes.setToolTip(
             "Если в выбранной ветви есть успешный этап Spike detection, "
@@ -704,18 +836,13 @@ class ProcessingWorkbenchWidget(QWidget):
                     lambda _checked=False, op=operation_id, pid=parent_id:
                     self._open_stage_configuration(pid, op)
                 )
+            apply_popup_theme(menu, self._theme)
             menu.exec(QCursor.pos())
         except Exception as exc:
             QMessageBox.warning(self, "Не удалось добавить ветвь", str(exc))
 
     def _open_stage_configuration(self, parent_id: str, operation_id: str) -> None:
-        """Show the selected node's existing parameter form in a compact dialog.
-
-        Reparenting the single existing form page avoids maintaining a second
-        set of parameter widgets with potentially divergent validation/defaults.
-        Closing the dialog does not create a history node; only the explicit
-        "create and run" action persists a candidate.
-        """
+        """Open one canonical stage form in a compact, theme-aware popup menu."""
         if self.is_busy:
             return
         parent = self.project.history.get(parent_id)
@@ -735,63 +862,117 @@ class ProcessingWorkbenchWidget(QWidget):
         form_info = self._forms.get(operation_id)
         if form_info is None:
             return
+
+        spec = self.registry.get(operation_id)
         page = form_info["page"]
-        dialog = QDialog(self)
-        dialog.setWindowTitle(f"Новый этап · {self.registry.get(operation_id).label}")
-        dialog.setModal(True)
-        dialog.setMinimumWidth(430)
-        dialog.resize(470, 390)
+        menu = QMenu(self)
+        menu.setObjectName("processingStagePopup")
+        menu.setWindowFlags(menu.windowFlags() | Qt.WindowType.NoDropShadowWindowHint)
+        panel = QWidget(menu)
+        panel.setObjectName("ProcessingStagePanel")
+        panel_layout = QVBoxLayout(panel)
+        panel_layout.setContentsMargins(8, 6, 8, 6)
+        panel_layout.setSpacing(5)
 
-        dialog_layout = QVBoxLayout(dialog)
-        dialog_layout.setContentsMargins(14, 12, 14, 12)
-        dialog_layout.setSpacing(9)
-        parent_label = QLabel(
-            f"<b>Входная ветвь:</b> {parent.label}<br>"
-            f"<span style='color:gray'>{self.registry.get(operation_id).description}</span>"
+        header = QLabel(
+            f"<b>{spec.label}</b>"
+            f"<span style='color:palette(mid)'>  ·  вход: {parent.label}</span>"
         )
-        parent_label.setTextFormat(Qt.TextFormat.RichText)
-        parent_label.setWordWrap(True)
-        dialog_layout.addWidget(parent_label)
+        header.setTextFormat(Qt.TextFormat.RichText)
+        header.setWordWrap(True)
+        header.setToolTip(spec.description)
+        panel_layout.addWidget(header)
 
-        scroll = QScrollArea(dialog)
+        scroll = QScrollArea(panel)
+        scroll.setObjectName("processingStageFormScroll")
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
 
-        # Remove from the hidden right-hand form stack while the dialog owns it.
+        # Re-use the exact existing parameter widgets; never maintain a second
+        # form with parallel defaults, parameter mapping, or validation.
         self.form_stack.removeWidget(page)
         page.setParent(None)
         scroll.setWidget(page)
-        dialog_layout.addWidget(scroll, 1)
+        for widget_type in (QSpinBox, QDoubleSpinBox, QComboBox, QLineEdit):
+            for field in page.findChildren(widget_type):
+                field.setMinimumHeight(20)
+                field.setMaximumHeight(23)
+                if isinstance(field, QDoubleSpinBox):
+                    field.setMinimumWidth(82)
+                elif isinstance(field, QSpinBox):
+                    field.setMinimumWidth(68)
+                elif isinstance(field, QComboBox):
+                    field.setMinimumWidth(105)
+        for checkbox in page.findChildren(QCheckBox):
+            checkbox.setStyleSheet("QCheckBox { font-size: 10px; spacing: 5px; }")
+        for label in page.findChildren(QLabel):
+            label.setStyleSheet("QLabel { font-size: 10px; }")
+        page_layout = form_info.get("layout")
+        if page_layout is not None:
+            page_layout.setContentsMargins(4, 4, 4, 4)
+            page_layout.setVerticalSpacing(4)
+            page_layout.setHorizontalSpacing(8)
 
-        buttons = QDialogButtonBox(dialog)
-        cancel_button = buttons.addButton(
-            "Отмена", QDialogButtonBox.ButtonRole.RejectRole
-        )
-        run_button = buttons.addButton(
-            "Создать и запустить", QDialogButtonBox.ButtonRole.AcceptRole
-        )
+        content_height = max(110, min(430, page.sizeHint().height() + 4))
+        scroll.setMinimumHeight(min(content_height, 210))
+        scroll.setMaximumHeight(content_height)
+        panel_layout.addWidget(scroll, 1)
+
+        footer = QHBoxLayout()
+        footer.setContentsMargins(0, 1, 0, 0)
+        footer.setSpacing(5)
+        footer.addStretch(1)
+        cancel_button = QPushButton("Отмена", panel)
+        run_button = QPushButton("Создать и запустить", panel)
         run_button.setDefault(True)
-        cancel_button.clicked.connect(dialog.reject)
+        for button in (cancel_button, run_button):
+            button.setMinimumHeight(22)
+            button.setMaximumHeight(24)
+            button.setStyleSheet("QPushButton { font-size: 10px; padding: 2px 8px; }")
+        footer.addWidget(cancel_button)
+        footer.addWidget(run_button)
+        panel_layout.addLayout(footer)
 
-        def _validate_and_accept_dialog() -> None:
+        action = QWidgetAction(menu)
+        action.setDefaultWidget(panel)
+        menu.addAction(action)
+        apply_popup_theme(menu, self._theme)
+        apply_widget_palette(panel, self._theme)
+        panel.setStyleSheet(
+            "QWidget#ProcessingStagePanel { background:palette(window); color:palette(window-text); }"
+            "QWidget#ProcessingStagePanel QLabel { background:transparent; color:palette(window-text); font-size:10px; }"
+            "QWidget#ProcessingStagePanel QSpinBox, QWidget#ProcessingStagePanel QDoubleSpinBox, "
+            "QWidget#ProcessingStagePanel QComboBox, QWidget#ProcessingStagePanel QLineEdit { "
+            "font-size:10px; min-height:20px; max-height:23px; padding:1px 3px; "
+            "background:palette(base); color:palette(text); border:1px solid palette(mid); border-radius:3px; }"
+            "QWidget#ProcessingStagePanel QCheckBox { font-size:10px; spacing:5px; }"
+            "QWidget#ProcessingStagePanel QPushButton { font-size:10px; padding:2px 8px; "
+            "background:palette(button); color:palette(button-text); border:1px solid palette(mid); border-radius:3px; }"
+            "QWidget#ProcessingStagePanel QPushButton:hover { background:palette(midlight); }"
+        )
+        panel.setFixedWidth(390)
+        menu.adjustSize()
+
+        accepted = False
+
+        def _validate_and_close() -> None:
+            nonlocal accepted
             try:
-                # Validate before closing. Malformed detector coordinates or any
-                # future domain constraint leave the form open for correction.
                 self.registry.get(operation_id).validate(
                     self._form_parameters(operation_id)
                 )
             except Exception as exc:
-                QMessageBox.warning(dialog, "Проверьте параметры этапа", str(exc))
+                QMessageBox.warning(menu, "Проверьте параметры этапа", str(exc))
                 return
-            dialog.accept()
+            accepted = True
+            menu.close()
 
-        run_button.clicked.connect(_validate_and_accept_dialog)
-        dialog_layout.addWidget(buttons)
-
-        accepted = False
+        run_button.clicked.connect(_validate_and_close)
+        cancel_button.clicked.connect(menu.close)
         try:
-            accepted = dialog.exec() == QDialog.DialogCode.Accepted
+            menu.exec(QCursor.pos())
             if accepted:
                 parameters = self._form_parameters(operation_id)
                 node_id = self._create_stage_candidate(
@@ -802,13 +983,14 @@ class ProcessingWorkbenchWidget(QWidget):
         except Exception as exc:
             QMessageBox.warning(self, "Не удалось создать этап", str(exc))
         finally:
-            # Detach the page before the dialog is destroyed; otherwise Qt would
-            # delete widgets still referenced by self._forms.
+            # Detach the form before popup destruction; Qt must not delete the
+            # canonical widgets still referenced by self._forms.
             if scroll.widget() is page:
                 scroll.takeWidget()
             page.setParent(self.form_stack)
             self.form_stack.addWidget(page)
             self._show_operation_form()
+            menu.deleteLater()
 
     def _on_graph_preview_requested(self, node_id: str) -> None:
         self.graph.select_node(node_id)
@@ -1189,10 +1371,30 @@ class ProcessingWorkbenchWidget(QWidget):
                 metadata=scan_bundle.metadata,
             )
             self.preview_requested.emit(request)
-            self.preview_summary.setText(
-                f"Предпросмотр: {node.label}. Внутренняя карта и ROC-кривая обновлены; "
-                "основные окна приложения могут подключаться через preview_requested."
-            )
+            if node.operation_id == "peaks.detect" and context.get("peaks") is not None:
+                peak_meta = context["peaks"].metadata
+                peak_cfg = peak_meta.get("peak_config", {})
+                signal_name = (
+                    "интерполированный сигнал после Spike detection"
+                    if peak_meta.get("used_interpolated_data")
+                    else "измеренные counts из Scan-входа"
+                )
+                window = int(peak_cfg.get("window_size", 3))
+                summary = (
+                    f"Поиск пиков: {signal_name}; детектор получает среднюю ROC-кривую "
+                    f"пространственной окрестности {window}×{window}. "
+                    "На графике отдельно показаны ROC выбранного пикселя и фактический "
+                    "сигнал поиска; маркеры относятся к последнему."
+                )
+                diagnostic_warning = context.get("spike_diagnostic_warning")
+                if diagnostic_warning:
+                    summary += " QC-overlay спайков недоступен: " + diagnostic_warning
+                self.preview_summary.setText(summary)
+            else:
+                self.preview_summary.setText(
+                    f"Предпросмотр: {node.label}. Внутренняя карта и ROC-кривая обновлены; "
+                    "основные окна приложения могут подключаться через preview_requested."
+                )
             self.status_label.setText(f"Предпросмотр загружен: {node.label}")
             self._log(f"Предпросмотр загружен: {node.label}")
         except Exception:
@@ -1284,7 +1486,7 @@ class ProcessingWorkbenchWidget(QWidget):
             map_title = "Число spike-точек"
         elif node.operation_id == "peaks.detect" and peaks is not None:
             map_data = np.asarray(peaks.arrays["peak_count_map"])
-            map_title = "Число найденных пиков"
+            map_title = "Число пиков в локальной ROC-окрестности"
         elif node.operation_id == "fit.scan" and fit is not None and "n_fitted_map" in fit.arrays:
             map_data = np.asarray(fit.arrays["n_fitted_map"])
             map_title = "Число fitted-компонент"
@@ -1434,6 +1636,7 @@ class ProcessingWorkbenchWidget(QWidget):
             ax.set_axis_off()
 
         self.diagnostic_figure.tight_layout()
+        self._style_matplotlib_figure(self.diagnostic_figure)
         self.diagnostic_canvas.draw_idle()
 
     def _draw_map_and_curve(
@@ -1449,7 +1652,8 @@ class ProcessingWorkbenchWidget(QWidget):
         fit = ctx.get("fit")
 
         overlay_titles = {
-            "Число spike-точек", "Число найденных пиков", "Число fitted-компонент"
+            "Число spike-точек", "Число пиков в локальной ROC-окрестности",
+            "Число fitted-компонент",
         }
         if map_title in overlay_titles:
             intensity = np.nansum(np.asarray(data_yxt, dtype=float), axis=-1)
@@ -1569,46 +1773,109 @@ class ProcessingWorkbenchWidget(QWidget):
             )
             self.ax_curve.set_axis_off()
         else:
-            curve_label = "Исходная ROC"
+            scan_meta = ctx["scan"].metadata if ctx.get("scan") is not None else {}
+            pool_meta = scan_meta.get("pool", {}) if isinstance(scan_meta, dict) else {}
+            if pool_meta:
+                pool_label = (
+                    f"pooling {pool_meta.get('size', '?')}×{pool_meta.get('size', '?')}, "
+                    f"stride {pool_meta.get('stride', '?')}"
+                )
+            else:
+                pool_label = "без pooling"
+            curve_label = f"ROC выбранного пикселя · {pool_label}"
             if partial_coverage:
-                curve_label = "ROC · частичное покрытие (только QC)"
-            self.ax_curve.plot(theta, curve, linewidth=1.1, alpha=0.8, label=curve_label)
+                curve_label += " · частичное покрытие (только QC)"
+            self.ax_curve.plot(theta, curve, linewidth=1.1, alpha=0.82, label=curve_label)
 
             # A partial pooling bin is intentionally excluded from scientific
             # analysis. Show only its observed valid-count sum; do not overlay
             # spike/peak/Fit outputs produced on fully covered sites.
             if not partial_coverage:
-                if spikes is not None and "clean_data_yxt" in spikes.arrays:
-                    clean = np.asarray(spikes.arrays["clean_data_yxt"], dtype=float)
-                    if clean.shape == data_yxt.shape:
+                if spikes is not None:
+                    spike_grid = str(spikes.metadata.get("grid_id", ""))
+                    scan_grid = str(ctx["scan"].metadata.get("grid_id", "")) if ctx.get("scan") is not None else ""
+                    if spike_grid and scan_grid and spike_grid != scan_grid:
+                        raise ValueError("Spike QC-артефакт относится к другой пространственной сетке")
+                    clean_values = spikes.arrays.get("clean_data_yxt")
+                    if clean_values is not None:
+                        clean = np.asarray(clean_values, dtype=float)
+                        if clean.shape != data_yxt.shape:
+                            raise ValueError("clean_data_yxt не согласована с Scan-входом")
                         self.ax_curve.plot(
                             theta, clean[y, x, :], linewidth=1.35,
-                            label="После интерполяции",
+                            label="После spike-interpolation",
                         )
-                if spikes is not None and "spike_mask_tyx" in spikes.arrays:
-                    mask = np.asarray(spikes.arrays["spike_mask_tyx"], dtype=bool)[:, y, x]
-                    if mask.shape == theta.shape and np.any(mask):
-                        self.ax_curve.scatter(
-                            theta[mask], curve[mask], marker="x", s=32,
-                            label="Обнаруженные спайки", zorder=5,
-                        )
+                    spike_values = spikes.arrays.get("spike_mask_tyx")
+                    if spike_values is not None:
+                        spike_mask = np.asarray(spike_values, dtype=bool)
+                        expected_spike_shape = (theta.size, *data_yxt.shape[:2])
+                        if spike_mask.shape != expected_spike_shape:
+                            raise ValueError(
+                                f"spike_mask_tyx имеет форму {spike_mask.shape}; "
+                                f"ожидалась {expected_spike_shape}"
+                            )
+                        mask = spike_mask[:, y, x]
+                        if np.any(mask):
+                            self.ax_curve.scatter(
+                                theta[mask], curve[mask], marker="x", s=32,
+                                label="Обнаруженные спайки", zorder=5,
+                            )
                 if peaks is not None and "peak_catalog" in peaks.tables:
+                    # Plot the exact signal used by the detector even when this
+                    # pixel has zero peaks; absence of markers must not hide the
+                    # search input and create a misleading QC view.
+                    from roc_mcs.peaks.peak_signal import local_neighbourhood_mean_curve
+
+                    peak_input = data_yxt
+                    input_source = "измеренные counts"
+                    if bool(peaks.metadata.get("used_interpolated_data", False)):
+                        if spikes is None or "clean_data_yxt" not in spikes.arrays:
+                            raise ValueError(
+                                "Поиск пиков выполнен на spike-interpolation, "
+                                "но QC предпросмотр не получил clean_data_yxt"
+                            )
+                        clean = np.asarray(spikes.arrays["clean_data_yxt"], dtype=float)
+                        if clean.shape != data_yxt.shape:
+                            raise ValueError("clean_data_yxt не согласована с Scan-входом")
+                        peak_input = clean
+                        input_source = "после spike-interpolation"
+
+                    peak_valid = np.ones(data_yxt.shape[:2], dtype=bool)
+                    if ctx.get("scan") is not None:
+                        scan_valid = ctx["scan"].arrays.get("valid_mask_yxt")
+                        if scan_valid is not None:
+                            scan_valid = np.asarray(scan_valid, dtype=bool)
+                            if scan_valid.shape != data_yxt.shape:
+                                raise ValueError("valid_mask_yxt не согласована с peak input")
+                            peak_valid &= np.all(scan_valid, axis=-1)
+                        analysis_valid = ctx["scan"].arrays.get("analysis_valid_mask_yx")
+                        if analysis_valid is not None:
+                            analysis_valid = np.asarray(analysis_valid, dtype=bool)
+                            if analysis_valid.shape != peak_valid.shape:
+                                raise ValueError("analysis_valid_mask_yx не согласована с peak input")
+                            peak_valid &= analysis_valid
+
+                    peak_cfg = peaks.metadata.get("peak_config", {})
+                    window_size = int(peak_cfg.get("window_size", 3))
+                    search_curve = local_neighbourhood_mean_curve(
+                        peak_input, y, x, window_size, pixel_valid=peak_valid
+                    )
+                    self.ax_curve.plot(
+                        theta, search_curve, linewidth=1.55, linestyle="--",
+                        label=f"Вход поиска · среднее {window_size}×{window_size} ({input_source})",
+                        zorder=4,
+                    )
                     catalog = peaks.tables["peak_catalog"]
-                    # Older v1 artifacts may contain an empty DataFrame without
-                    # column names. Keep the preview safe for legacy results.
                     if catalog is not None and not catalog.empty and {"x", "y", "theta"}.issubset(catalog.columns):
                         selected = catalog[(catalog["x"] == x) & (catalog["y"] == y)]
-                        if not selected.empty:
+                        # build_peak_catalog rejects incomplete θ traces, so markers
+                        # are plotted only when the complete detector input exists.
+                        if not selected.empty and np.isfinite(search_curve).all():
                             peak_theta = selected["theta"].to_numpy(float)
-                            marker_curve = curve
-                            if bool(peaks.metadata.get("used_interpolated_data", False)) and spikes is not None:
-                                clean = np.asarray(spikes.arrays.get("clean_data_yxt", data_yxt), dtype=float)
-                                if clean.shape == data_yxt.shape:
-                                    marker_curve = clean[y, x, :]
+                            peak_y = np.interp(peak_theta, theta, search_curve)
                             self.ax_curve.scatter(
-                                peak_theta,
-                                np.interp(peak_theta, theta, marker_curve),
-                                marker="v", s=38, label="Найденные пики", zorder=6,
+                                peak_theta, peak_y, marker="v", s=40,
+                                label="Найденные пики · фактический вход", zorder=7,
                             )
                 if fit is not None and "fit_cube" in fit.arrays:
                     fitted = np.asarray(fit.arrays["fit_cube"])[y, x, :]
@@ -1633,9 +1900,10 @@ class ProcessingWorkbenchWidget(QWidget):
                 suffix = " · ЧАСТИЧНОЕ ПОКРЫТИЕ · не для анализа"
         else:
             suffix = ""
-        self.ax_curve.set_title(f"ROC-кривая · x={x}, y={y}")
+        self.ax_curve.set_title(f"ROC пикселя и вход поиска · x={x}, y={y}")
         self.pixel_label.setText(f"Пиксель: X={x}, Y={y}{suffix}")
         self.figure.tight_layout()
+        self._style_matplotlib_figure(self.figure)
         self.canvas.draw_idle()
         self._current_map_data = np.asarray(map_data)
         self._current_curve_data = np.asarray(data_yxt)

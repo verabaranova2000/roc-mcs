@@ -140,14 +140,21 @@ def test_minimize_restore_refresh_signal_is_separate_from_close_release():
     assert "release_vtk_scene" not in ast.unparse(restore)
 
 
-def test_persistent_hud_is_child_of_qvtk_and_rebound_across_scene_lifecycle():
+def test_persistent_hud_is_a_layout_managed_native_overlay_sibling_of_qvtk():
     path = SRC / "gui/roi_explorer/vtk_backend/embedded_widget.py"
-    method, _ = _method(path, "EmbeddedVTKVolumeWidget", "_initialize_vtk")
-    source = ast.unparse(method)
-    assert "VTKVolumeDisplayWidget(widget)" in source
-    assert "self.display.set_viewport(widget)" in source
-    release, _ = _method(path, "EmbeddedVTKVolumeWidget", "release_vtk_scene")
-    assert "self.display.set_viewport(self.viewport)" in ast.unparse(release)
+    text = path.read_text(encoding="utf-8")
+    assert "self.viewport_layout = QtWidgets.QGridLayout(self.viewport)" in text
+    assert "self.viewport_layout.addWidget(widget, 0, 0)" in text
+    assert "self.display, 0, 0" in text
+    assert "AlignTop | QtCore.Qt.AlignmentFlag.AlignRight" in text
+    display_path = SRC / "gui/roi_explorer/vtk_backend/vtk_volume_display_widget.py"
+    display_text = display_path.read_text(encoding="utf-8")
+    assert "WA_NativeWindow" in display_text
+    assert "WA_AlwaysStackOnTop" in display_text
+    assert "self.setFixedSize(86, content_height)" in display_text
+    assert "def restack_over_viewport" in display_text
+    position, _ = _method(display_path, "VTKVolumeDisplayWidget", "_position_overlay")
+    assert "layout.setAlignment" in ast.unparse(position)
 
 
 def test_map_cursor_and_roi_preview_are_wired_to_embedded_vtk_widget():
@@ -184,7 +191,8 @@ def test_embedded_source_selection_is_an_icon_menu_and_vtk_colorbar_stays_pinned
     assert "self.source_button.setMenu(self.source_menu)" in source
     assert "self.source_combo.hide()" in source
     assert 'QtWidgets.QLabel("Источник"' not in source
-    assert "VTKVolumeDisplayWidget(widget)" in source
+    assert "VTKVolumeDisplayWidget(self.viewport)" in source
+    assert "_SourceDropdownButton(self.toolbar)" in source
     apply_payload, _ = _method(path, "EmbeddedVTKVolumeWidget", "_apply_payload")
     assert "self.display.set_scene_available(True)" in ast.unparse(apply_payload)
 
@@ -267,3 +275,162 @@ def test_rectangle_roi_aliases_use_shared_model_normalizer_without_cross_importi
     assert "return normalize_rectangular_roi(saved.roi)" in plotly
     assert "from roc_mcs.gui.roi_explorer.vtk_backend" not in plotly
     assert "from roc_mcs.roi.roi_types import normalize_rectangular_roi" in adapter
+
+
+def test_saving_roi_refreshes_only_source_catalogue_not_active_volume():
+    explorer_path = SRC / "gui/roi_explorer/explorer_window.py"
+    embedded_path = SRC / "gui/roi_explorer/vtk_backend/embedded_widget.py"
+    pin, _ = _method(explorer_path, "RockingCurveExplorerWindow", "pin_preview_roi")
+    pin_source = ast.unparse(pin)
+    assert "update_saved_rois" in pin_source
+    assert "refresh_volume" not in pin_source
+
+    refresh, _ = _method(embedded_path, "EmbeddedVTKVolumeWidget", "update_saved_rois")
+    refresh_source = ast.unparse(refresh)
+    assert "_rebuild_source_choices" in refresh_source
+    assert "_submit_payload" in refresh_source  # only for removal of the active ROI
+    assert "active_roi_removed" in refresh_source
+    assert "set_dataset" not in refresh_source
+
+
+def test_native_volume_hud_has_explicit_native_window_and_restacking_contract():
+    display_path = SRC / "gui/roi_explorer/vtk_backend/vtk_volume_display_widget.py"
+    display_text = display_path.read_text(encoding="utf-8")
+    assert "WA_NativeWindow" in display_text
+    assert "self.winId()" in display_text
+    sync, _ = _method(display_path, "VTKVolumeDisplayWidget", "_sync_visibility")
+    assert "raise_" in ast.unparse(sync)
+
+    embedded_path = SRC / "gui/roi_explorer/vtk_backend/embedded_widget.py"
+    render, _ = _method(embedded_path, "EmbeddedVTKVolumeWidget", "_render")
+    assert "self._qvtk.Render()" in ast.unparse(render)
+    assert "restack_over_viewport" not in ast.unparse(render)
+    loader, _ = _method(embedded_path, "EmbeddedVTKVolumeWidget", "_load_vtk_modules")
+    tracked = next(
+        node for node in ast.walk(loader)
+        if isinstance(node, ast.ClassDef) and node.name == "_TrackedQVTK"
+    )
+    assert not any(
+        isinstance(node, ast.FunctionDef) and node.name == "paintEvent"
+        for node in tracked.body
+    )
+
+
+def test_source_toolbar_button_is_smart_dropdown_and_nested_gap_is_removed():
+    path = SRC / "gui/roi_explorer/vtk_backend/embedded_widget.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    widget = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "EmbeddedVTKVolumeWidget")
+    init = next(n for n in widget.body if isinstance(n, ast.FunctionDef) and n.name == "__init__")
+    assignments = [n for n in ast.walk(init) if isinstance(n, ast.Assign)]
+    source_button = next(
+        n for n in assignments
+        if any(isinstance(t, ast.Attribute) and t.attr == "source_button" for t in n.targets)
+    )
+    assert isinstance(source_button.value, ast.Call)
+    assert isinstance(source_button.value.func, ast.Name)
+    assert source_button.value.func.id == "_SourceDropdownButton"
+    text = path.read_text(encoding="utf-8")
+    assert "tools_layout.setContentsMargins(0, 2, 5, 2)" in text
+    assert "row.setSpacing(0)" in text
+
+
+def test_theta_link_is_compact_and_disabled_as_a_whole_row_when_unavailable():
+    path = SRC / "gui/roi_explorer/vtk_backend/embedded_widget.py"
+    text = path.read_text(encoding="utf-8")
+    assert "vtkThetaSliceLinkButton" in text
+    assert "vtk_theta_link_" in text
+    assert "self.theta_link_row.setEnabled(available)" in text
+    assert "self.theta_link_label.setToolTip(tip)" in text
+    assert "self._theta_link_preference" in text
+    for variant in (1, 2, 3):
+        assert (SRC / "gui" / "resources" / "icons" / f"vtk_theta_link_{variant}.svg").is_file()
+
+
+def test_optional_theta_slice_marker_is_abstract_geometry_not_a_scalar_surface():
+    scene_path = SRC / "gui/roi_explorer/vtk_backend/vtk_scene.py"
+    text = scene_path.read_text(encoding="utf-8")
+    assert "self._theta_slice_marker_source = vtk.vtkPlaneSource()" in text
+    assert "self.renderer.AddActor(self._theta_slice_marker_actor)" in text
+    assert "def set_theta_slice_marker_visible" in text
+    assert "def set_theta_slice_marker_opacity" in text
+    setter, _ = _method(scene_path, "VTKVolumeScene", "set_theta_slice_index")
+    source = ast.unparse(setter)
+    assert "_update_theta_slice_marker_geometry" in source
+    assert "_update_theta_slice_shader_uniforms" in source
+    assert "vtkGPUVolumeRayCastMapper" not in source
+    assert "_theta_slice_plane_grid" not in text
+
+
+def test_vtk_colorbar_defaults_visible_is_anchored_and_retains_settings_control():
+    display_path = SRC / "gui/roi_explorer/vtk_backend/vtk_volume_display_widget.py"
+    text = display_path.read_text(encoding="utf-8")
+    assert "self._show_colorbar = True" in text
+    assert "self.setFixedWidth(86)" in text
+    assert "self.setFixedSize(86, content_height)" in text
+    assert "WA_AlwaysStackOnTop" in text
+    assert "margin = 12" in text
+    assert "self.options_button.clicked.connect(self._open_settings_menu)" in text
+    visible, _ = _method(display_path, "VTKVolumeDisplayWidget", "_sync_visibility")
+    assert "self._scene_available and self._show_colorbar" in ast.unparse(visible)
+
+    embedded_path = SRC / "gui/roi_explorer/vtk_backend/embedded_widget.py"
+    apply_payload, _ = _method(embedded_path, "EmbeddedVTKVolumeWidget", "_apply_payload")
+    assert "self.display.set_scene_available(True)" in ast.unparse(apply_payload)
+    settings, _ = _method(embedded_path, "EmbeddedVTKVolumeWidget", "apply_display_settings")
+    assert "show_vtk_colorbar" in ast.unparse(settings) and "True" in ast.unparse(settings)
+
+
+def test_vtk_colorbar_has_independent_true_default_from_legacy_plotly_flag():
+    settings_path = SRC / "gui/roi_explorer/plot_display_settings.py"
+    settings_text = settings_path.read_text(encoding="utf-8")
+    assert '"show_vtk_colorbar":True' in settings_text
+    assert '"show_vtk_colorbar",True' in settings_text
+    assert '"show_vtk_colorbar", "Компактная шкала в окне VTK"' in settings_text
+    embedded_path = SRC / "gui/roi_explorer/vtk_backend/embedded_widget.py"
+    embedded_text = embedded_path.read_text(encoding="utf-8")
+    assert 'get("show_vtk_colorbar", True)' in embedded_text
+    assert 'get("show_colorbar", True)' not in embedded_text
+
+
+def test_theta_link_icon_is_recolored_to_muted_theme_when_parent_row_is_disabled():
+    path = SRC / "gui/roi_explorer/vtk_backend/embedded_widget.py"
+    method, _ = _method(path, "EmbeddedVTKVolumeWidget", "_update_theta_link_icon")
+    source = ast.unparse(method)
+    assert "muted" in source
+    assert 'self.theta_link_row.isEnabled()' in source
+    assert "self.theta_link_checkbox.setIcon" in source
+
+
+def test_source_dropdown_has_only_custom_corner_triangle_and_compact_menu_typography():
+    path = SRC / "gui/roi_explorer/vtk_backend/embedded_widget.py"
+    text = path.read_text(encoding="utf-8")
+    assert "class _SourceDropdownButton(SmartDropdownButton)" in text
+    button_paint, _ = _method(path, "_SourceDropdownButton", "paintEvent")
+    paint_source = ast.unparse(button_paint)
+    assert "ToolButtonFeature.HasMenu" in paint_source
+    assert "features" in paint_source and "drawComplexControl" in paint_source
+    assert "super().paintEvent" not in paint_source
+    assert "QToolButton::menu-indicator" in text
+    assert "QMenu#vtkExplorerSourceMenu" in text
+    assert "font-size: 7pt" in text
+    assert "setPointSizeF(8.0)" in text
+    assert "min-height: 16px" in text
+
+
+def test_theta_slice_marker_is_abstract_geometry_and_does_not_replace_shader_highlight():
+    scene_path = SRC / "gui/roi_explorer/vtk_backend/vtk_scene.py"
+    scene_text = scene_path.read_text(encoding="utf-8")
+    assert "vtkPlaneSource()" in scene_text
+    assert "_theta_slice_marker_actor" in scene_text
+    assert "def set_theta_slice_marker_visible" in scene_text
+    assert "vtkRectilinearGrid()" not in scene_text[scene_text.index("# Optional abstract marker"):scene_text.index("# The map cursor")]
+    assert "_update_theta_slice_shader_uniforms()" in scene_text
+    assert "_update_theta_slice_marker_geometry()" in scene_text
+    assert "_theta_slice_plane_grid" not in scene_text
+
+    embedded_path = SRC / "gui/roi_explorer/vtk_backend/embedded_widget.py"
+    embedded_text = embedded_path.read_text(encoding="utf-8")
+    assert "Плоскость среза θ" in embedded_text
+    assert "set_theta_slice_marker_visible" in embedded_text
+    assert "set_theta_slice_marker_opacity" in embedded_text
+    assert "theta_slice_plane_checkbox" not in embedded_text

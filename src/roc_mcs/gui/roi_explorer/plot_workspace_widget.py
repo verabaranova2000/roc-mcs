@@ -36,7 +36,22 @@ class _PlotMdiArea(QMdiArea):
     panel_visibility_changed=pyqtSignal(str,bool)
     panel_restored=pyqtSignal(str)
     def __init__(self,parent=None):
-        super().__init__(parent);self.setObjectName("plotMdiArea");self.setViewMode(QMdiArea.ViewMode.SubWindowView);self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff);self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff);self.setActivationOrder(QMdiArea.WindowOrder.ActivationHistoryOrder);self.setOption(QMdiArea.AreaOption.DontMaximizeSubWindowOnActivation,True);self.setSizePolicy(QSizePolicy.Policy.Expanding,QSizePolicy.Policy.Expanding);self.setMinimumSize(340,300);self._keys={};self._layout_choice="focus";self._viewport_size=QSize();self._area_size=QSize();self._resize_pending=False;self._save_timer=QTimer(self);self._save_timer.setSingleShot(True);self._save_timer.setInterval(500);self._save_timer.timeout.connect(self.save_geometry);self._viewport_timer=QTimer(self);self._viewport_timer.setSingleShot(True);self._viewport_timer.setInterval(180);self._viewport_timer.timeout.connect(self._fit_after_viewport_resize);self.panel_visibility_changed.connect(self._schedule_save);self.panel_visibility_changed.connect(lambda *_:QTimer.singleShot(100,lambda:self._apply_layout(self._layout_choice)))
+        super().__init__(parent);self.setObjectName("plotMdiArea");self.setViewMode(QMdiArea.ViewMode.SubWindowView);self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff);self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff);self.setActivationOrder(QMdiArea.WindowOrder.ActivationHistoryOrder);self.setOption(QMdiArea.AreaOption.DontMaximizeSubWindowOnActivation,True);self.setSizePolicy(QSizePolicy.Policy.Expanding,QSizePolicy.Policy.Expanding);self.setMinimumSize(340,300);self._keys={};self._layout_choice="focus";self._initial_layout_done=False;self._initial_layout_pending=False;self._viewport_size=QSize();self._area_size=QSize();self._resize_pending=False;self._save_timer=QTimer(self);self._save_timer.setSingleShot(True);self._save_timer.setInterval(500);self._save_timer.timeout.connect(self.save_geometry);self._viewport_timer=QTimer(self);self._viewport_timer.setSingleShot(True);self._viewport_timer.setInterval(180);self._viewport_timer.timeout.connect(self._fit_after_viewport_resize);self.panel_visibility_changed.connect(self._schedule_save);self.panel_visibility_changed.connect(lambda *_:QTimer.singleShot(100,lambda:self._apply_layout(self._layout_choice)))
+    def _queue_initial_layout(self):
+        """Запланировать только раскладку, не меняя видимость MDI-окон."""
+        if self._initial_layout_done or self._initial_layout_pending:
+            return
+        self._initial_layout_pending = True
+        QTimer.singleShot(0, self._run_initial_layout)
+
+    def _run_initial_layout(self):
+        self._initial_layout_pending = False
+        self._layout_initial()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._queue_initial_layout()
+
     def add_plot(self,key,title,widget,*,initial_visible=True,on_close=None):
         win=_PlotSubWindow(self,key,title,on_close=on_close);win.setWindowFlags(Qt.WindowType.SubWindow|Qt.WindowType.CustomizeWindowHint|Qt.WindowType.WindowTitleHint|Qt.WindowType.WindowCloseButtonHint|Qt.WindowType.WindowMinMaxButtonsHint);win.setWidget(widget);m=widget.minimumSize();h=widget.minimumSizeHint();win.setMinimumSize(QSize(max(250,m.width(),h.width())+2,max(190,m.height(),h.height())+24));self.addSubWindow(win);self._keys[key]=win;win.installEventFilter(self)
         win.windowStateChanged.connect(lambda old,new,k=key:self._on_window_state_changed(k,old,new))
@@ -62,18 +77,65 @@ class _PlotMdiArea(QMdiArea):
     def _bounds(self):return self.viewport().rect().adjusted(2,2,-2,-2)
     def _visible(self):return [w for w in self._keys.values() if not w.isHidden() and not w.isMinimized()]
     def _layout_initial(self):
-        self._area_size=self.size();saved=load_plot_display_settings().get("workspace",{});self._layout_choice=saved.get("layout_choice","focus") if saved.get("layout_choice") in _LAYOUTS else "focus"
-        # Геометрии старых версий не восстанавливаем: они были записаны при другой геометрии панелей.
-        if int(saved.get("layout_version",0) or 0)<_LAYOUT_VERSION:self._apply_layout("focus");return
-        bounds=self._bounds();prev=saved.get("viewport_size") or [bounds.width(),bounds.height()];sx=bounds.width()/max(1,int(prev[0]));sy=bounds.height()/max(1,int(prev[1]))
-        restored=False
-        for key,w in self._keys.items():
-            g=saved.get(f"{key}_geometry")
-            if isinstance(g,(list,tuple)) and len(g)==4:
-                try:x,y,ww,hh=map(int,g);w.setGeometry(self._clamp(QRect(round(x*sx),round(y*sy),round(ww*sx),round(hh*sy)),bounds));restored=True
-                except (ValueError,TypeError,OverflowError):pass
-        if not restored:self._apply_layout(self._layout_choice)
-        self._viewport_size=self.viewport().size();self._area_size=self.size()
+        """Применить стартовую геометрию после получения реального viewport.
+
+        Видимость окон устанавливается в add_plot(). Эта функция меняет только
+        геометрию и никогда не скрывает/не показывает дочерние окна.
+        """
+        if self._initial_layout_done or not self.isVisible():
+            return
+        bounds = self._bounds()
+        # При раннем showEvent viewport ещё может иметь временный размер.
+        # Окна уже показаны; повторная попытка будет запрошена из resizeEvent.
+        if bounds.width() < 120 or bounds.height() < 100:
+            return
+
+        self._area_size = self.size()
+        saved = load_plot_display_settings().get("workspace", {})
+        self._layout_choice = (
+            saved.get("layout_choice", "focus")
+            if saved.get("layout_choice") in _LAYOUTS
+            else "focus"
+        )
+
+        # Геометрии старых версий не восстанавливаем: они записаны при другой
+        # геометрии панелей.
+        if int(saved.get("layout_version", 0) or 0) < _LAYOUT_VERSION:
+            self._apply_layout("focus")
+            self._initial_layout_done = True
+            self._viewport_size = self.viewport().size()
+            self._area_size = self.size()
+            return
+
+        prev = saved.get("viewport_size") or [bounds.width(), bounds.height()]
+        sx = bounds.width() / max(1, int(prev[0]))
+        sy = bounds.height() / max(1, int(prev[1]))
+        restored = False
+        for key, win in self._keys.items():
+            geometry = saved.get(f"{key}_geometry")
+            if isinstance(geometry, (list, tuple)) and len(geometry) == 4:
+                try:
+                    x, y, width, height = map(int, geometry)
+                    win.setGeometry(
+                        self._clamp(
+                            QRect(
+                                round(x * sx), round(y * sy),
+                                round(width * sx), round(height * sy),
+                            ),
+                            bounds,
+                        )
+                    )
+                    restored = True
+                except (ValueError, TypeError, OverflowError):
+                    pass
+
+        if not restored:
+            self._apply_layout(self._layout_choice)
+
+        self._initial_layout_done = True
+        self._viewport_size = self.viewport().size()
+        self._area_size = self.size()
+
     def set_layout_choice(self,choice):
         if choice not in _LAYOUTS:return
         self._layout_choice=choice;self._apply_layout(choice);self._schedule_save()
@@ -131,9 +193,16 @@ class _PlotMdiArea(QMdiArea):
         ww=max(1,min(rect.width(),bounds.width()));hh=max(1,min(rect.height(),bounds.height()));return QRect(max(bounds.x(),min(rect.x(),bounds.right()-ww+1)),max(bounds.y(),min(rect.y(),bounds.bottom()-hh+1)),ww,hh)
     def resizeEvent(self,event):
         old=QSize(self._area_size);super().resizeEvent(event);new=QSize(self.size())
-        # Переразмеривание дочернего QMdiSubWindow не влияет на соседей. При изменении
-        # внешней области лишь удерживаем каждое окно в пределах нового viewport.
-        if old.isValid() and old.width()>0 and old.height()>0 and (new.width()!=old.width() or new.height()!=old.height()):self._viewport_timer.start()
+        # Если showEvent пришёл до окончательной геометрии родительского layout,
+        # повторяем только стартовую раскладку. Сам факт видимости окон от этого
+        # не зависит: начальные окна уже показаны в add_plot().
+        if not self._initial_layout_done and self.isVisible():
+            bounds = self._bounds()
+            if bounds.width() >= 120 and bounds.height() >= 100:
+                self._queue_initial_layout()
+        # После начальной раскладки resize внешней области лишь удерживает окна
+        # в границах viewport и не перетасовывает их.
+        elif old.isValid() and old.width()>0 and old.height()>0 and (new.width()!=old.width() or new.height()!=old.height()):self._viewport_timer.start()
         elif not old.isValid():self._area_size=new;self._viewport_size=self.viewport().size()
     def _fit_after_viewport_resize(self):
         bounds=self._bounds()

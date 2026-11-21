@@ -7,10 +7,11 @@ The dual-range slider reuses ROI Explorer's map slider implementation.
 from __future__ import annotations
 
 from PyQt6.QtCore import QLineF, QPoint, QPointF, QRectF, QEvent, Qt, pyqtSignal
-from PyQt6.QtGui import QColor, QLinearGradient, QPainter, QPen, QPalette
+from PyQt6.QtGui import QColor, QFont, QLinearGradient, QPainter, QPen, QPalette
 from PyQt6.QtWidgets import (
     QApplication,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QMenu,
@@ -132,7 +133,14 @@ class VTKVolumeDisplayWidget(QFrame):
 
     def __init__(self, viewport: QWidget, parent=None):
         super().__init__(viewport if parent is None else parent)
+        # Give the entire HUD a valid point-sized font before constructing any
+        # child controls.  Some host applications use pixel-sized application
+        # fonts (pointSize() == -1); native popup widgets can otherwise emit
+        # QFont::setPointSize(-1) when deriving their menu fonts.
+        self._menu_font = self._make_positive_point_font(8.0)
+        self.setFont(self._menu_font)
         self._viewport = viewport
+        self._viewport_layout = viewport.layout()
         self._theme = "light"
         self._scene_available = False
         self._show_colorbar = True
@@ -145,6 +153,13 @@ class VTKVolumeDisplayWidget(QFrame):
         self.setObjectName("VTKVolumeDisplayOverlay")
         self.setFixedWidth(86)
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        # Embedded mode parents the HUD to the viewport container, as a sibling
+        # of QVTK, never to QVTK itself. Both are native children of the same
+        # parent; this avoids clipping/reparenting when QVTK is finalized.
+        # WA_AlwaysStackOnTop is important for QVTK's paint-on-screen surface.
+        self.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_AlwaysStackOnTop, True)
+        self.winId()  # force native-handle creation before the first volume render
 
         root = QVBoxLayout(self)
         root.setContentsMargins(5, 5, 5, 5)
@@ -170,7 +185,8 @@ class VTKVolumeDisplayWidget(QFrame):
         self.range_slider.setObjectName("vtkVolumeContrastRangeSlider")
         self.range_slider.setFixedHeight(154)
         self.range_slider.setToolTip(
-            "Нижняя и верхняя границы контраста · доли от положительного p99.9"
+            "Ползунки задают проценты от положительного p99.9. "
+            "Подписи max/min справа показывают соответствующие абсолютные значения интенсивности."
         )
         self.range_slider.valueChanged.connect(self._on_slider_changed)
         scale_row.addWidget(self.range_slider, 0, Qt.AlignmentFlag.AlignVCenter)
@@ -188,7 +204,10 @@ class VTKVolumeDisplayWidget(QFrame):
         for label in (self.vmax_label, self.vmin_label):
             label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
             label.setWordWrap(True)
-            label.setToolTip("Абсолютное значение интенсивности на соответствующей границе")
+            label.setToolTip(
+                "Абсолютное значение интенсивности на соответствующей границе; "
+                "это не процент, показанный в редакторах Vmin/Vmax."
+            )
         value_column.addWidget(self.vmax_label)
         value_column.addStretch(1)
         value_column.addWidget(self.vmin_label)
@@ -215,11 +234,22 @@ class VTKVolumeDisplayWidget(QFrame):
         self.settings_menu = QMenu(self)
         self.settings_menu.setObjectName("VTKVolumeDisplayMenu")
         self.settings_menu.setToolTipsVisible(True)
+        # Native popup menus can outlive the stylesheet context from which
+        # they were created; explicitly inherit the HUD's valid point font.
+        self.settings_menu.setFont(self._menu_font)
         self.settings_panel: QWidget | None = None
         self._settings_action: QWidgetAction | None = None
 
         viewport.installEventFilter(self)
         self._apply_overlay_theme(self._theme)
+        # Materialize both dimensions before the HUD is inserted into the
+        # shared viewport grid. A fixed width alone leaves a QWidget at its
+        # default height and clips the color ramp; QGridLayout owns final
+        # top-right placement once the widget is registered in that layout.
+        self.ensurePolished()
+        self.adjustSize()
+        content_height = max(190, int(self.sizeHint().height()))
+        self.setFixedSize(86, content_height)
         self._position_overlay()
         self.hide()
 
@@ -230,36 +260,68 @@ class VTKVolumeDisplayWidget(QFrame):
         self.settings_menu.close()
         self.hide()
         old_viewport = self._viewport
+        old_layout = self._viewport_layout
+        if old_layout is not None:
+            try:
+                old_layout.removeWidget(self)
+            except RuntimeError:
+                pass
         if old_viewport is not None:
             try:
                 old_viewport.removeEventFilter(self)
             except RuntimeError:
                 pass
         self._viewport = viewport
+        self._viewport_layout = viewport.layout()
         self.setParent(viewport)
+        self.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_AlwaysStackOnTop, True)
+        self.winId()
         viewport.installEventFilter(self)
+        if isinstance(self._viewport_layout, QGridLayout):
+            self._viewport_layout.addWidget(
+                self, 0, 0, alignment=Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignRight
+            )
+        self.ensurePolished()
+        self.adjustSize()
+        self.setFixedSize(86, max(190, int(self.sizeHint().height())))
         self._position_overlay()
         if self._scene_available and self._show_colorbar:
             self.show()
             self.raise_()
 
     def eventFilter(self, watched, event):
+        # Geometry events are infrequent and are the only times the overlay
+        # needs repositioning.  LayoutRequest can be generated by the HUD's
+        # own popup and controls; reacting to it would create an unnecessary
+        # layout/raise feedback loop.
         if watched is self._viewport and event.type() in (
             QEvent.Type.Resize,
             QEvent.Type.Show,
-            QEvent.Type.LayoutRequest,
         ):
             self._position_overlay()
+            if self.isVisible():
+                self.raise_()
         return super().eventFilter(watched, event)
 
     def _position_overlay(self) -> None:
         if self._viewport is None:
             return
-        margin = 12
-        x = max(margin, self._viewport.width() - self.width() - margin)
-        self.move(x, margin)
-        if self.isVisible():
-            self.raise_()
+        # Embedded Explorer uses a QGridLayout with QVTK and this fixed-size
+        # HUD in the same cell.  Let Qt own the child geometry; this avoids a
+        # manual move() racing the QVTK/native-window resize and clipping pass.
+        layout = self._viewport_layout or self._viewport.layout()
+        if isinstance(layout, QGridLayout) and layout.indexOf(self) >= 0:
+            # Alignment is assigned exactly once when the HUD is inserted via
+            # QGridLayout.addWidget(..., alignment=...).  Qt 6 exposes no
+            # QLayout.alignment(QWidget) getter; calling it with a widget raises
+            # TypeError and aborts VTK scene construction.  The grid owns the
+            # HUD geometry on resize, so there is nothing to query or mutate here.
+            return
+        else:
+            margin = 12
+            x = max(margin, self._viewport.width() - self.width() - margin)
+            self.move(x, margin)
 
     def attach_settings_panel(self, panel: QWidget) -> None:
         """Attach the caller-owned editor to the compact ellipsis menu."""
@@ -269,6 +331,7 @@ class VTKVolumeDisplayWidget(QFrame):
         self.settings_panel = panel
         panel.setParent(self.settings_menu)
         panel.setObjectName("VTKVolumeDisplaySettingsPanel")
+        panel.setFont(self._menu_font)
         panel.setMinimumWidth(286)
         action = QWidgetAction(self.settings_menu)
         action.setDefaultWidget(panel)
@@ -375,13 +438,69 @@ class VTKVolumeDisplayWidget(QFrame):
         self._scene_available = bool(available)
         self._sync_visibility()
 
+    def prepare_for_shutdown(self) -> None:
+        """Silence the native HUD before its parent viewport is destroyed.
+
+        This intentionally does not reparent the native child or force a
+        repaint.  The Qt parent remains its owner and destroys it normally.
+        """
+        self._scene_available = False
+        try:
+            self.settings_menu.close()
+        except RuntimeError:
+            pass
+        try:
+            self.hide()
+            self.setEnabled(False)
+        except RuntimeError:
+            pass
+        viewport = self._viewport
+        if viewport is not None:
+            try:
+                viewport.removeEventFilter(self)
+            except RuntimeError:
+                pass
+
     def _sync_visibility(self) -> None:
         visible = self._scene_available and self._show_colorbar
-        self.setVisible(visible)
+        was_visible = self.isVisible()
         self.setEnabled(visible)
-        if visible:
-            self._position_overlay()
+        if not visible:
+            if was_visible:
+                self.hide()
+            return
+
+        # Recompute the non-zero layout-derived height before the first show.
+        self.ensurePolished()
+        self.adjustSize()
+        self.setFixedSize(86, max(190, int(self.sizeHint().height())))
+        self._position_overlay()
+        if not was_visible:
+            self.show()
             self.raise_()
+
+    def restack_over_viewport(self) -> None:
+        """Reposition and restack this native HUD above a paint-on-screen viewport."""
+        if not (self._scene_available and self._show_colorbar):
+            return
+        self._position_overlay()
+        if not self.isVisible():
+            self.show()
+        self.raise_()
+        # Do not call update() here.  This method is scheduled after every
+        # QVTK paintEvent; repainting an unchanged overlay on every camera
+        # frame creates unnecessary nested Qt paint traffic over a native
+        # OpenGL widget.  Child controls update themselves when their actual
+        # values, palette, or labels change.
+
+    @staticmethod
+    def _make_positive_point_font(point_size: float) -> QFont:
+        """Return a point-sized font suitable for native popup widgets."""
+        font = QFont(QApplication.font())
+        if font.pointSizeF() <= 0.0:
+            font = QFont("Sans Serif")
+        font.setPointSizeF(float(point_size))
+        return font
 
     def _open_settings_menu(self) -> None:
         if self.settings_panel is None:
@@ -446,14 +565,14 @@ class VTKVolumeDisplayWidget(QFrame):
             }}
             QFrame#VTKVolumeDisplayOverlay QLabel {{
                 background: transparent; color: {c['text']}; border: 0;
-                font-size: 8px; padding: 0;
+                font-size: 6pt; padding: 0;
             }}
-            QLabel#VTKVolumeColorbarTitle {{ font-size: 8px; font-weight: 700; }}
-            QLabel#VTKVolumeMaxLabel, QLabel#VTKVolumeMinLabel {{ font-size: 8px; }}
+            QLabel#VTKVolumeColorbarTitle {{ font-size: 6pt; font-weight: 700; }}
+            QLabel#VTKVolumeMaxLabel, QLabel#VTKVolumeMinLabel {{ font-size: 6pt; }}
             QToolButton#VTKVolumeDisplayOptionsButton {{
                 background: {c['button']}; color: {c['button_text']};
                 border: 1px solid {c['border']}; border-radius: 3px;
-                padding: 0; font-size: 11px; font-weight: 700;
+                padding: 0; font-size: 8pt; font-weight: 700;
             }}
             QToolButton#VTKVolumeDisplayOptionsButton:hover {{
                 background: {c['hover']}; border-color: {c['highlight']};
@@ -476,7 +595,13 @@ class VTKVolumeDisplayWidget(QFrame):
 
     def closeEvent(self, event):
         try:
-            self._viewport.removeEventFilter(self)
+            self.settings_menu.close()
         except RuntimeError:
             pass
+        viewport = self._viewport
+        if viewport is not None:
+            try:
+                viewport.removeEventFilter(self)
+            except RuntimeError:
+                pass
         super().closeEvent(event)

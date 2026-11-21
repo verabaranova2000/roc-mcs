@@ -88,6 +88,11 @@ class WorkflowHistoryTests(unittest.TestCase):
             build_input_refs(history, spikes.id, "peaks.detect", {"use_interpolated_data": True})["spikes"]["node_id"],
             spikes.id,
         )
+        raw_peak_refs = build_input_refs(
+            history, spikes.id, "peaks.detect", {"use_interpolated_data": False}
+        )
+        self.assertEqual(raw_peak_refs["scan"]["node_id"], pool_a.id)
+        self.assertNotIn("spikes", raw_peak_refs)
         with self.assertRaises(ValueError):
             build_input_refs(history, pool_a.id, "peaks.detect", {"use_interpolated_data": True})
         with self.assertRaises(ValueError):
@@ -785,3 +790,28 @@ class FitMaskPropagationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+def test_peak_neighbourhood_mean_is_shared_and_excludes_invalid_pixels():
+    from roc_mcs.peaks.peak_signal import local_neighbourhood_mean_curve
+
+    values = np.zeros((3, 3, 4), dtype=float)
+    values[1, 1, :] = [10, 20, 30, 40]
+    values[1, 2, :] = [30, 40, 50, 60]
+    values[0, 0, :] = [1000, 1000, 1000, 1000]
+    valid = np.zeros((3, 3), dtype=bool)
+    valid[1, 1] = True
+    valid[1, 2] = True
+
+    mean = local_neighbourhood_mean_curve(values, 1, 1, 3, pixel_valid=valid)
+    np.testing.assert_allclose(mean, [20, 30, 40, 50])
+    np.testing.assert_array_equal(values[0, 0], [1000, 1000, 1000, 1000])
+
+
+def test_peak_neighbourhood_mean_marks_theta_without_contributors_as_nan():
+    from roc_mcs.peaks.peak_signal import local_neighbourhood_mean_curve
+
+    values = np.array([[[1.0, np.nan], [3.0, np.nan]]])
+    mean = local_neighbourhood_mean_curve(values, 0, 0, 3)
+    assert mean[0] == 2.0
+    assert np.isnan(mean[1])

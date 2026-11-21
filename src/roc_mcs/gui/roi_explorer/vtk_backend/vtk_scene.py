@@ -3,12 +3,24 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
+import logging
 
 import numpy as np
 
 from roc_mcs.gui.resource_monitor.activity import tracked_activity
 from .display_palette import resolve_projection_palette
 from .roi_preview_geometry import canonicalize_roi_preview
+
+
+logger = logging.getLogger(__name__)
+
+# vtkOpenGLVolumeRGBTable chooses a power-of-two 1D texture.  The user's
+# current OpenGL driver reports a 16384-texel maximum; keep the transfer
+# function's estimated requirement within that real hardware limit instead
+# of allowing VTK to silently downsample a 32768-texel request.
+_MAX_VOLUME_COLOR_TEXTURE_WIDTH = 16384
+_MAX_VOLUME_PALETTE_CONTROL_POINTS = 64
+_MIN_VOLUME_PALETTE_CONTROL_POINTS = 2
 
 
 def _vtk():
@@ -255,6 +267,82 @@ def _palette_samples(name: str, n: int = 48) -> np.ndarray:
         return np.column_stack([np.interp(new, old, anchors[:, i]) for i in range(3)])
 
 
+def _set_adaptive_volume_palette(
+    color_function: Any,
+    palette: str,
+    color_low: float,
+    color_high: float,
+    scalar_min: float,
+    scalar_max: float,
+    vtk_math: Any,
+    *,
+    max_texture_width: int = _MAX_VOLUME_COLOR_TEXTURE_WIDTH,
+) -> dict[str, int]:
+    """Populate a linear scalar palette without requesting an oversized GL LUT.
+
+    The transfer function is intentionally defined over the robust display
+    interval [color_low, color_high], while VTK estimates its 1D RGB texture
+    over the complete data scalar range [scalar_min, scalar_max].  When rare
+    outliers make that interval very small, a fixed 64-point palette can make
+    VTK request 32768 texels even on a driver limited to 16384.  Reduce only
+    the number of palette control points until VTK's own estimator fits the
+    hardware-safe texture width.  Scalar values, thresholds, opacity and the
+    linear mapping interval are not altered.
+    """
+    sample_count = int(_MAX_VOLUME_PALETTE_CONTROL_POINTS)
+    estimated_samples = 1
+    estimated_width = 1
+    scalar_min = float(scalar_min)
+    scalar_max = float(scalar_max)
+    if not (np.isfinite(scalar_min) and np.isfinite(scalar_max)):
+        raise ValueError("Границы скалярного диапазона для цветовой функции должны быть конечными.")
+
+    while True:
+        colors = _palette_samples(palette, sample_count)
+        color_function.RemoveAllPoints()
+        for i, color in enumerate(colors):
+            value = float(color_low + (color_high - color_low) * (i / (sample_count - 1)))
+            color_function.AddRGBPoint(value, *map(float, color))
+
+        if scalar_max > scalar_min:
+            estimated_samples = max(
+                1,
+                int(color_function.EstimateMinNumberOfSamples(scalar_min, scalar_max)),
+            )
+        else:
+            estimated_samples = 1
+        estimated_width = max(1, int(vtk_math.NearestPowerOfTwo(estimated_samples)))
+        if (
+            estimated_width <= int(max_texture_width)
+            or sample_count <= _MIN_VOLUME_PALETTE_CONTROL_POINTS
+        ):
+            break
+        sample_count = max(
+            _MIN_VOLUME_PALETTE_CONTROL_POINTS,
+            sample_count // 2,
+        )
+
+    if estimated_width > int(max_texture_width):
+        # Do not hide an exceptional data/driver mismatch.  This is only
+        # reachable when even a two-knot linear palette cannot fit the
+        # renderer's scalar range into the known OpenGL texture limit.
+        logger.warning(
+            "VTK volume color transfer still estimates a %d-texel table "
+            "(limit %d) for scalar range [%g, %g] and palette interval [%g, %g].",
+            estimated_width,
+            int(max_texture_width),
+            scalar_min,
+            scalar_max,
+            float(color_low),
+            float(color_high),
+        )
+    return {
+        "control_points": int(sample_count),
+        "estimated_samples": int(estimated_samples),
+        "estimated_texture_width": int(estimated_width),
+    }
+
+
 @dataclass(slots=True)
 class TransferSettings:
     # These are fractions of the robust p99.9 positive-intensity reference,
@@ -323,10 +411,11 @@ class VTKVolumeScene:
         self.vtk = vtk
         self.render_window = render_window
         self.interactor = interactor
-        # In QVTKRenderWindowInteractor, Render() schedules QWidget.update();
-        # the actual VTK render then happens inside Qt's paintEvent, when the
-        # native OpenGL context is current. Never call render_window.Render()
-        # directly from GUI slots.
+        # QVTKRenderWindowInteractor.Render() is delegated to the VTK
+        # interactor and renders immediately.  The owning Qt widget's
+        # paintEvent also invokes that VTK method.  GUI slots therefore pass
+        # QWidget.update as render_callback so Qt coalesces requests and the
+        # actual render runs through QVTK's normal paint lifecycle.
         self._render_callback = render_callback
         self.renderer = vtk.vtkRenderer()
         self.render_window.AddRenderer(self.renderer)
@@ -413,10 +502,10 @@ class VTKVolumeScene:
         self.projection_lut = None
         self.projection_info = None
         # Selected-theta emphasis is injected into the existing GPU volume
-        # ray-casting shader. No second actor, point mesh, plane or geometry is
-        # created; only the color of samples inside the selected theta slab is
-        # blended with a user-selected palette. The original opacity function
-        # and volume mapper remain authoritative.
+        # ray-casting shader. With the optional marker disabled (the default),
+        # this path creates no extra geometry and preserves the original slice
+        # appearance exactly. The marker is a separate abstract geometric plane,
+        # never a scalar-coloured copy of the source data.
         self._theta_slice_index: int | None = None
         self._theta_slice_enabled = False
         self._theta_slice_palette = "turbo"
@@ -426,6 +515,33 @@ class VTKVolumeScene:
         self._theta_slice_shader_installed = False
         self._theta_slice_bounds: tuple[float, float] | None = None
         self._theta_slice_transfer_range: tuple[float, float] | None = None
+        # Optional abstract marker at the selected physical theta. It mirrors
+        # the translucent geometric caps in the theta-range tool: no source
+        # scalars, lookup table, or change to the volume's slice shader.
+        self._theta_slice_marker_enabled = False
+        self._theta_slice_marker_opacity = 0.12
+        self._theta_slice_marker_source = vtk.vtkPlaneSource()
+        self._theta_slice_marker_source.SetXResolution(1)
+        self._theta_slice_marker_source.SetYResolution(1)
+        self._theta_slice_marker_source.SetOutputPointsPrecision(vtk.vtkAlgorithm.DOUBLE_PRECISION)
+        self._theta_slice_marker_mapper = vtk.vtkPolyDataMapper()
+        self._theta_slice_marker_mapper.SetInputConnection(
+            self._theta_slice_marker_source.GetOutputPort()
+        )
+        self._theta_slice_marker_actor = vtk.vtkActor()
+        self._theta_slice_marker_actor.SetMapper(self._theta_slice_marker_mapper)
+        self._theta_slice_marker_actor.SetUserMatrix(self._scene_user_matrix)
+        self._theta_slice_marker_actor.PickableOff()
+        marker_property = self._theta_slice_marker_actor.GetProperty()
+        marker_property.SetLighting(False)
+        marker_property.SetAmbient(1.0)
+        marker_property.SetDiffuse(0.0)
+        marker_property.SetOpacity(float(self._theta_slice_marker_opacity))
+        marker_property.SetEdgeVisibility(True)
+        marker_property.SetEdgeOpacity(0.92)
+        marker_property.SetLineWidth(1.5)
+        self._theta_slice_marker_actor.SetVisibility(0)
+        self.renderer.AddActor(self._theta_slice_marker_actor)
         # The map cursor is an independent, narrow optical marker inside the
         # volume ray. Unlike the previous RGB tint, it contributes its own
         # alpha even when the scalar transfer function is fully transparent.
@@ -682,6 +798,7 @@ class VTKVolumeScene:
             text.SetVerticalJustificationToCentered()
             text.SetBackgroundOpacity(0.0)
         self._style_theta_boundary_planes()
+        self._style_theta_slice_marker()
 
     def _style_roi_preview(self) -> None:
         """Apply one restrained, theme-aware accent to all ROI preview layers."""
@@ -1771,21 +1888,125 @@ class VTKVolumeScene:
             "rocThetaSliceEnabled", int(bool(self._theta_slice_enabled))
         )
 
+    def _style_theta_slice_marker(self) -> None:
+        """Match the restrained theme-aware style of the theta-range cap planes."""
+        actor = self._theta_slice_marker_actor
+        if actor is None:
+            return
+        if self.theme == "dark":
+            accent = (0.25, 0.74, 0.69)
+        else:
+            accent = (0.06, 0.43, 0.40)
+        prop = actor.GetProperty()
+        prop.SetColor(*accent)
+        prop.SetEdgeColor(*accent)
+        prop.SetLighting(False)
+        prop.SetAmbient(1.0)
+        prop.SetDiffuse(0.0)
+        prop.SetOpacity(float(self._theta_slice_marker_opacity))
+        prop.SetEdgeVisibility(True)
+        prop.SetEdgeOpacity(0.92)
+        prop.SetLineWidth(1.5)
+
+    def _update_theta_slice_marker_geometry(self) -> None:
+        """Place one abstract XY marker at the exact physical coordinate of θ[i]."""
+        source = self._theta_slice_marker_source
+        actor = self._theta_slice_marker_actor
+        x_axis, y_axis, theta = self._display_x, self._display_y, self._display_theta
+        if (
+            source is None
+            or actor is None
+            or self.payload is None
+            or x_axis is None
+            or y_axis is None
+            or theta is None
+            or self._theta_slice_index is None
+            or len(x_axis) < 2
+            or len(y_axis) < 2
+            or len(theta) == 0
+        ):
+            if actor is not None:
+                actor.SetVisibility(0)
+            return
+        x0, x1 = float(x_axis[0]), float(x_axis[-1])
+        y0, y1 = float(y_axis[0]), float(y_axis[-1])
+        if not (np.isfinite((x0, x1, y0, y1)).all() and x0 < x1 and y0 < y1):
+            actor.SetVisibility(0)
+            return
+        index = int(np.clip(self._theta_slice_index, 0, len(theta) - 1))
+        z = float(theta[index])
+        if not np.isfinite(z):
+            actor.SetVisibility(0)
+            return
+        source.SetOrigin(x0, y0, z)
+        source.SetPoint1(x1, y0, z)
+        source.SetPoint2(x0, y1, z)
+        source.Modified()
+        actor.SetUserMatrix(self._scene_user_matrix)
+        actor.GetProperty().SetOpacity(float(self._theta_slice_marker_opacity))
+        actor.SetVisibility(1 if self._theta_slice_marker_enabled else 0)
+        self._theta_slice_marker_mapper.Modified()
+
     @property
     def theta_slice_index(self) -> int | None:
+        """Current selected theta-slice index (None before a volume is loaded)."""
         return self._theta_slice_index
 
     @property
     def theta_slice_enabled(self) -> bool:
+        """Whether the in-volume theta-slice shader emphasis is enabled."""
         return bool(self._theta_slice_enabled)
 
     @property
     def theta_slice_palette(self) -> str:
+        """Palette used by the in-volume theta-slice shader emphasis."""
         return str(self._theta_slice_palette)
 
     @property
     def theta_slice_strength(self) -> float:
+        """Strength of the in-volume theta-slice shader emphasis."""
         return float(self._theta_slice_strength)
+
+    @property
+    def theta_slice_marker_enabled(self) -> bool:
+        return bool(self._theta_slice_marker_enabled)
+
+    @property
+    def theta_slice_marker_opacity(self) -> float:
+        return float(self._theta_slice_marker_opacity)
+
+    def set_theta_slice_marker_visible(
+        self, visible: bool, *, render: bool = True
+    ) -> bool:
+        requested = bool(visible)
+        self._theta_slice_marker_enabled = requested
+        self._update_theta_slice_marker_geometry()
+        if render:
+            self._request_render()
+        return bool(
+            requested
+            and self.payload is not None
+            and self._theta_slice_marker_actor is not None
+            and self._theta_slice_marker_actor.GetVisibility()
+        )
+
+    def set_theta_slice_marker_opacity(
+        self, opacity: float, *, render: bool = True
+    ) -> float:
+        try:
+            value = float(opacity)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("Прозрачность плоскости среза θ должна быть числом.") from exc
+        if not np.isfinite(value) or not (0.02 <= value <= 0.25):
+            raise ValueError("Прозрачность плоскости среза θ должна лежать в [0.02, 0.25].")
+        self._theta_slice_marker_opacity = value
+        if self._theta_slice_marker_actor is not None:
+            prop = self._theta_slice_marker_actor.GetProperty()
+            prop.SetOpacity(value)
+            prop.Modified()
+        if render:
+            self._request_render()
+        return value
 
     @property
     def theta_slice_shader_installed(self) -> bool:
@@ -1809,6 +2030,7 @@ class VTKVolumeScene:
         index = int(np.clip(int(index), 0, ntheta - 1))
         self._theta_slice_index = index
         self._update_theta_slice_shader_uniforms()
+        self._update_theta_slice_marker_geometry()
         if render:
             self._request_render()
         return index
@@ -1819,6 +2041,7 @@ class VTKVolumeScene:
             raise ValueError("Палитра выделения theta не может быть пустой.")
         self._theta_slice_palette = palette
         self._update_theta_slice_palette_uniforms()
+        
         if render:
             self._request_render()
 
@@ -2232,6 +2455,8 @@ class VTKVolumeScene:
         self.set_theme(self.theme)
         self._last_transfer_info = self.update_transfer_functions(self.settings, render=False)
         self._update_theta_slice_shader_uniforms()
+        self._update_theta_slice_marker_geometry()
+        
         # Establish a non-degenerate oblique camera BEFORE fitting. The previous
         # sequence called ResetCamera(), then assigned world-Z as view-up while
         # the default view direction could be parallel to Z, causing VTK's
@@ -2677,6 +2902,7 @@ class VTKVolumeScene:
                 self.outline_filter.Update()
 
             self._update_theta_slice_shader_uniforms()
+            self._update_theta_slice_marker_geometry()
             self._update_cursor_line_shader_uniforms()
             self._apply_theta_display_crop()
             self._update_theta_boundary_planes()
@@ -2719,6 +2945,10 @@ class VTKVolumeScene:
                     self.outline_filter.Modified()
                     self.outline_filter.Update()
                 self._update_theta_slice_shader_uniforms()
+                try:
+                    self._update_theta_slice_marker_geometry()
+                except Exception:
+                    pass
                 self._update_cursor_line_shader_uniforms()
                 try:
                     self._update_theta_boundary_planes()
@@ -2811,17 +3041,21 @@ class VTKVolumeScene:
         value_min = float(self.grid_info["scalar_min"])
         value_max = float(self.grid_info["scalar_max"])
         sentinel = float(self.grid_info["invalid_sentinel"])
-        self.color_function.RemoveAllPoints()
-        rgb = _palette_samples(settings.palette, 64)
         # Match colour contrast to the same robust intensity interval as the
         # opacity ramp. Rare hot pixels remain in the data/diagnostics but can
         # no longer stretch the entire transfer function and flatten the volume.
         color_low, color_high = float(low), float(high)
         if color_high <= color_low:
             color_high = color_low + max(abs(color_low) * 1e-6, 1e-6)
-        for i, color in enumerate(rgb):
-            value = color_low + (color_high - color_low) * (i / (len(rgb) - 1))
-            self.color_function.AddRGBPoint(float(value), *map(float, color))
+        color_table_info = _set_adaptive_volume_palette(
+            self.color_function,
+            settings.palette,
+            color_low,
+            color_high,
+            value_min,
+            value_max,
+            self.vtk.vtkMath,
+        )
 
         self.opacity_function.RemoveAllPoints()
         self.opacity_function.AddPoint(sentinel, 0.0)
@@ -2838,6 +3072,7 @@ class VTKVolumeScene:
 
         self.settings = settings
         self._update_theta_slice_shader_uniforms(low, high)
+        
         if self.projection_lut is not None:
             self._update_projection_palette()
         if self.projection_actor is not None:
@@ -2860,6 +3095,8 @@ class VTKVolumeScene:
             "sample_distance": float(sample_distance),
             "opacity_unit_distance": float(opacity_unit_distance),
             "projection_visible": bool(self.projection_actor.GetVisibility()) if self.projection_actor is not None else False,
+            "color_table_control_points": int(color_table_info["control_points"]),
+            "color_table_estimated_width": int(color_table_info["estimated_texture_width"]),
         }
         self._last_transfer_info = result
         if render:
@@ -2932,7 +3169,14 @@ class VTKVolumeScene:
             "theta_slice_display_bounds": self._theta_slice_bounds,
             "theta_slice_palette": self._theta_slice_palette,
             "theta_slice_strength": float(self._theta_slice_strength),
-            "theta_slice_extra_actors": 0,
+            "theta_slice_extra_actors": 0,  # shader highlight itself remains actor-free
+            "theta_slice_marker_requested_visible": bool(self._theta_slice_marker_enabled),
+            "theta_slice_marker_visible": bool(
+                self._theta_slice_marker_actor.GetVisibility()
+            ) if self._theta_slice_marker_actor is not None else False,
+            "theta_slice_marker_opacity": float(self._theta_slice_marker_opacity),
+            "theta_slice_marker_actor_present": self._theta_slice_marker_actor is not None,
+            "theta_slice_marker_bounds": _safe_bounds(self._theta_slice_marker_actor),
             "theta_boundary_planes_requested_visible": bool(self._theta_boundary_planes_visible),
             "theta_boundary_planes_visible": bool(
                 self._theta_boundary_plane_actor.GetVisibility()
@@ -3190,6 +3434,9 @@ class VTKVolumeScene:
         self._theta_slice_transfer_range = None
         self._theta_slice_index = None
         self._theta_slice_enabled = False
+        self._theta_slice_marker_enabled = False
+        if self._theta_slice_marker_actor is not None:
+            self._theta_slice_marker_actor.SetVisibility(0)
         self._cursor_line_enabled = False
         self._cursor_line_position = None
         self._cursor_line_radii = None
@@ -3233,6 +3480,7 @@ class VTKVolumeScene:
             self.axis_tick_actor,
             self.grid_actor,
             self._theta_boundary_plane_actor,
+            self._theta_slice_marker_actor,
         ):
             if prop is not None:
                 prop.SetVisibility(0)
@@ -3247,74 +3495,27 @@ class VTKVolumeScene:
         self._theta_scale = 1.0
         self._last_transfer_info = {}
         # A combo-box signal can run while Qt is processing another GUI event.
-        # QVTKRenderWindowInteractor.Render() is the non-blocking update() API;
-        # it schedules paintEvent instead of rendering outside the GL context.
+        # _request_render() schedules QWidget.update through the QVTK owner;
+        # it does not invoke the VTK interactor's immediate Render() method.
         if had_content and render:
             self._request_render()
 
-    @staticmethod
-    def _release_renderer_resources(renderer: Any, render_window: Any, errors: list[str], label: str, *, remove_props: bool = True) -> None:
-        """Free GPU state while props remain attached; optionally detach props."""
-        if renderer is None:
-            return
-        if render_window is not None:
-            try:
-                renderer.ReleaseGraphicsResources(render_window)
-            except Exception as exc:
-                errors.append(f"{label}.ReleaseGraphicsResources: {type(exc).__name__}: {exc}")
-        if remove_props:
-            try:
-                renderer.RemoveAllViewProps()
-            except Exception as exc:
-                errors.append(f"{label}.RemoveAllViewProps: {type(exc).__name__}: {exc}")
-
     def close(self) -> None:
-        """Release VTK props and GPU resources before QVTK finalizes its window."""
+        """Detach scene observers before the owning QVTK widget finalizes.
+
+        The QVTK render window is the sole owner of the OpenGL context and the
+        sole component allowed to finalize/release its GPU resources.  Do not
+        call MakeCurrent(), ReleaseGraphicsResources(), RemoveAllViewProps(),
+        or RemoveRenderer() here: QVTK's Finalize() performs the one authoritative
+        teardown while its native Qt surface is still alive.
+        """
         if self._closed:
             return
         self._closed = True
         errors: list[str] = []
-        render_window, renderer, interactor = self.render_window, self.renderer, self.interactor
-        try:
-            if render_window is not None:
-                render_window.MakeCurrent()
-        except Exception as exc:
-            errors.append(f"RenderWindow.MakeCurrent: {type(exc).__name__}: {exc}")
+        interactor = self.interactor
 
-        # The orientation widget owns a second renderer on the same window.
-        # Release it while enabled, then let the widget detach its own marker.
-        axes_widget = self.axes_widget
-        marker_renderer = None
-        if axes_widget is not None:
-            try:
-                marker_renderer = axes_widget.GetRenderer()
-            except Exception:
-                pass
-            if marker_renderer is not None and marker_renderer is not renderer:
-                self._release_renderer_resources(marker_renderer, render_window, errors, "orientation renderer", remove_props=False)
-            try:
-                axes_widget.SetEnabled(0)
-            except Exception as exc:
-                errors.append(f"orientation widget disable: {type(exc).__name__}: {exc}")
-            try:
-                axes_widget.SetInteractor(None)
-            except Exception as exc:
-                errors.append(f"orientation widget interactor detach: {type(exc).__name__}: {exc}")
-            try:
-                axes_widget.SetOrientationMarker(None)
-            except Exception as exc:
-                errors.append(f"orientation marker detach: {type(exc).__name__}: {exc}")
-            try:
-                axes_widget.SetRenderer(None)
-            except Exception as exc:
-                errors.append(f"orientation renderer detach: {type(exc).__name__}: {exc}")
-        if marker_renderer is not None and marker_renderer is not renderer:
-            try:
-                marker_renderer.RemoveAllViewProps()
-            except Exception as exc:
-                errors.append(f"orientation renderer.RemoveAllViewProps: {type(exc).__name__}: {exc}")
-        self.axes_widget = None
-
+        # Remove application-owned observers while the interactor is alive.
         if self._camera_observer_id is not None and interactor is not None:
             try:
                 interactor.RemoveObserver(self._camera_observer_id)
@@ -3322,9 +3523,23 @@ class VTKVolumeScene:
                 errors.append(f"camera observer removal: {type(exc).__name__}: {exc}")
         self._camera_observer_id = None
 
-        # Break the interactor-style -> default-renderer reference before removing
-        # the renderer from the window. QVTK still owns the interactor until its
-        # closeEvent calls Finalize().
+        # Disable/detach the orientation marker before QVTK tears down its
+        # interactor. These operations unregister widget observers; they do not
+        # manually release any OpenGL resources.
+        axes_widget = self.axes_widget
+        if axes_widget is not None:
+            for label, operation in (
+                ("orientation widget disable", lambda: axes_widget.SetEnabled(0)),
+                ("orientation widget interactor detach", lambda: axes_widget.SetInteractor(None)),
+                ("orientation marker detach", lambda: axes_widget.SetOrientationMarker(None)),
+                ("orientation renderer detach", lambda: axes_widget.SetRenderer(None)),
+            ):
+                try:
+                    operation()
+                except Exception as exc:
+                    errors.append(f"{label}: {type(exc).__name__}: {exc}")
+        self.axes_widget = None
+
         style = getattr(self, "interactor_style", None)
         if style is not None:
             try:
@@ -3338,27 +3553,9 @@ class VTKVolumeScene:
                 errors.append(f"interactor style detach: {type(exc).__name__}: {exc}")
         self.interactor_style = None
 
-        # Release before RemoveAllViewProps: removing a prop only detaches it;
-        # it is not a substitute for the renderer's OpenGL-resource release.
-        self._release_renderer_resources(renderer, render_window, errors, "main renderer")
-        if render_window is not None and renderer is not None:
-            try:
-                render_window.RemoveRenderer(renderer)
-            except Exception as exc:
-                errors.append(f"RenderWindow.RemoveRenderer: {type(exc).__name__}: {exc}")
-
+        # Break Python callbacks, but deliberately retain the render window,
+        # renderer, props and mappers until the caller has invoked QVTK Finalize.
         self._render_callback = None
-        self.renderer = None
-        self.render_window = None
-        self.interactor = None
-        self.payload = None
-        self.grid = self.mapper = self.volume = self.volume_property = None
-        self.projection_grid = self.projection_mapper = self.projection_actor = self.projection_lut = None
-        self.outline_filter = self.outline_mapper = self.outline_actor = None
-        self.axis_tick_polydata = self.axis_tick_mapper = self.axis_tick_actor = None
-        self.grid_polydata = self.grid_mapper = self.grid_actor = None
-        self._axis_label_actors.clear()
-        self._axis_label_title_flags.clear()
         if errors:
             raise RuntimeError("; ".join(errors))
 

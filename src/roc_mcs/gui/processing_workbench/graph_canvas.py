@@ -13,7 +13,7 @@ from PyQt6.QtWidgets import (
 )
 
 from roc_mcs.analysis.workflow_history import NodeStatus, ReviewStatus, WorkflowHistory
-from .graph_layout import vertical_dag_positions
+from .graph_layout import vertical_dag_positions, vertical_dag_edge_ports
 
 
 class _WorkflowNodeItem(QGraphicsObject):
@@ -25,7 +25,8 @@ class _WorkflowNodeItem(QGraphicsObject):
     HEIGHT = 78.0
 
     def __init__(
-        self, node, *, can_add: bool, can_preview: bool, is_selected: bool = False
+        self, node, *, can_add: bool, can_preview: bool, is_selected: bool = False,
+        input_descriptions: tuple[str, ...] = (),
     ):
         super().__init__()
         self.node = node
@@ -39,13 +40,18 @@ class _WorkflowNodeItem(QGraphicsObject):
         self.setZValue(2)
         if is_selected:
             self.setSelected(True)
-        self.setToolTip(
+        tooltip = (
             f"{node.label}\n{node.operation_id}\n"
             f"Execution: {node.status}\nReview: {node.review_status}\n"
             f"Summary: {node.summary or '—'}\n"
             f"Parameters: {node.parameters}\nID: {node.id}\n"
             "Глаз — открыть результат; + — создать следующую ветвь."
         )
+        if input_descriptions:
+            tooltip += "\n\nСохранённые входы операции:\n" + "\n".join(
+                f"• {description}" for description in input_descriptions
+            )
+        self.setToolTip(tooltip)
 
     def boundingRect(self) -> QRectF:
         return QRectF(0.0, 0.0, self.WIDTH, self.HEIGHT)
@@ -57,7 +63,8 @@ class _WorkflowNodeItem(QGraphicsObject):
         return QRectF(self.WIDTH - 30.0, self.HEIGHT - 28.0, 20.0, 20.0)
 
     def paint(self, painter: QPainter, _option, _widget=None) -> None:
-        palette = QApplication.palette()
+        views = self.scene().views() if self.scene() is not None else []
+        palette = views[0].palette() if views else QApplication.palette()
         window = palette.color(QPalette.ColorRole.Window)
         text = palette.color(QPalette.ColorRole.WindowText)
         muted = palette.color(QPalette.ColorRole.Mid)
@@ -228,7 +235,7 @@ class ProcessingGraphView(QGraphicsView):
         self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.setMinimumSize(300, 300)
-        self.setBackgroundBrush(QApplication.palette().color(QPalette.ColorRole.Base))
+        self.setBackgroundBrush(self.palette().color(QPalette.ColorRole.Base))
         self.setFrameShape(QFrame.Shape.NoFrame)
 
     @property
@@ -266,43 +273,78 @@ class ProcessingGraphView(QGraphicsView):
         max_x = max((point.x() + _WorkflowNodeItem.WIDTH for point in positions.values()), default=0.0)
         max_y = max((point.y() + _WorkflowNodeItem.HEIGHT for point in positions.values()), default=0.0)
         selected = selected_id or self._selected_id
-        palette = QApplication.palette()
+        palette = self.palette()
         edge_color = palette.color(QPalette.ColorRole.Mid)
+        edge_ports = vertical_dag_edge_ports(
+            visible_nodes,
+            {key: (point.x(), point.y()) for key, point in positions.items()},
+            width=_WorkflowNodeItem.WIDTH,
+            height=_WorkflowNodeItem.HEIGHT,
+            port_margin=22.0,
+        )
 
-        # Dependencies flow top-to-bottom. Curved connectors remain behind cards.
+        # The canvas renders the transitive reduction: redundant ancestor
+        # shortcuts are omitted, while the exact direct inputs remain visible
+        # in each node's tooltip.
+        nodes_by_id = {node.id: node for node in visible_nodes}
+        history_nodes_by_id = {node.id: node for node in history.nodes}
+        input_descriptions_by_node: dict[str, tuple[str, ...]] = {}
         for node in visible_nodes:
-            target_pos = positions[node.id]
-            end = QPointF(target_pos.x() + _WorkflowNodeItem.WIDTH / 2.0, target_pos.y())
-            for parent_id in node.parent_ids:
-                if parent_id not in positions:
-                    continue
-                source_pos = positions[parent_id]
-                start = QPointF(source_pos.x() + _WorkflowNodeItem.WIDTH / 2.0,
-                                source_pos.y() + _WorkflowNodeItem.HEIGHT)
-                bend = max(18.0, (end.y() - start.y()) * 0.45)
-                path = QPainterPath(start)
-                path.cubicTo(QPointF(start.x(), start.y() + bend),
-                             QPointF(end.x(), end.y() - bend), end)
-                edge = QGraphicsPathItem(path)
-                pen_color = QColor(edge_color)
-                pen_color.setAlpha(150)
-                edge.setPen(QPen(pen_color, 1.25))
-                edge.setZValue(0)
-                self._graph_scene.addItem(edge)
+            descriptions = []
+            for port, reference in node.input_refs.items():
+                source_node = history_nodes_by_id.get(reference.get("node_id", ""))
+                source_label = (
+                    source_node.label if source_node is not None
+                    else reference.get("node_id", "неизвестный узел")
+                )
+                descriptions.append(
+                    f"{port} ← {source_label} [{reference.get('output', '?')}]"
+                )
+            input_descriptions_by_node[node.id] = tuple(descriptions)
+        for (parent_id, child_id), (start_xy, end_xy) in edge_ports.items():
+            start = QPointF(*start_xy)
+            end = QPointF(*end_xy)
+            bend = max(18.0, (end.y() - start.y()) * 0.45)
+            path = QPainterPath(start)
+            path.cubicTo(QPointF(start.x(), start.y() + bend),
+                         QPointF(end.x(), end.y() - bend), end)
+            pen_color = QColor(edge_color)
+            pen_color.setAlpha(175)
+            edge = QGraphicsPathItem(path)
+            child = nodes_by_id[child_id]
+            input_ports = [
+                port for port, ref in child.input_refs.items()
+                if ref.get("node_id") == parent_id
+            ]
+            if input_ports:
+                edge.setPen(QPen(pen_color, 1.35, Qt.PenStyle.SolidLine))
+                tooltip = "Вычислительный вход: " + ", ".join(input_ports)
+            else:
+                edge.setPen(QPen(pen_color, 1.15, Qt.PenStyle.DashLine))
+                tooltip = (
+                    "Связь происхождения ветви: прямой вход от этого узла "
+                    "операцией не читается."
+                )
+            if input_descriptions_by_node[child_id]:
+                tooltip += "\nВсе прямые входы операции перечислены в подсказке карточки."
+            edge.setToolTip(tooltip)
+            edge.setZValue(0)
+            self._graph_scene.addItem(edge)
 
-                arrow_path = QPainterPath(end)
-                arrow_path.lineTo(QPointF(end.x() - 4.0, end.y() - 7.0))
-                arrow_path.lineTo(QPointF(end.x() + 4.0, end.y() - 7.0))
-                arrow_path.closeSubpath()
-                arrow = QGraphicsPathItem(arrow_path)
-                arrow.setPen(QPen(pen_color, 0.6))
-                arrow.setBrush(QBrush(pen_color))
-                arrow.setZValue(1)
-                self._graph_scene.addItem(arrow)
+            arrow_path = QPainterPath(end)
+            arrow_path.lineTo(QPointF(end.x() - 4.0, end.y() - 7.0))
+            arrow_path.lineTo(QPointF(end.x() + 4.0, end.y() - 7.0))
+            arrow_path.closeSubpath()
+            arrow = QGraphicsPathItem(arrow_path)
+            arrow.setPen(QPen(pen_color, 0.6))
+            arrow.setBrush(QBrush(pen_color))
+            arrow.setZValue(1)
+            self._graph_scene.addItem(arrow)
 
         for node in visible_nodes:
             item = _WorkflowNodeItem(
                 node,
+                input_descriptions=input_descriptions_by_node[node.id],
                 can_preview=node.status == NodeStatus.SUCCEEDED,
                 can_add=(
                     node.status == NodeStatus.SUCCEEDED

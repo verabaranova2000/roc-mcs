@@ -737,6 +737,10 @@ def _run_peaks(inputs: Mapping[str, ArtifactBundle], parameters: Mapping[str, An
     metadata = {
         "grid_id": scan.metadata["grid_id"],
         "used_interpolated_data": used_interpolated_data,
+        "peak_input_source": (
+            "spike_interpolated" if used_interpolated_data else "scan_counts"
+        ),
+        "peak_signal_definition": "spatial_neighbourhood_mean",
         "excluded_detector_pixels": int(
             scan.metadata.get(
                 "detector_bad_pixel_count",

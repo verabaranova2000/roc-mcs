@@ -10,6 +10,11 @@ import numpy as np
 from PyQt6 import QtCore, QtGui, QtWidgets
 
 from roc_mcs.gui.roi_explorer.theme import resolve_theme, theme_colors
+from roc_mcs.gui.roi_explorer.map_tools_widget import SmartDropdownButton
+from roc_mcs.gui.roi_explorer.plot_toolbar_style import (
+    SMART_DROPDOWN_INDICATOR_RGBA,
+    SMART_DROPDOWN_INDICATOR_SIZE,
+)
 from .cursor_link import map_detector_cursor_to_volume
 from .scan_view_adapter import build_volume_payload
 from roc_mcs.roi.roi_types import normalize_rectangular_roi
@@ -19,6 +24,11 @@ from .vtk_volume_display_widget import VTKVolumeDisplayWidget
 
 
 logger = logging.getLogger(__name__)
+
+# Keep the VTK console output sink alive for the process lifetime.  VTK uses a
+# process-wide singleton; retaining the Python wrapper prevents it from being
+# collected while native VTK objects still hold the instance.
+_VTK_OUTPUT_WINDOW_KEEPALIVE = None
 
 
 class _WorkerSignals(QtCore.QObject):
@@ -41,6 +51,39 @@ class _PayloadWorker(QtCore.QRunnable):
             self.signals.finished.emit(self.token, None, exc)
 
 
+class _SourceDropdownButton(SmartDropdownButton):
+    """Smart dropdown with only the scientific corner marker, no native chevron.
+
+    QToolButton's platform style paints its own menu indicator even when a QSS
+    rule hides it on some native styles.  Paint the normal toolbutton control
+    with HasMenu removed, then draw the same lower-right marker as
+    SmartDropdownButton.  The attached QMenu and InstantPopup interaction are
+    unchanged.
+    """
+
+    def paintEvent(self, event):
+        option = QtWidgets.QStyleOptionToolButton()
+        self.initStyleOption(option)
+        option.features &= ~QtWidgets.QStyleOptionToolButton.ToolButtonFeature.HasMenu
+        option.subControls &= ~QtWidgets.QStyle.SubControl.SC_ToolButtonMenu
+        painter = QtWidgets.QStylePainter(self)
+        painter.drawComplexControl(QtWidgets.QStyle.ComplexControl.CC_ToolButton, option)
+        painter.end()
+
+        marker = QtGui.QPainter(self)
+        marker.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
+        marker.setPen(QtCore.Qt.PenStyle.NoPen)
+        marker.setBrush(QtGui.QColor(*SMART_DROPDOWN_INDICATOR_RGBA))
+        rect = self.rect()
+        size = SMART_DROPDOWN_INDICATOR_SIZE
+        marker.drawPolygon(QtGui.QPolygon([
+            QtCore.QPoint(rect.right() - size, rect.bottom()),
+            QtCore.QPoint(rect.right(), rect.bottom() - size),
+            QtCore.QPoint(rect.right(), rect.bottom()),
+        ]))
+        marker.end()
+
+
 class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
     """Лёгкая оболочка; QVTK/OpenGL создаются только при первом показе окна."""
 
@@ -53,9 +96,20 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
     # Choose one of the four supplied scientific source symbols (1..4).
     # 1 is the default nested-volume/cube glyph.
     SOURCE_ICON_VARIANT = 1
+    # Small outline variants are provided in resources/icons/vtk_theta_link_*.svg.
+    THETA_LINK_ICON_VARIANT = 1
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        # The host application can use a pixel-sized QApplication font, for
+        # which QFont.pointSizeF() is -1.  Give this pane a valid inherited
+        # point size before creating child controls, but preserve the host
+        # family/weight/style and its existing point size when it is valid.
+        inherited_font = QtGui.QFont(QtWidgets.QApplication.font())
+        inherited_point_size = float(inherited_font.pointSizeF())
+        if not np.isfinite(inherited_point_size) or inherited_point_size <= 0.0:
+            inherited_font.setPointSizeF(9.0)
+        self.setFont(inherited_font)
         self.setObjectName("EmbeddedVTKVolumeWidget")
         self._theme = resolve_theme(self)
         self.setProperty("rocMcsTheme", self._theme)
@@ -70,6 +124,8 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
         self._pending_request: tuple[int, dict] | None = None
         self._generation = 0
         self._closed = False
+        self._permanently_closed = False
+        self._release_in_progress = False
         self._init_pending = False
         self._init_generation = 0
         self._first_payload = True
@@ -81,6 +137,8 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
         self._map_theta_mode = False
         self._map_theta_values = np.empty(0, dtype=np.float64)
         self._map_theta_index = 0
+        # Remember the user's link preference while theta-map mode is unavailable.
+        self._theta_link_preference = True
         self._transfer = TransferSettings()
         self._settings = {}
         self._settings_timer = QtCore.QTimer(self)
@@ -101,17 +159,22 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
         self.toolbar.setObjectName("EmbeddedVTKToolbar")
         row = QtWidgets.QHBoxLayout(self.toolbar)
         row.setContentsMargins(3, 1, 3, 1)
-        row.setSpacing(4)
+        row.setSpacing(0)
         # Keep the combo as an internal selection model for API compatibility,
         # but expose the source choice through one compact icon-only menu.
         self.source_combo = QtWidgets.QComboBox(self.toolbar)
         self.source_combo.setObjectName("vtkExplorerVolumeSource")
         self.source_combo.addItem("Полный детектор", "full")
         self.source_combo.hide()
-        self.source_button = QtWidgets.QToolButton(self.toolbar)
+        self.source_button = _SourceDropdownButton(self.toolbar)
         self.source_button.setObjectName("vtkExplorerSourceButton")
         self.source_button.setAutoRaise(True)
         self.source_button.setPopupMode(QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
+        # SmartDropdownButton paints the custom lower-right triangle itself.
+        # Suppress Qt's second native menu chevron (the unwanted "v").
+        self.source_button.setStyleSheet(
+            "QToolButton::menu-indicator { image: none; width: 0px; height: 0px; }"
+        )
         self.source_button.setFixedSize(28, 28)
         self.source_button.setIconSize(QtCore.QSize(19, 19))
         self.source_button.setToolTip("Выбрать источник 3D-объёма")
@@ -119,9 +182,17 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
         self.source_menu = QtWidgets.QMenu(self.source_button)
         self.source_menu.setObjectName("vtkExplorerSourceMenu")
         self.source_menu.setToolTipsVisible(True)
+        # The complete palette-aware menu stylesheet is reapplied in
+        # apply_theme(); never append to an existing stylesheet on theme
+        # changes, otherwise identical rules accumulate indefinitely.
         self.source_button.setMenu(self.source_menu)
         row.addWidget(self.source_button, 0)
         self.tools = VTKToolsWidget(self.toolbar)
+        # The first VTK tool starts directly beside the source dropdown; remove
+        # the nested toolbar's default left inset for this embedded layout only.
+        tools_layout = self.tools.layout()
+        if tools_layout is not None:
+            tools_layout.setContentsMargins(0, 2, 5, 2)
         self.tools.volume_source_btn.hide()
         self.tools.theme_btn.hide()
         row.addWidget(self.tools, 1)
@@ -129,13 +200,18 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
 
         self.viewport = QtWidgets.QWidget(self)
         self.viewport.setObjectName("EmbeddedVTKViewport")
-        self.viewport_layout = QtWidgets.QVBoxLayout(self.viewport)
+        # A grid permits QVTK and the HUD to occupy the same viewport cell.
+        # QVTK fills it; the fixed-size native HUD is aligned top-right by the
+        # layout, so it is never clipped or left at QWidget's default height.
+        self.viewport_layout = QtWidgets.QGridLayout(self.viewport)
         self.viewport_layout.setContentsMargins(0, 0, 0, 0)
         self.viewport_layout.setSpacing(0)
+        self.viewport_layout.setRowStretch(0, 1)
+        self.viewport_layout.setColumnStretch(0, 1)
         self.placeholder = QtWidgets.QLabel("3D-сцена будет создана при первом открытии окна.", self.viewport)
         self.placeholder.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         self.placeholder.setWordWrap(True)
-        self.viewport_layout.addWidget(self.placeholder)
+        self.viewport_layout.addWidget(self.placeholder, 0, 0)
         root.addWidget(self.viewport, 1)
 
         self.status = QtWidgets.QLabel("3D не инициализировано", self)
@@ -167,10 +243,20 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
     def has_dataset_request(self) -> bool:
         return self._dataset_request is not None
 
-    def _spin(self, minimum, maximum, value, decimals=2, suffix=""):
+    def _spin(self, minimum, maximum, value, decimals=2, suffix="", step=None):
+        """Create a compact floating-point control with a precision-safe wheel step.
+
+        QDoubleSpinBox defaults to a 1.0 wheel step even when it displays two
+        decimal places.  That made values such as opacity=0.18 jump directly to
+        1.00/0.00.  Unless a control supplies a domain-specific step, use its
+        smallest displayed decimal place.
+        """
         widget = QtWidgets.QDoubleSpinBox()
+        precision = max(0, int(decimals))
         widget.setRange(float(minimum), float(maximum))
-        widget.setDecimals(int(decimals))
+        widget.setDecimals(precision)
+        wheel_step = float(step) if step is not None else (10.0 ** -precision if precision else 1.0)
+        widget.setSingleStep(max(wheel_step, 10.0 ** -precision if precision else 1.0))
         widget.setValue(float(value))
         widget.setSuffix(str(suffix))
         widget.setKeyboardTracking(False)
@@ -190,17 +276,65 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
         for name in ("viridis", "inferno", "magma", "plasma", "cividis", "gray"):
             self.theta_palette.addItem(name, name)
         self.theta_strength = self._spin(0.0, 1.0, 0.75, 2)
-        theta = self._settings_panel(("Срез", self.theta_label), ("Индекс θ", self.theta_index), ("Палитра", self.theta_palette), ("Сила", self.theta_strength))
-        self.theta_link_checkbox = QtWidgets.QCheckBox("Связать с 2D-картой")
-        self.theta_link_checkbox.setObjectName("vtkThetaSliceLinkCheckbox")
+        theta = self._settings_panel(
+            ("Срез", self.theta_label),
+            ("Индекс θ", self.theta_index),
+            ("Палитра", self.theta_palette),
+            ("Подсветка", self.theta_strength),
+        )
+
+        # A compact icon + caption replaces the oversized native checkbox. The
+        # parent row is disabled as a whole when physical 2D/3D theta axes cannot
+        # be linked, so neither the icon nor its label suggests an available action.
+        self.theta_link_row = QtWidgets.QWidget(theta)
+        link_layout = QtWidgets.QHBoxLayout(self.theta_link_row)
+        link_layout.setContentsMargins(0, 0, 0, 0)
+        link_layout.setSpacing(4)
+        self.theta_link_checkbox = QtWidgets.QToolButton(self.theta_link_row)
+        self.theta_link_checkbox.setObjectName("vtkThetaSliceLinkButton")
+        self.theta_link_checkbox.setAutoRaise(True)
+        self.theta_link_checkbox.setCheckable(True)
         self.theta_link_checkbox.setChecked(True)
-        self.theta_link_checkbox.setEnabled(False)
-        self.theta_link_checkbox.setToolTip(
+        self.theta_link_checkbox.setFixedSize(20, 20)
+        self.theta_link_checkbox.setIconSize(QtCore.QSize(14, 14))
+        self.theta_link_checkbox.setToolButtonStyle(QtCore.Qt.ToolButtonStyle.ToolButtonIconOnly)
+        self.theta_link_checkbox.setAccessibleName("Связать срез θ в 3D с 2D-картой")
+        self.theta_link_label = QtWidgets.QLabel("Связать с 2D-картой", self.theta_link_row)
+        self.theta_link_label.setObjectName("vtkThetaSliceLinkLabel")
+        self.theta_link_label.setToolTip(
             "Синхронизация доступна только в режиме 2D-карты «Срез по θ» "
             "и при совпадающих физических θ-осях."
         )
-        self.theta_link_checkbox.setAccessibleName("Связать срез θ в 3D с 2D-картой")
-        theta.layout().addRow(self.theta_link_checkbox)
+        link_layout.addWidget(self.theta_link_checkbox, 0)
+        link_layout.addWidget(self.theta_link_label, 1)
+        theta.layout().addRow("Связь", self.theta_link_row)
+
+        # Optional abstract geometry marker at the selected theta coordinate.
+        # It is deliberately NOT a colored copy of the XY data slice: the
+        # intensity highlight remains the original in-volume shader path above.
+        self.theta_marker_checkbox = QtWidgets.QCheckBox("Плоскость среза θ")
+        self.theta_marker_checkbox.setObjectName("vtkThetaSliceMarkerCheckbox")
+        self.theta_marker_checkbox.setToolTip(
+            "Показать дополнительную полупрозрачную геометрическую XY-плоскость "
+            "в координате выбранного θ. Интенсивности и палитра данных не меняются."
+        )
+        self.theta_marker_opacity = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.theta_marker_opacity.setObjectName("vtkThetaSliceMarkerOpacity")
+        self.theta_marker_opacity.setRange(2, 25)
+        self.theta_marker_opacity.setValue(12)
+        self.theta_marker_opacity.setFixedWidth(82)
+        self.theta_marker_opacity.setToolTip("Непрозрачность геометрической плоскости: 2–25 %")
+        self.theta_marker_opacity_label = QtWidgets.QLabel("12 %")
+        marker_row = QtWidgets.QWidget(theta)
+        marker_layout = QtWidgets.QHBoxLayout(marker_row)
+        marker_layout.setContentsMargins(0, 0, 0, 0)
+        marker_layout.setSpacing(5)
+        marker_layout.addWidget(self.theta_marker_checkbox, 0)
+        marker_layout.addStretch(1)
+        marker_layout.addWidget(self.theta_marker_opacity_label, 0)
+        marker_layout.addWidget(self.theta_marker_opacity, 0)
+        theta.layout().addRow(marker_row)
+        self._update_theta_link_icon()
 
         self.projection_opacity = self._spin(0.0, 1.0, 0.75, 2)
         self.projection_palette = QtWidgets.QComboBox()
@@ -222,6 +356,8 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
         self.theta_link_checkbox.toggled.connect(self._on_theta_link_toggled)
         self.theta_palette.currentIndexChanged.connect(self._apply_theta_palette)
         self.theta_strength.valueChanged.connect(self._apply_theta_strength)
+        self.theta_marker_checkbox.toggled.connect(self._toggle_theta_marker)
+        self.theta_marker_opacity.valueChanged.connect(self._apply_theta_marker_opacity)
         self.projection_opacity.valueChanged.connect(self._queue_transfer_settings)
         self.projection_palette.currentIndexChanged.connect(self._queue_transfer_settings)
         self.roi_preview_opacity.valueChanged.connect(self._update_roi_preview)
@@ -232,23 +368,41 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
         form = QtWidgets.QFormLayout(self.display_panel)
         form.setContentsMargins(8, 7, 8, 7)
         form.setSpacing(5)
-        self.low_threshold = self._spin(0.0, 99.0, 16.0, 1, " %")
-        self.high_threshold = self._spin(1.0, 100.0, 95.0, 1, " %")
-        self.opacity = self._spin(0.0, 1.0, 0.18, 2)
-        self.gamma = self._spin(0.05, 8.0, 2.0, 2)
-        self.sample_factor = self._spin(0.25, 8.0, 1.0, 2, " ×")
-        self.unit_distance = self._spin(0.05, 20.0, 1.0, 2, " ×")
+        self.low_threshold = self._spin(0.0, 99.0, 16.0, 1, " %", step=0.1)
+        self.high_threshold = self._spin(1.0, 100.0, 95.0, 1, " %", step=0.1)
+        self.low_threshold.setToolTip("Нижняя граница в процентах от положительного p99.9; число на шкале показывает абсолютную интенсивность.")
+        self.high_threshold.setToolTip("Верхняя граница в процентах от положительного p99.9; число на шкале показывает абсолютную интенсивность.")
+        self.opacity = self._spin(0.0, 1.0, 0.18, 2, step=0.01)
+        self.opacity.setToolTip("Максимальная opacity VTK transfer function (0–1). Это параметр VTK-рендера, не Plotly-opacity.")
+        self.gamma = self._spin(0.05, 8.0, 2.0, 2, step=0.05)
+        self.gamma.setToolTip("Форма нарастания opacity между Vmin и Vmax; 2.0 плавнее подавляет слабые значения, чем 1.0.")
+        self.sample_factor = self._spin(0.25, 8.0, 1.0, 2, " ×", step=0.1)
+        self.unit_distance = self._spin(0.05, 20.0, 1.0, 2, " ×", step=0.1)
         self.palette = QtWidgets.QComboBox(self.display_panel)
         from roc_mcs.gui.roi_explorer.colormap_catalog import NAPARI_STYLE_COLORMAPS
         for name in NAPARI_STYLE_COLORMAPS:
             self.palette.addItem(str(name), str(name))
-        for label, control in (("Vmin", self.low_threshold), ("Vmax", self.high_threshold), ("Макс. opacity", self.opacity), ("Gamma", self.gamma), ("Ray sample", self.sample_factor), ("Opacity distance", self.unit_distance), ("Colormap", self.palette)):
+        for label, control in (("Vmin · % p99.9", self.low_threshold), ("Vmax · % p99.9", self.high_threshold), ("Макс. opacity", self.opacity), ("Gamma", self.gamma), ("Ray sample", self.sample_factor), ("Opacity distance", self.unit_distance), ("Colormap", self.palette)):
             form.addRow(label, control)
         self.display = None
         self._threshold_sync = False
         for control in (self.low_threshold, self.high_threshold, self.opacity, self.gamma, self.sample_factor, self.unit_distance):
             control.valueChanged.connect(self._queue_transfer_settings)
         self.palette.currentIndexChanged.connect(self._queue_transfer_settings)
+
+    def _update_theta_link_icon(self) -> None:
+        variant = int(self.THETA_LINK_ICON_VARIANT)
+        if variant not in (1, 2, 3):
+            raise ValueError("THETA_LINK_ICON_VARIANT должен быть 1..3.")
+        from roc_mcs.gui.components.icon_provider import svg_icon
+        from roc_mcs.gui.roi_explorer.plot_toolbar_style import ICON_DIR
+
+        colors = theme_colors(self._theme)
+        foreground = colors["text"] if self.theta_link_row.isEnabled() else colors["muted"]
+        icon_path = ICON_DIR / f"vtk_theta_link_{variant}.svg"
+        self.theta_link_checkbox.setIcon(svg_icon(
+            icon_path, color=foreground, widget=self.theta_link_checkbox, monochrome=True,
+        ))
 
     def _update_source_icon(self) -> None:
         """Apply the selected monochrome source glyph to the compact button."""
@@ -362,7 +516,9 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
             "raw": raw, "theta": th, "axis": axis, "x_coords": x_coords, "y_coords": y_coords,
             "valid_mask": valid_mask, "roi": self._selected_roi(), "scan_key": scan_key,
             "h5_path": source_path, "operation_id": str(operation_id), "metadata": details,
-            "smoothing_sigma": float(self._settings.get("smooth_sigma", 0.5)),
+            # Match the standalone VTK viewer's crisp, unsmoothed starting point.
+            # A user-selected non-zero value remains fully supported.
+            "smoothing_sigma": float(self._settings.get("smooth_sigma", 0.0)),
         }
         self.source_button.setEnabled(True)
         self._refresh_theta_link_control()
@@ -371,6 +527,45 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
             self._submit_payload(self._dataset_request)
         else:
             self._schedule_vtk_init()
+
+    def update_saved_rois(self, saved_rois) -> None:
+        """Refresh the source menu without rebuilding an unchanged volume.
+
+        Saving a new ROI changes the catalogue, not the active dataset. In that
+        common case this method deliberately leaves the current payload, VTK
+        scene, camera, clipping range, and render-worker generation untouched.
+        If the active ROI was actually removed, the source falls back to the full
+        detector and only then is a new payload requested.
+        """
+        previous_source = self.source_combo.currentData() or "full"
+        previous_roi_ids = {int(item.id) for item in self._rois}
+        validated = []
+        seen_roi_ids: set[int] = set()
+        for item in (saved_rois or []):
+            try:
+                normalize_rectangular_roi(item.roi)
+                roi_id = int(item.id)
+            except (AttributeError, TypeError, ValueError, OverflowError):
+                continue
+            if roi_id in seen_roi_ids:
+                continue
+            seen_roi_ids.add(roi_id)
+            validated.append(item)
+        new_roi_ids = {int(item.id) for item in validated}
+        self._rois = validated
+        self._rebuild_source_choices()
+        self._refresh_theta_link_control()
+        active_roi_removed = (
+            previous_source != "full"
+            and int(previous_source) not in new_roi_ids
+            and int(previous_source) in previous_roi_ids
+        )
+        if active_roi_removed and self._dataset_request is not None:
+            request = dict(self._dataset_request)
+            request["roi"] = None
+            self._dataset_request = request
+            if self._scene is not None:
+                self._submit_payload(request)
 
     def _rebuild_source_choices(self):
         selected = self.source_combo.currentData() or "full"
@@ -477,6 +672,14 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
         self.tools.set_axis_scales(*self._scene.axis_scales)
         self.tools.set_overlay_controls_enabled(cursor=True, theta=len(payload.theta) > 2, projection=True, roi_preview=True)
         self.tools.set_projection_enabled(settings.show_projection)
+        self._scene.set_theta_slice_palette(str(self.theta_palette.currentData() or "viridis"), render=False)
+        self._scene.set_theta_slice_strength(float(self.theta_strength.value()), render=False)
+        self._scene.set_theta_slice_marker_opacity(
+            float(self.theta_marker_opacity.value()) / 100.0, render=False
+        )
+        self._scene.set_theta_slice_marker_visible(
+            self.theta_marker_checkbox.isChecked(), render=False
+        )
         if self.display is not None:
             self.display.set_colormap(settings.palette)
             self.display.set_thresholds(self.low_threshold.value(), self.high_threshold.value(), absolute_low=info.get("threshold_min"), absolute_high=info.get("threshold_max"), reference=info.get("threshold_reference"))
@@ -503,21 +706,63 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
         import vtkmodules.vtkRenderingOpenGL2  # noqa: F401
         import vtkmodules.vtkInteractionStyle  # noqa: F401
         import vtkmodules.vtkRenderingVolumeOpenGL2  # noqa: F401
+        # VTK may choose the platform-specific vtkWin32OutputWindow singleton
+        # on Windows.  Its native diagnostics window can appear outside the
+        # Qt application even when the Python process already has a console.
+        # Install the generic vtkOutputWindow explicitly: it writes messages
+        # to stderr/stdout and does not create a second native window.  Keep a
+        # Python reference because this is a process-wide VTK singleton.
+        from vtkmodules.vtkCommonCore import vtkOutputWindow
+
+        global _VTK_OUTPUT_WINDOW_KEEPALIVE
+        previous_output_window = vtkOutputWindow.GetInstance()
+        if previous_output_window is not None:
+            previous_output_window.SetPromptUser(False)
+            if hasattr(previous_output_window, "ShowWindowOff"):
+                previous_output_window.ShowWindowOff()
+            elif hasattr(previous_output_window, "SetShowWindow"):
+                previous_output_window.SetShowWindow(False)
+
+        if (
+            previous_output_window is not None
+            and previous_output_window.GetClassName() == "vtkOutputWindow"
+        ):
+            # Reuse an already-installed generic console sink.  This makes
+            # lazy/repeated 3D initialization idempotent.
+            previous_output_window.SetDisplayModeToAlways()
+            _VTK_OUTPUT_WINDOW_KEEPALIVE = previous_output_window
+        else:
+            output_window = vtkOutputWindow()
+            output_window.SetPromptUser(False)
+            output_window.SetDisplayModeToAlways()
+            vtkOutputWindow.SetInstance(output_window)
+            _VTK_OUTPUT_WINDOW_KEEPALIVE = output_window
+
         from vtkmodules.qt.QVTKRenderWindowInteractor import QVTKRenderWindowInteractor
 
         class _TrackedQVTK(QVTKRenderWindowInteractor):
             def __init__(self, parent=None):
                 super().__init__(parent)
                 self._roc_finalized = False
-                self._paint_count = 0
-
-            def paintEvent(self, event):
-                super().paintEvent(event)
-                self._paint_count += 1
 
             def closeEvent(self, event):
                 if not self._roc_finalized:
                     self._roc_finalized = True
+                    # QVTK owns the Qt timer used for VTK TimerEvent dispatch.
+                    # Stop it and disable the interactor before Finalize so no
+                    # queued timer can render against a finalized HWND/context.
+                    try:
+                        timer = getattr(self, "_Timer", None)
+                        if timer is not None:
+                            timer.stop()
+                    except RuntimeError:
+                        pass
+                    try:
+                        interactor = self.GetRenderWindow().GetInteractor()
+                        if interactor is not None:
+                            interactor.Disable()
+                    except Exception:
+                        logger.exception("Не удалось отключить VTK interactor перед Finalize")
                     super().closeEvent(event)  # Единственный вызов Finalize внутри QVTK.
                 event.accept()
 
@@ -562,7 +807,7 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
             widget.setAttribute(QtCore.Qt.WidgetAttribute.WA_DontCreateNativeAncestors, False)
             self.viewport_layout.removeWidget(self.placeholder)
             self.placeholder.hide()
-            self.viewport_layout.addWidget(widget, 1)
+            self.viewport_layout.addWidget(widget, 0, 0)
             widget.show()
             widget.winId()
             QtCore.QTimer.singleShot(100, lambda t=ticket: self._initialize_vtk(t))
@@ -596,30 +841,48 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
             if interactor is None:
                 raise RuntimeError("QVTK не создал vtkRenderWindowInteractor.")
             if not bool(interactor.GetInitialized()):
-                # Создаём native surface и просим Qt выполнить первый paint до Initialize.
-                if getattr(widget, "_paint_count", 0) < 1:
-                    widget.repaint()
+                # QVTK deliberately uses WA_PaintOnScreen and returns no
+                # QPaintEngine.  A synchronous QWidget.repaint() here can
+                # re-enter its paintEvent/backing-store path and produce
+                # recursive-repaint / inactive-QPainter warnings.  winId()
+                # was already materialized in _ensure_vtk(); Initialize()
+                # is safe here and the first normal Qt paint performs Render.
                 widget.Initialize()
             if not bool(interactor.GetInitialized()):
                 raise RuntimeError("VTK interactor не перешёл в состояние Initialized.")
             self._render_window = render_window
             self._interactor = interactor
-            self._scene = VTKVolumeScene(render_window, interactor, render_callback=widget.Render)
+            # QWidget.update() queues/coalesces a Qt paint event. QVTK's
+            # paintEvent then calls vtkGenericRenderWindowInteractor.Render()
+            # with the widget's native paint lifecycle in control. Calling
+            # widget.Render() here would resolve through __getattr__ to VTK and
+            # render synchronously, allowing nested paints during Qt events.
+            self._scene = VTKVolumeScene(render_window, interactor, render_callback=widget.update)
             self._scene.set_theme(self._theme)
             self.tools.apply_theme(self._theme)
             self.tools.set_scene_available(False)
             if self.display is None:
-                # HUD должен быть дочерним QVTK native widget: соседний QWidget
-                # может оказаться под native OpenGL surface и стать невидимым.
-                self.display = VTKVolumeDisplayWidget(widget)
+                # The HUD is a native sibling of QVTK in the shared viewport.
+                # A child of the render widget can be clipped by its paint-on-screen
+                # surface or be destroyed when the QVTK widget is finalized.
+                self.display = VTKVolumeDisplayWidget(self.viewport)
                 self.display.attach_settings_panel(self.display_panel)
                 self.display.bind_threshold_spins(self.low_threshold, self.high_threshold)
                 self.display.thresholds_changed.connect(self._queue_transfer_settings)
+                self.viewport_layout.addWidget(
+                    self.display, 0, 0,
+                    alignment=(QtCore.Qt.AlignmentFlag.AlignTop | QtCore.Qt.AlignmentFlag.AlignRight),
+                )
             else:
-                self.display.set_viewport(widget)
+                self.display.set_viewport(self.viewport)
+                if self.viewport_layout.indexOf(self.display) < 0:
+                    self.viewport_layout.addWidget(
+                        self.display, 0, 0,
+                        alignment=(QtCore.Qt.AlignmentFlag.AlignTop | QtCore.Qt.AlignmentFlag.AlignRight),
+                    )
             self.display.set_colormap(self._transfer.palette)
             self.display.apply_theme(self._theme)
-            self.display.set_colorbar_visible(bool(self._settings.get("show_colorbar", True)))
+            self.display.set_colorbar_visible(bool(self._settings.get("show_vtk_colorbar", True)))
             self.display.set_scene_available(False)
             self._apply_cached_scene_controls()
             if self._payload is not None:
@@ -680,13 +943,16 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
         if settings is None:
             return
         values = dict(settings)
-        old_sigma = float(self._settings.get("smooth_sigma", 0.5))
-        new_sigma = float(values.get("smooth_sigma", 0.5))
+        old_sigma = float(self._settings.get("smooth_sigma", 0.0))
+        new_sigma = float(values.get("smooth_sigma", 0.0))
         self._settings = values
         self.low_threshold.setValue(100.0 * float(values.get("isomin_fraction", 0.16)))
         self.high_threshold.setValue(100.0 * float(values.get("isomax_fraction", 0.95)))
-        self.opacity.setValue(float(values.get("volume_opacity", 0.18)))
-        self.gamma.setValue(2.0 if values.get("volume_opacity_mode", "uniform") == "soft" else 1.0)
+        # Plotly's volume_opacity/opacity_mode are not numerically equivalent to
+        # VTK's scalar-opacity maximum and gamma.  Keep the VTK controls on the
+        # standalone viewer's baseline (0.18 / 2.0), and let the VTK HUD own
+        # subsequent edits instead of silently overwriting them with Plotly
+        # settings every time the global display dialog is applied.
         self.sample_factor.setValue({"fast": 1.75, "balanced": 1.0, "full": 0.65, "auto": 1.0}.get(str(values.get("quality", "auto")), 1.0))
         self.unit_distance.setValue(1.0)
         idx = self.palette.findData(str(values.get("volume_colormap", "magma")))
@@ -699,7 +965,7 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
         self.tools.set_grid_visible(bool(values.get("show_grid", True)))
         self.tools.set_projection_enabled(bool(values.get("show_projection", True)))
         if self.display is not None:
-            self.display.set_colorbar_visible(bool(values.get("show_colorbar", True)))
+            self.display.set_colorbar_visible(bool(values.get("show_vtk_colorbar", True)))
         if self._scene is not None:
             self._scene.set_theme(self._theme)  # применить изменения шрифта осей
             self._scene.set_perspective(str(values.get("projection_type", "perspective")) == "perspective")
@@ -717,11 +983,52 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
         self._theme = active if active in ("light", "dark") else "light"
         self.setProperty("rocMcsTheme", self._theme)
         colors = theme_colors(self._theme)
-        self.setStyleSheet(f"QWidget#EmbeddedVTKVolumeWidget{{background:{colors['window']};color:{colors['text']};}} QWidget#EmbeddedVTKToolbar{{background:{colors['window']};}} QLabel#vtkEmbeddedStatus{{color:{colors['muted']};font-size:9px;padding:1px 4px;}}")
+        self.setStyleSheet(f"""
+            QWidget#EmbeddedVTKVolumeWidget {{ background:{colors['window']}; color:{colors['text']}; }}
+            QWidget#EmbeddedVTKToolbar {{ background:{colors['window']}; }}
+            QLabel#vtkEmbeddedStatus {{ color:{colors['muted']}; font-size: 7pt; padding:1px 4px; }}
+            QToolButton#vtkThetaSliceLinkButton {{
+                min-width:20px; max-width:20px; min-height:20px; max-height:20px;
+                padding:0; margin:0; border:1px solid transparent; border-radius:3px;
+                background:transparent;
+            }}
+            QToolButton#vtkThetaSliceLinkButton:hover {{ background:{colors['hover']}; border-color:{colors['border']}; }}
+            QToolButton#vtkThetaSliceLinkButton:checked {{ background:{colors['button']}; border-color:{colors['highlight']}; }}
+            QToolButton#vtkThetaSliceLinkButton:disabled {{ background:transparent; border-color:transparent; }}
+            QLabel#vtkThetaSliceLinkLabel {{ font-size: 7pt; color:{colors['text']}; }}
+            QLabel#vtkThetaSliceLinkLabel:disabled {{ color:{colors['muted']}; }}
+        """)
         if hasattr(self, "tools"):
             self.tools.apply_theme(self._theme)
+        self._update_theta_link_icon()
         if hasattr(self, "source_button"):
             self._update_source_icon()
+            from roc_mcs.gui.roi_explorer.theme import apply_popup_theme
+            apply_popup_theme(self.source_menu, self._theme)
+            menu_font = QtGui.QFont(self.font())
+            if menu_font.pointSizeF() <= 0.0:
+                menu_font = QtGui.QFont("Sans Serif")
+            menu_font.setPointSizeF(8.0)
+            self.source_menu.setFont(menu_font)
+            menu_colors = theme_colors(self._theme)
+            self.source_menu.setStyleSheet(f"""
+                QMenu#vtkExplorerSourceMenu {{
+                    background:{menu_colors['base']}; color:{menu_colors['text']};
+                    border:1px solid {menu_colors['border']}; padding:2px;
+                    font-size: 7pt;
+                }}
+                QMenu#vtkExplorerSourceMenu::item {{
+                    background:transparent; color:{menu_colors['text']};
+                    padding:3px 20px 3px 8px; min-height: 16px;
+                }}
+                QMenu#vtkExplorerSourceMenu::item:selected {{
+                    background:{menu_colors['highlight']};
+                    color:{menu_colors['highlight_text']};
+                }}
+                QMenu#vtkExplorerSourceMenu::separator {{
+                    height:1px; margin:3px 7px; background:{menu_colors['border']};
+                }}
+            """)
         if self._scene is not None:
             self._scene.set_theme(self._theme)
             self._render()
@@ -789,7 +1096,7 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
         """Whether bidirectional 2D↔3D theta synchronization is effective now."""
         return bool(
             self._map_theta_mode
-            and self.theta_link_checkbox.isEnabled()
+            and self.theta_link_row.isEnabled()
             and self.theta_link_checkbox.isChecked()
         )
 
@@ -839,25 +1146,42 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
                 rtol=1e-10, atol=1e-12,
             )
         )
-        self.theta_link_checkbox.setEnabled(bool(compatible))
-        if compatible:
-            self.theta_link_checkbox.setToolTip(
+        available = bool(compatible)
+        self.theta_link_row.setEnabled(available)
+        if available:
+            tip = (
                 "Связать физическое положение θ-среза в 2D-карте и 3D. "
                 "Изменение любого ползунка обновляет второй."
             )
+        elif self._map_theta_mode:
+            tip = "Синхронизация недоступна: физические θ-оси 2D-карты и 3D-источника не совпадают."
+        else:
+            tip = "Доступно только в режиме 2D-карты «Срез по θ». В остальных режимах 3D-срез независимый."
+        self.theta_link_checkbox.setToolTip(tip)
+        self.theta_link_label.setToolTip(tip)
+        # Do not lose the user's preference when the control is temporarily
+        # unavailable; an inactive disabled row must not look checked/clickable.
+        if not available:
+            blocked = self.theta_link_checkbox.blockSignals(True)
+            try:
+                self.theta_link_checkbox.setChecked(False)
+            finally:
+                self.theta_link_checkbox.blockSignals(blocked)
+        else:
+            blocked = self.theta_link_checkbox.blockSignals(True)
+            try:
+                self.theta_link_checkbox.setChecked(self._theta_link_preference)
+            finally:
+                self.theta_link_checkbox.blockSignals(blocked)
             if self.is_theta_link_active and self._payload is not None:
                 map_value = float(self._map_theta_values[self._map_theta_index])
                 self.set_theta_index_from_map(map_value)
-        elif self._map_theta_mode:
-            self.theta_link_checkbox.setToolTip(
-                "Синхронизация недоступна: физические θ-оси 2D-карты и 3D-источника не совпадают."
-            )
-        else:
-            self.theta_link_checkbox.setToolTip(
-                "Доступно только в режиме 2D-карты «Срез по θ». В остальных режимах 3D-срез независимый."
-            )
+        self._update_theta_link_icon()
 
     def _on_theta_link_toggled(self, checked: bool) -> None:
+        if not self.theta_link_row.isEnabled():
+            return
+        self._theta_link_preference = bool(checked)
         if checked and self.is_theta_link_active and self._map_theta_values.size:
             map_value = float(self._map_theta_values[self._map_theta_index])
             self.set_theta_index_from_map(map_value)
@@ -885,6 +1209,21 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
     def _apply_theta_palette(self, _index):
         if self._scene is not None:
             self._scene.set_theta_slice_palette(str(self.theta_palette.currentData()), render=False)
+            self._render()
+
+    def _toggle_theta_marker(self, enabled: bool) -> None:
+        if self._scene is None or self._payload is None:
+            if enabled:
+                self.theta_marker_checkbox.setChecked(False)
+            return
+        self._scene.set_theta_slice_marker_visible(bool(enabled), render=False)
+        self._render()
+
+    def _apply_theta_marker_opacity(self, value: int) -> None:
+        percent = int(value)
+        self.theta_marker_opacity_label.setText(f"{percent} %")
+        if self._scene is not None:
+            self._scene.set_theta_slice_marker_opacity(percent / 100.0, render=False)
             self._render()
 
     def _apply_theta_strength(self, value):
@@ -1011,71 +1350,154 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
         self.tools.set_scene_available(False)
         self.status.setText(str(message))
 
-    def release_vtk_scene(self):
-        """Закрыть VTK/OpenGL полностью; обычное hide/minimize этот метод не вызывает."""
+    def release_vtk_scene(self, *, final: bool = False):
+        """Release one QVTK instance through its owning Qt widget.
+
+        Closing the 3D MDI subwindow is temporary and permits later reopening.
+        Closing the Explorer is terminal.  Scene observers are detached first;
+        QVTKRenderWindowInteractor.closeEvent() then performs the single
+        authoritative RenderWindow.Finalize() while its native surface exists.
+        """
+        # Record a terminal request even if a temporary MDI release is already
+        # in progress.  The outer release's finally block will then keep the
+        # widget closed and skip rebuilding UI for a parent that is closing.
+        if final:
+            self._permanently_closed = True
+        if self._release_in_progress:
+            return
+        if self._permanently_closed and self._scene is None and self._qvtk is None:
+            self._closed = True
+            return
+
+        self._release_in_progress = True
         self._closed = True
-        self._roi_preview_timer.stop()
-        self._settings_timer.stop()
-        self._init_pending = False
-        self._init_generation += 1
-        self._generation += 1
-        self._pending_request = None
-        self._dataset_request = None
-        self._payload = None
-        self._roi_preview = None
-        scene, self._scene = self._scene, None
-        cleanup_errors = []
-        if scene is not None:
+        try:
+            self._roi_preview_timer.stop()
+            self._settings_timer.stop()
+            self._init_pending = False
+            self._init_generation += 1
+            self._generation += 1
+            self._pending_request = None
+            self._dataset_request = None
+            self._payload = None
+            self._roi_preview = None
+
+            # Discard queued work and invalidate any in-flight CPU-only payload
+            # build.  A late result is ignored by its generation token; Python
+            # worker threads are never force-killed during Qt shutdown.
             try:
-                scene.close()
-            except Exception as exc:
-                cleanup_errors.append(f"VTK resources: {type(exc).__name__}: {exc}")
-                logger.exception("Не удалось полностью освободить ресурсы VTK-сцены")
-        # HUD and its settings panel are ordinary Qt controls, not VTK/GPU
-        # resources. Keep them alive so closing/reopening 3D does not leave a
-        # deleted QWidget wrapper in display_panel or duplicate signal bindings.
-        if self.display is not None:
-            try:
-                self.display.set_scene_available(False)
-                # HUD/settings persist across scene teardown, but must not be
-                # destroyed as a child of the QVTK widget being finalized.
-                self.display.set_viewport(self.viewport)
-            except (RuntimeError, AttributeError) as exc:
-                cleanup_errors.append(f"display HUD detach: {exc}")
-        widget, self._qvtk = self._qvtk, None
-        self._render_window = None
-        self._interactor = None
-        if widget is not None:
-            try:
-                widget.setUpdatesEnabled(False)
-                widget.close()  # QVTK closeEvent performs Finalize exactly once.
-            except Exception as exc:
-                cleanup_errors.append(f"QVTK Finalize: {type(exc).__name__}: {exc}")
-                logger.exception("Ошибка Finalize для QVTK render window")
-            try:
-                self.viewport_layout.removeWidget(widget)
-                widget.setParent(None)
-                widget.deleteLater()
-            except RuntimeError as exc:
-                cleanup_errors.append(f"QVTK widget detach: {exc}")
-        self.placeholder.setText("3D-сцена закрыта. Нажмите кнопку 3D, чтобы создать её заново.")
-        if self.placeholder.parent() is None:
-            self.placeholder.setParent(self.viewport)
-        self.viewport_layout.addWidget(self.placeholder)
-        self.placeholder.show()
-        self.tools.set_scene_available(False)
-        self.tools.set_overlay_controls_enabled(cursor=False, theta=False, projection=False, roi_preview=False)
-        if cleanup_errors:
-            self.status.setText("3D закрыто; предупреждение очистки: " + " | ".join(cleanup_errors))
-        else:
-            self.status.setText("VTK/OpenGL-сцена закрыта; ресурсы рендерера освобождены.")
-        self._closed = False
-        self._first_payload = True
+                self._thread_pool.clear()
+            except RuntimeError:
+                pass
+            self._active_worker = None
+
+            scene, self._scene = self._scene, None
+            widget, self._qvtk = self._qvtk, None
+            self._render_window = None
+            self._interactor = None
+            cleanup_errors = []
+
+            # Quiesce the native HUD before touching the render window.  Its
+            # popup is a QWidgetAction attached to a native sibling of QVTK;
+            # leaving it visible while the parent HWND is being torn down can
+            # provoke late QPainter/QWidgetWindow callbacks on Windows.
+            if self.display is not None:
+                try:
+                    if final:
+                        self.display.prepare_for_shutdown()
+                    else:
+                        self.display.set_scene_available(False)
+                except (RuntimeError, AttributeError) as exc:
+                    cleanup_errors.append(f"display HUD: {exc}")
+
+            # Stop QVTK's Qt timer first, so no queued TimerEvent can enter
+            # the scene while its observers/widgets are being detached.  Keep
+            # the interactor enabled until scene.close() has unregistered its
+            # own widgets; disable it immediately afterwards, before Finalize.
+            interactor_to_disable = None
+            if widget is not None:
+                try:
+                    timer = getattr(widget, "_Timer", None)
+                    if timer is not None:
+                        timer.stop()
+                    render_window = widget.GetRenderWindow()
+                    interactor_to_disable = (
+                        render_window.GetInteractor() if render_window is not None else None
+                    )
+                except Exception as exc:
+                    cleanup_errors.append(f"QVTK quiesce: {type(exc).__name__}: {exc}")
+                    logger.exception("Не удалось остановить QVTK timer перед очисткой VTK-сцены")
+
+            # Detach application observers and widgets, but never call
+            # MakeCurrent/ReleaseGraphicsResources/RemoveRenderer here.  Those
+            # operations duplicate or race the native-window cleanup owned by
+            # QVTK's Finalize().
+            if scene is not None:
+                try:
+                    scene.close()
+                except Exception as exc:
+                    cleanup_errors.append(f"VTK scene detach: {type(exc).__name__}: {exc}")
+                    logger.exception("Не удалось отключить наблюдатели VTK-сцены")
+
+            if widget is not None:
+                try:
+                    if interactor_to_disable is not None:
+                        interactor_to_disable.Disable()
+                except Exception as exc:
+                    cleanup_errors.append(f"VTK interactor disable: {type(exc).__name__}: {exc}")
+                    logger.exception("Не удалось отключить VTK interactor после очистки сцены")
+                try:
+                    widget.setUpdatesEnabled(False)
+                    # _TrackedQVTK performs the one authoritative Finalize.
+                    widget.close()
+                except Exception as exc:
+                    cleanup_errors.append(f"QVTK Finalize: {type(exc).__name__}: {exc}")
+                    logger.exception("Ошибка Finalize для QVTK render window")
+                try:
+                    self.viewport_layout.removeWidget(widget)
+                    # Keep the finalized native child under its original Qt
+                    # parent until deleteLater; setParent(None) would turn it
+                    # into a top-level native window during shutdown.
+                    widget.deleteLater()
+                except RuntimeError as exc:
+                    cleanup_errors.append(f"QVTK widget detach: {exc}")
+
+            if not self._permanently_closed:
+                if self.placeholder.parent() is None:
+                    self.placeholder.setParent(self.viewport)
+                self.viewport_layout.addWidget(self.placeholder, 0, 0)
+                self.placeholder.setText(
+                    "3D-сцена закрыта. Нажмите кнопку 3D, чтобы создать её заново."
+                )
+                self.placeholder.show()
+                self.tools.set_scene_available(False)
+                self.tools.set_overlay_controls_enabled(
+                    cursor=False, theta=False, projection=False, roi_preview=False
+                )
+                if cleanup_errors:
+                    self.status.setText(
+                        "3D закрыто; предупреждение очистки: " + " | ".join(cleanup_errors)
+                    )
+                else:
+                    self.status.setText("VTK/OpenGL-сцена закрыта.")
+
+            # Keep the scene wrapper alive until QVTK.close()/Finalize has
+            # returned.  It is then released with the local reference below.
+            scene = None
+            widget = None
+            self._first_payload = True
+        finally:
+            self._release_in_progress = False
+            self._closed = self._permanently_closed
 
     def _render(self):
-        if self._qvtk is not None and self._scene is not None:
-            self._qvtk.Render()
+        widget = self._qvtk
+        if widget is not None and self._scene is not None and not self._closed:
+            # update() is asynchronous and coalesced by Qt.  The QVTK
+            # paintEvent owns the actual VTK render; never call the delegated
+            # vtkGenericRenderWindowInteractor.Render() synchronously here.
+            widget.update()
 
     def closeEvent(self, event):
-        self.release_vtk_scene()
+        self.release_vtk_scene(final=True)
         super().closeEvent(event)

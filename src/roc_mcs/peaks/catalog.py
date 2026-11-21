@@ -4,6 +4,7 @@ from tqdm.auto import tqdm
 from collections import defaultdict
 
 from roc_mcs.peaks.detection import PIXEL_PEAK_CONFIG, detect_peaks
+from roc_mcs.peaks.peak_signal import local_neighbourhood_mean_curve
 from roc_mcs.utils import to_yxt
 from roc_mcs.processing.background import BackgroundStats, estimate_background_stats
 from roc_mcs.roi.extraction import roi_pixel_mask
@@ -269,30 +270,18 @@ def build_peak_catalog(
     print(f"background threshold = {background.threshold:.6g}")
 
     records = []
-    half_w = int(window_size) // 2
-    if half_w < 0:
-        raise ValueError("window_size должен быть положительным")
+    if int(window_size) < 1 or int(window_size) % 2 == 0:
+        raise ValueError("window_size должен быть положительным нечётным числом")
     peak_id = 0
     for y in tqdm(range(ny), desc="Building peak catalogue", unit="row"):
-        y_s = max(0, y - half_w)
-        y_e = min(ny, y + half_w + 1)
         for x in range(nx):
             if not valid_yx[y, x] or not np.isfinite(max_map[y, x]):
                 continue
             if max_map[y, x] < background.threshold:
                 continue
 
-            x_s = max(0, x - half_w)
-            x_e = min(nx, x + half_w + 1)
-            neighbourhood = work_yxt[y_s:y_e, x_s:x_e, :]
-            finite_neighbourhood = np.isfinite(neighbourhood)
-            n_contributors = np.count_nonzero(finite_neighbourhood, axis=(0, 1))
-            sums = np.sum(np.where(finite_neighbourhood, neighbourhood, 0.0), axis=(0, 1))
-            mean_curve = np.divide(
-                sums,
-                n_contributors,
-                out=np.full(ntheta, np.nan, dtype=float),
-                where=n_contributors > 0,
+            mean_curve = local_neighbourhood_mean_curve(
+                work_yxt, y, x, int(window_size)
             )
             # The detector's peak routine expects a complete θ trace. Do not
             # invent/interpolate missing θ samples at this stage.

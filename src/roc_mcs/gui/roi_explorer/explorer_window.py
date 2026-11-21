@@ -1,4 +1,5 @@
 import sys
+import logging
 
 try:
     from PyQt6 import QtCore, QtGui, QtWidgets
@@ -25,6 +26,8 @@ from matplotlib.patches import Rectangle
 from matplotlib.transforms import Affine2D
 
 import matplotlib.pyplot as plt
+
+_logger = logging.getLogger(__name__)
 
 Qt = QtCore.Qt
 QTimer = QtCore.QTimer
@@ -1183,12 +1186,14 @@ class RockingCurveExplorerWindow(QMainWindow):
         if self.map_widget.roi_btn.isChecked():
             self.map_widget._apply_current_roi_tool(active=True)
         
-        # --- ОБНОВЛЕНИЕ UI ЧЕРЕЗ ТАБЛИЦУ ---
-        self._set_selected_roi_id(saved.id)            # Сначала говорим системе, что этот ROI теперь выбран
-        self.refresh_roi_table()                       # Полностью перестраиваем таблицу (она сама отрисует новый ROI и выделит его строку)
-        
-        self._set_selected_roi_id(saved.id)            # _set_selected_roi_id выделяет элемент в UI
-        self.refresh_volume()  # New ROI becomes an available volume source.
+        # One selection refresh updates the map, curves, inspector and ROI table.
+        # Repeating it here rebuilt the same UI several times without changing data.
+        self._set_selected_roi_id(saved.id)
+        # Сохранение ROI меняет только каталог доступных источников. Если активный
+        # 3D-источник не менялся, не пересобираем payload/VTK actors и не трогаем камеру.
+        update_sources = getattr(self.volume_widget, "update_saved_rois", None)
+        if callable(update_sources):
+            update_sources(self.current_rois())
         self.status.showMessage(f"Saved {saved.roi.label}")
 
 
@@ -1794,9 +1799,12 @@ class RockingCurveExplorerWindow(QMainWindow):
         """Сохраняет расположение экранов и освобождает HDF5-дескриптор."""
         try: self.plot_workspace.mdi_area.save_geometry()
         except Exception: pass
-        # Завершаем VTK до уничтожения native Qt/OpenGL surface.
-        try: self.volume_widget.release_vtk_scene()
-        except Exception: pass
+        # Завершаем VTK до уничтожения native Qt/OpenGL surface. This is the
+        # terminal Explorer close, unlike closing only the 3D MDI subwindow.
+        try:
+            self.volume_widget.release_vtk_scene(final=True)
+        except Exception:
+            _logger.exception("Ошибка финального закрытия встроенной VTK-сцены")
         closer = getattr(self.repo, "close", None)
         if callable(closer):
             try: closer()

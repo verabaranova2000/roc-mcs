@@ -308,16 +308,17 @@ def build_input_refs(
         refs["scan"] = {"node_id": required("scan").id, "output": "scan"}
         use_interpolated = bool((parameters or {}).get("use_interpolated_data", False))
         spikes = history.find_ancestor_output(selected_node_id, "spikes")
-        if use_interpolated and spikes is None:
-            raise ValueError(
-                "Для использования интерполированных данных сначала добавьте и выполните "
-                "этап обнаружения спайков либо отключите соответствующий параметр."
-            )
-        if spikes is not None:
+        if use_interpolated:
+            if spikes is None:
+                raise ValueError(
+                    "Для использования интерполированных данных сначала добавьте и выполните "
+                    "этап обнаружения спайков либо отключите соответствующий параметр."
+                )
             if spikes.status != NodeStatus.SUCCEEDED:
                 raise ValueError("Spike detection должен быть успешно завершён")
-            # Keep upstream spike diagnostics available to the preview even if
-            # peak detection itself is explicitly run on raw counts.
+            # The spike artifact is a computational input only in this mode.
+            # In raw-count mode it may still be loaded by the preview as QC-only
+            # context, but it must not masquerade as an algorithm dependency.
             refs["spikes"] = {"node_id": spikes.id, "output": "spikes"}
     elif operation_id == "fit.scan":
         require_detector_mask_stage()
