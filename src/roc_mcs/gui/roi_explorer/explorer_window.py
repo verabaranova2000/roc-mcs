@@ -32,6 +32,7 @@ _logger = logging.getLogger(__name__)
 Qt = QtCore.Qt
 QTimer = QtCore.QTimer
 QAction = QtGui.QAction
+QActionGroup = QtGui.QActionGroup
 QKeySequence = QtGui.QKeySequence
 QShortcut = QtGui.QShortcut
 QApplication = QtWidgets.QApplication
@@ -115,6 +116,10 @@ class RockingCurveExplorerWindow(QMainWindow):
         self._volume_refresh_pending = True
         self._analysis_previous_pool = None
         self._analysis_curve_cache = {}
+        self._analysis_map_key = None
+        self._analysis_curve_key = None
+        self._analysis_display_identity = None
+        self._analysis_display_preferences = {}
 
         self._theta_render_timer = QTimer(self); self._theta_render_timer.setSingleShot(True); self._theta_render_timer.setInterval(35); self._theta_render_timer.timeout.connect(self.refresh_map)
         self._preview_timer = QTimer(self)
@@ -149,7 +154,7 @@ class RockingCurveExplorerWindow(QMainWindow):
         outer.addWidget(self.splitter)
 
         # Левая панель: отдельная узкая рейка остаётся видимой в свёрнутом состоянии.
-        self.left_sidebar = QWidget(self.splitter); self.left_sidebar.setObjectName("leftSidebarSurface"); self.left_sidebar.setMinimumWidth(262)
+        self.left_sidebar = QWidget(self.splitter); self.left_sidebar.setObjectName("leftSidebarSurface"); self.left_sidebar.setMinimumWidth(340)
         self.left_sidebar_layout = QHBoxLayout(self.left_sidebar); self.left_sidebar_layout.setContentsMargins(0, 0, 0, 0); self.left_sidebar_layout.setSpacing(2)
         self.left_rail = QWidget(self.left_sidebar); self.left_rail.setObjectName("leftSidebarRail"); self.left_rail.setFixedWidth(20)
         left_rail_layout = QVBoxLayout(self.left_rail); left_rail_layout.setContentsMargins(0, 0, 0, 0); left_rail_layout.setSpacing(0)
@@ -161,7 +166,7 @@ class RockingCurveExplorerWindow(QMainWindow):
         self.left_scroll.setWidgetResizable(True)
         self.left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.left_sidebar_layout.addWidget(self.left_rail); self.left_sidebar_layout.addWidget(self.left_scroll, 1)
-        self._left_sidebar_collapsed = False; self._left_sidebar_width = 262
+        self._left_sidebar_collapsed = False; self._left_sidebar_width = 340
         self.left_sidebar_toggle.clicked.connect(self._toggle_left_sidebar)
 
         left = QWidget()
@@ -228,7 +233,7 @@ class RockingCurveExplorerWindow(QMainWindow):
         self.splitter.addWidget(self.plot_splitter)
         self.splitter.setStretchFactor(0, 0)
         self.splitter.setStretchFactor(1, 1)
-        self.left_scroll.setMinimumWidth(240)
+        self.left_scroll.setMinimumWidth(316)
 
         # --- Подключение сигналов ---
         # 1. Правый клик (Контекстное меню)
@@ -250,6 +255,8 @@ class RockingCurveExplorerWindow(QMainWindow):
             icon_color = QColor(theme_colors(active_theme)["text"])
             self.left_sidebar_toggle.setIcon(_pane_toggle_icon(not self._left_sidebar_collapsed, icon_color))
             self.map_widget.apply_theme(active_theme); self.curve_widget.apply_theme(active_theme); self.volume_widget.apply_theme(active_theme); self.roi_manager.apply_theme(active_theme)
+            if hasattr(self, "processing_panel"):
+                self.processing_panel.apply_theme(active_theme)
             display_settings = load_plot_display_settings(); self.map_widget.apply_display_settings(display_settings["map"]); self.curve_widget.apply_display_settings(display_settings["curve"]); self.volume_widget.apply_display_settings(display_settings["volume"])
             self.plot_workspace.apply_theme(active_theme)
             for popup in self.findChildren(QWidget):
@@ -300,9 +307,9 @@ class RockingCurveExplorerWindow(QMainWindow):
             self.left_sidebar_toggle.setIcon(_pane_toggle_icon(False, self.palette().color(QPalette.ColorRole.WindowText))); self.left_sidebar_toggle.setToolTip("Expand sidebar")
             self.splitter.setSizes([22, max(1, sum(sizes) - 22)])
         else:
-            self._left_sidebar_collapsed = False; self.left_sidebar.setMaximumWidth(16777215); self.left_sidebar.setMinimumWidth(262); self.left_scroll.show()
+            self._left_sidebar_collapsed = False; self.left_sidebar.setMaximumWidth(16777215); self.left_sidebar.setMinimumWidth(340); self.left_scroll.show()
             self.left_sidebar_toggle.setIcon(_pane_toggle_icon(True, self.palette().color(QPalette.ColorRole.WindowText))); self.left_sidebar_toggle.setToolTip("Collapse sidebar")
-            total = max(sum(sizes), self.width()); left_width = max(262, self._left_sidebar_width); self.splitter.setSizes([left_width, max(1, total - left_width)])
+            total = max(sum(sizes), self.width()); left_width = max(340, self._left_sidebar_width); self.splitter.setSizes([left_width, max(1, total - left_width)])
 
     def _build_actions(self) -> None:
         file_menu = self.menuBar().addMenu("&File")
@@ -412,6 +419,8 @@ class RockingCurveExplorerWindow(QMainWindow):
         self._analysis_view = None
         self._analysis_previous_pool = None
         self._analysis_curve_cache.clear()
+        self._analysis_map_key = None; self._analysis_curve_key = None; self._analysis_display_identity = None
+        self._sync_analysis_result_menus(None)
         old_repo = self.repo; self.repo = repo
         self.map_widget.set_pool_spec(repo.pool); self.map_widget.set_pool_enabled(True)
         self.current_file = path; self.file_path_edit.setText(str(path))
@@ -975,18 +984,129 @@ class RockingCurveExplorerWindow(QMainWindow):
         self.map_widget.scan_combo.setEnabled(not busy)
         self.map_widget.pool_btn.setEnabled(not busy and self._analysis_view is None and self.repo is not None)
 
+    def _analysis_display_key(self, state) -> tuple[str, str, str]:
+        metadata = getattr(state, "metadata", {}) or {}
+        source = str(metadata.get("source_file", self.current_file or ""))
+        scan = str(metadata.get("scan_key", self.selected_scan or ""))
+        node = str(getattr(state, "node_id", metadata.get("workflow_node_id", "")))
+        return source, scan, node
+
+    def _remember_analysis_display_preferences(self) -> None:
+        if self._analysis_display_identity is not None:
+            self._analysis_display_preferences[self._analysis_display_identity] = (
+                self._analysis_map_key, self._analysis_curve_key,
+            )
+
+    @staticmethod
+    def _analysis_menu_items(state, attribute: str):
+        items = getattr(state, attribute, ()) if state is not None else ()
+        return tuple(items or ())
+
+    def _build_analysis_result_menu(self, menu, items, selected_key, callback) -> None:
+        previous_group = getattr(menu, "_analysis_result_action_group", None)
+        if previous_group is not None:
+            previous_group.deleteLater()
+        menu.clear()
+        groups = {}
+        action_group = QActionGroup(menu)
+        action_group.setObjectName("analysisResultExclusiveActions")
+        action_group.setExclusive(True)
+        menu._analysis_result_action_group = action_group
+        for item in items:
+            group_name = str(getattr(item, "group", "Результаты"))
+            target_menu = groups.get(group_name)
+            if target_menu is None:
+                target_menu = menu.addMenu(group_name) if len({getattr(x, "group", "Результаты") for x in items}) > 1 else menu
+                groups[group_name] = target_menu
+            action = QAction(str(item.label), action_group)
+            action.setData(str(item.key))
+            action.setCheckable(True)
+            action.setChecked(str(item.key) == str(selected_key))
+            description = str(getattr(item, "description", "") or "")
+            unit = str(getattr(item, "unit", "") or "")
+            tooltip = description
+            if unit:
+                tooltip = (tooltip + "\n" if tooltip else "") + f"Единица: {unit}"
+            if tooltip:
+                action.setToolTip(tooltip)
+            action.triggered.connect(lambda checked=False, key=str(item.key): callback(key))
+            target_menu.addAction(action)
+
+    @staticmethod
+    def _set_result_menu_checked(menu, selected_key: str | None) -> None:
+        def update(current_menu):
+            for action in current_menu.actions():
+                submenu = action.menu()
+                if submenu is not None:
+                    update(submenu)
+                elif action.isCheckable():
+                    action.setChecked(str(action.data()) == str(selected_key))
+        update(menu)
+
+    def _sync_analysis_result_menus(self, state) -> None:
+        map_items = self._analysis_menu_items(state, "map_layers")
+        curve_items = self._analysis_menu_items(state, "curve_sources")
+        map_button = self.map_widget.tools.results_btn
+        curve_button = self.curve_widget.toolbar.results_btn
+        self._build_analysis_result_menu(
+            self.map_widget.tools.results_menu, map_items, self._analysis_map_key,
+            self.set_analysis_map_layer,
+        )
+        self._build_analysis_result_menu(
+            self.curve_widget.toolbar.results_menu, curve_items, self._analysis_curve_key,
+            self.set_analysis_curve_source,
+        )
+        active_theme = resolve_theme(self)
+        apply_popup_theme(self.map_widget.tools.results_menu, active_theme)
+        apply_popup_theme(self.curve_widget.toolbar.results_menu, active_theme)
+        map_button.setEnabled(bool(state is not None and map_items and not self._theta_slice_mode))
+        curve_button.setEnabled(bool(state is not None and curve_items))
+        if state is None:
+            map_button.setToolTip("Нет активного предпросмотра workflow")
+            curve_button.setToolTip("Нет активного предпросмотра workflow")
+        else:
+            map_button.setToolTip("Выбрать пространственную карту текущего узла workflow")
+            curve_button.setToolTip("Выбрать θ-зависимый сигнал текущего узла workflow")
+
+    def set_analysis_map_layer(self, key: str) -> None:
+        state = self._analysis_view
+        if state is None or not hasattr(state, "map_layers"):
+            return
+        if not any(layer.key == str(key) for layer in state.map_layers):
+            return
+        self._analysis_map_key = str(key)
+        self._remember_analysis_display_preferences()
+        self._set_result_menu_checked(self.map_widget.tools.results_menu, self._analysis_map_key)
+        self.refresh_map()
+        self._update_inspector()
+
+    def set_analysis_curve_source(self, key: str) -> None:
+        state = self._analysis_view
+        if state is None or not hasattr(state, "curve_sources"):
+            return
+        if not any(source.key == str(key) for source in state.curve_sources):
+            return
+        self._analysis_curve_key = str(key)
+        self._remember_analysis_display_preferences()
+        self._set_result_menu_checked(self.curve_widget.toolbar.results_menu, self._analysis_curve_key)
+        self._analysis_curve_cache.clear()
+        self.refresh_curves(update_volume=False)
+        self._update_inspector()
+
     def show_analysis_preview(self, state) -> None:
-        """Подключает неизменяемый workflow-артефакт к Map/ROC/3D как одну версию."""
+        """Подключает один узел workflow к карте и ROC как согласованную версию."""
         if self.repo is None or self.selected_scan is None:
             return
-        metadata = state.metadata
+        metadata = getattr(state, "metadata", {}) or {}
         if str(metadata.get("scan_key", "")) != str(self.selected_scan):
             self.status.showMessage("Предпросмотр относится к другому скану; переключение отменено", 8000)
             return
         source_file = metadata.get("source_file")
-        if source_file and Path(str(source_file)).resolve() != Path(self.current_file).resolve():
+        if source_file and Path(str(source_file)).expanduser().resolve() != Path(self.current_file).resolve():
             self.status.showMessage("Предпросмотр относится к другому HDF5-файлу", 8000)
             return
+        self._remember_analysis_display_preferences()
+        identity = self._analysis_display_key(state)
         if self._analysis_previous_pool is None:
             self._analysis_previous_pool = self.repo.pool
         if self.repo.pool != PoolSpec():
@@ -995,6 +1115,13 @@ class RockingCurveExplorerWindow(QMainWindow):
             self.map_widget.set_pool_spec(PoolSpec(), source_shape_yx=source.source_shape_yx)
         self.map_widget.set_pool_enabled(False)
         self._analysis_view = state
+        self._analysis_display_identity = identity
+        saved = self._analysis_display_preferences.get(identity, (None, None))
+        map_keys = {layer.key for layer in getattr(state, "map_layers", ())}
+        curve_keys = {source.key for source in getattr(state, "curve_sources", ())}
+        self._analysis_map_key = saved[0] if saved[0] in map_keys else getattr(state, "default_map_key", None)
+        self._analysis_curve_key = saved[1] if saved[1] in curve_keys else getattr(state, "default_curve_key", None)
+        self._sync_analysis_result_menus(state)
         self._analysis_curve_cache.clear()
         self.selected_pixel = None
         self._theta_scan_cache_key = None; self._theta_scan_cache = None
@@ -1007,7 +1134,12 @@ class RockingCurveExplorerWindow(QMainWindow):
 
     def restore_analysis_preview(self) -> None:
         """Возвращает исходный HDF5-view и прежний spatial pooling."""
+        self._remember_analysis_display_preferences()
         self._analysis_view = None
+        self._analysis_map_key = None
+        self._analysis_curve_key = None
+        self._analysis_display_identity = None
+        self._sync_analysis_result_menus(None)
         self._analysis_curve_cache.clear()
         if self.repo is not None and self._analysis_previous_pool is not None:
             previous = self._analysis_previous_pool
@@ -1022,15 +1154,20 @@ class RockingCurveExplorerWindow(QMainWindow):
         self.status.showMessage("Исходный HDF5-view восстановлен")
 
     def _analysis_curve(self, state, roi):
+        source = state.curve_source(self._analysis_curve_key) if hasattr(state, "curve_source") else None
+        data = source.data_yxt if source is not None else state.data_yxt
+        theta = source.theta if source is not None else state.theta
+        valid_mask = source.valid_mask_yxt if source is not None else state.valid_mask_yxt
+        source_key = source.key if source is not None else "legacy"
         geometry = (round(float(roi.cx), 7), round(float(roi.cy), 7), round(float(roi.width), 7), round(float(roi.height), 7), round(float(roi.angle), 7), str(roi.type), self.reduction_mode)
-        key = (state.node_id, geometry)
+        key = (state.node_id, source_key, geometry)
         cached = self._analysis_curve_cache.get(key)
         if cached is None:
             th, curve, count = extract_from_roi(
-                state.data_yxt, state.theta, 2, roi,
-                state.data_yxt.shape[1], state.data_yxt.shape[0],
+                data, theta, 2, roi,
+                data.shape[1], data.shape[0],
                 reduction_mode=self.reduction_mode, x_coords=state.x_coords,
-                y_coords=state.y_coords, valid_mask=state.valid_mask_yxt,
+                y_coords=state.y_coords, valid_mask=valid_mask,
             )
             cached = (np.asarray(th), np.asarray(curve), int(count))
             if len(self._analysis_curve_cache) > 128:
@@ -1436,11 +1573,20 @@ class RockingCurveExplorerWindow(QMainWindow):
             state = self._analysis_view
             if self._theta_slice_mode:
                 idx = max(0, min(int(self.map_widget.theta_slider.value()), state.theta.size - 1))
-                img = state.data_yxt[:, :, idx]
+                img = np.asarray(state.data_yxt[:, :, idx], dtype=float).copy()
+                if state.valid_mask_yxt is not None:
+                    img[~np.asarray(state.valid_mask_yxt[:, :, idx], dtype=bool)] = np.nan
                 title = f"{state.label} · θ={state.theta[idx]:.6g}"
+                self.map_widget.tools.results_btn.setEnabled(False)
             else:
-                img = state.map_data
-                title = f"{state.label} · {state.map_title}"
+                if hasattr(state, "map_layer"):
+                    layer = state.map_layer(self._analysis_map_key)
+                    img = layer.data_yx
+                    title = f"{state.label} · {layer.label}"
+                else:
+                    img = state.map_data
+                    title = f"{state.label} · {state.map_title}"
+                self.map_widget.tools.results_btn.setEnabled(bool(getattr(state, "map_layers", ())))
             p_lo = float(self.map_widget.low_pct.value()); p_hi = float(self.map_widget.high_pct.value())
             try:
                 finite = np.asarray(img)[np.isfinite(img)]
@@ -1517,6 +1663,12 @@ class RockingCurveExplorerWindow(QMainWindow):
         """Подготавливает профили из активной версии данных."""
         if self._analysis_view is not None:
             state = self._analysis_view
+            curve_source = state.curve_source(self._analysis_curve_key) if hasattr(state, "curve_source") else None
+            curve_data_yxt = curve_source.data_yxt if curve_source is not None else state.data_yxt
+            curve_theta = curve_source.theta if curve_source is not None else state.theta
+            curve_valid_mask = curve_source.valid_mask_yxt if curve_source is not None else state.valid_mask_yxt
+            curve_view_label = f"{state.label} · {curve_source.label}" if curve_source is not None else state.label
+            self.curve_widget.toolbar.results_btn.setEnabled(bool(getattr(state, "curve_sources", ())))
             curves_data = []
             for pinned in self.current_rois():
                 roi = pinned.roi.normalized()
@@ -1545,18 +1697,18 @@ class RockingCurveExplorerWindow(QMainWindow):
             pixel_data = None
             if self.selected_pixel is not None:
                 ix, iy = self.selected_pixel
-                if 0 <= iy < state.data_yxt.shape[0] and 0 <= ix < state.data_yxt.shape[1]:
-                    curve = np.asarray(state.data_yxt[iy, ix, :], dtype=float).copy()
-                    if state.valid_mask_yxt is not None:
-                        curve[~state.valid_mask_yxt[iy, ix, :]] = np.nan
-                    pixel_data = {"th": state.theta, "curve": curve,
-                                  "label": f"Pixel ({ix}, {iy}) · workflow data"}
+                if 0 <= iy < curve_data_yxt.shape[0] and 0 <= ix < curve_data_yxt.shape[1]:
+                    curve = np.asarray(curve_data_yxt[iy, ix, :], dtype=float).copy()
+                    if curve_valid_mask is not None:
+                        curve[~curve_valid_mask[iy, ix, :]] = np.nan
+                    pixel_data = {"th": curve_theta, "curve": curve,
+                                  "label": f"Pixel ({ix}, {iy}) · {curve_source.label if curve_source is not None else 'workflow data'}"}
                 else:
                     self.selected_pixel = None
             theta_guide = self._current_theta_value() if self._show_theta_guide and self._theta_slice_mode else None
             self._curve_lines = self.curve_widget.draw_curves(
                 curves_data, preview_data, pixel_data=pixel_data,
-                view_label=state.label, fit_view=fit_curve_view, fit_y=fit_curve_y,
+                view_label=curve_view_label, fit_view=fit_curve_view, fit_y=fit_curve_y,
                 theta_guide=theta_guide,
             )
             if update_volume:

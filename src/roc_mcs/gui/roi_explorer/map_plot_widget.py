@@ -236,7 +236,7 @@ class MapPlotWidget(QWidget):
         self.tools = MapToolsWidget(self.ROI_TOOLS_CONFIG, self._current_roi_type, SmartDropdownButton, QRangeSlider, self)
         self.toolbar = self.tools
         for name in ("home_btn", "roi_btn", "roi_menu", "roi_action_group", "roi_tool_buttons", "pool_btn", "pool_menu",
-                     "pool_size_spin", "pool_stride_spin", "pool_apply_btn", "pool_preview_label", "pin_roi_btn", "cmap_btn",
+                     "pool_size_spin", "pool_stride_spin", "pool_apply_btn", "pool_preview_label", "pin_roi_btn", "results_btn", "cmap_btn",
                      "cmap_menu", "auto_contrast_btn", "low_pct", "high_pct", "settings_btn"):
             setattr(self, name, getattr(self.tools, name))
         self.range_slider = QRangeSlider(low=1.0, high=99.0, orientation=Qt.Orientation.Vertical, parent=self.canvas)

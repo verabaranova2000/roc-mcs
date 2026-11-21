@@ -27,6 +27,7 @@ from roc_mcs.analysis.operations import default_registry, fit_backend_availabili
 from roc_mcs.analysis.project import WorkflowProject
 from roc_mcs.analysis.workflow_history import NodeStatus, ReviewStatus, WorkflowHistory
 from .presenter import ArtifactPreviewRequest
+from roc_mcs.analysis.workflow_preview import build_workflow_preview_state
 from .graph_canvas import ProcessingGraphView
 from roc_mcs.gui.components.icon_provider import svg_icon
 from roc_mcs.gui.roi_explorer.plot_toolbar_style import ICON_DIR
@@ -63,11 +64,12 @@ class _RunNodeTask(QRunnable):
 class _PreviewNodeTask(QRunnable):
     """Loads potentially large preview artifacts outside the GUI thread."""
 
-    def __init__(self, node_id: str, history: WorkflowHistory, artifact_directory: str):
+    def __init__(self, node_id: str, history: WorkflowHistory, artifact_directory: str, source_metadata: dict[str, Any] | None = None):
         super().__init__()
         self.node_id = node_id
         self.history_snapshot = WorkflowHistory(list(history.nodes))
         self.artifact_directory = artifact_directory
+        self.source_metadata = dict(source_metadata or {})
         self.signals = _WorkerSignals()
 
     def run(self) -> None:
@@ -124,6 +126,11 @@ class _PreviewNodeTask(QRunnable):
                 }
             if context["scan"] is None:
                 raise RuntimeError("Для предпросмотра не удалось разрешить ScanArtifact")
+            # Build the typed host view in the worker: ROI Explorer receives only
+            # grid-validated maps and θ-compatible signal cubes.
+            context["view_state"] = build_workflow_preview_state(
+                node, context, self.source_metadata
+            )
             self.signals.succeeded.emit(self.node_id, context)
         except Exception:
             self.signals.failed.emit(self.node_id, traceback.format_exc())
@@ -138,11 +145,15 @@ class ProcessingWorkbenchWidget(QWidget):
     """
 
     preview_requested = pyqtSignal(object)
+    preview_state_ready = pyqtSignal(object)
     preview_restore_requested = pyqtSignal()
+    busy_changed = pyqtSignal(bool)
 
-    def __init__(self, project: WorkflowProject, parent: QWidget | None = None):
+    def __init__(self, project: WorkflowProject, parent: QWidget | None = None, *, embedded: bool = False):
         super().__init__(parent)
         self.project = project
+        self.embedded = bool(embedded)
+        self._last_busy_state = False
         self.registry = default_registry()
         self.thread_pool = QThreadPool.globalInstance()
         self._active_task: _RunNodeTask | None = None
@@ -188,6 +199,7 @@ class ProcessingWorkbenchWidget(QWidget):
         outer.addLayout(header)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.splitter = splitter
         splitter.setChildrenCollapsible(False)
         outer.addWidget(splitter, 1)
 
@@ -208,6 +220,7 @@ class ProcessingWorkbenchWidget(QWidget):
         self.fit_graph_button.clicked.connect(lambda: self.graph.fit_graph())
         graph_header.addWidget(self.fit_graph_button)
         left_layout.addLayout(graph_header)
+        self._left_graph_layout = left_layout
 
         self.graph = ProcessingGraphView(left)
         self.graph.node_selected.connect(self._on_graph_node_selected)
@@ -365,6 +378,55 @@ class ProcessingWorkbenchWidget(QWidget):
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         splitter.setSizes([310, 850])
+
+        if self.embedded:
+            # Embed the existing graph/runner, not a second workflow UI. The
+            # operation forms remain alive for the graph's contextual + popup.
+            self.theme_button.hide()
+            self.save_button.hide()
+            self.show_rejected_check.setText("Архив")
+            self.show_rejected_check.setToolTip("Показывать отклонённые ветви истории")
+            self.branch_hint.hide()
+            right.hide()
+            self.tabs.hide()
+            self.graph.setMinimumSize(280, 240)
+            self.graph.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+            self.fit_graph_button.setText("Вписать")
+            self.fit_graph_button.setMaximumWidth(70)
+
+            actions_top = QHBoxLayout()
+            actions_top.setContentsMargins(0, 2, 0, 0)
+            actions_top.setSpacing(4)
+            self.embedded_run_button = QPushButton("Запустить")
+            self.embedded_run_button.setToolTip("Выполнить выбранный ожидающий этап")
+            self.embedded_run_button.clicked.connect(self._run_selected)
+            self.embedded_restore_button = QPushButton("Исходный вид")
+            self.embedded_restore_button.setToolTip("Снять предпросмотр workflow и вернуть представление HDF5")
+            self.embedded_restore_button.clicked.connect(self._restore_preview)
+            actions_top.addWidget(self.embedded_run_button, 1)
+            actions_top.addWidget(self.embedded_restore_button, 1)
+            self._left_graph_layout.addLayout(actions_top)
+
+            actions_bottom = QHBoxLayout()
+            actions_bottom.setContentsMargins(0, 0, 0, 0)
+            actions_bottom.setSpacing(4)
+            self.embedded_accept_button = QPushButton("Принять")
+            self.embedded_accept_button.setToolTip("Зафиксировать проверенный результат для следующих этапов")
+            self.embedded_accept_button.clicked.connect(self._accept_selected)
+            self.embedded_reject_button = QPushButton("Отклонить")
+            self.embedded_reject_button.setToolTip("Отклонить результат; история и provenance сохраняются")
+            self.embedded_reject_button.clicked.connect(self._reject_selected)
+            actions_bottom.addWidget(self.embedded_accept_button, 1)
+            actions_bottom.addWidget(self.embedded_reject_button, 1)
+            self._left_graph_layout.addLayout(actions_bottom)
+
+            # These are the same status/progress objects used by the standalone
+            # workbench; reparenting avoids duplicated or divergent indicators.
+            self.status_label.setWordWrap(True)
+            self.status_label.setMaximumHeight(44)
+            self.progress.setMaximumHeight(5)
+            self._left_graph_layout.addWidget(self.status_label)
+            self._left_graph_layout.addWidget(self.progress)
 
         self._show_operation_form()
 
@@ -1306,6 +1368,16 @@ class ProcessingWorkbenchWidget(QWidget):
         self.reject_button.setEnabled(not busy and reject_enabled)
         self.fit_graph_button.setEnabled(not busy)
         self.show_rejected_check.setEnabled(not busy)
+        if self.embedded:
+            self.embedded_run_button.setEnabled(not busy and runnable)
+            self.embedded_restore_button.setEnabled(not busy and self._preview_context is not None)
+            self.embedded_accept_button.setVisible(accept_enabled)
+            self.embedded_reject_button.setVisible(accept_enabled)
+            self.embedded_accept_button.setEnabled(not busy and accept_enabled)
+            self.embedded_reject_button.setEnabled(not busy and reject_enabled)
+        if busy != self._last_busy_state:
+            self._last_busy_state = busy
+            self.busy_changed.emit(busy)
 
     def _save_project(self) -> None:
         try:
@@ -1333,6 +1405,7 @@ class ProcessingWorkbenchWidget(QWidget):
                 node_id,
                 WorkflowHistory(list(self.project.history.nodes)),
                 str(self.project.artifact_store.directory),
+                self.project.source_metadata or {},
             )
             task.signals.succeeded.connect(self._on_preview_ready)
             task.signals.failed.connect(self._on_preview_failed)
@@ -1371,6 +1444,9 @@ class ProcessingWorkbenchWidget(QWidget):
                 metadata=scan_bundle.metadata,
             )
             self.preview_requested.emit(request)
+            view_state = context.get("view_state")
+            if view_state is not None:
+                self.preview_state_ready.emit(view_state)
             if node.operation_id == "peaks.detect" and context.get("peaks") is not None:
                 peak_meta = context["peaks"].metadata
                 peak_cfg = peak_meta.get("peak_config", {})

@@ -86,6 +86,19 @@ class MapToolsWidget(QWidget):
         self.pin_roi_btn.setToolTip("Pin preview ROI")
         self.pin_roi_btn.clicked.connect(self.pin_roi_requested.emit)
         layout.addWidget(self.pin_roi_btn)
+        self.results_btn = QToolButton(self)
+        self.results_btn.setObjectName("mapAnalysisResultsButton")
+        self.results_btn.setAutoRaise(True)
+        self.results_btn.setIcon(svg_icon(ICON_DIR / "analysis.svg", widget=self.results_btn))
+        self.results_btn.setIconSize(QSize(16, 16))
+        self.results_btn.setToolTip("Выбрать результат анализа для карты")
+        self.results_btn.setAccessibleName("Результат анализа на 2D-карте")
+        self.results_menu = QMenu(self.results_btn)
+        self.results_menu.setToolTipsVisible(True)
+        self.results_btn.setMenu(self.results_menu)
+        self.results_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.results_btn.setEnabled(False)
+        layout.addWidget(self.results_btn)
         layout.addStretch(1)
         # Контраст вынесен из узкой панели в отдельный немодальный диалог.
         self.contrast_dialog = QDialog(self, Qt.WindowType.Tool); self.contrast_dialog.setObjectName("mapContrastDialog")
@@ -122,6 +135,8 @@ class MapToolsWidget(QWidget):
         icon_color = c["text"]
         self.home_btn.setIcon(svg_icon(ICON_DIR / "zoom_out_map.svg", color=icon_color, widget=self.home_btn))
         self.pin_roi_btn.setIcon(svg_icon(ICON_DIR / "push_pin.svg", color=icon_color, widget=self.pin_roi_btn))
+        self.results_btn.setIcon(svg_icon(ICON_DIR / "analysis.svg", color=icon_color, widget=self.results_btn))
+        apply_popup_theme(self.results_menu, active)
         self.settings_btn.setIcon(svg_icon(ICON_DIR / "setting_icon.svg", color=icon_color, widget=self.settings_btn))
         self.pool_btn.setIcon(svg_icon(ICON_DIR / "pool_stride_dense.svg", color=icon_color, widget=self.pool_btn))
         for roi_id, button in self.roi_tool_buttons.items():
