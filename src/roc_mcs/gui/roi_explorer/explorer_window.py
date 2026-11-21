@@ -1796,11 +1796,20 @@ class RockingCurveExplorerWindow(QMainWindow):
 
 
     def closeEvent(self, event) -> None:
-        """Сохраняет расположение экранов и освобождает HDF5-дескриптор."""
+        """Stop pending UI refreshes, finalize VTK once, and release HDF5."""
+        # Prevent queued GUI slots from requesting map/volume updates while
+        # the embedded native QVTK surface is being finalized.
+        for timer_name in ("_theta_render_timer", "_preview_timer", "_volume_refresh_timer"):
+            timer = getattr(self, timer_name, None)
+            if timer is not None:
+                try:
+                    timer.stop()
+                except RuntimeError:
+                    pass
         try: self.plot_workspace.mdi_area.save_geometry()
         except Exception: pass
-        # Завершаем VTK до уничтожения native Qt/OpenGL surface. This is the
-        # terminal Explorer close, unlike closing only the 3D MDI subwindow.
+        # Only the terminal Explorer close finalizes the reusable 3D scene.
+        # Closing the 3D MDI child itself only hides that panel.
         try:
             self.volume_widget.release_vtk_scene(final=True)
         except Exception:

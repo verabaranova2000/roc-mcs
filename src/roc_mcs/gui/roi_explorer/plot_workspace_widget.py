@@ -21,7 +21,7 @@ ROI_RAIL_COMPACT_WIDTH = 22
 ROI_RAIL_EXPANDED_WIDTH = 282
 
 class _PlotSubWindow(QMdiSubWindow):
-    """Закрытие скрывает экран и освобождает только его backend."""
+    """Закрытие скрывает MDI-экран; финальный backend teardown принадлежит владельцу."""
     def __init__(self, area, key, title, on_close=None):
         super().__init__()
         self._area = area
@@ -33,16 +33,16 @@ class _PlotSubWindow(QMdiSubWindow):
         self.setOption(QMdiSubWindow.SubWindowOption.RubberBandResize, True)
 
     def closeEvent(self, event):
-        # Кнопка X закрывает только это MDI-окно; при следующем открытии backend
-        # будет создан заново. Сначала освобождаем QVTK, затем скрываем окно.
-        if callable(self._on_explicit_close):
-            try:
-                self._on_explicit_close()
-            except Exception:
-                pass
+        # MDI close means "hide this panel", not "destroy its renderer".
+        # The 3D scene remains reusable while the other ROI Explorer panels are
+        # open. Any optional backend cleanup is deferred until this close event
+        # has returned, never performed re-entrantly inside QMdiSubWindow.
+        callback = self._on_explicit_close
         event.accept()
         self.hide()
         self._area._on_subwindow_closed(self.plot_key)
+        if callable(callback):
+            QTimer.singleShot(0, callback)
 
 
 class _PlotMdiArea(QMdiArea):
@@ -537,7 +537,7 @@ class PlotWorkspaceWidget(QSplitter):
         self.layout_btn=QToolButton(controls);self.layout_btn.setText("Раскладка ▦");self.layout_btn.setToolTip("Выбрать схему размещения окон");self.layout_btn.setAutoRaise(True);self.layout_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup);self.layout_menu=QMenu(self.layout_btn);self.layout_btn.setMenu(self.layout_menu);self._layout_preview_buttons={}
         self.arrange_btn=QToolButton(controls);self.arrange_btn.setText("Выровнять");self.arrange_btn.setToolTip("Применить выбранную схему к видимым окнам");self.arrange_btn.setAutoRaise(True);self.arrange_btn.setFixedHeight(23);row.addStretch(1);row.addWidget(self.layout_btn);row.addWidget(self.arrange_btn)
         self.mdi_area=_PlotMdiArea(self.plot_area);layout.addWidget(controls);layout.addWidget(self.mdi_area,1)
-        self.map_subwindow=self.mdi_area.add_plot("map","2D MAP · Детектор",self.map_widget);self.curve_subwindow=self.mdi_area.add_plot("curve","ROC CURVES · Rocking curves",self.curve_widget);self.volume_subwindow=self.mdi_area.add_plot("volume","3D VOLUME · Diffraction",self.volume_widget,initial_visible=False,on_close=self.volume_widget.release_vtk_scene)
+        self.map_subwindow=self.mdi_area.add_plot("map","2D MAP · Детектор",self.map_widget);self.curve_subwindow=self.mdi_area.add_plot("curve","ROC CURVES · Rocking curves",self.curve_widget);self.volume_subwindow=self.mdi_area.add_plot("volume","3D VOLUME · Diffraction",self.volume_widget,initial_visible=False)
         for key,b in self._buttons.items():
             b.toggled.connect(lambda visible,k=key:self.mdi_area.show_panel(k,visible))
             if key not in DEFAULT_VISIBLE_PANELS:self.mdi_area.show_panel(key,False)

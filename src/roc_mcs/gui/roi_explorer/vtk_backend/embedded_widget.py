@@ -758,22 +758,16 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
             def closeEvent(self, event):
                 if not self._roc_finalized:
                     self._roc_finalized = True
-                    # QVTK owns the Qt timer used for VTK TimerEvent dispatch.
-                    # Stop it and disable the interactor before Finalize so no
-                    # queued timer can render against a finalized HWND/context.
+                    # QVTK owns both the interactor lifecycle and RenderWindow
+                    # finalization. Stop only its Qt timer here; do not call
+                    # interactor.Disable() or detach its style separately.
                     try:
                         timer = getattr(self, "_Timer", None)
                         if timer is not None:
                             timer.stop()
                     except RuntimeError:
                         pass
-                    try:
-                        interactor = self.GetRenderWindow().GetInteractor()
-                        if interactor is not None:
-                            interactor.Disable()
-                    except Exception:
-                        logger.exception("Не удалось отключить VTK interactor перед Finalize")
-                    super().closeEvent(event)  # Единственный вызов Finalize внутри QVTK.
+                    super().closeEvent(event)  # QVTK performs the single Finalize.
                 event.accept()
 
         return _TrackedQVTK
@@ -1389,9 +1383,10 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
     def release_vtk_scene(self, *, final: bool = False):
         """Освободить одну QVTK-сцену через владельца native Qt surface.
 
-        Закрытие MDI-окна временное; закрытие ROI Explorer терминальное. HUD
-        останавливается первым, наблюдатели сцены снимаются при живом interactor,
-        затем QVTK closeEvent единожды отключает interactor и вызывает Finalize.
+        Закрытие MDI-окна только скрывает панель и не вызывает этот метод.
+        При окончательном закрытии HUD скрывается, снимаются только observers
+        сцены, затем QVTK closeEvent останавливает свой timer и вызывает один
+        штатный Finalize без ручного Disable/detach interactor.
         """
         if final:
             self._permanently_closed = True
@@ -1477,9 +1472,9 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
 
             if widget is not None:
                 try:
-                    widget.setUpdatesEnabled(False)
-                    # _TrackedQVTK.closeEvent: stop timer, Disable один раз,
-                    # затем QVTK base closeEvent -> единственный Finalize.
+                    # QVTK is WA_PaintOnScreen and deliberately has no
+                    # QPaintEngine.  Hide/close it through its own closeEvent;
+                    # do not toggle QWidget updates during native teardown.
                     widget.close()
                 except Exception as exc:
                     cleanup_errors.append(f"QVTK Finalize: {type(exc).__name__}: {exc}")

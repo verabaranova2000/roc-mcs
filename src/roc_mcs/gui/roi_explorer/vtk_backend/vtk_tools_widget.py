@@ -8,7 +8,7 @@ from __future__ import annotations
 from bisect import bisect_left, bisect_right
 import math
 
-from PyQt6.QtCore import QPoint, QPointF, QRectF, QSize, Qt, pyqtSignal
+from PyQt6.QtCore import QPoint, QPointF, QRectF, QSize, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap, QPalette, QPolygon
 from PyQt6.QtWidgets import (
     QApplication,
@@ -136,21 +136,54 @@ class _PopupHorizontalResizeGrip(QWidget):
 
 
 class _DirectionalAxisButton(QToolButton):
-    """Deterministic camera command: LMB = +axis, RMB = -axis."""
+    """Deterministic camera command: LMB = +axis, RMB = -axis.
+
+    Left-click follows the normal QToolButton press/release lifecycle.  The
+    right-click command is emitted only on release inside the button.  Camera
+    commands must not execute from mousePressEvent while QMenu is still holding
+    the pointer grab: doing so can leave the first subsequent QVTK pointer
+    event paired with a stale VTK event position.
+    """
 
     direction_requested = pyqtSignal(str, int)
 
     def __init__(self, axis: str, parent=None):
         super().__init__(parent)
         self._axis = str(axis).lower()
+        self._right_press_armed = False
+        self.clicked.connect(self._emit_positive_direction)
+
+    def _emit_positive_direction(self, _checked: bool = False) -> None:
+        self.direction_requested.emit(self._axis, 1)
 
     def mousePressEvent(self, event):
-        if event.button() in (Qt.MouseButton.LeftButton, Qt.MouseButton.RightButton):
-            polarity = 1 if event.button() == Qt.MouseButton.LeftButton else -1
-            self.direction_requested.emit(self._axis, polarity)
+        if event.button() == Qt.MouseButton.RightButton:
+            self._right_press_armed = True
+            self.setDown(True)
             event.accept()
             return
         super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.RightButton and self._right_press_armed:
+            self._right_press_armed = False
+            try:
+                released_inside = self.rect().contains(event.position().toPoint())
+            except (AttributeError, RuntimeError):
+                released_inside = False
+            self.setDown(False)
+            if released_inside:
+                self.direction_requested.emit(self._axis, -1)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def focusOutEvent(self, event):
+        # Do not let an interrupted right-click leave the button visually down.
+        if self._right_press_armed:
+            self._right_press_armed = False
+            self.setDown(False)
+        super().focusOutEvent(event)
 
 
 class _AxisScalePreview(QWidget):
@@ -295,6 +328,10 @@ class VTKToolsWidget(QWidget):
         self._overlay_tool_specs: dict[str, dict[str, object]] = {}
         self._active_overlay_settings: str | None = None
         self._perspective_enabled = True
+        self._pending_camera_preset = None
+        self._camera_preset_timer = QTimer(self)
+        self._camera_preset_timer.setSingleShot(True)
+        self._camera_preset_timer.timeout.connect(self._flush_camera_preset_request)
         self._axis_scales = (1.0, 1.0, 1.0)
         self._applied_axis_scales = (1.0, 1.0, 1.0)
         self._theta_axis_values: list[float] = []
@@ -1017,7 +1054,7 @@ class VTKToolsWidget(QWidget):
         self.perspective_button.setAccessibleName(
             "Установить стандартный перспективный изометрический ракурс"
         )
-        self.perspective_button.clicked.connect(self._emit_perspective_view_requested)
+        self.perspective_button.clicked.connect(self._queue_perspective_view_requested)
         row.addWidget(self.perspective_button)
 
         self.camera_axis_buttons: dict[str, QToolButton] = {}
@@ -1032,7 +1069,7 @@ class VTKToolsWidget(QWidget):
                 f"Вид вдоль оси {axis.upper()} · ЛКМ: +{axis.upper()}, ПКМ: −{axis.upper()}"
             )
             button.setAccessibleName(f"Вид вдоль оси {axis.upper()}")
-            button.direction_requested.connect(self._emit_camera_axis_direction)
+            button.direction_requested.connect(self._queue_camera_axis_direction)
             self.camera_axis_buttons[axis] = button
             row.addWidget(button)
 
@@ -1110,6 +1147,26 @@ class VTKToolsWidget(QWidget):
         action = QWidgetAction(self.camera_menu)
         action.setDefaultWidget(self._camera_panel)
         self.camera_menu.addAction(action)
+
+    def _queue_camera_axis_direction(self, axis: str, polarity: int) -> None:
+        """Apply a camera preset after Qt has completed the popup mouse event."""
+        axis = str(axis).lower()
+        polarity = 1 if int(polarity) >= 0 else -1
+        self._pending_camera_preset = ("axis", axis, polarity)
+        self._camera_preset_timer.start(0)
+
+    def _queue_perspective_view_requested(self) -> None:
+        self._pending_camera_preset = ("perspective",)
+        self._camera_preset_timer.start(0)
+
+    def _flush_camera_preset_request(self) -> None:
+        request, self._pending_camera_preset = self._pending_camera_preset, None
+        if not request:
+            return
+        if request[0] == "axis":
+            self._emit_camera_axis_direction(request[1], request[2])
+        elif request[0] == "perspective":
+            self._emit_perspective_view_requested()
 
     def _emit_camera_axis_direction(self, axis: str, polarity: int) -> None:
         axis = str(axis).lower()

@@ -56,15 +56,13 @@ class _VolumeContrastRangeSlider(QRangeSlider):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         colors = self._theme_palette
         is_dark = self._theme == "dark"
-        surface = QColor(colors["window"])
         track = QColor(colors["border"])
         active = QColor("#76A9D5" if is_dark else "#477FA8")
         handle_fill = QColor(colors["button"] if is_dark else colors["base"])
         handle_edge = QColor(colors["text"] if is_dark else colors["border"])
 
-        # Explicitly paint the tiny slider canvas; do not rely on inherited
-        # QPalette.Base, which may belong to the host application's light theme.
-        painter.fillRect(self.rect(), surface)
+        # Leave the track canvas transparent so the compact HUD reads as one
+        # integrated overlay rather than a framed panel.
         if self._orientation == Qt.Orientation.Vertical:
             x = self.width() * 0.5
             low_y = self._val_to_pos(self._low)
@@ -101,7 +99,8 @@ class _VerticalColorRamp(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._name = "inferno"
-        self.setFixedSize(14, 154)
+        self.setFixedSize(8, 154)
+        self.setToolTip("Интенсивность")
         self.setAccessibleName("Цветовая шкала интенсивности объёма")
 
     def set_colormap(self, name: str) -> None:
@@ -113,7 +112,7 @@ class _VerticalColorRamp(QWidget):
         if not painter.isActive():
             return
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        rect = self.rect().adjusted(1, 1, -1, -1)
+        rect = self.rect().adjusted(0, 0, -1, -1)
         gradient = QLinearGradient(0.0, float(rect.bottom()), 0.0, float(rect.top()))
         cmap = mpl_colormap(self._name)
         for index in range(33):
@@ -124,9 +123,9 @@ class _VerticalColorRamp(QWidget):
                 QColor.fromRgbF(float(r), float(g), float(b), float(a)),
             )
         edge = self.palette().color(QPalette.ColorRole.Mid)
-        painter.setPen(QPen(edge, 1.0))
+        painter.setPen(QPen(edge, 0.45))
         painter.setBrush(gradient)
-        painter.drawRoundedRect(rect, 2.0, 2.0)
+        painter.drawRect(rect)
         painter.end()
 
 
@@ -164,8 +163,12 @@ class VTKVolumeDisplayWidget(QFrame):
         self._last_low: float | None = None
         self._last_high: float | None = None
         self.setObjectName("VTKVolumeDisplayOverlay")
-        self.setFixedWidth(86)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setLineWidth(0)
+        self.setFixedWidth(44)
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
+        self.setAutoFillBackground(True)
         # Embedded mode parents the HUD to the viewport container, as a sibling
         # of QVTK, never to QVTK itself. Both are native children of the same
         # parent; this avoids clipping/reparenting when QVTK is finalized.
@@ -175,17 +178,30 @@ class VTKVolumeDisplayWidget(QFrame):
         self.winId()  # force native-handle creation before the first volume render
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(5, 5, 5, 5)
-        root.setSpacing(3)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(1)
 
-        title = QLabel("INTENSITY", self)
-        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        title.setObjectName("VTKVolumeColorbarTitle")
-        root.addWidget(title)
+        # Numeric bounds sit above/below the combined slider + color strip.
+        # They no longer occupy a side column, so long values cannot widen the
+        # gap between the two vertical controls.
+        self.vmax_label = QLabel("—", self)
+        self.vmax_label.setObjectName("VTKVolumeMaxLabel")
+        self.vmin_label = QLabel("—", self)
+        self.vmin_label.setObjectName("VTKVolumeMinLabel")
+        for label in (self.vmax_label, self.vmin_label):
+            label.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter)
+            label.setWordWrap(False)
+            label.setMinimumWidth(0)
+            label.setFixedHeight(10)
+            label.setToolTip("Абсолютная интенсивность; подробности — при наведении на цветовую шкалу.")
+
+        root.addWidget(self.vmax_label, 0, Qt.AlignmentFlag.AlignHCenter)
 
         scale_row = QHBoxLayout()
         scale_row.setContentsMargins(0, 0, 0, 0)
         scale_row.setSpacing(4)
+        scale_row.addStretch(1)
+
         self.range_slider = _VolumeContrastRangeSlider(
             low=16.0,
             high=95.0,
@@ -196,39 +212,22 @@ class VTKVolumeDisplayWidget(QFrame):
             minimum_gap=0.01,
         )
         self.range_slider.setObjectName("vtkVolumeContrastRangeSlider")
-        self.range_slider.setFixedHeight(154)
+        self.range_slider.setFixedSize(7, 154)
         self.range_slider.setToolTip(
             "Ползунки задают проценты от положительного p99.9. "
-            "Подписи max/min справа показывают соответствующие абсолютные значения интенсивности."
+            "Абсолютные значения min/max показаны над и под шкалой."
         )
         self.range_slider.valueChanged.connect(self._on_slider_changed)
         scale_row.addWidget(self.range_slider, 0, Qt.AlignmentFlag.AlignVCenter)
 
         self.color_ramp = _VerticalColorRamp(self)
+        self.color_ramp.setAccessibleName("Цветовая шкала интенсивности объёма")
         scale_row.addWidget(self.color_ramp, 0, Qt.AlignmentFlag.AlignVCenter)
-
-        value_column = QVBoxLayout()
-        value_column.setContentsMargins(0, 0, 0, 0)
-        value_column.setSpacing(0)
-        self.vmax_label = QLabel("max: —", self)
-        self.vmax_label.setObjectName("VTKVolumeMaxLabel")
-        self.vmin_label = QLabel("min: —", self)
-        self.vmin_label.setObjectName("VTKVolumeMinLabel")
-        for label in (self.vmax_label, self.vmin_label):
-            label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
-            label.setWordWrap(True)
-            label.setToolTip(
-                "Абсолютное значение интенсивности на соответствующей границе; "
-                "это не процент, показанный в редакторах Vmin/Vmax."
-            )
-        value_column.addWidget(self.vmax_label)
-        value_column.addStretch(1)
-        value_column.addWidget(self.vmin_label)
-        scale_row.addLayout(value_column, 1)
+        scale_row.addStretch(1)
         root.addLayout(scale_row)
 
-        # Reuse the exact compact ellipsis control already used below the
-        # map colorbar; only its hit target is adapted to this vertical HUD.
+        root.addWidget(self.vmin_label, 0, Qt.AlignmentFlag.AlignHCenter)
+
         self.options_button = ColorbarOptionsButton(self)
         self.options_button.setObjectName("VTKVolumeDisplayOptionsButton")
         self.options_button.setAutoRaise(False)
@@ -238,7 +237,7 @@ class VTKVolumeDisplayWidget(QFrame):
         self.options_button.setAccessibleName("Параметры отображения объёма")
         self.options_button.clicked.connect(self._open_settings_menu)
         options_row = QHBoxLayout()
-        options_row.setContentsMargins(0, 1, 0, 0)
+        options_row.setContentsMargins(0, 0, 0, 0)
         options_row.addStretch(1)
         options_row.addWidget(self.options_button)
         options_row.addStretch(1)
@@ -266,7 +265,7 @@ class VTKVolumeDisplayWidget(QFrame):
         self.ensurePolished()
         self.adjustSize()
         content_height = max(190, int(self.sizeHint().height()))
-        self.setFixedSize(86, content_height)
+        self.setFixedSize(44, content_height)
         self._position_overlay()
         self.hide()
 
@@ -307,7 +306,7 @@ class VTKVolumeDisplayWidget(QFrame):
             )
         self.ensurePolished()
         self.adjustSize()
-        self.setFixedSize(86, max(190, int(self.sizeHint().height())))
+        self.setFixedSize(44, max(190, int(self.sizeHint().height())))
         self._position_overlay()
         if self._scene_available and self._show_colorbar:
             self.show()
@@ -389,6 +388,9 @@ class VTKVolumeDisplayWidget(QFrame):
         self.range_slider.blockSignals(False)
         low, high = self.range_slider.low(), self.range_slider.high()
         self._last_low, self._last_high = low, high
+        self._update_bound_labels(
+            self._absolute_from_percent(low), self._absolute_from_percent(high)
+        )
         self.thresholds_changed.emit(low, high)
 
     def _on_slider_changed(self, low: float, high: float) -> None:
@@ -407,6 +409,10 @@ class VTKVolumeDisplayWidget(QFrame):
         finally:
             self._syncing_thresholds = False
         self._last_low, self._last_high = float(low), float(high)
+        self._update_bound_labels(
+            self._absolute_from_percent(float(low)),
+            self._absolute_from_percent(float(high)),
+        )
         self.thresholds_changed.emit(float(low), float(high))
 
     def set_thresholds(
@@ -441,8 +447,25 @@ class VTKVolumeDisplayWidget(QFrame):
             absolute_low = self._threshold_reference * low / 100.0
         if absolute_high is None and self._threshold_reference is not None:
             absolute_high = self._threshold_reference * high / 100.0
-        self.vmin_label.setText(f"min: {self._format_value(absolute_low)}")
-        self.vmax_label.setText(f"max: {self._format_value(absolute_high)}")
+        self._update_bound_labels(absolute_low, absolute_high)
+
+    def _absolute_from_percent(self, value: float) -> float | None:
+        if self._threshold_reference is None:
+            return None
+        return float(self._threshold_reference) * float(value) / 100.0
+
+    def _update_bound_labels(
+        self, absolute_low: float | None, absolute_high: float | None
+    ) -> None:
+        min_text = self._format_value(absolute_low)
+        max_text = self._format_value(absolute_high)
+        self.vmin_label.setText(min_text)
+        self.vmax_label.setText(max_text)
+        self.color_ramp.setToolTip(
+            "Интенсивность"
+            f"\nmax: {max_text}"
+            f"\nmin: {min_text}"
+        )
 
     @staticmethod
     def _format_value(value: float | None) -> str:
@@ -490,7 +513,6 @@ class VTKVolumeDisplayWidget(QFrame):
                 except RuntimeError:
                     pass
             try:
-                self.setUpdatesEnabled(False)
                 self.settings_menu.deleteLater()
             except RuntimeError:
                 pass
@@ -507,7 +529,7 @@ class VTKVolumeDisplayWidget(QFrame):
         # Recompute the non-zero layout-derived height before the first show.
         self.ensurePolished()
         self.adjustSize()
-        self.setFixedSize(86, max(190, int(self.sizeHint().height())))
+        self.setFixedSize(44, max(190, int(self.sizeHint().height())))
         self._position_overlay()
         if not was_visible:
             self.show()
@@ -591,18 +613,29 @@ class VTKVolumeDisplayWidget(QFrame):
     def _apply_overlay_theme(self, theme: str) -> None:
         self._theme = str(theme).lower() if str(theme).lower() in ("light", "dark") else "light"
         c = theme_colors(self._theme)
+        # Match the exact VTK renderer clear colour. The HUD is a native
+        # always-on-top sibling of QVTK, so a transparent background exposes
+        # whatever MDI window happens to sit behind it after maximize/restore.
+        surface = "#111316" if self._theme == "dark" else "#ffffff"
         apply_widget_palette(self, self._theme)
+        palette = self.palette()
+        palette.setColor(QPalette.ColorRole.Window, QColor(surface))
+        palette.setColor(QPalette.ColorRole.WindowText, QColor(c["text"]))
+        self.setPalette(palette)
         self.setStyleSheet(f"""
             QFrame#VTKVolumeDisplayOverlay {{
-                background: {c['window']}; color: {c['text']};
-                border: 1px solid {c['border']}; border-radius: 5px;
+                background-color: {surface}; color: {c['text']};
+                border: 0; border-radius: 0;
             }}
             QFrame#VTKVolumeDisplayOverlay QLabel {{
                 background: transparent; color: {c['text']}; border: 0;
                 font-size: 6pt; padding: 0;
             }}
-            QLabel#VTKVolumeColorbarTitle {{ font-size: 6pt; font-weight: 700; }}
-            QLabel#VTKVolumeMaxLabel, QLabel#VTKVolumeMinLabel {{ font-size: 6pt; }}
+            QLabel#VTKVolumeMaxLabel, QLabel#VTKVolumeMinLabel {{
+                font-size: 6pt; font-weight: 500; padding: 0; margin: 0;
+                background: transparent; border: 0;
+            }}
+            QWidget#vtkVolumeContrastRangeSlider {{ background: transparent; border: 0; }}
             QToolButton#VTKVolumeDisplayOptionsButton {{
                 background: {c['button']}; color: {c['button_text']};
                 border: 1px solid {c['border']}; border-radius: 3px;

@@ -19,8 +19,10 @@ logger = logging.getLogger(__name__)
 # function's estimated requirement within that real hardware limit instead
 # of allowing VTK to silently downsample a 32768-texel request.
 _MAX_VOLUME_COLOR_TEXTURE_WIDTH = 16384
+_MAX_VOLUME_OPACITY_TEXTURE_WIDTH = 16384
 _MAX_VOLUME_PALETTE_CONTROL_POINTS = 64
 _MIN_VOLUME_PALETTE_CONTROL_POINTS = 2
+_INITIAL_VOLUME_OPACITY_CONTROL_POINTS = 17
 
 
 def _vtk():
@@ -342,6 +344,118 @@ def _set_adaptive_volume_palette(
         "estimated_texture_width": int(estimated_width),
     }
 
+
+def _set_adaptive_volume_opacity(
+    opacity_function: Any,
+    sentinel: float,
+    scalar_min: float,
+    scalar_max: float,
+    opacity_low: float,
+    opacity_high: float,
+    max_opacity: float,
+    gamma: float,
+    vtk_math: Any,
+    *,
+    max_texture_width: int = _MAX_VOLUME_OPACITY_TEXTURE_WIDTH,
+) -> dict[str, int]:
+    """Keep the original gamma transfer curve and bake only the GPU-safe LUT.
+
+    The normal 17-knot function is retained unchanged whenever it fits. If
+    VTK estimates a larger power-of-two texture than the graphics driver
+    supports, sample that exact function once at the driver's maximum 1D LUT
+    resolution and rebuild it from those samples. This matches the fallback
+    resolution VTK would otherwise use internally, but makes the resolution
+    explicit and prevents a second, silent downsampling pass.
+    """
+    data_min = float(scalar_min)
+    table_min = float(min(sentinel, data_min))
+    scalar_max = float(scalar_max)
+    opacity_low = float(opacity_low)
+    opacity_high = float(opacity_high)
+    max_opacity = float(max_opacity)
+    gamma = float(gamma)
+    if not all(np.isfinite(v) for v in (
+        sentinel, data_min, scalar_max, opacity_low, opacity_high, max_opacity, gamma
+    )):
+        raise ValueError("Границы и параметры opacity transfer function должны быть конечными.")
+    if scalar_max < data_min:
+        raise ValueError("Некорректный скалярный диапазон opacity transfer function.")
+    if opacity_high <= opacity_low:
+        raise ValueError("Верхний порог opacity должен быть выше нижнего.")
+    if not (0.0 <= max_opacity <= 1.0) or gamma <= 0.0:
+        raise ValueError("max_opacity должен быть в [0,1], gamma — строго положительной.")
+
+    opacity_function.RemoveAllPoints()
+    opacity_function.AddPoint(float(sentinel), 0.0)
+    opacity_function.AddPoint(float(data_min), 0.0)
+    opacity_function.AddPoint(float(opacity_low), 0.0)
+    for t in np.linspace(0.0, 1.0, _INITIAL_VOLUME_OPACITY_CONTROL_POINTS):
+        value = opacity_low + (opacity_high - opacity_low) * float(t)
+        alpha = max_opacity * (float(t) ** gamma)
+        opacity_function.AddPoint(float(value), float(alpha))
+    if scalar_max > opacity_high:
+        opacity_function.AddPoint(float(scalar_max), max_opacity)
+
+    if scalar_max > table_min:
+        estimated_samples = max(
+            1,
+            int(opacity_function.EstimateMinNumberOfSamples(table_min, scalar_max)),
+        )
+    else:
+        estimated_samples = 1
+    estimated_width = max(1, int(vtk_math.NearestPowerOfTwo(estimated_samples)))
+    original_estimated_width = int(estimated_width)
+    original_control_points = int(opacity_function.GetSize())
+    resampled = False
+
+    if estimated_width > int(max_texture_width) and scalar_max > table_min:
+        # vtkPiecewiseFunction.GetTable uses the same scalar interval and
+        # uniform sampling basis required by the GPU mapper. Rebuilding from
+        # these samples reproduces the driver's maximum-resolution fallback.
+        table_size = int(max_texture_width)
+        if table_size < 2:
+            raise ValueError("Лимит текстуры opacity LUT должен быть не меньше 2.")
+        table_values = [0.0] * table_size
+        opacity_function.GetTable(table_min, scalar_max, table_size, table_values)
+        opacity_function.BuildFunctionFromTable(
+            table_min, scalar_max, table_size, table_values
+        )
+        resampled = True
+        estimated_samples = max(
+            1,
+            int(opacity_function.EstimateMinNumberOfSamples(table_min, scalar_max)),
+        )
+        estimated_width = max(1, int(vtk_math.NearestPowerOfTwo(estimated_samples)))
+
+    if estimated_width > int(max_texture_width):
+        logger.warning(
+            "VTK volume opacity transfer still estimates a %d-texel table "
+            "(limit %d) for scalar range [%g, %g] and opacity interval [%g, %g].",
+            estimated_width,
+            int(max_texture_width),
+            table_min,
+            scalar_max,
+            opacity_low,
+            opacity_high,
+        )
+    elif resampled:
+        logger.info(
+            "VTK volume opacity transfer sampled at the GPU limit (%d texels; "
+            "original estimate %d; resulting estimate %d; scalar range [%g, %g]).",
+            int(max_texture_width),
+            int(original_estimated_width),
+            int(estimated_width),
+            table_min,
+            scalar_max,
+        )
+
+    return {
+        "control_points": int(opacity_function.GetSize()),
+        "original_control_points": int(original_control_points),
+        "estimated_samples": int(estimated_samples),
+        "estimated_texture_width": int(estimated_width),
+        "resampled": int(resampled),
+    }
 
 @dataclass(slots=True)
 class TransferSettings:
@@ -2370,13 +2484,10 @@ class VTKVolumeScene:
         self.volume_property.SetScalarOpacityUnitDistance(
             float(compute_opacity_unit_distance(self._min_spacing, settings.opacity_unit_distance_factor))
         )
-        # Gradient opacity is intentionally neutral; weak data are not suppressed by gradients.
-        gradient = vtk.vtkPiecewiseFunction()
-        data_min = float(self.grid_info["scalar_min"])
-        data_max = float(self.grid_info["scalar_max"])
-        gradient.AddPoint(data_min, 1.0)
-        gradient.AddPoint(data_max if data_max > data_min else data_min + 1.0, 1.0)
-        self.volume_property.SetGradientOpacity(gradient)
+        # The gradient-opacity function is neutral (constant 1.0) in this
+        # renderer.  Do not allocate a second GPU opacity lookup texture for a
+        # function that cannot change the image.
+        self.volume_property.DisableGradientOpacityOn()
 
         self.volume = vtk.vtkVolume()
         self.volume.SetMapper(self.mapper)
@@ -3057,18 +3168,21 @@ class VTKVolumeScene:
             self.vtk.vtkMath,
         )
 
-        self.opacity_function.RemoveAllPoints()
-        self.opacity_function.AddPoint(sentinel, 0.0)
-        self.opacity_function.AddPoint(value_min, 0.0)
-        self.opacity_function.AddPoint(low, 0.0)
-        # The same gamma ramp is used by the VTK prototype; thresholds now
-        # follow its p99.9-fraction semantics rather than array percentiles.
-        for t in np.linspace(0.0, 1.0, 17):
-            value = low + (high - low) * float(t)
-            alpha = float(settings.max_opacity) * (float(t) ** float(settings.gamma))
-            self.opacity_function.AddPoint(value, alpha)
-        if value_max > high:
-            self.opacity_function.AddPoint(value_max, float(settings.max_opacity))
+        # Preserve the original 17-knot gamma ramp unless its estimated GPU
+        # opacity LUT exceeds the driver's 16384-texel limit.  In that case
+        # reduce only redundant interpolation knots; scalar thresholds and the
+        # exact max-opacity/gamma parameters remain unchanged.
+        opacity_table_info = _set_adaptive_volume_opacity(
+            self.opacity_function,
+            sentinel,
+            value_min,
+            value_max,
+            low,
+            high,
+            float(settings.max_opacity),
+            float(settings.gamma),
+            self.vtk.vtkMath,
+        )
 
         self.settings = settings
         self._update_theta_slice_shader_uniforms(low, high)
@@ -3097,6 +3211,8 @@ class VTKVolumeScene:
             "projection_visible": bool(self.projection_actor.GetVisibility()) if self.projection_actor is not None else False,
             "color_table_control_points": int(color_table_info["control_points"]),
             "color_table_estimated_width": int(color_table_info["estimated_texture_width"]),
+            "opacity_table_control_points": int(opacity_table_info["control_points"]),
+            "opacity_table_estimated_width": int(opacity_table_info["estimated_texture_width"]),
         }
         self._last_transfer_info = result
         if render:
@@ -3318,6 +3434,36 @@ class VTKVolumeScene:
         self._update_geometry_axes(force=True)
         self._request_render()
 
+    def _prepare_camera_preset_interaction(self) -> None:
+        """End stale trackball state and synchronize VTK's previous/current pointer.
+
+        QVTK records current and previous mouse positions separately. A camera
+        preset is a programmatic camera change, not a mouse gesture. If it is
+        issued while a popup is completing its pointer sequence, the next
+        trackball event can otherwise be measured from an old position.
+        Stopping the interaction style and synchronizing both positions makes
+        the next real drag start with a zero stale delta; it does not alter the
+        camera pose or the user's subsequent mouse movement.
+        """
+        style = getattr(self, "interactor_style", None)
+        if style is not None:
+            try:
+                style.StopState()
+            except Exception:
+                logger.debug("Could not stop VTK interaction state before camera preset", exc_info=True)
+
+        interactor = getattr(self, "interactor", None)
+        if interactor is not None:
+            try:
+                position = interactor.GetEventPosition()
+                x, y = int(position[0]), int(position[1])
+                # The interactor exposes an explicit previous-position setter;
+                # synchronize it rather than relying on a synthetic mouse move.
+                interactor.SetLastEventPosition(x, y)
+                interactor.SetEventPosition(x, y)
+            except Exception:
+                logger.debug("Could not synchronize VTK pointer position before camera preset", exc_info=True)
+
     def set_perspective_view(self) -> None:
         """Set the canonical oblique/isometric camera pose in perspective mode.
 
@@ -3328,6 +3474,7 @@ class VTKVolumeScene:
         """
         if self.payload is None:
             return
+        self._prepare_camera_preset_interaction()
         bounds = self.renderer.ComputeVisiblePropBounds()
         bounds_array = np.asarray(bounds, dtype=np.float64)
         if (
@@ -3380,6 +3527,7 @@ class VTKVolumeScene:
         polarity = int(polarity)
         if polarity not in (-1, 1):
             raise ValueError("Полярность направления камеры должна быть +1 или -1.")
+        self._prepare_camera_preset_interaction()
         bounds = self.renderer.ComputeVisiblePropBounds()
         if not np.all(np.isfinite(bounds)) or bounds[0] > bounds[1]:
             return
@@ -3501,61 +3649,45 @@ class VTKVolumeScene:
             self._request_render()
 
     def close(self) -> None:
-        """Detach scene observers before the owning QVTK widget finalizes.
+        """Stop scene-owned observers before the owning QVTK widget finalizes.
 
-        The QVTK render window is the sole owner of the OpenGL context and the
-        sole component allowed to finalize/release its GPU resources.  Do not
-        call MakeCurrent(), ReleaseGraphicsResources(), RemoveAllViewProps(),
-        or RemoveRenderer() here: QVTK's Finalize() performs the one authoritative
-        teardown while its native Qt surface is still alive.
+        QVTK is the sole owner of the native render-window/interactor teardown.
+        This method removes only observers and the optional orientation widget
+        that this scene explicitly registered. It deliberately does not detach
+        VTK's interactor style/renderer graph node by node: doing so during a
+        Qt close event can invalidate objects still used by QVTK's own
+        Finalize()/parent-destroyed lifecycle.
         """
         if self._closed:
             return
         self._closed = True
-        errors: list[str] = []
         interactor = self.interactor
 
-        # Remove application-owned observers while the interactor is alive.
         if self._camera_observer_id is not None and interactor is not None:
             try:
                 interactor.RemoveObserver(self._camera_observer_id)
-            except Exception as exc:
-                errors.append(f"camera observer removal: {type(exc).__name__}: {exc}")
+            except Exception:
+                logger.debug("Could not remove the scene camera observer during close", exc_info=True)
         self._camera_observer_id = None
-
-        # Disable/detach the orientation marker before QVTK tears down its
-        # interactor. These operations unregister widget observers; they do not
-        # manually release any OpenGL resources.
-        axes_widget = self.axes_widget
-        if axes_widget is not None:
-            for label, operation in (
-                ("orientation widget disable", lambda: axes_widget.SetEnabled(0)),
-                ("orientation widget interactor detach", lambda: axes_widget.SetInteractor(None)),
-                ("orientation marker detach", lambda: axes_widget.SetOrientationMarker(None)),
-                ("orientation renderer detach", lambda: axes_widget.SetRenderer(None)),
-            ):
-                try:
-                    operation()
-                except Exception as exc:
-                    errors.append(f"{label}: {type(exc).__name__}: {exc}")
-        self.axes_widget = None
 
         style = getattr(self, "interactor_style", None)
         if style is not None:
             try:
-                style.SetDefaultRenderer(None)
-            except Exception as exc:
-                errors.append(f"interactor style renderer detach: {type(exc).__name__}: {exc}")
-        if interactor is not None:
-            try:
-                interactor.SetInteractorStyle(None)
-            except Exception as exc:
-                errors.append(f"interactor style detach: {type(exc).__name__}: {exc}")
-        self.interactor_style = None
+                style.StopState()
+            except Exception:
+                logger.debug("Could not stop VTK interaction state during close", exc_info=True)
 
-        # Break Python callbacks, but deliberately retain the render window,
-        # renderer, props and mappers until the caller has invoked QVTK Finalize.
+        axes_widget = self.axes_widget
+        if axes_widget is not None:
+            try:
+                # SetEnabled(0) is the widget's supported observer-unregistration
+                # path. Avoid redundant SetInteractor/SetRenderer/SetMarker(None)
+                # calls while QVTK is about to finalize the interactor.
+                axes_widget.SetEnabled(0)
+            except Exception:
+                logger.debug("Could not disable the VTK orientation marker during close", exc_info=True)
+        self.axes_widget = None
+
+        # Keep renderer/interactor/style ownership intact until QVTK Finalize.
         self._render_callback = None
-        if errors:
-            raise RuntimeError("; ".join(errors))
 

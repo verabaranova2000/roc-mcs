@@ -15,7 +15,7 @@ from PyQt6.QtWidgets import (
 from roc_mcs.analysis.artifacts import ArtifactStore
 from roc_mcs.analysis.engine import (
     WorkflowExecutor, application_version, build_input_refs,
-    make_operation_label, source_fingerprint,
+    make_operation_label,
 )
 from roc_mcs.gui.resource_monitor.activity import activity
 from roc_mcs.analysis.operations import default_registry
@@ -66,16 +66,10 @@ class _PreviewTask(QRunnable):
                 self.history, ArtifactStore(self.artifact_dir), default_registry()
             )
             node = self.history.get(self.node_id)
-            source_node = next(n for n in self.history.nodes if n.operation_id == "source.scan")
-            source_meta = source_node.metadata
-            current_source = source_fingerprint(source_meta["source_file"])
-            expected_source = {
-                "path": source_meta["source_file"],
-                "size_bytes": int(source_meta["source_size_bytes"]),
-                "mtime_ns": int(source_meta["source_mtime_ns"]),
-            }
-            if current_source != expected_source:
-                raise RuntimeError("Исходный HDF5 изменился после создания Analysis Project")
+            # Preview is reconstructed exclusively from the project's immutable
+            # ArtifactStore outputs.  The HDF5 container may legitimately have
+            # grown because a new scan was appended; that must not invalidate
+            # already-computed artifacts for this scan_key.
             if node.operation_id == "preprocess.spikes":
                 inputs = executor.resolve_node_inputs(node)
                 scan = inputs["scan"]
@@ -200,20 +194,34 @@ class ProcessingStepsPanel(QWidget):
             documents = Path(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DocumentsLocation) or (Path.home() / "Documents"))
             project_dir = documents / "ROC-MCS Analyses" / f"{path.stem}_{safe_scan}.roi-analysis"
             manifest = project_dir / WorkflowProject.MANIFEST_NAME
+            container_revision_changed = False
             if manifest.is_file():
                 project = WorkflowProject.open(manifest)
                 metadata = project.source_metadata or {}
-                expected = source_fingerprint(path)
-                actual = {
-                    "path": str(metadata.get("source_file", "")),
-                    "size_bytes": int(metadata.get("source_size_bytes", -1)),
-                    "mtime_ns": int(metadata.get("source_mtime_ns", -1)),
-                }
-                if actual != expected or str(metadata.get("scan_key", "")) != str(scan_key):
+                # A single HDF5 file is a container for many independent scans.
+                # Appending a new scan changes the *container* size and mtime,
+                # but does not change the identity of scans already stored in it.
+                # Therefore a processing session is bound to the canonical HDF5
+                # path + the repository's stable scan_key, not to the global file
+                # fingerprint.  The fingerprint captured in the source node is
+                # retained as provenance and is deliberately not rewritten.
+                recorded_path = Path(str(metadata.get("source_file", ""))).expanduser().resolve()
+                recorded_scan_key = str(metadata.get("scan_key", ""))
+                if recorded_path != path or recorded_scan_key != str(scan_key):
                     raise RuntimeError(
-                        "Существующий Analysis Project относится к другой версии исходного HDF5/скану. "
-                        "Он не будет перезаписан; выберите/создайте отдельную сессию анализа."
+                        "Существующий Analysis Project принадлежит другому HDF5-файлу "
+                        "или другому scan_key. Существующая история не будет перезаписана."
                     )
+                try:
+                    recorded_size = int(metadata.get("source_size_bytes", -1))
+                    recorded_mtime = int(metadata.get("source_mtime_ns", -1))
+                    current_stat = path.stat()
+                    container_revision_changed = (
+                        recorded_size != int(current_stat.st_size)
+                        or recorded_mtime != int(current_stat.st_mtime_ns)
+                    )
+                except (OSError, TypeError, ValueError):
+                    container_revision_changed = False
             else:
                 project = WorkflowProject.create(project_dir, path, str(scan_key))
             if project.source_node_id is None:
@@ -224,7 +232,17 @@ class ProcessingStepsPanel(QWidget):
             self.project_label.setToolTip(str(project.directory))
             self._refresh_tree(project.source_node_id)
             self._set_enabled(True)
-            self._set_status("История обработки готова. Исходный HDF5 не изменяется.")
+            if manifest.is_file() and container_revision_changed:
+                self._set_status(
+                    f"Открыта сохранённая сессия скана «{scan_key}». Контейнер HDF5 "
+                    "изменился после её создания, но путь и scan_key совпадают. "
+                    "Исторические артефакты сохранены; новые сканы получают собственные сессии."
+                )
+            else:
+                self._set_status(
+                    "История обработки готова. Сессия привязана к выбранному scan_key; "
+                    "исходный HDF5 не изменяется."
+                )
         except Exception as exc:
             self.project = None
             self._source_key = None
