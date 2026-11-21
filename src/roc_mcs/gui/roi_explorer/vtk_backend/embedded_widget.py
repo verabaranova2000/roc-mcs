@@ -67,10 +67,14 @@ class _SourceDropdownButton(SmartDropdownButton):
         option.features &= ~QtWidgets.QStyleOptionToolButton.ToolButtonFeature.HasMenu
         option.subControls &= ~QtWidgets.QStyle.SubControl.SC_ToolButtonMenu
         painter = QtWidgets.QStylePainter(self)
+        if not painter.isActive():
+            return
         painter.drawComplexControl(QtWidgets.QStyle.ComplexControl.CC_ToolButton, option)
         painter.end()
 
         marker = QtGui.QPainter(self)
+        if not marker.isActive():
+            return
         marker.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
         marker.setPen(QtCore.Qt.PenStyle.NoPen)
         marker.setBrush(QtGui.QColor(*SMART_DROPDOWN_INDICATOR_RGBA))
@@ -126,6 +130,8 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
         self._closed = False
         self._permanently_closed = False
         self._release_in_progress = False
+        self._final_shutdown_pending = False
+        self._vtk_init_attempts = 0
         self._init_pending = False
         self._init_generation = 0
         self._first_payload = True
@@ -273,9 +279,13 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
         self.theta_index.setRange(0, 0)
         self.theta_label = QtWidgets.QLabel("θ = —")
         self.theta_palette = QtWidgets.QComboBox()
-        for name in ("viridis", "inferno", "magma", "plasma", "cividis", "gray"):
+        # Match the independently tested standalone VTK viewer defaults.
+        for name in ("turbo", "viridis", "inferno", "magma", "plasma", "cividis", "gray"):
             self.theta_palette.addItem(name, name)
-        self.theta_strength = self._spin(0.0, 1.0, 0.75, 2)
+        turbo_index = self.theta_palette.findData("turbo")
+        if turbo_index >= 0:
+            self.theta_palette.setCurrentIndex(turbo_index)
+        self.theta_strength = self._spin(0.0, 1.0, 0.90, 2, step=0.05)
         theta = self._settings_panel(
             ("Срез", self.theta_label),
             ("Индекс θ", self.theta_index),
@@ -776,10 +786,13 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
         self._init_pending = True
         self._init_generation += 1
         ticket = self._init_generation
+        # Geometry is committed by the MDI area before show(). Create the
+        # native QVTK surface on the next event-loop turn; readiness is
+        # checked explicitly below instead of sleeping for fixed 80/100 ms.
         if self._qvtk is not None:
             QtCore.QTimer.singleShot(0, lambda t=ticket: self._initialize_vtk(t))
         else:
-            QtCore.QTimer.singleShot(80, lambda t=ticket: self._ensure_vtk(t))
+            QtCore.QTimer.singleShot(0, lambda t=ticket: self._ensure_vtk(t))
 
     def showEvent(self, event):
         active_theme = resolve_theme(self.parentWidget() or self)
@@ -808,9 +821,14 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
             self.viewport_layout.removeWidget(self.placeholder)
             self.placeholder.hide()
             self.viewport_layout.addWidget(widget, 0, 0)
+            # Activate the already-sized viewport layout before creating the
+            # native child surface. This uses the final MDI geometry, not a
+            # temporary default-size QVTK window.
+            self.viewport_layout.activate()
             widget.show()
             widget.winId()
-            QtCore.QTimer.singleShot(100, lambda t=ticket: self._initialize_vtk(t))
+            self._vtk_init_attempts = 0
+            QtCore.QTimer.singleShot(0, lambda t=ticket: self._initialize_vtk(t))
         except Exception as exc:
             self._init_pending = False
             request = self._dataset_request
@@ -831,7 +849,25 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
             self._init_pending = False
             return
         try:
-            # Обновляем тему до первого paint QVTK/HUD, а не после загрузки объёма.
+            native_created = bool(
+                widget.testAttribute(QtCore.Qt.WidgetAttribute.WA_WState_Created)
+            )
+            surface_ready = (
+                widget.isVisible()
+                and native_created
+                and widget.width() > 1
+                and widget.height() > 1
+            )
+            if not surface_ready:
+                self._vtk_init_attempts += 1
+                if self._vtk_init_attempts <= 40:
+                    QtCore.QTimer.singleShot(25, lambda t=ticket: self._initialize_vtk(t))
+                    return
+                raise RuntimeError(
+                    "Qt не подготовил видимую native surface QVTK за 1 секунду "
+                    "(видимость, HWND или размер viewport не готовы)."
+                )
+            # Не вызываем repaint()/processEvents(): QVTK владеет paint-on-screen
             self.apply_theme(resolve_theme(self.parentWidget() or self))
             render_window = widget.GetRenderWindow()
             if not bool(render_window.IsA("vtkOpenGLRenderWindow")):
@@ -1351,22 +1387,38 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
         self.status.setText(str(message))
 
     def release_vtk_scene(self, *, final: bool = False):
-        """Release one QVTK instance through its owning Qt widget.
+        """Освободить одну QVTK-сцену через владельца native Qt surface.
 
-        Closing the 3D MDI subwindow is temporary and permits later reopening.
-        Closing the Explorer is terminal.  Scene observers are detached first;
-        QVTKRenderWindowInteractor.closeEvent() then performs the single
-        authoritative RenderWindow.Finalize() while its native surface exists.
+        Закрытие MDI-окна временное; закрытие ROI Explorer терминальное. HUD
+        останавливается первым, наблюдатели сцены снимаются при живом interactor,
+        затем QVTK closeEvent единожды отключает interactor и вызывает Finalize.
         """
-        # Record a terminal request even if a temporary MDI release is already
-        # in progress.  The outer release's finally block will then keep the
-        # widget closed and skip rebuilding UI for a parent that is closing.
         if final:
             self._permanently_closed = True
         if self._release_in_progress:
+            if final:
+                self._final_shutdown_pending = True
             return
+
+        # A previous X-button close may already have released the scene/QVTK.
+        # Final Explorer close must still retire the native HUD and its popup.
         if self._permanently_closed and self._scene is None and self._qvtk is None:
             self._closed = True
+            self._roi_preview_timer.stop()
+            self._settings_timer.stop()
+            self._init_pending = False
+            self._init_generation += 1
+            self._generation += 1
+            try:
+                self._thread_pool.clear()
+            except RuntimeError:
+                pass
+            self._active_worker = None
+            if self.display is not None:
+                try:
+                    self.display.prepare_for_shutdown(final=True)
+                except (RuntimeError, AttributeError):
+                    logger.exception("Не удалось окончательно остановить native VTK HUD")
             return
 
         self._release_in_progress = True
@@ -1382,9 +1434,7 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
             self._payload = None
             self._roi_preview = None
 
-            # Discard queued work and invalidate any in-flight CPU-only payload
-            # build.  A late result is ignored by its generation token; Python
-            # worker threads are never force-killed during Qt shutdown.
+            # Инвалидируем незавершённые CPU-задачи; не завершаем потоки насильно.
             try:
                 self._thread_pool.clear()
             except RuntimeError:
@@ -1397,41 +1447,27 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
             self._interactor = None
             cleanup_errors = []
 
-            # Quiesce the native HUD before touching the render window.  Its
-            # popup is a QWidgetAction attached to a native sibling of QVTK;
-            # leaving it visible while the parent HWND is being torn down can
-            # provoke late QPainter/QWidgetWindow callbacks on Windows.
             if self.display is not None:
                 try:
-                    if final:
-                        self.display.prepare_for_shutdown()
-                    else:
-                        self.display.set_scene_available(False)
+                    # Закрывает popup при обоих сценариях. При temporary close
+                    # HUD/event filter остаются переиспользуемыми; final удаляет
+                    # popup и снимает event filter перед уничтожением родителей.
+                    self.display.prepare_for_shutdown(final=final)
                 except (RuntimeError, AttributeError) as exc:
                     cleanup_errors.append(f"display HUD: {exc}")
+                    logger.exception("Не удалось остановить VTK HUD")
 
-            # Stop QVTK's Qt timer first, so no queued TimerEvent can enter
-            # the scene while its observers/widgets are being detached.  Keep
-            # the interactor enabled until scene.close() has unregistered its
-            # own widgets; disable it immediately afterwards, before Finalize.
-            interactor_to_disable = None
             if widget is not None:
                 try:
                     timer = getattr(widget, "_Timer", None)
                     if timer is not None:
                         timer.stop()
-                    render_window = widget.GetRenderWindow()
-                    interactor_to_disable = (
-                        render_window.GetInteractor() if render_window is not None else None
-                    )
                 except Exception as exc:
-                    cleanup_errors.append(f"QVTK quiesce: {type(exc).__name__}: {exc}")
-                    logger.exception("Не удалось остановить QVTK timer перед очисткой VTK-сцены")
+                    cleanup_errors.append(f"QVTK timer: {type(exc).__name__}: {exc}")
+                    logger.exception("Не удалось остановить QVTK timer перед очисткой сцены")
 
-            # Detach application observers and widgets, but never call
-            # MakeCurrent/ReleaseGraphicsResources/RemoveRenderer here.  Those
-            # operations duplicate or race the native-window cleanup owned by
-            # QVTK's Finalize().
+            # Сначала снимаем application observers/widgets сцены при живом
+            # interactor. Native OpenGL ресурсы здесь вручную не трогаем.
             if scene is not None:
                 try:
                     scene.close()
@@ -1441,23 +1477,17 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
 
             if widget is not None:
                 try:
-                    if interactor_to_disable is not None:
-                        interactor_to_disable.Disable()
-                except Exception as exc:
-                    cleanup_errors.append(f"VTK interactor disable: {type(exc).__name__}: {exc}")
-                    logger.exception("Не удалось отключить VTK interactor после очистки сцены")
-                try:
                     widget.setUpdatesEnabled(False)
-                    # _TrackedQVTK performs the one authoritative Finalize.
+                    # _TrackedQVTK.closeEvent: stop timer, Disable один раз,
+                    # затем QVTK base closeEvent -> единственный Finalize.
                     widget.close()
                 except Exception as exc:
                     cleanup_errors.append(f"QVTK Finalize: {type(exc).__name__}: {exc}")
                     logger.exception("Ошибка Finalize для QVTK render window")
                 try:
                     self.viewport_layout.removeWidget(widget)
-                    # Keep the finalized native child under its original Qt
-                    # parent until deleteLater; setParent(None) would turn it
-                    # into a top-level native window during shutdown.
+                    # Не setParent(None): native child остаётся под прежним
+                    # Qt-родителем и уничтожается стандартным parent lifecycle.
                     widget.deleteLater()
                 except RuntimeError as exc:
                     cleanup_errors.append(f"QVTK widget detach: {exc}")
@@ -1481,14 +1511,20 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
                 else:
                     self.status.setText("VTK/OpenGL-сцена закрыта.")
 
-            # Keep the scene wrapper alive until QVTK.close()/Finalize has
-            # returned.  It is then released with the local reference below.
+            # Локальные ссылки удерживают scene/widget до завершения Finalize.
             scene = None
             widget = None
             self._first_payload = True
         finally:
             self._release_in_progress = False
             self._closed = self._permanently_closed
+            if self._final_shutdown_pending:
+                self._final_shutdown_pending = False
+                if self.display is not None:
+                    try:
+                        self.display.prepare_for_shutdown(final=True)
+                    except (RuntimeError, AttributeError):
+                        logger.exception("Не удалось окончательно остановить native VTK HUD")
 
     def _render(self):
         widget = self._qvtk

@@ -1,7 +1,7 @@
 """Рабочая область научных экранов: ручное изменение окон не перетасовывает соседей."""
 from __future__ import annotations
 import math
-from PyQt6.QtCore import QEvent,QRect,QSize,Qt,QTimer,pyqtSignal,QRectF
+from PyQt6.QtCore import QEvent,QLineF,QRect,QSize,Qt,QTimer,pyqtSignal,QRectF
 from PyQt6.QtWidgets import QHBoxLayout,QMdiArea,QMdiSubWindow,QSizePolicy,QSplitter,QToolButton,QVBoxLayout,QWidget,QMenu,QWidgetAction
 from PyQt6.QtGui import QPainter,QPen,QColor,QPainterPath
 from roc_mcs.gui.roi_explorer.roi_manager_widget import RoiManagerWidget
@@ -21,24 +21,66 @@ ROI_RAIL_COMPACT_WIDTH = 22
 ROI_RAIL_EXPANDED_WIDTH = 282
 
 class _PlotSubWindow(QMdiSubWindow):
-    """Закрытие скрывает экран и сохраняет его состояние."""
-    def __init__(self,area,key,title,on_close=None):
-        super().__init__();self._area=area;self.plot_key=key;self._on_explicit_close=on_close;self.setWindowTitle(title);self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose,False);self.setOption(QMdiSubWindow.SubWindowOption.RubberBandMove,True);self.setOption(QMdiSubWindow.SubWindowOption.RubberBandResize,True)
-    def closeEvent(self,event):
-        # X = уничтожить ресурсы конкретного backend; hide/minimize этого не вызывает.
+    """Закрытие скрывает экран и освобождает только его backend."""
+    def __init__(self, area, key, title, on_close=None):
+        super().__init__()
+        self._area = area
+        self.plot_key = key
+        self._on_explicit_close = on_close
+        self.setWindowTitle(title)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
+        self.setOption(QMdiSubWindow.SubWindowOption.RubberBandMove, True)
+        self.setOption(QMdiSubWindow.SubWindowOption.RubberBandResize, True)
+
+    def closeEvent(self, event):
+        # Кнопка X закрывает только это MDI-окно; при следующем открытии backend
+        # будет создан заново. Сначала освобождаем QVTK, затем скрываем окно.
         if callable(self._on_explicit_close):
-            try:self._on_explicit_close()
-            except Exception:pass
-        event.accept();self.hide();self._area.panel_visibility_changed.emit(self.plot_key,False)
+            try:
+                self._on_explicit_close()
+            except Exception:
+                pass
+        event.accept()
+        self.hide()
+        self._area._on_subwindow_closed(self.plot_key)
+
 
 class _PlotMdiArea(QMdiArea):
-    """Раскладывает окна только по явной команде; ручной resize соседей не затрагивает."""
-    panel_visibility_changed=pyqtSignal(str,bool)
-    panel_restored=pyqtSignal(str)
-    def __init__(self,parent=None):
-        super().__init__(parent);self.setObjectName("plotMdiArea");self.setViewMode(QMdiArea.ViewMode.SubWindowView);self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff);self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff);self.setActivationOrder(QMdiArea.WindowOrder.ActivationHistoryOrder);self.setOption(QMdiArea.AreaOption.DontMaximizeSubWindowOnActivation,True);self.setSizePolicy(QSizePolicy.Policy.Expanding,QSizePolicy.Policy.Expanding);self.setMinimumSize(340,300);self._keys={};self._layout_choice="focus";self._initial_layout_done=False;self._initial_layout_pending=False;self._viewport_size=QSize();self._area_size=QSize();self._resize_pending=False;self._save_timer=QTimer(self);self._save_timer.setSingleShot(True);self._save_timer.setInterval(500);self._save_timer.timeout.connect(self.save_geometry);self._viewport_timer=QTimer(self);self._viewport_timer.setSingleShot(True);self._viewport_timer.setInterval(180);self._viewport_timer.timeout.connect(self._fit_after_viewport_resize);self.panel_visibility_changed.connect(self._schedule_save);self.panel_visibility_changed.connect(lambda *_:QTimer.singleShot(100,lambda:self._apply_layout(self._layout_choice)))
+    """Управляет геометрией/порядком MDI-панелей без пересоздания их содержимого."""
+    panel_visibility_changed = pyqtSignal(str, bool)
+    panel_restored = pyqtSignal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("plotMdiArea")
+        self.setViewMode(QMdiArea.ViewMode.SubWindowView)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setActivationOrder(QMdiArea.WindowOrder.ActivationHistoryOrder)
+        self.setOption(QMdiArea.AreaOption.DontMaximizeSubWindowOnActivation, True)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.setMinimumSize(340, 300)
+        self._keys = {}
+        self._layout_choice = "focus"
+        self._initial_layout_done = False
+        self._initial_layout_pending = False
+        self._maximized_key = None
+        self._viewport_size = QSize()
+        self._area_size = QSize()
+        self._save_timer = QTimer(self)
+        self._save_timer.setSingleShot(True)
+        self._save_timer.setInterval(500)
+        self._save_timer.timeout.connect(self.save_geometry)
+        self._viewport_timer = QTimer(self)
+        self._viewport_timer.setSingleShot(True)
+        self._viewport_timer.setInterval(16)
+        self._viewport_timer.timeout.connect(self._fit_after_viewport_resize)
+        # Visibility changes are laid out synchronously in show_panel(); do not
+        # schedule a second 100 ms layout which caused the visible overlap/flicker.
+        self.panel_visibility_changed.connect(self._schedule_save)
+
     def _queue_initial_layout(self):
-        """Запланировать только раскладку, не меняя видимость MDI-окон."""
+        """Запланировать геометрию; видимость начальных окон от этого не зависит."""
         if self._initial_layout_done or self._initial_layout_pending:
             return
         self._initial_layout_pending = True
@@ -52,41 +94,155 @@ class _PlotMdiArea(QMdiArea):
         super().showEvent(event)
         self._queue_initial_layout()
 
-    def add_plot(self,key,title,widget,*,initial_visible=True,on_close=None):
-        win=_PlotSubWindow(self,key,title,on_close=on_close);win.setWindowFlags(Qt.WindowType.SubWindow|Qt.WindowType.CustomizeWindowHint|Qt.WindowType.WindowTitleHint|Qt.WindowType.WindowCloseButtonHint|Qt.WindowType.WindowMinMaxButtonsHint);win.setWidget(widget);m=widget.minimumSize();h=widget.minimumSizeHint();win.setMinimumSize(QSize(max(250,m.width(),h.width())+2,max(190,m.height(),h.height())+24));self.addSubWindow(win);self._keys[key]=win;win.installEventFilter(self)
-        win.windowStateChanged.connect(lambda old,new,k=key:self._on_window_state_changed(k,old,new))
-        if initial_visible:win.show()
-        else:win.hide()
+    def add_plot(self, key, title, widget, *, initial_visible=True, on_close=None):
+        win = _PlotSubWindow(self, key, title, on_close=on_close)
+        win.setWindowFlags(
+            Qt.WindowType.SubWindow
+            | Qt.WindowType.CustomizeWindowHint
+            | Qt.WindowType.WindowTitleHint
+            | Qt.WindowType.WindowCloseButtonHint
+            | Qt.WindowType.WindowMinMaxButtonsHint
+        )
+        win.setWidget(widget)
+        minimum = widget.minimumSize()
+        hint = widget.minimumSizeHint()
+        win.setMinimumSize(
+            QSize(
+                max(250, minimum.width(), hint.width()) + 2,
+                max(190, minimum.height(), hint.height()) + 24,
+            )
+        )
+        self.addSubWindow(win)
+        self._keys[key] = win
+        win.installEventFilter(self)
+        win.windowStateChanged.connect(
+            lambda old, new, panel_key=key: self._on_window_state_changed(panel_key, old, new)
+        )
+        # Важно: стартовые карта и ROC остаются видимыми сразу при создании.
+        # Только 3D явно скрыто до нажатия кнопки. Не повторять прежнюю ошибку,
+        # когда все MDI-окна hide() зависели от успешного первого layout pass.
+        if initial_visible:
+            win.show()
+        else:
+            win.hide()
         return win
+
+    def _current_maximized_key(self):
+        for key, win in self._keys.items():
+            if not win.isHidden() and not win.isMinimized() and win.isMaximized():
+                return key
+        return None
+
     def _on_window_state_changed(self, key, old_state, new_state):
         minimized = Qt.WindowState.WindowMinimized
-        if bool(old_state & minimized) and not bool(new_state & minimized):
-            QTimer.singleShot(0, lambda k=key: self.panel_restored.emit(k) if self.is_panel_visible(k) else None)
+        maximized = Qt.WindowState.WindowMaximized
+        win = self._keys.get(key)
+        if win is None:
+            return
 
-    def show_panel(self,key,visible):
-        win=self._keys.get(key)
-        if win is None:return
+        if bool(new_state & maximized):
+            self._maximized_key = key
+            # windowStateChanged приходит во время перехода Qt. Переставляем
+            # sibling windows в следующий event-loop turn, когда MDI уже
+            # завершил внутреннюю обработку maximize/restore.
+            QTimer.singleShot(0, lambda panel_key=key: self._restack_panel(panel_key))
+        elif bool(old_state & maximized):
+            if self._maximized_key == key:
+                self._maximized_key = None
+            QTimer.singleShot(0, lambda panel_key=key: self._restack_panel(panel_key))
+
+        if bool(old_state & minimized) and not bool(new_state & minimized):
+            QTimer.singleShot(0, lambda panel_key=key: self._notify_panel_restored(panel_key))
+
+    def _restack_panel(self, key):
+        win = self._keys.get(key)
+        if win is None or win.isHidden() or win.isMinimized():
+            return
+        # В максимизированном состоянии все остальные MDI-панели должны
+        # оставаться позади 3D. На restore активная панель также остаётся
+        # сверху, но геометрия соседей не меняется.
+        for other in self._keys.values():
+            if other is not win and not other.isHidden() and not other.isMinimized():
+                other.lower()
+        win.raise_()
+        self.setActiveSubWindow(win)
+
+    def _notify_panel_restored(self, key):
+        if self.is_panel_visible(key):
+            self._restack_panel(key)
+            self.panel_restored.emit(key)
+
+    def _on_subwindow_closed(self, key):
+        self._maximized_key = None if self._maximized_key == key else self._maximized_key
+        maximized_key = self._current_maximized_key()
+        if maximized_key:
+            QTimer.singleShot(0, lambda panel_key=maximized_key: self._restack_panel(panel_key))
+        else:
+            # Убираем освободившуюся панель и синхронно перераскладываем только
+            # оставшиеся окна. Нет отложенного второго layout pass.
+            self._apply_layout(self._layout_choice, windows=self._visible())
+        self.panel_visibility_changed.emit(key, False)
+
+    def show_panel(self, key, visible):
+        win = self._keys.get(key)
+        if win is None:
+            return
+
         if visible:
-            if win.isMinimized():win.showNormal()
-            win.show();win.raise_();self.setActiveSubWindow(win)
-        else:win.hide()
-        self.panel_visibility_changed.emit(key,bool(visible))
-    def is_panel_visible(self,key):
-        win=self._keys.get(key)
+            if win.isMinimized():
+                win.showNormal()
+            if not self._initial_layout_done and self.isVisible():
+                self._layout_initial()
+
+            # При открытии 3D конечная геометрия назначается ДО show(). Поэтому
+            # showEvent/ленивая инициализация QVTK сразу получают правильный
+            # размер; не возникает первого кадра с наложенными окнами.
+            target = [item for item in self._visible() if item is not win]
+            target.append(win)
+            maximized_key = self._current_maximized_key()
+            if maximized_key is None:
+                self._apply_layout(self._layout_choice, windows=target)
+
+            win.show()
+            if maximized_key is None:
+                win.raise_()
+                self.setActiveSubWindow(win)
+            else:
+                QTimer.singleShot(0, lambda panel_key=maximized_key: self._restack_panel(panel_key))
+        else:
+            if win.isMaximized():
+                win.showNormal()
+            win.hide()
+            if self._maximized_key == key:
+                self._maximized_key = None
+            maximized_key = self._current_maximized_key()
+            if maximized_key is None:
+                self._apply_layout(self._layout_choice, windows=self._visible())
+            else:
+                QTimer.singleShot(0, lambda panel_key=maximized_key: self._restack_panel(panel_key))
+
+        self.panel_visibility_changed.emit(key, bool(visible))
+
+    def is_panel_visible(self, key):
+        win = self._keys.get(key)
         return bool(win is not None and not win.isHidden() and not win.isMinimized())
-    def _bounds(self):return self.viewport().rect().adjusted(2,2,-2,-2)
-    def _visible(self):return [w for w in self._keys.values() if not w.isHidden() and not w.isMinimized()]
+
+    def _bounds(self):
+        return self.viewport().rect().adjusted(2, 2, -2, -2)
+
+    def _visible(self):
+        return [win for win in self._keys.values() if not win.isHidden() and not win.isMinimized()]
+
     def _layout_initial(self):
         """Применить стартовую геометрию после получения реального viewport.
 
-        Видимость окон устанавливается в add_plot(). Эта функция меняет только
-        геометрию и никогда не скрывает/не показывает дочерние окна.
+        Этот метод никогда не меняет видимость окон. Если первый Qt showEvent
+        пришёл с временным размером viewport, resizeEvent запросит повторную
+        попытку; карта и ROC к этому моменту уже показаны.
         """
         if self._initial_layout_done or not self.isVisible():
             return
         bounds = self._bounds()
-        # При раннем showEvent viewport ещё может иметь временный размер.
-        # Окна уже показаны; повторная попытка будет запрошена из resizeEvent.
         if bounds.width() < 120 or bounds.height() < 100:
             return
 
@@ -98,8 +254,6 @@ class _PlotMdiArea(QMdiArea):
             else "focus"
         )
 
-        # Геометрии старых версий не восстанавливаем: они записаны при другой
-        # геометрии панелей.
         if int(saved.get("layout_version", 0) or 0) < _LAYOUT_VERSION:
             self._apply_layout("focus")
             self._initial_layout_done = True
@@ -110,118 +264,232 @@ class _PlotMdiArea(QMdiArea):
         prev = saved.get("viewport_size") or [bounds.width(), bounds.height()]
         sx = bounds.width() / max(1, int(prev[0]))
         sy = bounds.height() / max(1, int(prev[1]))
-        restored = False
-        for key, win in self._keys.items():
+        restored_geometries = {}
+        for key in self._keys:
             geometry = saved.get(f"{key}_geometry")
             if isinstance(geometry, (list, tuple)) and len(geometry) == 4:
                 try:
                     x, y, width, height = map(int, geometry)
-                    win.setGeometry(
-                        self._clamp(
-                            QRect(
-                                round(x * sx), round(y * sy),
-                                round(width * sx), round(height * sy),
-                            ),
-                            bounds,
-                        )
+                    restored_geometries[key] = self._clamp(
+                        QRect(
+                            round(x * sx), round(y * sy),
+                            round(width * sx), round(height * sy),
+                        ),
+                        bounds,
                     )
-                    restored = True
                 except (ValueError, TypeError, OverflowError):
                     pass
 
-        if not restored:
+        # Восстанавливаем пользовательскую геометрию только когда она есть для
+        # всех сейчас видимых окон. Частичный набор мог бы оставить одну панель
+        # в Qt default-геометрии и визуально наложить её на соседнюю.
+        visible_keys = [win.plot_key for win in self._visible()]
+        if visible_keys and all(key in restored_geometries for key in visible_keys):
+            for key, geometry in restored_geometries.items():
+                self._keys[key].setGeometry(geometry)
+        else:
             self._apply_layout(self._layout_choice)
 
         self._initial_layout_done = True
         self._viewport_size = self.viewport().size()
         self._area_size = self.size()
 
-    def set_layout_choice(self,choice):
-        if choice not in _LAYOUTS:return
-        self._layout_choice=choice;self._apply_layout(choice);self._schedule_save()
-    def _apply_layout(self,choice=None):
-        if choice in _LAYOUTS:self._layout_choice=choice
-        wins=self._visible();bounds=self._bounds();n=len(wins)
-        if not n or bounds.width()<120 or bounds.height()<100:return
-        by={w.plot_key:w for w in wins};x,y,w,h=bounds.x(),bounds.y(),bounds.width(),bounds.height();gap=6
-        def minimum(key,axis):
-            win=by[key];return win.minimumWidth() if axis=="w" else win.minimumHeight()
-        # При тесном окне безопаснее расположить окна каскадом, чем выталкивать их за рамки.
-        choice=self._layout_choice
-        if n==1:by[wins[0].plot_key].setGeometry(bounds)
-        elif n==2:
-            keys=[k for k in ("map","curve","volume") if k in by];a,b=keys
-            if choice=="column" and h-gap>=minimum(a,"h")+minimum(b,"h"):
-                first=max(minimum(a,"h"),min(h-gap-minimum(b,"h"),int((h-gap)*0.5)));by[a].setGeometry(QRect(x,y,w,first));by[b].setGeometry(QRect(x,y+first+gap,w,h-first-gap))
-            elif w-gap>=minimum(a,"w")+minimum(b,"w"):
-                first=max(minimum(a,"w"),min(w-gap-minimum(b,"w"),int((w-gap)*0.5)));by[a].setGeometry(QRect(x,y,first,h));by[b].setGeometry(QRect(x+first+gap,y,w-first-gap,h))
+    def set_layout_choice(self, choice):
+        if choice not in _LAYOUTS:
+            return
+        self._layout_choice = choice
+        if self._current_maximized_key() is None:
+            self._apply_layout(choice)
+        self._schedule_save()
+
+    def _apply_layout(self, choice=None, *, windows=None):
+        if choice in _LAYOUTS:
+            self._layout_choice = choice
+        wins = list(self._visible() if windows is None else windows)
+        wins = [win for win in wins if win is not None and not win.isMinimized()]
+        if not wins or any(win.isMaximized() for win in wins):
+            return
+        bounds = self._bounds()
+        n = len(wins)
+        if bounds.width() < 120 or bounds.height() < 100:
+            return
+        by = {win.plot_key: win for win in wins}
+        x, y, width, height = bounds.x(), bounds.y(), bounds.width(), bounds.height()
+        gap = 6
+
+        def minimum(key, axis):
+            win = by[key]
+            return win.minimumWidth() if axis == "w" else win.minimumHeight()
+
+        choice = self._layout_choice
+        if n == 1:
+            by[wins[0].plot_key].setGeometry(bounds)
+        elif n == 2:
+            keys = [key for key in ("map", "curve", "volume") if key in by]
+            first_key, second_key = keys
+            if choice == "column" and height-gap >= minimum(first_key, "h") + minimum(second_key, "h"):
+                first_size = max(
+                    minimum(first_key, "h"),
+                    min(height-gap-minimum(second_key, "h"), int((height-gap)*0.5)),
+                )
+                by[first_key].setGeometry(QRect(x, y, width, first_size))
+                by[second_key].setGeometry(QRect(x, y+first_size+gap, width, height-first_size-gap))
+            elif width-gap >= minimum(first_key, "w") + minimum(second_key, "w"):
+                first_size = max(
+                    minimum(first_key, "w"),
+                    min(width-gap-minimum(second_key, "w"), int((width-gap)*0.5)),
+                )
+                by[first_key].setGeometry(QRect(x, y, first_size, height))
+                by[second_key].setGeometry(QRect(x+first_size+gap, y, width-first_size-gap, height))
             else:
-                first=max(1,(h-gap)//2);by[a].setGeometry(QRect(x,y,w,first));by[b].setGeometry(QRect(x,y+first+gap,w,h-first-gap))
-        elif choice=="row" and w-2*gap>=sum(minimum(k,"w") for k in ("map","curve","volume")):
-            sizes=self._fit_sizes(w-2*gap,[.34,.33,.33],[minimum(k,"w") for k in ("map","curve","volume")]);pos=x
-            for key,size in zip(("map","curve","volume"),sizes):by[key].setGeometry(QRect(pos,y,size,h));pos+=size+gap
-        elif choice=="column" and h-2*gap>=sum(minimum(k,"h") for k in ("map","curve","volume")):
-            sizes=self._fit_sizes(h-2*gap,[.30,.30,.40],[minimum(k,"h") for k in ("map","curve","volume")]);pos=y
-            for key,size in zip(("map","curve","volume"),sizes):by[key].setGeometry(QRect(x,pos,w,size));pos+=size+gap
-        elif choice=="map3d-top" and h-gap>=max(minimum("map","h"),minimum("volume","h"))+minimum("curve","h"):
-            top=max(max(minimum("map","h"),minimum("volume","h")),min(h-gap-minimum("curve","h"),int((h-gap)*.58)));left=max(minimum("map","w"),min(w-gap-minimum("volume","w"),(w-gap)//2));by["map"].setGeometry(QRect(x,y,left,top));by["volume"].setGeometry(QRect(x+left+gap,y,w-left-gap,top));by["curve"].setGeometry(QRect(x,y+top+gap,w,h-top-gap))
+                first_size = max(1, (height-gap)//2)
+                by[first_key].setGeometry(QRect(x, y, width, first_size))
+                by[second_key].setGeometry(QRect(x, y+first_size+gap, width, height-first_size-gap))
+        elif choice == "row" and width-2*gap >= sum(minimum(key, "w") for key in ("map", "curve", "volume")):
+            sizes = self._fit_sizes(
+                width-2*gap, [.34, .33, .33],
+                [minimum(key, "w") for key in ("map", "curve", "volume")],
+            )
+            pos = x
+            for key, size in zip(("map", "curve", "volume"), sizes):
+                by[key].setGeometry(QRect(pos, y, size, height))
+                pos += size + gap
+        elif choice == "column" and height-2*gap >= sum(minimum(key, "h") for key in ("map", "curve", "volume")):
+            sizes = self._fit_sizes(
+                height-2*gap, [.30, .30, .40],
+                [minimum(key, "h") for key in ("map", "curve", "volume")],
+            )
+            pos = y
+            for key, size in zip(("map", "curve", "volume"), sizes):
+                by[key].setGeometry(QRect(x, pos, width, size))
+                pos += size + gap
+        elif choice == "map3d-top" and height-gap >= max(minimum("map", "h"), minimum("volume", "h")) + minimum("curve", "h"):
+            top = max(
+                max(minimum("map", "h"), minimum("volume", "h")),
+                min(height-gap-minimum("curve", "h"), int((height-gap)*.58)),
+            )
+            left = max(
+                minimum("map", "w"),
+                min(width-gap-minimum("volume", "w"), (width-gap)//2),
+            )
+            by["map"].setGeometry(QRect(x, y, left, top))
+            by["volume"].setGeometry(QRect(x+left+gap, y, width-left-gap, top))
+            by["curve"].setGeometry(QRect(x, y+top+gap, width, height-top-gap))
         else:
-            # Стартовая схема: карта слева на всю высоту; ROC сверху справа, 3D снизу справа.
-            left_min=max(minimum("map","w"),180);right_min=max(minimum("curve","w"),minimum("volume","w"),180)
-            if w-gap>=left_min+right_min and h-gap>=minimum("curve","h")+minimum("volume","h"):
-                left=max(left_min,min(w-gap-right_min,round((w-gap)*FOCUS_LEFT_RATIO)));right=w-left-gap
-                top=max(minimum("curve","h"),min(h-gap-minimum("volume","h"),round((h-gap)*FOCUS_TOP_RATIO)))
-                by["map"].setGeometry(QRect(x,y,left,h));by["curve"].setGeometry(QRect(x+left+gap,y,right,top));by["volume"].setGeometry(QRect(x+left+gap,y+top+gap,right,h-top-gap))
+            # Стартовая схема: карта слева, ROC сверху справа, 3D снизу справа.
+            left_min = max(minimum("map", "w"), 180)
+            right_min = max(minimum("curve", "w"), minimum("volume", "w"), 180)
+            if width-gap >= left_min+right_min and height-gap >= minimum("curve", "h")+minimum("volume", "h"):
+                left = max(left_min, min(width-gap-right_min, round((width-gap)*FOCUS_LEFT_RATIO)))
+                right = width-left-gap
+                top = max(
+                    minimum("curve", "h"),
+                    min(height-gap-minimum("volume", "h"), round((height-gap)*FOCUS_TOP_RATIO)),
+                )
+                by["map"].setGeometry(QRect(x, y, left, height))
+                by["curve"].setGeometry(QRect(x+left+gap, y, right, top))
+                by["volume"].setGeometry(QRect(x+left+gap, y+top+gap, right, height-top-gap))
             else:
-                # Если места мало, панели не накладываются: они доступны прокруткой MDI.
-                heights=self._fit_sizes(max(3,h-2*gap),[.34,.33,.33],[minimum(k,"h") for k in ("map","curve","volume")]);pos=y
-                for key,size in zip(("map","curve","volume"),heights):by[key].setGeometry(QRect(x,pos,w,size));pos+=size+gap
-        self._viewport_size=self.viewport().size();self._area_size=self.size();self._schedule_save()
+                sizes = self._fit_sizes(
+                    max(3, height-2*gap), [.34, .33, .33],
+                    [minimum(key, "h") for key in ("map", "curve", "volume")],
+                )
+                pos = y
+                for key, size in zip(("map", "curve", "volume"), sizes):
+                    by[key].setGeometry(QRect(x, pos, width, size))
+                    pos += size + gap
+
+        self._viewport_size = self.viewport().size()
+        self._area_size = self.size()
+        self._schedule_save()
+
     @staticmethod
-    def _fit_sizes(total,weights,minimums):
-        total=max(1,int(total));minimums=[max(1,int(v)) for v in minimums]
-        if sum(minimums)>total:return [max(1,int(total*max(.01,w)/sum(weights))) for w in weights]
-        weights=[max(.01,float(v)) for v in weights];sw=sum(weights);sizes=[max(m,int(total*v/sw)) for m,v in zip(minimums,weights)]
-        while sum(sizes)>total:
-            i=max((i for i,v in enumerate(sizes) if v>minimums[i]),key=lambda i:sizes[i]-minimums[i],default=None)
-            if i is None:break
-            sizes[i]-=1
-        while sum(sizes)<total:sizes[max(range(len(weights)),key=lambda i:weights[i])]+=1
+    def _fit_sizes(total, weights, minimums):
+        total = max(1, int(total))
+        minimums = [max(1, int(value)) for value in minimums]
+        if sum(minimums) > total:
+            return [max(1, int(total*max(.01, weight)/sum(weights))) for weight in weights]
+        weights = [max(.01, float(value)) for value in weights]
+        weight_sum = sum(weights)
+        sizes = [max(minimum, int(total*weight/weight_sum)) for weight, minimum in zip(weights, minimums)]
+        while sum(sizes) > total:
+            index = max(
+                (i for i, value in enumerate(sizes) if value > minimums[i]),
+                key=lambda i: sizes[i]-minimums[i],
+                default=None,
+            )
+            if index is None:
+                break
+            sizes[index] -= 1
+        while sum(sizes) < total:
+            sizes[max(range(len(weights)), key=lambda i: weights[i])] += 1
         return sizes
+
     @staticmethod
-    def _clamp(rect,bounds):
-        ww=max(1,min(rect.width(),bounds.width()));hh=max(1,min(rect.height(),bounds.height()));return QRect(max(bounds.x(),min(rect.x(),bounds.right()-ww+1)),max(bounds.y(),min(rect.y(),bounds.bottom()-hh+1)),ww,hh)
-    def resizeEvent(self,event):
-        old=QSize(self._area_size);super().resizeEvent(event);new=QSize(self.size())
-        # Если showEvent пришёл до окончательной геометрии родительского layout,
-        # повторяем только стартовую раскладку. Сам факт видимости окон от этого
-        # не зависит: начальные окна уже показаны в add_plot().
+    def _clamp(rect, bounds):
+        width = max(1, min(rect.width(), bounds.width()))
+        height = max(1, min(rect.height(), bounds.height()))
+        return QRect(
+            max(bounds.x(), min(rect.x(), bounds.right()-width+1)),
+            max(bounds.y(), min(rect.y(), bounds.bottom()-height+1)),
+            width,
+            height,
+        )
+
+    def resizeEvent(self, event):
+        old = QSize(self._area_size)
+        super().resizeEvent(event)
+        new = QSize(self.size())
         if not self._initial_layout_done and self.isVisible():
             bounds = self._bounds()
             if bounds.width() >= 120 and bounds.height() >= 100:
                 self._queue_initial_layout()
-        # После начальной раскладки resize внешней области лишь удерживает окна
-        # в границах viewport и не перетасовывает их.
-        elif old.isValid() and old.width()>0 and old.height()>0 and (new.width()!=old.width() or new.height()!=old.height()):self._viewport_timer.start()
-        elif not old.isValid():self._area_size=new;self._viewport_size=self.viewport().size()
+        elif old.isValid() and old.width() > 0 and old.height() > 0 and (new.width() != old.width() or new.height() != old.height()):
+            self._viewport_timer.start()
+        elif not old.isValid():
+            self._area_size = new
+            self._viewport_size = self.viewport().size()
+
     def _fit_after_viewport_resize(self):
-        bounds=self._bounds()
+        bounds = self._bounds()
         for win in self._visible():
-            g=win.geometry();ww=min(g.width(),bounds.width());hh=min(g.height(),bounds.height())
-            x=max(bounds.left(),min(g.x(),bounds.right()-ww+1));y=max(bounds.top(),min(g.y(),bounds.bottom()-hh+1))
-            if (x,y,ww,hh)!=(g.x(),g.y(),g.width(),g.height()):win.setGeometry(QRect(x,y,ww,hh))
-        self._viewport_size=self.viewport().size();self._area_size=self.size();self._schedule_save()
-    def eventFilter(self,watched,event):
-        # Только сохраняем ручную геометрию — никогда не меняем её в ответ на drag/resize.
-        if watched in self._keys.values() and event.type() in (QEvent.Type.Move,QEvent.Type.Resize):self._schedule_save()
-        return super().eventFilter(watched,event)
-    def _schedule_save(self,*_):self._save_timer.start()
+            if win.isMaximized():
+                continue
+            geometry = win.geometry()
+            width = min(geometry.width(), bounds.width())
+            height = min(geometry.height(), bounds.height())
+            x = max(bounds.left(), min(geometry.x(), bounds.right()-width+1))
+            y = max(bounds.top(), min(geometry.y(), bounds.bottom()-height+1))
+            if (x, y, width, height) != (geometry.x(), geometry.y(), geometry.width(), geometry.height()):
+                win.setGeometry(QRect(x, y, width, height))
+        self._viewport_size = self.viewport().size()
+        self._area_size = self.size()
+        self._schedule_save()
+
+    def eventFilter(self, watched, event):
+        # Перетаскивание/ручной resize сохраняются, но не перестраивают соседей.
+        if watched in self._keys.values() and event.type() in (QEvent.Type.Move, QEvent.Type.Resize):
+            self._schedule_save()
+        return super().eventFilter(watched, event)
+
+    def _schedule_save(self, *_args):
+        self._save_timer.start()
+
     def save_geometry(self):
-        data=load_plot_display_settings();work=data.setdefault("workspace",{})
-        for key,win in self._keys.items():work[f"{key}_geometry"]=list(win.geometry().getRect()) if not win.isHidden() else None
-        work["orientation"]="manual";work["layout_choice"]=self._layout_choice;work["layout_version"]=_LAYOUT_VERSION;work["viewport_size"]=[max(1,self.viewport().width()),max(1,self.viewport().height())]
-        try:save_plot_display_settings(data)
-        except Exception:pass
+        data = load_plot_display_settings()
+        workspace = data.setdefault("workspace", {})
+        for key, win in self._keys.items():
+            geometry = win.normalGeometry() if (win.isMaximized() or win.isMinimized()) else win.geometry()
+            workspace[f"{key}_geometry"] = list(geometry.getRect()) if not win.isHidden() else None
+        workspace["orientation"] = "manual"
+        workspace["layout_choice"] = self._layout_choice
+        workspace["layout_version"] = _LAYOUT_VERSION
+        workspace["viewport_size"] = [max(1, self.viewport().width()), max(1, self.viewport().height())]
+        try:
+            save_plot_display_settings(data)
+        except Exception:
+            pass
+
 
 class _LayoutPreviewButton(QToolButton):
     """Схематичная плитка-предпросмотр схемы окон."""
@@ -229,7 +497,9 @@ class _LayoutPreviewButton(QToolButton):
         super().__init__(parent);self.mode=mode;self.label=label;self._selected=False;self.setFixedSize(158,54);self.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly);self.setCursor(Qt.CursorShape.PointingHandCursor);self.setToolTip(label)
     def set_selected(self,value):self._selected=bool(value);self.update()
     def paintEvent(self,event):
-        p=QPainter(self);p.setRenderHint(QPainter.RenderHint.Antialiasing,True);pal=self.palette();bg=pal.color(pal.ColorRole.Base);fg=pal.color(pal.ColorRole.Text);edge=pal.color(pal.ColorRole.Highlight if self._selected else pal.ColorRole.Mid)
+        p=QPainter(self)
+        if not p.isActive(): return
+        p.setRenderHint(QPainter.RenderHint.Antialiasing,True);pal=self.palette();bg=pal.color(pal.ColorRole.Base);fg=pal.color(pal.ColorRole.Text);edge=pal.color(pal.ColorRole.Highlight if self._selected else pal.ColorRole.Mid)
         p.setPen(QPen(edge,1.5 if self._selected else 0.8));p.setBrush(bg);p.drawRoundedRect(QRectF(1,1,self.width()-2,self.height()-2),4,4)
         left,top,ww,hh,gap=8,7,82,40,3;panel=QColor(100,145,185,75)
         def tile(rx,ry,rw,rh,kind):
@@ -274,7 +544,7 @@ class PlotWorkspaceWidget(QSplitter):
         for mode,label in (("focus","Карта слева · ROC и 3D справа"),("row","Три окна в ряд"),("column","Три окна вертикально"),("map3d-top","Карта и 3D сверху · ROC снизу")):
             preview=_LayoutPreviewButton(mode,label,self.layout_menu);action=QWidgetAction(self.layout_menu);action.setDefaultWidget(preview);self.layout_menu.addAction(action);preview.clicked.connect(lambda _=False,m=mode:self._choose_layout(m));self._layout_preview_buttons[mode]=preview
         self.arrange_btn.clicked.connect(lambda:self.mdi_area.set_layout_choice(self.mdi_area._layout_choice));self.mdi_area.panel_visibility_changed.connect(self._sync_panel_buttons)
-        self.addWidget(self.roi_manager);self.addWidget(self.plot_area);self.setStretchFactor(0,0);self.setStretchFactor(1,1);self.setCollapsible(0,True);self.setCollapsible(1,False);self.setHandleWidth(8);self.roi_manager.setFixedWidth(22);self.setSizes([22,900]);self.setMinimumSize(400,340);self._style_toolbar();QTimer.singleShot(0,self._force_compact_rail);QTimer.singleShot(0,self.mdi_area._layout_initial)
+        self.addWidget(self.roi_manager);self.addWidget(self.plot_area);self.setStretchFactor(0,0);self.setStretchFactor(1,1);self.setCollapsible(0,True);self.setCollapsible(1,False);self.setHandleWidth(8);self.roi_manager.setFixedWidth(22);self.setSizes([22,900]);self.setMinimumSize(400,340);self._style_toolbar();QTimer.singleShot(0,self._force_compact_rail)
     def _choose_layout(self,mode):
         self.mdi_area.set_layout_choice(mode)
         for key,button in self._layout_preview_buttons.items():button.set_selected(key==mode)

@@ -51,6 +51,8 @@ class _VolumeContrastRangeSlider(QRangeSlider):
 
     def paintEvent(self, _event):
         painter = QPainter(self)
+        if not painter.isActive():
+            return
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         colors = self._theme_palette
         is_dark = self._theme == "dark"
@@ -108,6 +110,8 @@ class _VerticalColorRamp(QWidget):
 
     def paintEvent(self, _event):
         painter = QPainter(self)
+        if not painter.isActive():
+            return
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         rect = self.rect().adjusted(1, 1, -1, -1)
         gradient = QLinearGradient(0.0, float(rect.bottom()), 0.0, float(rect.top()))
@@ -131,6 +135,14 @@ class VTKVolumeDisplayWidget(QFrame):
 
     thresholds_changed = pyqtSignal(float, float)
 
+    @staticmethod
+    def _root_window_widget(widget: QWidget) -> QWidget:
+        """Return the outermost QWidget owner, not an MDI/native child window."""
+        owner = widget
+        while owner.parentWidget() is not None:
+            owner = owner.parentWidget()
+        return owner
+
     def __init__(self, viewport: QWidget, parent=None):
         super().__init__(viewport if parent is None else parent)
         # Give the entire HUD a valid point-sized font before constructing any
@@ -144,6 +156,7 @@ class VTKVolumeDisplayWidget(QFrame):
         self._theme = "light"
         self._scene_available = False
         self._show_colorbar = True
+        self._native_shutdown_prepared = False
         self._low_spin = None
         self._high_spin = None
         self._syncing_thresholds = False
@@ -231,7 +244,11 @@ class VTKVolumeDisplayWidget(QFrame):
         options_row.addStretch(1)
         root.addLayout(options_row)
 
-        self.settings_menu = QMenu(self)
+        # This HUD is a native child QWidgetWindow above QVTK, not a top-level
+        # owner for a popup. Give QMenu the real root application window so
+        # Windows transient-parenting never targets VTKVolumeDisplayOverlayWindow.
+        self._popup_owner = self._root_window_widget(self)
+        self.settings_menu = QMenu(self._popup_owner)
         self.settings_menu.setObjectName("VTKVolumeDisplayMenu")
         self.settings_menu.setToolTipsVisible(True)
         # Native popup menus can outlive the stylesheet context from which
@@ -274,6 +291,12 @@ class VTKVolumeDisplayWidget(QFrame):
         self._viewport = viewport
         self._viewport_layout = viewport.layout()
         self.setParent(viewport)
+        if not self._native_shutdown_prepared:
+            new_popup_owner = self._root_window_widget(viewport)
+            if new_popup_owner is not self._popup_owner:
+                menu_flags = self.settings_menu.windowFlags()
+                self.settings_menu.setParent(new_popup_owner, menu_flags)
+                self._popup_owner = new_popup_owner
         self.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
         self.setAttribute(Qt.WidgetAttribute.WA_AlwaysStackOnTop, True)
         self.winId()
@@ -438,12 +461,15 @@ class VTKVolumeDisplayWidget(QFrame):
         self._scene_available = bool(available)
         self._sync_visibility()
 
-    def prepare_for_shutdown(self) -> None:
-        """Silence the native HUD before its parent viewport is destroyed.
+    def prepare_for_shutdown(self, *, final: bool = False) -> None:
+        """Stop popup/paint traffic without manually destroying the native HUD.
 
-        This intentionally does not reparent the native child or force a
-        repaint.  The Qt parent remains its owner and destroys it normally.
+        Temporary 3D-window close keeps the HUD reusable. Final Explorer close
+        removes its viewport event filter and retires the top-level-owned menu;
+        Qt still owns the native child HWND and destroys it with its viewport.
         """
+        if final and self._native_shutdown_prepared:
+            return
         self._scene_available = False
         try:
             self.settings_menu.close()
@@ -454,10 +480,18 @@ class VTKVolumeDisplayWidget(QFrame):
             self.setEnabled(False)
         except RuntimeError:
             pass
-        viewport = self._viewport
-        if viewport is not None:
+
+        if final:
+            self._native_shutdown_prepared = True
+            viewport = self._viewport
+            if viewport is not None:
+                try:
+                    viewport.removeEventFilter(self)
+                except RuntimeError:
+                    pass
             try:
-                viewport.removeEventFilter(self)
+                self.setUpdatesEnabled(False)
+                self.settings_menu.deleteLater()
             except RuntimeError:
                 pass
 
