@@ -24,6 +24,7 @@ class ProcessingStepsPanel(QWidget):
     restore_requested = pyqtSignal()
     busy_changed = pyqtSignal(bool)
     status_changed = pyqtSignal(str)
+    pixel_pick_mode_requested = pyqtSignal(bool, str, bool)
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -69,6 +70,8 @@ class ProcessingStepsPanel(QWidget):
             return
         if old.is_busy:
             raise RuntimeError("Нельзя сменить скан во время выполнения workflow")
+        if old._active_stage_popup is not None:
+            old._active_stage_popup.close()
         # A preview is temporary: restore the host's HDF5 view before the old
         # workbench is detached, then persist its workflow history atomically.
         old._restore_preview()
@@ -77,6 +80,16 @@ class ProcessingStepsPanel(QWidget):
         old.setParent(None)
         old.deleteLater()
         self.workbench = None
+
+    def set_peak_preview_pixel(self, detector_x: float, detector_y: float) -> None:
+        """Forward a detector-map pick to the active Workbench form."""
+        if self.workbench is not None:
+            self.workbench.set_peak_preview_pixel(float(detector_x), float(detector_y))
+
+    def cancel_peak_pixel_pick_mode(self) -> None:
+        """Synchronize the embedded point-picker toggle after a host-side cancel."""
+        if self.workbench is not None:
+            self.workbench.cancel_peak_pixel_pick_mode()
 
     def set_source(self, h5_path: str | Path, scan_key: str) -> None:
         """Open or create the standard per-file/per-scan analysis project."""
@@ -129,6 +142,7 @@ class ProcessingStepsPanel(QWidget):
             workbench = ProcessingWorkbenchWidget(project, self._workbench_host, embedded=True)
             workbench.preview_state_ready.connect(self.preview_ready.emit)
             workbench.preview_restore_requested.connect(self.restore_requested.emit)
+            workbench.pixel_pick_mode_requested.connect(self.pixel_pick_mode_requested.emit)
             workbench.busy_changed.connect(self.busy_changed.emit)
             self._workbench_layout.addWidget(workbench)
             self.project = project

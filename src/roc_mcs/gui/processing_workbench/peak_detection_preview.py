@@ -8,12 +8,12 @@ from PyQt6.QtWidgets import QWidget, QSizePolicy
 
 
 class PeakDetectionPreview(QWidget):
-    """A deterministic toy neighbourhood passed through the production detector.
+    """A compact preview that can show either a deterministic schematic or real data.
 
-    The preview is intentionally labelled schematic. It uses the same local
-    neighbourhood averaging, background-noise estimator and peak detector as
-    the scientific operation, but its synthetic data and fixed geometry are
-    not a prediction for any selected experimental pixel.
+    The default is an explicitly labelled synthetic neighbourhood. After
+    ``set_real_input()``, the widget instead uses the selected pixel's exact
+    Scan/Spike input tile and its branch-wide noise estimate. Both modes call
+    the production neighbourhood averaging and peak detector.
     """
 
     _N_SAMPLES = 256
@@ -30,7 +30,12 @@ class PeakDetectionPreview(QWidget):
             "prominence_mode": "sigma",
             "prominence_value": 3.0,
             "min_relative_prominence": 0.07,
+            "use_interpolated_data": False,
         }
+        self._real_input: dict | None = None
+        self._real_pixel_label = ""
+        self._curve_theta = None
+        self._active_source_label = "синтетическая"
         self._demo_data = self._make_demo_volume()
         self._raw = np.empty(self._N_SAMPLES, dtype=float)
         self._smooth = self._raw.copy()
@@ -42,14 +47,14 @@ class PeakDetectionPreview(QWidget):
         self._relative_cutoff = float("nan")
         self._error = ""
         self._recalculate()
-        self.setMinimumSize(300, 142)
+        self.setMinimumSize(270, 142)
         self.setMaximumHeight(168)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.setToolTip(
-            "Схематическая синтетическая ROC-кривая. Локальная кривая строится "
-            "из пространственной окрестности N×N; затем применяются тот же "
-            "Savitzky–Golay и тот же detect_peaks, что в научном этапе. "
-            "Иллюстрация не является прогнозом для выбранного пикселя скана."
+            "По умолчанию показана детерминированная синтетическая ROC. "
+            "Можно выбрать пиксель на 2D-карте: тогда будет показана реальная "
+            "средняя ROC его N×N-окрестности из точного входа текущей ветви workflow. "
+            "К ней применяются те же SG и detect_peaks, что в научном этапе."
         )
 
     @classmethod
@@ -90,7 +95,28 @@ class PeakDetectionPreview(QWidget):
         return volume
 
     def sizeHint(self) -> QSize:
-        return QSize(420, 150)
+        return QSize(360, 150)
+
+    @property
+    def has_real_input(self) -> bool:
+        return self._real_input is not None
+
+    def set_real_input(self, payload: dict) -> None:
+        """Switch the illustration to a real pixel from the active workflow input."""
+        self._real_input = dict(payload)
+        self._real_pixel_label = (
+            f"X={int(payload['pixel_x'])}, Y={int(payload['pixel_y'])}"
+        )
+        self._recalculate()
+        self.update()
+
+    def clear_real_input(self) -> None:
+        """Return to the deterministic schematic when starting another stage form."""
+        self._real_input = None
+        self._real_pixel_label = ""
+        self._curve_theta = None
+        self._recalculate()
+        self.update()
 
     def set_parameters(self, **parameters) -> None:
         changed = False
@@ -108,17 +134,46 @@ class PeakDetectionPreview(QWidget):
             from roc_mcs.peaks.peak_signal import local_neighbourhood_mean_curve
             from roc_mcs.processing.background import estimate_background_stats
 
-            # Match the production path: background sigma from theta×Y×X, then
-            # exact local-neighbourhood averaging, then Savitzky–Golay/find_peaks.
-            data_tyx = np.moveaxis(self._demo_data, -1, 0)
-            background = estimate_background_stats(data_tyx)
-            self._noise_sigma = float(background.sigma)
-            self._raw = local_neighbourhood_mean_curve(
-                self._demo_data,
-                self._CENTER,
-                self._CENTER,
-                int(self._config["window_size"]),
-            )
+            if self._real_input is not None:
+                use_interpolated = bool(self._config.get("use_interpolated_data", False))
+                if use_interpolated:
+                    source = self._real_input.get("interpolated_tile_yxt")
+                    sigma = self._real_input.get("noise_sigma_interpolated")
+                    if source is None or sigma is None:
+                        raise ValueError(
+                            "В выбранной ветви нет доступного clean_data_yxt. "
+                            "Отключите интерполированную ROC или добавьте Spike detection."
+                        )
+                    source_label = "интерполированная"
+                else:
+                    source = self._real_input["measured_tile_yxt"]
+                    sigma = self._real_input["noise_sigma_measured"]
+                    source_label = "измеренная"
+                self._raw = local_neighbourhood_mean_curve(
+                    np.asarray(source, dtype=float),
+                    int(self._real_input["center_y"]),
+                    int(self._real_input["center_x"]),
+                    int(self._config["window_size"]),
+                    pixel_valid=np.asarray(self._real_input["pixel_valid_yx"], dtype=bool),
+                )
+                self._noise_sigma = float(sigma)
+                self._curve_theta = np.asarray(self._real_input["theta"], dtype=float)
+                self._active_source_label = source_label
+            else:
+                # Match the production path on the deterministic schematic:
+                # background sigma from theta×Y×X, exact neighbourhood mean,
+                # then the same Savitzky–Golay/find_peaks implementation.
+                data_tyx = np.moveaxis(self._demo_data, -1, 0)
+                background = estimate_background_stats(data_tyx)
+                self._noise_sigma = float(background.sigma)
+                self._raw = local_neighbourhood_mean_curve(
+                    self._demo_data,
+                    self._CENTER,
+                    self._CENTER,
+                    int(self._config["window_size"]),
+                )
+                self._curve_theta = None
+                self._active_source_label = "синтетическая"
 
             mode = str(self._config["prominence_mode"])
             prominence_value = float(self._config["prominence_value"])
@@ -130,6 +185,11 @@ class PeakDetectionPreview(QWidget):
                 prominence_fraction=prominence_value if mode == "fraction" else None,
                 min_relative_prominence=float(self._config["min_relative_prominence"]),
             )
+            if not np.isfinite(self._raw).all():
+                raise ValueError(
+                    "Локальная ROC содержит пропуски по θ; алгоритм не дополняет "
+                    "неполные угловые трассы искусственными значениями."
+                )
             smooth, peaks, properties, valid = detect_peaks(
                 self._raw, config, noise_sigma=self._noise_sigma
             )
@@ -149,7 +209,42 @@ class PeakDetectionPreview(QWidget):
             )
             self._error = ""
         except Exception as exc:
-            self._raw = self._demo_data[self._CENTER, self._CENTER].copy()
+            if self._real_input is None:
+                self._raw = self._demo_data[self._CENTER, self._CENTER].copy()
+                self._active_source_label = "синтетическая"
+            else:
+                # Do not silently fall back to synthetic data after a real pixel
+                # has been selected: preserve its local measured curve as a
+                # diagnostic baseline, while clearly reporting that detection
+                # could not be recalculated for the selected data source.
+                use_interpolated = bool(self._config.get("use_interpolated_data"))
+                interpolated_missing = (
+                    use_interpolated
+                    and self._real_input.get("interpolated_tile_yxt") is None
+                )
+                self._active_source_label = (
+                    "интерполированная · недоступна" if interpolated_missing
+                    else ("интерполированная" if use_interpolated else "измеренная")
+                )
+                if interpolated_missing:
+                    self._raw = np.empty(0, dtype=float)
+                else:
+                    try:
+                        from roc_mcs.peaks.peak_signal import local_neighbourhood_mean_curve
+                        fallback_source = (
+                            self._real_input.get("interpolated_tile_yxt")
+                            if use_interpolated else self._real_input["measured_tile_yxt"]
+                        )
+                        self._raw = local_neighbourhood_mean_curve(
+                            np.asarray(fallback_source, dtype=float),
+                            int(self._real_input["center_y"]),
+                            int(self._real_input["center_x"]),
+                            int(self._config["window_size"]),
+                            pixel_valid=np.asarray(self._real_input["pixel_valid_yx"], dtype=bool),
+                        )
+                    except Exception:
+                        self._raw = np.empty(0, dtype=float)
+                self._curve_theta = np.asarray(self._real_input.get("theta", ()), dtype=float)
             self._smooth = self._raw.copy()
             self._peaks = np.empty(0, dtype=int)
             self._valid = np.empty(0, dtype=bool)
@@ -214,7 +309,11 @@ class PeakDetectionPreview(QWidget):
         painter.drawText(
             QRectF(8, 3, width - 16, 17),
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-            "СХЕМА ПОИСКА · синтетическая ROC",
+            (
+                f"РЕАЛЬНАЯ ROC · {self._real_pixel_label} · {self._active_source_label}"
+                if self._real_input is not None
+                else "СХЕМА ПОИСКА · синтетическая ROC"
+            ),
         )
 
         painter.setPen(QPen(grid, 0.6, Qt.PenStyle.DotLine))
@@ -238,10 +337,11 @@ class PeakDetectionPreview(QWidget):
 
         # Mark the vertical prominence of the strongest candidate: prominence
         # is measured relative to its local contour, not from y=0.
+        sample_denominator = max(1, int(self._raw.size) - 1)
         if self._peaks.size and self._prominences.size:
             best = int(np.argmax(self._prominences))
             peak_index = int(self._peaks[best])
-            x_peak = plot.left() + peak_index / (self._N_SAMPLES - 1) * plot.width()
+            x_peak = plot.left() + peak_index / sample_denominator * plot.width()
             y_peak = self._value_y(self._smooth[peak_index], plot, low, high)
             y_base = self._value_y(
                 self._smooth[peak_index] - self._prominences[best], plot, low, high
@@ -254,14 +354,14 @@ class PeakDetectionPreview(QWidget):
         if self._peaks.size:
             center = int(self._peaks[len(self._peaks) // 2])
             distance = max(1, int(self._config["min_distance"]))
-            left = plot.left() + max(0, center - distance / 2) / (self._N_SAMPLES - 1) * plot.width()
-            right = plot.left() + min(self._N_SAMPLES - 1, center + distance / 2) / (self._N_SAMPLES - 1) * plot.width()
+            left = plot.left() + max(0, center - distance / 2) / sample_denominator * plot.width()
+            right = plot.left() + min(sample_denominator, center + distance / 2) / sample_denominator * plot.width()
             painter.setPen(QPen(rejected, 0.8, Qt.PenStyle.DashLine))
             painter.drawLine(QPointF(left, plot.bottom() - 2), QPointF(right, plot.bottom() - 2))
 
         y_span = max(1e-12, high - low)
         for index, peak in enumerate(self._peaks):
-            px = plot.left() + int(peak) / (self._N_SAMPLES - 1) * plot.width()
+            px = plot.left() + int(peak) / sample_denominator * plot.width()
             py = plot.bottom() - (float(self._smooth[peak]) - low) / y_span * plot.height()
             is_accepted = index < self._valid.size and bool(self._valid[index])
             color = accepted if is_accepted else rejected
@@ -276,7 +376,11 @@ class PeakDetectionPreview(QWidget):
         painter.drawText(
             QRectF(plot.left(), plot.bottom() + 3, plot.width(), 15),
             Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
-            "θ-отсчёты →",
+            (
+                "θ-отсчёты →"
+                if self._curve_theta is None or self._curve_theta.size < 2
+                else f"θ-отсчёты →  ({self._curve_theta[0]:.4g} … {self._curve_theta[-1]:.4g}°)"
+            ),
         )
 
         info_x = plot.right() + 12

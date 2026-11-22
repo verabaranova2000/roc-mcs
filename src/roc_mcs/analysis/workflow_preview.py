@@ -409,6 +409,20 @@ def build_workflow_preview_state(
     _add_map(layers, key="scan.intensity_mean", label=f"Средняя интенсивность{signal_qualifier} по θ", value=mean,
              shape_yx=(ny, nx), group="Основные данные", unit="counts",
              description=f"Среднее по валидным отсчётам{signal_qualifier} вдоль θ.")
+    # When configuring a peak stage from the Spike node, keep a measured-count
+    # map available as well as the cleaned primary map. This lets the optional
+    # real-pixel preview select a location on the same signal source that will
+    # be passed to peaks.detect (measured or interpolated), without changing
+    # the normal default map for Spike detection.
+    if node.operation_id == "preprocess.spikes" and display_is_interpolated:
+        measured_sum, _ = _sum_and_mean_maps(data, scan_valid)
+        _add_map(
+            layers, key="scan.measured_intensity_sum",
+            label="Суммарная интенсивность измеренного сигнала по θ",
+            value=measured_sum, shape_yx=(ny, nx), group="Основные данные",
+            unit="counts",
+            description="Сумма исходных измеренных counts Scan-входа вдоль θ, до интерполяции спайков.",
+        )
     effective_valid = np.isfinite(display_data)
     if display_valid is not None:
         effective_valid &= display_valid

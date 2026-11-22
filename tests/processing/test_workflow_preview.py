@@ -131,3 +131,19 @@ def test_analysis_spatial_validity_mask_shape_is_validated():
     scan.arrays["analysis_valid_mask_yx"] = np.ones((2, 2), dtype=bool)
     with pytest.raises(ValueError, match="analysis_valid_mask_yx"):
         build_workflow_preview_state(_node("peaks.detect"), {"scan": scan})
+
+
+def test_spike_input_offers_measured_intensity_map_for_peak_configuration():
+    scan = _scan()
+    spikes = _spikes()
+    state = build_workflow_preview_state(
+        _node("preprocess.spikes"), {"scan": scan, "spikes": spikes}
+    )
+
+    measured_layer = state.map_layer("scan.measured_intensity_sum")
+    assert measured_layer is not None
+    # This layer intentionally shows the original measured counts, including
+    # the sample later marked as a spike. Pixel eligibility is checked against
+    # the same combined validity mask as peaks.detect when a point is selected.
+    assert measured_layer.data_yx[0, 0] == 104.0
+    assert state.map_layer("scan.intensity_sum").data_yx[0, 0] == 6.0

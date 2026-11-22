@@ -156,6 +156,7 @@ class MapPlotWidget(QWidget):
     reduction_changed =  pyqtSignal(str)
     pool_changed = pyqtSignal(object)      # Новый PoolSpec выбран пользователем
     pixel_clicked = pyqtSignal(int, int)   # Индексы пикселя в текущем view: x, y
+    pixel_pick_selected = pyqtSignal(float, float)  # Физические координаты X/Y detector-grid
     data_updated =  pyqtSignal()             # Сигнал, что картинка перерисовалась
     settings_requested = pyqtSignal()
     pin_roi_requested = pyqtSignal()         # сигнал умного списка ROI
@@ -201,6 +202,8 @@ class MapPlotWidget(QWidget):
         self.reduction_mode = "mean"
         self._current_roi_type = "rect"  # Дефолтное состояние селектора. Теперь оно на 100% бьется с ROI(type="rect")
         self._current_selector = None    # Здесь будет жить инстанс активного селектора
+        self._pixel_pick_mode = False
+        self._pixel_pick_paused_selector = None
         
         # --- Состояние для Pan (перемещения) ---
         self._pan_active = False
@@ -970,12 +973,54 @@ class MapPlotWidget(QWidget):
     
 
 
+    def set_pixel_pick_mode(self, enabled: bool) -> None:
+        """Temporarily reserve a left click for selecting a detector pixel.
+
+        The existing ROI selector is paused, not destroyed, and is restored
+        after selection or cancellation. This preserves its in-progress state.
+        """
+        enabled = bool(enabled)
+        if enabled == self._pixel_pick_mode:
+            return
+        if enabled:
+            self._pixel_pick_mode = True
+            self._pixel_pick_paused_selector = self._current_selector
+            if self._pixel_pick_paused_selector is not None:
+                self._pixel_pick_paused_selector.set_active(False)
+            self.canvas.setCursor(Qt.CursorShape.CrossCursor)
+            self.canvas.draw_idle()
+            return
+
+        self._pixel_pick_mode = False
+        self.canvas.setCursor(Qt.CursorShape.ArrowCursor)
+        selector = self._pixel_pick_paused_selector
+        self._pixel_pick_paused_selector = None
+        if selector is not None and selector is self._current_selector:
+            selector.set_active(True)
+        self.canvas.draw_idle()
+
+    def _restore_selector_after_pixel_pick(self) -> None:
+        """Restore ROI interaction after Matplotlib dispatches the pick click."""
+        selector = self._pixel_pick_paused_selector
+        self._pixel_pick_paused_selector = None
+        if selector is not None and selector is self._current_selector:
+            selector.set_active(True)
+        self.canvas.draw_idle()
+
     # ========================================================
     # ЕДИНЫЕ ОБРАБОТЧИКИ СОБЫТИЙ МЫШИ
     # ========================================================
     def _on_mouse_press(self, event) -> None:
         """Единый обработчик мыши; не запускает создание точки по контуру сохранённой ROI."""
         if event.inaxes != self.ax: return
+        if self._pixel_pick_mode and event.button == 1 and event.xdata is not None and event.ydata is not None:
+            # Keep the selector paused until all canvas callbacks for this click
+            # have returned; otherwise the same click could create a new ROI.
+            self._pixel_pick_mode = False
+            self.canvas.setCursor(Qt.CursorShape.ArrowCursor)
+            self.pixel_pick_selected.emit(float(event.xdata), float(event.ydata))
+            QTimer.singleShot(0, self._restore_selector_after_pixel_pick)
+            return
         if event.button == 1 and self._current_roi_type == "point" and self._current_selector is not None:
             for artist in reversed(tuple(self.ax.patches)+tuple(self.ax.lines)):
                 if not hasattr(artist,"_roi_id"): continue

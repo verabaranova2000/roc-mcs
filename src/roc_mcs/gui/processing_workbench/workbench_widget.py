@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from PyQt6.QtCore import Qt, QObject, QRunnable, QThreadPool, pyqtSignal, QEvent, QSize
+from PyQt6.QtCore import Qt, QObject, QRunnable, QThreadPool, pyqtSignal, QEvent, QSize, QTimer
 from PyQt6.QtGui import QCursor, QPalette
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QSplitter, QFormLayout, QComboBox,
@@ -50,6 +50,58 @@ _PEAK_FORM_DEFAULTS = {
     "use_interpolated_data": False,
 }
 _PEAK_PROMINENCE_MODE_DEFAULTS = {"sigma": 3.0, "fraction": 0.07}
+
+
+class _PopupDragTitle(QLabel):
+    """Small drag handle for non-modal tool popups."""
+
+    def __init__(self, text: str, parent: QWidget):
+        super().__init__(text, parent)
+        self._drag_offset = None
+        self.setCursor(Qt.CursorShape.SizeAllCursor)
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_offset = event.globalPosition().toPoint() - self.window().frameGeometry().topLeft()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        if self._drag_offset is not None and event.buttons() & Qt.MouseButton.LeftButton:
+            self.window().move(event.globalPosition().toPoint() - self._drag_offset)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_offset = None
+        super().mouseReleaseEvent(event)
+
+
+class _StageConfigurationPopup(QFrame):
+    """Movable, non-modal stage editor; stays open while the map is clicked."""
+
+    about_to_close = pyqtSignal()
+
+    def __init__(self, parent: QWidget):
+        super().__init__(parent, Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint)
+        self.setObjectName("processingStagePopup")
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        self.setWindowModality(Qt.WindowModality.NonModal)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def closeEvent(self, event) -> None:
+        self.about_to_close.emit()
+        super().closeEvent(event)
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key.Key_Escape:
+            self.close()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
 
 class _WorkerSignals(QObject):
@@ -153,6 +205,45 @@ class _PreviewNodeTask(QRunnable):
             self.signals.failed.emit(self.node_id, traceback.format_exc())
 
 
+class _PeakPixelInputTask(QRunnable):
+    """Loads the exact Scan/Spike inputs for one selected detector pixel."""
+
+    def __init__(self, parent_id: str, history: WorkflowHistory, artifact_directory: str,
+                 detector_x: float, detector_y: float):
+        super().__init__()
+        self.parent_id = str(parent_id)
+        self.history_snapshot = WorkflowHistory(list(history.nodes))
+        self.artifact_directory = str(artifact_directory)
+        self.detector_x = float(detector_x)
+        self.detector_y = float(detector_y)
+        self.signals = _WorkerSignals()
+
+    def run(self) -> None:
+        try:
+            from .peak_preview_data import build_peak_pixel_preview_data
+
+            history = self.history_snapshot
+            executor = WorkflowExecutor(
+                history, ArtifactStore(self.artifact_directory), default_registry()
+            )
+            scan_node = history.find_ancestor_output(self.parent_id, "scan")
+            if scan_node is None or scan_node.status != NodeStatus.SUCCEEDED:
+                raise RuntimeError("В выбранной ветви не найден успешно завершённый Scan-вход")
+            scan_bundle = executor.load_output(scan_node, "scan")
+
+            spike_bundle = None
+            spike_node = history.find_ancestor_output(self.parent_id, "spikes")
+            if spike_node is not None and spike_node.status == NodeStatus.SUCCEEDED:
+                spike_bundle = executor.load_output(spike_node, "spikes")
+
+            payload = build_peak_pixel_preview_data(
+                scan_bundle, spike_bundle, self.detector_x, self.detector_y
+            )
+            self.signals.succeeded.emit(self.parent_id, payload)
+        except Exception:
+            self.signals.failed.emit(self.parent_id, traceback.format_exc())
+
+
 class ProcessingWorkbenchWidget(QWidget):
     """The workbench itself; host applications can embed it in a dock/dialog.
 
@@ -164,6 +255,7 @@ class ProcessingWorkbenchWidget(QWidget):
     preview_requested = pyqtSignal(object)
     preview_state_ready = pyqtSignal(object)
     preview_restore_requested = pyqtSignal()
+    pixel_pick_mode_requested = pyqtSignal(bool, str, bool)
     busy_changed = pyqtSignal(bool)
 
     def __init__(self, project: WorkflowProject, parent: QWidget | None = None, *, embedded: bool = False):
@@ -175,9 +267,13 @@ class ProcessingWorkbenchWidget(QWidget):
         self.thread_pool = QThreadPool.globalInstance()
         self._active_task: _RunNodeTask | None = None
         self._active_preview_task: _PreviewNodeTask | None = None
+        self._active_peak_input_task: _PeakPixelInputTask | None = None
         self._preview_context: dict[str, Any] | None = None
         self._map_click_connection = None
         self._branch_parent_id: str | None = None
+        self._active_stage_popup: _StageConfigurationPopup | None = None
+        self._active_stage_operation: str | None = None
+        self._pending_peak_map_parent_id: str | None = None
         self._theme = resolve_theme(parent if parent is not None else self)
         self._applying_theme = False
         self._build_ui()
@@ -634,19 +730,6 @@ class ProcessingWorkbenchWidget(QWidget):
     def _build_peak_form(self) -> None:
         layout = self._add_form_page("peaks.detect", "Поиск дифракционных пиков")
 
-        # A compact reset action sits above the controls. It only affects this
-        # not-yet-added form; existing workflow nodes remain immutable.
-        reset_row = QHBoxLayout()
-        reset_row.addStretch(1)
-        reset_button = QToolButton()
-        reset_button.setText("↺ По умолчанию")
-        reset_button.setToolTip(
-            "Вернуть исходные параметры детектора пиков. Сброс действует на форму "
-            "создаваемого этапа и не изменяет уже добавленные этапы workflow."
-        )
-        reset_row.addWidget(reset_button)
-        layout.addRow(reset_row)
-
         window = self._int_spin(1, 15, _PEAK_FORM_DEFAULTS["window_size"], 2)
         smooth = self._int_spin(3, 101, _PEAK_FORM_DEFAULTS["smooth_window"], 2)
         poly = self._int_spin(0, 10, _PEAK_FORM_DEFAULTS["smooth_polyorder"])
@@ -715,6 +798,30 @@ class ProcessingWorkbenchWidget(QWidget):
         layout.addRow("Относительный порог от max:", relative)
 
         preview = PeakDetectionPreview()
+        preview_row = QWidget()
+        preview_row_layout = QHBoxLayout(preview_row)
+        preview_row_layout.setContentsMargins(0, 2, 0, 2)
+        preview_row_layout.setSpacing(5)
+        preview.setMinimumWidth(270)
+        preview_row_layout.addWidget(preview, 1)
+        pick_button = QToolButton(preview_row)
+        pick_button.setObjectName("peakPreviewPixelPickButton")
+        pick_button.setCheckable(True)
+        pick_button.setAutoRaise(False)
+        pick_button.setFixedSize(27, 27)
+        pick_button.setIcon(svg_icon(ICON_DIR / "roi_point.svg", widget=pick_button))
+        pick_button.setIconSize(QSize(17, 17))
+        pick_button.setToolTip(
+            "Выбрать пиксель на 2D-карте и показать реальную локальную ROC-кривую "
+            "из входных данных этой ветви workflow. Нажмите ещё раз, чтобы отменить выбор."
+        )
+        pick_button.setAccessibleName("Выбрать пиксель для реальной ROC-кривой")
+        pick_button.setEnabled(self.embedded)
+        if not self.embedded:
+            pick_button.setToolTip(
+                "Выбор пикселя доступен при открытии Workbench внутри ROI Explorer."
+            )
+        preview_row_layout.addWidget(pick_button, 0, Qt.AlignmentFlag.AlignVCenter)
 
         def refresh_preview(*_args) -> None:
             preview.set_parameters(
@@ -725,6 +832,7 @@ class ProcessingWorkbenchWidget(QWidget):
                 prominence_mode=str(mode.currentData()),
                 prominence_value=prominence.value(),
                 min_relative_prominence=relative.value(),
+                use_interpolated_data=interpolated.isChecked(),
             )
 
         # A Savitzky–Golay polynomial must have lower order than its window.
@@ -780,21 +888,30 @@ class ProcessingWorkbenchWidget(QWidget):
                 for control, was_blocked in zip(controls, previous_block_states):
                     control.blockSignals(was_blocked)
             refresh_preview()
+            if pick_button.isChecked():
+                self._request_peak_pixel_pick(True)
+
+        def input_source_changed(_checked: bool) -> None:
+            refresh_preview()
+            if pick_button.isChecked():
+                self._request_peak_pixel_pick(True)
 
         smooth.valueChanged.connect(adapt_polynomial_limit)
         for control in (window, smooth, poly, distance, relative):
             control.valueChanged.connect(refresh_preview)
         prominence.valueChanged.connect(remember_prominence)
         mode.currentIndexChanged.connect(change_prominence_mode)
-        reset_button.clicked.connect(reset_peak_parameters)
-        layout.addRow("Эффект параметров:", preview)
+        interpolated.toggled.connect(input_source_changed)
+        pick_button.toggled.connect(self._request_peak_pixel_pick)
+        layout.addRow(preview_row)
         layout.addRow("", interpolated)
         refresh_preview()
         self._forms["peaks.detect"].update(
             window_size=window, smooth_window=smooth, smooth_polyorder=poly,
             min_distance=distance, prominence_mode=mode, prominence_value=prominence,
             min_relative_prominence=relative, use_interpolated_data=interpolated,
-            preview=preview, reset_button=reset_button,
+            preview=preview, reset_parameters=reset_peak_parameters,
+            pick_button=pick_button,
         )
 
     def _build_fit_form(self) -> None:
@@ -1052,7 +1169,7 @@ class ProcessingWorkbenchWidget(QWidget):
             QMessageBox.warning(self, "Не удалось добавить ветвь", str(exc))
 
     def _open_stage_configuration(self, parent_id: str, operation_id: str) -> None:
-        """Open one canonical stage form in a compact, theme-aware popup menu."""
+        """Open a movable, non-modal editor for one canonical stage form."""
         if self.is_busy:
             return
         parent = self.project.history.get(parent_id)
@@ -1064,6 +1181,9 @@ class ProcessingWorkbenchWidget(QWidget):
                 "Проверьте состояние и принятые результаты ветви.",
             )
             return
+        if self._active_stage_popup is not None:
+            self._active_stage_popup.close()
+
         self._branch_parent_id = parent_id
         combo_index = self.operation_combo.findData(operation_id)
         if combo_index < 0:
@@ -1075,46 +1195,58 @@ class ProcessingWorkbenchWidget(QWidget):
 
         spec = self.registry.get(operation_id)
         page = form_info["page"]
-        menu = QMenu(self)
-        menu.setObjectName("processingStagePopup")
-        menu.setWindowFlags(menu.windowFlags() | Qt.WindowType.NoDropShadowWindowHint)
-        panel = QWidget(menu)
-        panel.setObjectName("ProcessingStagePanel")
-        panel_layout = QVBoxLayout(panel)
-        panel_layout.setContentsMargins(8, 6, 8, 6)
-        panel_layout.setSpacing(5)
+        popup = _StageConfigurationPopup(self)
+        popup.setObjectName("processingStagePopup")
+        root = QVBoxLayout(popup)
+        root.setContentsMargins(8, 6, 8, 7)
+        root.setSpacing(5)
 
-        header = QLabel(
+        header = QHBoxLayout()
+        header.setContentsMargins(1, 0, 1, 0)
+        header.setSpacing(6)
+        title = _PopupDragTitle(
             f"<b>{spec.label}</b>"
-            f"<span style='color:palette(mid)'>  ·  вход: {parent.label}</span>"
+            f"<span style='color:palette(mid)'>  ·  вход: {parent.label}</span>",
+            popup,
         )
-        header.setTextFormat(Qt.TextFormat.RichText)
-        header.setWordWrap(True)
-        header.setToolTip(spec.description)
-        panel_layout.addWidget(header)
+        title.setTextFormat(Qt.TextFormat.RichText)
+        title.setWordWrap(False)
+        title.setToolTip("Перетащите за эту строку, чтобы переместить окно")
+        header.addWidget(title, 1)
+        close_button = QToolButton(popup)
+        close_button.setObjectName("processingStageCloseButton")
+        close_button.setText("×")
+        close_button.setFixedSize(20, 20)
+        close_button.setToolTip("Закрыть окно параметров")
+        close_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        close_button.clicked.connect(popup.close)
+        header.addWidget(close_button, 0, Qt.AlignmentFlag.AlignTop)
+        root.addLayout(header)
 
-        scroll = QScrollArea(panel)
+        scroll = QScrollArea(popup)
         scroll.setObjectName("processingStageFormScroll")
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setMinimumWidth(0)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
 
-        # Re-use the exact existing parameter widgets; never maintain a second
-        # form with parallel defaults, parameter mapping, or validation.
+        # Re-use the canonical parameter widgets: no parallel form, no copied
+        # defaults, and no second parameter-to-operation mapping.
         self.form_stack.removeWidget(page)
         page.setParent(None)
+        page.setMinimumWidth(0)
         scroll.setWidget(page)
         for widget_type in (QSpinBox, QDoubleSpinBox, QComboBox, QLineEdit):
             for field in page.findChildren(widget_type):
-                field.setMinimumHeight(20)
-                field.setMaximumHeight(23)
+                field.setMinimumHeight(21)
+                field.setMaximumHeight(25)
                 if isinstance(field, QDoubleSpinBox):
                     field.setMinimumWidth(82)
                 elif isinstance(field, QSpinBox):
                     field.setMinimumWidth(68)
                 elif isinstance(field, QComboBox):
-                    field.setMinimumWidth(105)
+                    field.setMinimumWidth(112)
         for checkbox in page.findChildren(QCheckBox):
             checkbox.setStyleSheet("QCheckBox { font-size: 10px; spacing: 5px; }")
         for label in page.findChildren(QLabel):
@@ -1122,85 +1254,244 @@ class ProcessingWorkbenchWidget(QWidget):
         page_layout = form_info.get("layout")
         if page_layout is not None:
             page_layout.setContentsMargins(4, 4, 4, 4)
-            page_layout.setVerticalSpacing(4)
+            page_layout.setVerticalSpacing(5)
             page_layout.setHorizontalSpacing(8)
-
-        content_height = max(110, min(430, page.sizeHint().height() + 4))
-        scroll.setMinimumHeight(min(content_height, 210))
-        scroll.setMaximumHeight(content_height)
-        panel_layout.addWidget(scroll, 1)
+        root.addWidget(scroll, 1)
 
         footer = QHBoxLayout()
         footer.setContentsMargins(0, 1, 0, 0)
-        footer.setSpacing(5)
+        footer.setSpacing(6)
         footer.addStretch(1)
-        cancel_button = QPushButton("Отмена", panel)
-        run_button = QPushButton("Создать и запустить", panel)
+        reset_button = None
+        if operation_id == "peaks.detect":
+            reset_button = QPushButton("↺ По умолчанию", popup)
+            reset_button.setToolTip(
+                "Восстановить исходные параметры поиска пиков. "
+                "Уже добавленные этапы workflow не изменяются."
+            )
+            reset_button.setMinimumHeight(24)
+            reset_button.clicked.connect(form_info["reset_parameters"])
+            footer.addWidget(reset_button)
+        cancel_button = QPushButton("Отмена", popup)
+        run_button = QPushButton("Создать и запустить", popup)
         run_button.setDefault(True)
         for button in (cancel_button, run_button):
-            button.setMinimumHeight(22)
-            button.setMaximumHeight(24)
-            button.setStyleSheet("QPushButton { font-size: 10px; padding: 2px 8px; }")
+            button.setMinimumHeight(24)
         footer.addWidget(cancel_button)
         footer.addWidget(run_button)
-        panel_layout.addLayout(footer)
+        root.addLayout(footer)
 
-        action = QWidgetAction(menu)
-        action.setDefaultWidget(panel)
-        menu.addAction(action)
-        apply_popup_theme(menu, self._theme)
-        apply_widget_palette(panel, self._theme)
-        panel.setStyleSheet(
-            "QWidget#ProcessingStagePanel { background:palette(window); color:palette(window-text); }"
-            "QWidget#ProcessingStagePanel QLabel { background:transparent; color:palette(window-text); font-size:10px; }"
-            "QWidget#ProcessingStagePanel QSpinBox, QWidget#ProcessingStagePanel QDoubleSpinBox, "
-            "QWidget#ProcessingStagePanel QComboBox, QWidget#ProcessingStagePanel QLineEdit { "
-            "font-size:10px; min-height:20px; max-height:23px; padding:1px 3px; "
+        apply_popup_theme(popup, self._theme)
+        apply_widget_palette(popup, self._theme)
+        popup.setStyleSheet(
+            "QFrame#processingStagePopup { background:palette(window); color:palette(window-text); "
+            "border:1px solid palette(mid); border-radius:5px; }"
+            "QFrame#processingStagePopup QLabel { background:transparent; color:palette(window-text); font-size:10px; }"
+            "QFrame#processingStagePopup QSpinBox, QFrame#processingStagePopup QDoubleSpinBox, "
+            "QFrame#processingStagePopup QComboBox, QFrame#processingStagePopup QLineEdit { "
+            "font-size:10px; min-height:21px; max-height:25px; padding:1px 3px; "
             "background:palette(base); color:palette(text); border:1px solid palette(mid); border-radius:3px; }"
-            "QWidget#ProcessingStagePanel QCheckBox { font-size:10px; spacing:5px; }"
-            "QWidget#ProcessingStagePanel QPushButton { font-size:10px; padding:2px 8px; "
+            "QFrame#processingStagePopup QCheckBox { font-size:10px; spacing:5px; }"
+            "QFrame#processingStagePopup QPushButton { font-size:10px; padding:3px 8px; "
             "background:palette(button); color:palette(button-text); border:1px solid palette(mid); border-radius:3px; }"
-            "QWidget#ProcessingStagePanel QPushButton:hover { background:palette(midlight); }"
+            "QFrame#processingStagePopup QPushButton:hover, QFrame#processingStagePopup QToolButton:hover { "
+            "background:palette(midlight); }"
+            "QToolButton#processingStageCloseButton { border:0; font-size:17px; padding:0; }"
         )
-        panel.setFixedWidth(390)
-        menu.adjustSize()
 
-        accepted = False
+        # A bounded, adaptive height keeps all controls reachable on smaller
+        # displays. The form itself scrolls vertically rather than being clipped.
+        cursor_pos = QCursor.pos()
+        screen = QApplication.screenAt(cursor_pos) or QApplication.primaryScreen()
+        available = screen.availableGeometry() if screen is not None else self.frameGeometry()
+        popup_width = max(340, min(440, available.width() - 16))
+        popup.setFixedWidth(popup_width)
+        content_height = max(140, page.sizeHint().height() + 8)
+        max_popup_height = max(190, int(available.height() * 0.82))
+        desired_height = min(content_height + 85, max_popup_height)
+        popup.setMaximumHeight(max_popup_height)
+        scroll.setMinimumHeight(min(max(115, content_height), max(115, desired_height - 90)))
+        popup.resize(popup_width, desired_height)
+        popup.adjustSize()
+        x = min(max(cursor_pos.x(), available.left() + 4), available.right() - popup.width() + 1)
+        y = min(max(cursor_pos.y(), available.top() + 4), available.bottom() - popup.height() + 1)
+        popup.move(x, y)
 
-        def _validate_and_close() -> None:
-            nonlocal accepted
-            try:
-                self.registry.get(operation_id).validate(
-                    self._form_parameters(operation_id)
-                )
-            except Exception as exc:
-                QMessageBox.warning(menu, "Проверьте параметры этапа", str(exc))
+        self._active_stage_popup = popup
+        self._active_stage_operation = operation_id
+        popup._stage_form_page = page
+        popup._stage_form_scroll = scroll
+        popup._stage_parent_id = parent_id
+
+        def restore_page() -> None:
+            if getattr(popup, "_stage_form_page_restored", False):
                 return
-            accepted = True
-            menu.close()
+            popup._stage_form_page_restored = True
+            if scroll.widget() is page:
+                scroll.takeWidget()
+            page.setParent(self.form_stack)
+            if self.form_stack.indexOf(page) < 0:
+                self.form_stack.addWidget(page)
+            if self._active_stage_popup is popup:
+                self._active_stage_popup = None
+                self._active_stage_operation = None
+            if operation_id == "peaks.detect":
+                self._pending_peak_map_parent_id = None
+                pick_button = form_info.get("pick_button")
+                if pick_button is not None:
+                    was_blocked = pick_button.blockSignals(True)
+                    pick_button.setChecked(False)
+                    pick_button.blockSignals(was_blocked)
+                self.pixel_pick_mode_requested.emit(False, parent_id, False)
+            self._show_operation_form()
 
-        run_button.clicked.connect(_validate_and_close)
-        cancel_button.clicked.connect(menu.close)
-        try:
-            menu.exec(QCursor.pos())
-            if accepted:
+        popup.about_to_close.connect(restore_page)
+        cancel_button.clicked.connect(popup.close)
+
+        def validate_create_and_run() -> None:
+            try:
                 parameters = self._form_parameters(operation_id)
+                spec.validate(parameters)
+            except Exception as exc:
+                QMessageBox.warning(popup, "Проверьте параметры этапа", str(exc))
+                return
+            popup.close()
+            try:
                 node_id = self._create_stage_candidate(
                     parent_id, operation_id, parameters, run_immediately=True
                 )
                 if node_id:
                     self.graph.select_node(node_id)
+            except Exception as exc:
+                QMessageBox.warning(self, "Не удалось создать этап", str(exc))
+
+        run_button.clicked.connect(validate_create_and_run)
+        popup.show()
+        popup.raise_()
+        popup.activateWindow()
+
+        if operation_id == "peaks.detect":
+            preview = form_info.get("preview")
+            if preview is not None:
+                preview.clear_real_input()
+            self._ensure_peak_parent_preview(parent_id)
+
+    def _ensure_peak_parent_preview(self, parent_id: str) -> None:
+        """Ensure the host 2D map displays the exact selected branch input."""
+        form_info = self._forms.get("peaks.detect", {})
+        pick_button = form_info.get("pick_button")
+        if pick_button is None or not self.embedded:
+            return
+        pick_button.setEnabled(False)
+        pick_button.setToolTip("Подготавливается 2D-карта входной ветви…")
+        current_node = None
+        if self._preview_context is not None:
+            current_node = self._preview_context.get("node")
+        if current_node is not None and current_node.id == parent_id:
+            self._pending_peak_map_parent_id = None
+            pick_button.setEnabled(True)
+            pick_button.setToolTip(
+                "Выбрать пиксель на 2D-карте и показать реальную локальную ROC из входа этой ветви."
+            )
+            return
+        self._pending_peak_map_parent_id = parent_id
+        if self._active_preview_task is None:
+            self._start_preview_for_node(parent_id, switch_tab=False, show_error_dialog=False)
+
+    def _request_peak_pixel_pick(self, enabled: bool) -> None:
+        parent_id = self._branch_parent_id or ""
+        if enabled:
+            if not self.embedded or self._active_stage_operation != "peaks.detect":
+                form = self._forms.get("peaks.detect", {})
+                button = form.get("pick_button")
+                if button is not None:
+                    button.setChecked(False)
+                return
+            if self._pending_peak_map_parent_id is not None:
+                self.status_label.setText("Подождите, пока обновится входная 2D-карта ветви")
+                button = self._forms["peaks.detect"].get("pick_button")
+                if button is not None:
+                    button.setChecked(False)
+                return
+        use_interpolated = bool(
+            self._forms.get("peaks.detect", {}).get("use_interpolated_data")
+            and self._forms["peaks.detect"]["use_interpolated_data"].isChecked()
+        )
+        self.pixel_pick_mode_requested.emit(bool(enabled), parent_id, use_interpolated)
+
+    def cancel_peak_pixel_pick_mode(self) -> None:
+        """Uncheck the map-picker control after a host-side cancellation."""
+        button = self._forms.get("peaks.detect", {}).get("pick_button")
+        if button is not None and button.isChecked():
+            button.setChecked(False)
+
+    def set_peak_preview_pixel(self, detector_x: float, detector_y: float) -> None:
+        """Queue a real-pixel preview from the exact input artifacts of this branch."""
+        if self._active_stage_popup is None or self._active_stage_operation != "peaks.detect":
+            return
+        parent_id = self._branch_parent_id
+        if not parent_id:
+            return
+        form_info = self._forms.get("peaks.detect", {})
+        pick_button = form_info.get("pick_button")
+        if pick_button is not None:
+            QTimer.singleShot(0, lambda button=pick_button: button.setChecked(False))
+        if self._active_peak_input_task is not None:
+            self.status_label.setText("Загрузка данных для выбранного пикселя уже выполняется")
+            return
+        try:
+            task = _PeakPixelInputTask(
+                parent_id,
+                WorkflowHistory(list(self.project.history.nodes)),
+                str(self.project.artifact_store.directory),
+                float(detector_x), float(detector_y),
+            )
+            task.signals.succeeded.connect(self._on_peak_pixel_input_ready)
+            task.signals.failed.connect(self._on_peak_pixel_input_failed)
+            self._active_peak_input_task = task
+            self.status_label.setText("Загрузка реальной ROC выбранного пикселя…")
+            self._log(
+                f"Выбран detector-пиксель X={float(detector_x):.6g}, Y={float(detector_y):.6g}; "
+                "загружаются точные Scan/Spike-входы ветви."
+            )
+            self.thread_pool.start(task)
         except Exception as exc:
-            QMessageBox.warning(self, "Не удалось создать этап", str(exc))
-        finally:
-            # Detach the form before popup destruction; Qt must not delete the
-            # canonical widgets still referenced by self._forms.
-            if scroll.widget() is page:
-                scroll.takeWidget()
-            page.setParent(self.form_stack)
-            self.form_stack.addWidget(page)
-            self._show_operation_form()
-            menu.deleteLater()
+            self.status_label.setText(f"Не удалось подготовить пиксель: {exc}")
+            self._log(traceback.format_exc())
+
+    def _on_peak_pixel_input_ready(self, parent_id: str, payload: dict[str, Any]) -> None:
+        self._active_peak_input_task = None
+        if (
+            self._active_stage_popup is None
+            or self._active_stage_operation != "peaks.detect"
+            or parent_id != self._branch_parent_id
+        ):
+            return
+        form_info = self._forms.get("peaks.detect", {})
+        preview = form_info.get("preview")
+        if preview is None:
+            return
+        preview.set_real_input(payload)
+        if bool(payload.get("interpolation_available")):
+            source_hint = "измеренная / интерполированная по переключателю формы"
+        else:
+            source_hint = "измеренная; Spike-вход в этой ветви отсутствует"
+        self.status_label.setText(
+            f"Реальная ROC: пиксель ({payload['pixel_x']}, {payload['pixel_y']}); {source_hint}"
+        )
+        self._log(
+            f"Реальное превью обновлено для пикселя ({payload['pixel_x']}, {payload['pixel_y']}); "
+            f"grid={payload.get('grid_id', '')}."
+        )
+
+    def _on_peak_pixel_input_failed(self, parent_id: str, error: str) -> None:
+        self._active_peak_input_task = None
+        if parent_id != self._branch_parent_id:
+            return
+        self.status_label.setText("Не удалось загрузить реальную ROC выбранного пикселя")
+        self._log(error)
+        # Keep the popup and any previously selected real trace intact; a user
+        # can choose another pixel without reopening the parameter form.
 
     def _on_graph_preview_requested(self, node_id: str) -> None:
         self.graph.select_node(node_id)
@@ -1539,16 +1830,25 @@ class ProcessingWorkbenchWidget(QWidget):
         self.log_text.appendPlainText(message)
 
     def _preview_selected(self) -> None:
-        if self._active_task is not None or self._active_preview_task is not None:
-            return
         node_id = self._selected_node_id()
         if not node_id:
             return
-        node = self.project.history.get(node_id)
-        if node.status != NodeStatus.SUCCEEDED:
-            QMessageBox.information(self, "Предпросмотр", "Сначала успешно выполните выбранный этап.")
-            return
+        self._start_preview_for_node(node_id, switch_tab=True, show_error_dialog=True)
+
+    def _start_preview_for_node(
+        self, node_id: str, *, switch_tab: bool, show_error_dialog: bool
+    ) -> bool:
+        if self._active_task is not None or self._active_preview_task is not None:
+            return False
         try:
+            node = self.project.history.get(node_id)
+            if node.status != NodeStatus.SUCCEEDED:
+                message = "Сначала успешно выполните выбранный этап."
+                if show_error_dialog:
+                    QMessageBox.information(self, "Предпросмотр", message)
+                else:
+                    self.status_label.setText(message)
+                return False
             task = _PreviewNodeTask(
                 node_id,
                 WorkflowHistory(list(self.project.history.nodes)),
@@ -1560,15 +1860,53 @@ class ProcessingWorkbenchWidget(QWidget):
             self._active_preview_task = task
             self.status_label.setText(f"Загрузка результата: {node.label}")
             self.progress.setRange(0, 0)
-            self.tabs.setCurrentIndex(0)
+            if switch_tab:
+                self.tabs.setCurrentIndex(0)
             self._update_controls()
             self.thread_pool.start(task)
+            return True
         except Exception as exc:
             self._active_preview_task = None
             self.progress.setRange(0, 1)
             self.progress.setValue(0)
-            QMessageBox.warning(self, "Предпросмотр недоступен", str(exc))
+            if show_error_dialog:
+                QMessageBox.warning(self, "Предпросмотр недоступен", str(exc))
+            else:
+                self.status_label.setText(f"Предпросмотр входной карты недоступен: {exc}")
             self._update_controls()
+            return False
+
+    def _complete_pending_peak_map_preview(self, completed_node_id: str) -> None:
+        pending_id = self._pending_peak_map_parent_id
+        if pending_id is None:
+            return
+        if self._active_stage_popup is None or self._active_stage_operation != "peaks.detect":
+            self._pending_peak_map_parent_id = None
+            return
+        context_node = (
+            self._preview_context.get("node") if self._preview_context is not None else None
+        )
+        if pending_id == completed_node_id and context_node is not None and context_node.id == pending_id:
+            self._pending_peak_map_parent_id = None
+            button = self._forms.get("peaks.detect", {}).get("pick_button")
+            if button is not None and self.embedded:
+                button.setEnabled(True)
+                button.setToolTip(
+                    "Выбрать пиксель на 2D-карте и показать реальную локальную ROC из входа этой ветви."
+                )
+            return
+        if pending_id == completed_node_id:
+            self._pending_peak_map_parent_id = None
+            button = self._forms.get("peaks.detect", {}).get("pick_button")
+            if button is not None:
+                button.setEnabled(False)
+                button.setToolTip("Не удалось подготовить предпросмотр входной карты этой ветви.")
+            return
+        # A different preview finished while the user was configuring peaks.
+        # Load the requested branch now rather than allowing a stale-map pick.
+        self._start_preview_for_node(
+            pending_id, switch_tab=False, show_error_dialog=False
+        )
 
     def _on_preview_ready(self, node_id: str, context: dict[str, Any]) -> None:
         previous_context = self._preview_context
@@ -1623,14 +1961,15 @@ class ProcessingWorkbenchWidget(QWidget):
             self._log(f"Предпросмотр загружен: {node.label}")
         except Exception:
             error_text = traceback.format_exc()
-            # A failed preview must not replace a previously visible preview.
-            # Restore the last successfully displayed local context atomically.
             self._preview_context = previous_context
             if previous_context is not None:
                 try:
                     self._draw_preview()
                 except Exception:
-                    self._log("Не удалось восстановить предыдущий предпросмотр:\n" + traceback.format_exc())
+                    self._log(
+                        "Не удалось восстановить предыдущий предпросмотр:\n"
+                        + traceback.format_exc()
+                    )
             else:
                 self.figure.clear()
                 empty_map = self.figure.add_subplot(1, 2, 1)
@@ -1640,12 +1979,16 @@ class ProcessingWorkbenchWidget(QWidget):
                 empty_curve.set_axis_off()
                 self.canvas.draw_idle()
             self._log(error_text)
-            QMessageBox.warning(self, "Ошибка отображения", error_text)
+            if self._pending_peak_map_parent_id is None:
+                QMessageBox.warning(self, "Ошибка отображения", error_text)
+            else:
+                self.status_label.setText("Не удалось подготовить входную 2D-карту для выбора пикселя")
         finally:
             self._active_preview_task = None
             self.progress.setRange(0, 1)
             self.progress.setValue(1)
             self._update_controls()
+            self._complete_pending_peak_map_preview(node_id)
 
     def _on_preview_failed(self, node_id: str, error: str) -> None:
         self._active_preview_task = None
@@ -1653,7 +1996,16 @@ class ProcessingWorkbenchWidget(QWidget):
         self.progress.setValue(0)
         self.status_label.setText("Не удалось загрузить предпросмотр")
         self._log(error)
-        QMessageBox.warning(self, "Предпросмотр недоступен", error)
+        if node_id == self._pending_peak_map_parent_id:
+            self._pending_peak_map_parent_id = None
+            button = self._forms.get("peaks.detect", {}).get("pick_button")
+            if button is not None:
+                button.setEnabled(False)
+                button.setToolTip(
+                    "Не удалось загрузить входную 2D-карту этой ветви. Закройте и откройте форму заново."
+                )
+        elif self._active_stage_popup is None:
+            QMessageBox.warning(self, "Предпросмотр недоступен", error)
         self._update_controls()
 
     @staticmethod

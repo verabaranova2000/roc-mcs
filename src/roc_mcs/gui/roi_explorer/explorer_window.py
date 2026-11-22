@@ -354,6 +354,7 @@ class RockingCurveExplorerWindow(QMainWindow):
         self.map_widget.pool_changed.connect(self._on_pool_changed)
         self.map_widget.theta_index_changed.connect(self._on_theta_index_changed)
         self.map_widget.pixel_clicked.connect(self._on_pixel_clicked)
+        self.map_widget.pixel_pick_selected.connect(self.processing_panel.set_peak_preview_pixel)
         self.map_widget.cursor_position_changed.connect(self.volume_widget.set_map_cursor_position)
         self.map_widget.preview_roi_changed.connect(self.volume_widget.set_roi_preview_geometry)
         self.map_widget.preview_roi_finished.connect(self.volume_widget.set_roi_preview_geometry)
@@ -363,6 +364,7 @@ class RockingCurveExplorerWindow(QMainWindow):
         self.plot_workspace.mdi_area.panel_restored.connect(self._on_plot_panel_restored)
         self.curve_widget.theta_guide_toggled.connect(self._on_theta_guide_toggled)
         self.processing_panel.preview_ready.connect(self.show_analysis_preview)
+        self.processing_panel.pixel_pick_mode_requested.connect(self._set_peak_pixel_pick_mode)
         self.processing_panel.restore_requested.connect(self.restore_analysis_preview)
         self.processing_panel.busy_changed.connect(self._set_processing_busy)
         self.processing_panel.status_changed.connect(lambda text: self.status.showMessage(text, 8000))
@@ -1094,8 +1096,45 @@ class RockingCurveExplorerWindow(QMainWindow):
         self.refresh_curves(update_volume=False)
         self._update_inspector()
 
+    def _set_peak_pixel_pick_mode(
+        self, enabled: bool, parent_node_id: str, use_interpolated_data: bool = False
+    ) -> None:
+        """Switch the map into one-shot detector-pixel picking for peak QC."""
+        if not enabled:
+            self.map_widget.set_pixel_pick_mode(False)
+            return
+        state = self._analysis_view
+        if state is None or str(getattr(state, "node_id", "")) != str(parent_node_id):
+            self.map_widget.set_pixel_pick_mode(False)
+            self.processing_panel.cancel_peak_pixel_pick_mode()
+            self.status.showMessage(
+                "2D-карта ещё не показывает вход выбранной ветви. Дождитесь её обновления и повторите выбор.",
+                8000,
+            )
+            return
+        # The selected detector coordinate must be visible on the input map,
+        # not on the downstream spike/peak count layer.
+        input_map_key = (
+            "scan.intensity_sum" if use_interpolated_data
+            else "scan.measured_intensity_sum"
+        )
+        if not any(
+            layer.key == input_map_key for layer in getattr(state, "map_layers", ())
+        ):
+            input_map_key = "scan.intensity_sum"
+        self.set_analysis_map_layer(input_map_key)
+        self.map_widget.set_pixel_pick_mode(True)
+        self.status.showMessage(
+            "Выбор пикселя для превью ROC: щёлкните левой кнопкой по нужной точке 2D-карты. "
+            "Закройте окно параметров кнопкой × или Esc, чтобы отменить выбор.",
+            10000,
+        )
+
     def show_analysis_preview(self, state) -> None:
         """Подключает один узел workflow к карте и ROC как согласованную версию."""
+        if getattr(self.map_widget, "_pixel_pick_mode", False):
+            self.map_widget.set_pixel_pick_mode(False)
+            self.processing_panel.cancel_peak_pixel_pick_mode()
         if self.repo is None or self.selected_scan is None:
             return
         metadata = getattr(state, "metadata", {}) or {}
