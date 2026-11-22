@@ -5,11 +5,11 @@ forwards select / add / preview gestures to the owning QWidget.
 """
 from __future__ import annotations
 
-from PyQt6.QtCore import Qt, QRectF, QPointF, pyqtSignal
+from PyQt6.QtCore import Qt, QRectF, QPointF, QSize, pyqtSignal
 from PyQt6.QtGui import QColor, QBrush, QFont, QFontMetricsF, QPainter, QPainterPath, QPen, QPalette
 from PyQt6.QtWidgets import (
-    QApplication, QFrame, QGraphicsItem, QGraphicsObject, QGraphicsPathItem,
-    QGraphicsScene, QGraphicsView, QWidget,
+    QApplication, QAbstractScrollArea, QFrame, QGraphicsItem, QGraphicsObject,
+    QGraphicsPathItem, QGraphicsScene, QGraphicsView, QSizePolicy, QWidget,
 )
 
 from roc_mcs.analysis.workflow_history import NodeStatus, ReviewStatus, WorkflowHistory
@@ -234,9 +234,24 @@ class ProcessingGraphView(QGraphicsView):
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        # QGraphicsView::sizeHint() is derived from transform.mapRect(sceneRect()).
+        # That means Ctrl+wheel zoom changes the widget's preferred size; in the
+        # ROI sidebar this propagates through QSplitter -> Workbench -> QScrollArea
+        # and creates large blank regions around the workflow.  Keep the viewport
+        # layout size independent of the scene transform.
+        self.setSizeAdjustPolicy(QAbstractScrollArea.SizeAdjustPolicy.AdjustIgnored)
+        self.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding,
+        )
         self.setMinimumSize(300, 300)
         self.setBackgroundBrush(self.palette().color(QPalette.ColorRole.Base))
         self.setFrameShape(QFrame.Shape.NoFrame)
+
+    def sizeHint(self) -> QSize:
+        """Stable preferred viewport size; never derive it from zoom/scene size."""
+        return QSize(420, 300)
 
     @property
     def selected_node_id(self) -> str | None:

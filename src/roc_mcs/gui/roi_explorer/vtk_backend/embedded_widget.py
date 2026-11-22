@@ -1007,8 +1007,10 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
                 lower_percentile=None,
                 upper_percentile=None,
             )
-            self.display.set_thresholds(
-                float(low), float(high),
+            # Percentage controls are the single source of truth during a
+            # pointer drag. This throttled VTK callback may update the physical
+            # min/max labels, but must never rewrite spinboxes or slider handles.
+            self.display.update_absolute_thresholds(
                 absolute_low=info.get("threshold_min"),
                 absolute_high=info.get("threshold_max"),
                 reference=info.get("threshold_reference"),

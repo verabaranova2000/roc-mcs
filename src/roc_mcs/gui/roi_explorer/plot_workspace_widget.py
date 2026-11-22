@@ -30,7 +30,10 @@ class _PlotSubWindow(QMdiSubWindow):
         self.setWindowTitle(title)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
         self.setOption(QMdiSubWindow.SubWindowOption.RubberBandMove, True)
-        self.setOption(QMdiSubWindow.SubWindowOption.RubberBandResize, True)
+        # Live resize is required so Matplotlib and QVTK receive the real size
+        # continuously. RubberBandResize=True only animates an outline and sends
+        # one final QResizeEvent on mouse release, making plots jump in steps.
+        self.setOption(QMdiSubWindow.SubWindowOption.RubberBandResize, False)
 
     def closeEvent(self, event):
         # MDI close means "hide this panel", not "destroy its renderer".
