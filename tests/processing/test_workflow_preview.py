@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from roc_mcs.analysis.workflow_preview import build_workflow_preview_state
 
@@ -116,3 +117,17 @@ def test_fit_node_exposes_only_registered_derived_maps_and_compatible_curves():
     assert state.default_curve_key == "fit.model"
     assert state.map_layer("fit.derived.FWHM.component0").data_yx[0, 0] == 0.3
     assert state.map_layer("fit.residual_mean").data_yx[0, 0] == 0.5
+
+
+def test_analysis_spatial_validity_mask_is_preserved_in_preview_state():
+    scan = _scan()
+    scan.arrays["analysis_valid_mask_yx"] = np.array([[True]])
+    state = build_workflow_preview_state(_node("peaks.detect"), {"scan": scan})
+    np.testing.assert_array_equal(state.analysis_valid_mask_yx, [[True]])
+
+
+def test_analysis_spatial_validity_mask_shape_is_validated():
+    scan = _scan()
+    scan.arrays["analysis_valid_mask_yx"] = np.ones((2, 2), dtype=bool)
+    with pytest.raises(ValueError, match="analysis_valid_mask_yx"):
+        build_workflow_preview_state(_node("peaks.detect"), {"scan": scan})

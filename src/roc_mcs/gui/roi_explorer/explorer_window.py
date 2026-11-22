@@ -79,6 +79,7 @@ from roc_mcs.gui.roi_explorer.plot_display_settings import PlotDisplaySettingsDi
 from roc_mcs.roi.roi_types import ROI, SavedROI
 from roc_mcs.roi.extraction import extract_from_roi
 from roc_mcs.gui.processing_workbench.roi_workflow_panel import ProcessingStepsPanel
+from roc_mcs.visualization.peak_count_map import integrated_intensity_map
 
 
 class RockingCurveExplorerWindow(QMainWindow):
@@ -1587,6 +1588,42 @@ class RockingCurveExplorerWindow(QMainWindow):
                     img = state.map_data
                     title = f"{state.label} · {state.map_title}"
                 self.map_widget.tools.results_btn.setEnabled(bool(getattr(state, "map_layers", ())))
+            if not self._theta_slice_mode and self._analysis_map_key == "peaks.count":
+                # Match the display intensity to the signal actually consumed
+                # by peaks.detect: measured counts or upstream interpolation.
+                peak_input = state.data_yxt
+                peak_valid = state.valid_mask_yxt
+                if bool(state.metadata.get("peaks_used_interpolated_data", False)):
+                    interpolated = next(
+                        (source for source in state.curve_sources if source.key == "spikes.interpolated"),
+                        None,
+                    )
+                    if interpolated is not None:
+                        peak_input = interpolated.data_yxt
+                        peak_valid = interpolated.valid_mask_yxt
+                intensity, valid_yx = integrated_intensity_map(
+                    peak_input,
+                    state.theta,
+                    valid_mask_yxt=peak_valid,
+                    analysis_valid_mask_yx=getattr(state, "analysis_valid_mask_yx", None),
+                )
+                counts = np.asarray(img, dtype=float)
+                if counts.shape != intensity.shape:
+                    raise ValueError(
+                        f"peak_count_map имеет форму {counts.shape}, ожидалась {intensity.shape}"
+                    )
+                counts = np.where(valid_yx, counts, np.nan)
+                self.map_widget.draw_peak_count_map(
+                    counts,
+                    intensity,
+                    title,
+                    x_coords=state.x_coords,
+                    y_coords=state.y_coords,
+                    valid_mask_yx=valid_yx,
+                )
+                self._draw_pinned_rois(); self.map_widget.canvas.draw_idle()
+                return
+
             p_lo = float(self.map_widget.low_pct.value()); p_hi = float(self.map_widget.high_pct.value())
             try:
                 finite = np.asarray(img)[np.isfinite(img)]

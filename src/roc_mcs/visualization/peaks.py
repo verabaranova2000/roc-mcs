@@ -9,6 +9,7 @@ import matplotlib.font_manager as fm
 
 
 from roc_mcs.utils import to_yxt
+from roc_mcs.visualization.peak_count_map import PEAK_COUNT_COLORS
 
 
 
@@ -38,7 +39,7 @@ def plot_peak_count_map(data_3d, th_array, peak_catalog, theme='dark', pixel_siz
             'spine_cax': '#444444',    # Рамка легенды
             'grid': '#666666',         # Цвет сетки
             'zero_domain': '#000000',  # Цвет пикселей, где 0 пиков
-            'cmap_colors': ['#1f77b4', '#d62728', '#2ca02c', '#ff7f0e', '#9467bd']
+            'cmap_colors': list(PEAK_COUNT_COLORS)
         },
         'light': {
             'bg': 'white',
@@ -47,7 +48,7 @@ def plot_peak_count_map(data_3d, th_array, peak_catalog, theme='dark', pixel_siz
             'spine_cax': '#AAAAAA',
             'grid': '#CCCCCC',
             'zero_domain': '#FFFFFF',
-            'cmap_colors': ['#1f77b4', '#d62728', '#2ca02c', '#ff7f0e', '#9467bd']
+            'cmap_colors': list(PEAK_COUNT_COLORS)
         }
     }
     

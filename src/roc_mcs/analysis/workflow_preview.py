@@ -48,6 +48,7 @@ class WorkflowPreviewState:
     default_map_key: str
     default_curve_key: str
     summary: str = ""
+    analysis_valid_mask_yx: np.ndarray | None = None
 
     def map_layer(self, key: str | None = None) -> PreviewMapLayer:
         selected = str(key or self.default_map_key)
@@ -362,6 +363,15 @@ def build_workflow_preview_state(
     shape = (ny, nx, ntheta)
 
     scan_valid = _valid_mask(arrays.get("valid_mask_yxt"), shape, "Scan valid_mask_yxt")
+    analysis_valid_value = arrays.get("analysis_valid_mask_yx")
+    analysis_valid = None
+    if analysis_valid_value is not None:
+        analysis_valid = np.asarray(analysis_valid_value, dtype=bool)
+        if analysis_valid.shape != (ny, nx):
+            raise ValueError(
+                f"Scan analysis_valid_mask_yx имеет форму {analysis_valid.shape}, "
+                f"ожидалась {(ny, nx)}"
+            )
     spikes = context.get("spikes")
     peaks = context.get("peaks")
     fit = context.get("fit")
@@ -557,4 +567,5 @@ def build_workflow_preview_state(
         map_layers=tuple(layers), curve_sources=tuple(curve_sources),
         default_map_key=default_map, default_curve_key=default_curve,
         summary=str(getattr(node, "summary", "") or ""),
+        analysis_valid_mask_yx=analysis_valid,
     )

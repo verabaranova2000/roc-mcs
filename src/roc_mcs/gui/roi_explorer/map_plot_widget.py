@@ -1,6 +1,6 @@
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QComboBox, QLabel, QSizePolicy, QToolButton, QSlider
 from PyQt6.QtGui import QIcon, QPainter, QPen, QPalette
-from PyQt6.QtCore import Qt, pyqtSignal, QPoint, QPointF, QRect, QRectF, QTimer
+from PyQt6.QtCore import Qt, pyqtSignal, QPoint, QPointF, QRect, QRectF, QSize, QTimer
 from matplotlib.ticker import FuncFormatter, MaxNLocator
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
@@ -17,6 +17,8 @@ from roc_mcs.roi.spatial_pooling import PoolSpec
 from  roc_mcs.gui.roi_explorer.map_tools_widget import MapToolsWidget, pooling_preview_pixmap as _pooling_preview_pixmap
 from roc_mcs.gui.roi_explorer.plot_toolbar_style import ICON_DIR
 from roc_mcs.gui.components.icon_provider import svg_icon
+from roc_mcs.gui.components.floating_legend import FloatingLegendPanel, LegendEntry
+from roc_mcs.visualization.peak_count_map import peak_count_rgba
 from roc_mcs.gui.roi_explorer.theme import apply_widget_palette, theme_colors
 from roc_mcs.gui.roi_explorer.plot_display_settings import load_plot_display_settings
 from roc_mcs.gui.roi_explorer.colormap_catalog import mpl_colormap
@@ -230,6 +232,20 @@ class MapPlotWidget(QWidget):
         self.cax = None
         self._divider = None
         self._cbar_multiplier = None
+        self._peak_map_active = False
+        self.peak_count_legend = FloatingLegendPanel(
+            self.canvas, "2D-ЛЕГЕНДА", default_size=QSize(258, 214), margin=10
+        )
+        self.peak_count_legend.set_alpha_gradient_rows(
+            [
+                LegendEntry("1", "#1f77b4"),
+                LegendEntry("2", "#d62728"),
+                LegendEntry("3", "#2ca02c"),
+                LegendEntry("4", "#ff7f0e"),
+                LegendEntry("5+", "#9467bd"),
+            ],
+            axis_label="Яркость цвета ∝ интегральной интенсивности",
+        )
         
         # Панель вынесена отдельно; публичные атрибуты сохранены для совместимости.
         self.current_cmap = "inferno"
@@ -518,6 +534,7 @@ class MapPlotWidget(QWidget):
             view.viewport().setPalette(combo.palette()); view.viewport().setAutoFillBackground(True)
         for label in self.header_widget.findChildren(QLabel, "MapHeaderSeparator"):
             label.setStyleSheet(f"font-size:11px; font-weight:normal; color:{c['muted']}; background:transparent;")
+        self.peak_count_legend.set_panel_palette(self.canvas.palette())
         self._apply_axes_theme(); self._update_scalebar(); self.tools.apply_theme(self._theme); self._update_pool_preview()
         self.coord_label.setStyleSheet(f"QLabel#MapCoordLabel {{ font-family:monospace; font-size:10px; font-weight:600; color:{c['muted']}; padding:1px 4px; background:transparent; }}")
         self.theta_row.setStyleSheet(f"QWidget#thetaSliceRow{{background:transparent;}} QLabel#thetaSliceValue{{color:{c['text']};font-family:Segoe UI,Arial,sans-serif;font-size:9px;font-weight:600;background:transparent;padding:0 1px;}}")
@@ -525,8 +542,9 @@ class MapPlotWidget(QWidget):
         self.canvas.draw_idle()
 
     def apply_display_settings(self, settings: dict | None = None) -> None:
-        if settings is not None: self._display_settings = dict(settings)
-        if self.map_image is not None:
+        if settings is not None:
+            self._display_settings = dict(settings)
+        if self.map_image is not None and not self._peak_map_active:
             show_cbar = bool(self._display_settings.get("show_colorbar", True))
             if show_cbar and self.cbar is None:
                 self.figure.subplots_adjust(right=0.76)
@@ -540,6 +558,9 @@ class MapPlotWidget(QWidget):
             elif show_cbar:
                 self.figure.subplots_adjust(right=0.76)
             self._configure_colorbar()
+        elif self._peak_map_active:
+            self.range_slider.hide()
+            self.contrast_popup_btn.hide()
         self._apply_axes_theme()
         if self.map_image is not None: self._update_scalebar()
         self.canvas.draw_idle()
@@ -707,8 +728,94 @@ class MapPlotWidget(QWidget):
         return j
         
 
+    def draw_peak_count_map(
+        self,
+        peak_count_map,
+        intensity_map,
+        title: str,
+        *,
+        x_coords=None,
+        y_coords=None,
+        valid_mask_yx=None,
+    ) -> None:
+        """Render peak count as discrete hue and integrated intensity as alpha.
+
+        The regular scalar colorbar/contrast rail is intentionally replaced by
+        the movable 2D legend: the two visual channels are coupled, not one
+        ordinary scalar map.
+        """
+        counts = np.asarray(peak_count_map, dtype=float)
+        intensity = np.asarray(intensity_map, dtype=float)
+        if counts.ndim != 2 or intensity.shape != counts.shape:
+            raise ValueError("peak_count_map и intensity_map должны иметь одинаковую 2D-форму")
+        rgba, intensity_range = peak_count_rgba(
+            counts, intensity, theme=self._theme, valid_mask_yx=valid_mask_yx
+        )
+        self._x_coords, x_edges = self._axis_centers(x_coords, counts.shape[1], "x_coords")
+        self._y_coords, y_edges = self._axis_centers(y_coords, counts.shape[0], "y_coords")
+        extent = (x_edges[0], x_edges[1], y_edges[0], y_edges[1])
+
+        if self.cbar is not None:
+            self.cbar.remove()
+            self.cbar = None
+            self.cax = None
+            self._cbar_multiplier = None
+            self._divider = None
+            self.figure.subplots_adjust(right=0.91)
+        self.range_slider.hide()
+        self.contrast_popup_btn.hide()
+        first_draw = self.map_image is None
+        if first_draw:
+            self.ax.clear()
+            self.map_image = self.ax.imshow(
+                rgba, origin="lower", interpolation="nearest", aspect="auto", extent=extent
+            )
+        else:
+            old_xlim, old_ylim = self.ax.get_xlim(), self.ax.get_ylim()
+            self.map_image.set_data(rgba)
+            self.map_image.set_extent(extent)
+            self.map_image.set_alpha(None)
+            self.ax.set_xlim(old_xlim)
+            self.ax.set_ylim(old_ylim)
+
+        self.ax.set_xlabel("Detector X (source pixels)")
+        self.ax.set_ylabel("Detector Y (source pixels)")
+        self.ax.set_title(str(title), pad=7)
+        self.ax.xaxis.set_major_locator(MaxNLocator(nbins=5, integer=True))
+        self.ax.yaxis.set_major_locator(MaxNLocator(nbins=5, integer=True))
+        self.ax.set_aspect("equal", adjustable="box")
+        self.ax.set_anchor("N")
+        colors = theme_colors(self._theme)
+        self.ax.set_facecolor("#000000" if self._theme == "dark" else "#ffffff")
+        self.ax.grid(True, color=colors["grid"], linestyle=":", linewidth=0.55, alpha=0.34)
+        low, high = intensity_range
+        if np.isfinite(low) and np.isfinite(high):
+            label = f"I по θ · {low:.3g}–{high:.3g}"
+        else:
+            label = "Интегральная интенсивность I"
+        self.peak_count_legend.set_alpha_gradient_rows(
+            [
+                LegendEntry("1", "#1f77b4"),
+                LegendEntry("2", "#d62728"),
+                LegendEntry("3", "#2ca02c"),
+                LegendEntry("4", "#ff7f0e"),
+                LegendEntry("5+", "#9467bd"),
+            ],
+            axis_label=label + " · низкая → высокая",
+        )
+        self._peak_map_active = True
+        self.peak_count_legend.set_panel_palette(self.canvas.palette())
+        self._apply_axes_theme()
+        # Preserve the pure black/white base used by plot_peak_count_map().
+        self.ax.set_facecolor("#000000" if self._theme == "dark" else "#ffffff")
+        self._update_scalebar()
+        self.peak_count_legend.show_on_canvas()
+        self.canvas.draw_idle()
+
     def draw_map(self, img, title: str, cmap: str, vmin: float, vmax: float, *, x_coords=None, y_coords=None) -> None:
         """Обновляет карту в координатах исходной detector-grid, сохраняя ROI и селектор."""
+        self._peak_map_active = False
+        self.peak_count_legend.hide_on_canvas()
         img = np.asarray(img)
         if img.ndim != 2:
             raise ValueError(f"Ожидалась 2D-карта, получена форма {img.shape}")
@@ -721,6 +828,8 @@ class MapPlotWidget(QWidget):
             self.ax.clear()
             self.ax.set_xlabel("Detector X (source pixels)")
             self.ax.set_ylabel("Detector Y (source pixels)")
+            self.ax.set_title(str(title), pad=7)
+            self.ax.grid(False)
             self.ax.xaxis.set_major_locator(MaxNLocator(nbins=5, integer=True)); self.ax.yaxis.set_major_locator(MaxNLocator(nbins=5, integer=True))
             self.ax.set_aspect("equal", adjustable="box"); self.ax.set_anchor("N")
             self.map_image = self.ax.imshow(img, origin="lower", cmap=mpl_colormap(cmap), interpolation="nearest",
@@ -739,6 +848,8 @@ class MapPlotWidget(QWidget):
                 self.map_image.autoscale()
             self.ax.set_xlabel("Detector X (source pixels)")
             self.ax.set_ylabel("Detector Y (source pixels)")
+            self.ax.set_title(str(title), pad=7)
+            self.ax.grid(False)
             self.ax.xaxis.set_major_locator(MaxNLocator(nbins=5, integer=True)); self.ax.yaxis.set_major_locator(MaxNLocator(nbins=5, integer=True))
             self.ax.set_aspect("equal", adjustable="box"); self.ax.set_anchor("N")
             self.ax.set_xlim(old_xlim)

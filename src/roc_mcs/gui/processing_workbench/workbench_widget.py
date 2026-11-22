@@ -29,10 +29,27 @@ from roc_mcs.analysis.workflow_history import NodeStatus, ReviewStatus, Workflow
 from .presenter import ArtifactPreviewRequest
 from roc_mcs.analysis.workflow_preview import build_workflow_preview_state
 from .graph_canvas import ProcessingGraphView
+from .peak_detection_preview import PeakDetectionPreview
+from roc_mcs.visualization.peak_count_map import integrated_intensity_map, peak_count_rgba
 from roc_mcs.gui.components.icon_provider import svg_icon
 from roc_mcs.gui.roi_explorer.plot_toolbar_style import ICON_DIR
 from roc_mcs.gui.roi_explorer.map_tools_widget import pooling_preview_pixmap
 from roc_mcs.gui.roi_explorer.theme import apply_widget_palette, apply_popup_theme, resolve_theme, theme_colors
+
+
+# Keep the initial values and the in-form reset action in one place. These are
+# the established pixel peak-detector defaults used by the current workflow.
+_PEAK_FORM_DEFAULTS = {
+    "window_size": 3,
+    "smooth_window": 11,
+    "smooth_polyorder": 2,
+    "min_distance": 6,
+    "prominence_mode": "sigma",
+    "prominence_value": 3.0,
+    "min_relative_prominence": 0.07,
+    "use_interpolated_data": False,
+}
+_PEAK_PROMINENCE_MODE_DEFAULTS = {"sigma": 3.0, "fraction": 0.07}
 
 
 class _WorkerSignals(QObject):
@@ -615,38 +632,169 @@ class ProcessingWorkbenchWidget(QWidget):
         )
 
     def _build_peak_form(self) -> None:
-        layout = self._add_form_page("peaks.detect", "Peak detection")
-        window = self._int_spin(1, 15, 3, 2)
-        smooth = self._int_spin(3, 101, 11, 2)
-        poly = self._int_spin(0, 10, 2)
-        distance = self._int_spin(1, 1000, 6)
-        mode = QComboBox()
-        mode.addItem("Порог в σ шума", "sigma")
-        mode.addItem("Доля размаха ROC", "fraction")
-        prominence = self._float_spin(0.0001, 1000.0, 3.0, 4)
-        relative = self._float_spin(0.0001, 1.0, 0.07, 4)
-        interpolated = QCheckBox("Вход: интерполированная ROC")
-        interpolated.setChecked(False)
-        interpolated.setToolTip(
-            "ВЫКЛ.: поиск выполняется по измеренным counts Scan-входа (включая "
-            "отмеченные spike-точки; исходные данные не меняются). "
-            "ВКЛ.: поиск выполняется по clean_data_yxt из upstream Spike detection, "
-            "где обнаруженные точки заменены интерполированными значениями. "
-            "Это отдельное решение о входном сигнале, а не автоматическое следствие "
-            "принятия этапа Spike detection. Включение требует предшествующий spike-узел."
+        layout = self._add_form_page("peaks.detect", "Поиск дифракционных пиков")
+
+        # A compact reset action sits above the controls. It only affects this
+        # not-yet-added form; existing workflow nodes remain immutable.
+        reset_row = QHBoxLayout()
+        reset_row.addStretch(1)
+        reset_button = QToolButton()
+        reset_button.setText("↺ По умолчанию")
+        reset_button.setToolTip(
+            "Вернуть исходные параметры детектора пиков. Сброс действует на форму "
+            "создаваемого этапа и не изменяет уже добавленные этапы workflow."
         )
-        layout.addRow("Окрестность каталога:", window)
-        layout.addRow("Окно Savitzky–Golay:", smooth)
-        layout.addRow("Степень полинома:", poly)
-        layout.addRow("Минимальная дистанция:", distance)
-        layout.addRow("Порог prominence:", mode)
-        layout.addRow("Значение prominence:", prominence)
-        layout.addRow("Относительный prominence:", relative)
+        reset_row.addWidget(reset_button)
+        layout.addRow(reset_row)
+
+        window = self._int_spin(1, 15, _PEAK_FORM_DEFAULTS["window_size"], 2)
+        smooth = self._int_spin(3, 101, _PEAK_FORM_DEFAULTS["smooth_window"], 2)
+        poly = self._int_spin(0, 10, _PEAK_FORM_DEFAULTS["smooth_polyorder"])
+        distance = self._int_spin(1, 1000, _PEAK_FORM_DEFAULTS["min_distance"])
+        mode = QComboBox()
+        mode.addItem("Порог по шуму (σ)", "sigma")
+        mode.addItem("Доля размаха ROC", "fraction")
+        mode.setCurrentIndex(mode.findData(_PEAK_FORM_DEFAULTS["prominence_mode"]))
+        prominence = self._float_spin(
+            0.0001, 1000.0, _PEAK_FORM_DEFAULTS["prominence_value"], 4
+        )
+        prominence.setSuffix(" σ")
+        prominence.setSingleStep(0.1)
+        relative = self._float_spin(
+            0.0001, 1.0, _PEAK_FORM_DEFAULTS["min_relative_prominence"], 4
+        )
+        interpolated = QCheckBox("Использовать интерполированную ROC")
+        interpolated.setChecked(_PEAK_FORM_DEFAULTS["use_interpolated_data"])
+        interpolated.setToolTip(
+            "ВЫКЛ.: поиск выполняется по измеренным counts Scan-входа. "
+            "ВКЛ.: используется clean_data_yxt из предшествующего этапа Spike detection, "
+            "где отмеченные точки заменены интерполированными значениями. "
+            "Это отдельное решение о входном сигнале. Включение требует Spike detection "
+            "в выбранной ветви. Исходные counts не перезаписываются."
+        )
+
+        window.setToolTip(
+            "Размер пространственной окрестности detector-пикселей. Для каждого пикселя "
+            "соседние ROC усредняются по окну N×N до поиска пиков. Это не окно сглаживания "
+            "вдоль θ. Допустимы нечётные размеры."
+        )
+        smooth.setToolTip(
+            "Ширина Savitzky–Golay-фильтра вдоль угловой оси θ, в числе отсчётов. "
+            "Нечётное окно: большее значение подавляет мелкие быстрые флуктуации, "
+            "но может сгладить близкие/узкие компоненты. Не может превышать длину ROC."
+        )
+        poly.setToolTip(
+            "Степень локального полинома, которым Savitzky–Golay-фильтр аппроксимирует "
+            "сигнал внутри окна. Должна быть строго меньше ширины окна."
+        )
+        distance.setToolTip(
+            "Минимальный горизонтальный интервал между соседними максимумами, "
+            "в отсчётах θ. При конфликте find_peaks удаляет более слабый максимум. "
+            "Это не ширина пика и не расстояние между пикселями детектора."
+        )
+        mode.setToolTip(
+            "Способ задать нижнюю границу prominence — насколько вершина выступает "
+            "над локальным контуром (основанием), а не над нулём."
+        )
+        prominence.setToolTip(
+            "Для режима σ: минимум prominence = значение × оценка σ фонового шума. "
+            "Для режима размаха: минимум = доля × (max сглаженной ROC − min сглаженной ROC)."
+        )
+        relative.setToolTip(
+            "Второй фильтр после абсолютного prominence: сохраняются кандидаты, "
+            "чья prominence не меньше указанной доли от самого выраженного кандидата "
+            "в этой же ROC-кривой. Например, 0.07 означает 7%."
+        )
+
+        layout.addRow("Пространственная окрестность, px:", window)
+        layout.addRow("Окно сглаживания SG, θ-точек:", smooth)
+        layout.addRow("Степень полинома SG:", poly)
+        layout.addRow("Минимальная дистанция, θ-точек:", distance)
+        layout.addRow("Критерий prominence:", mode)
+        layout.addRow("Минимальная prominence:", prominence)
+        layout.addRow("Относительный порог от max:", relative)
+
+        preview = PeakDetectionPreview()
+
+        def refresh_preview(*_args) -> None:
+            preview.set_parameters(
+                window_size=window.value(),
+                smooth_window=smooth.value(),
+                smooth_polyorder=poly.value(),
+                min_distance=distance.value(),
+                prominence_mode=str(mode.currentData()),
+                prominence_value=prominence.value(),
+                min_relative_prominence=relative.value(),
+            )
+
+        # A Savitzky–Golay polynomial must have lower order than its window.
+        def adapt_polynomial_limit(window_value: int) -> None:
+            poly.setMaximum(max(0, min(10, int(window_value) - 1)))
+            if poly.value() > poly.maximum():
+                poly.setValue(poly.maximum())
+
+        mode_values = dict(_PEAK_PROMINENCE_MODE_DEFAULTS)
+
+        def remember_prominence(value: float) -> None:
+            mode_values[str(mode.currentData())] = float(value)
+            refresh_preview()
+
+        def change_prominence_mode(_index: int) -> None:
+            key = str(mode.currentData())
+            prominence.blockSignals(True)
+            if key == "fraction":
+                prominence.setRange(0.0001, 1.0)
+                prominence.setDecimals(4)
+                prominence.setSingleStep(0.01)
+                prominence.setSuffix(" × размаха")
+            else:
+                prominence.setRange(0.0001, 1000.0)
+                prominence.setDecimals(4)
+                prominence.setSingleStep(0.1)
+                prominence.setSuffix(" σ")
+            prominence.setValue(float(mode_values[key]))
+            prominence.blockSignals(False)
+            refresh_preview()
+
+        def reset_peak_parameters() -> None:
+            # Block individual signals so the preview is recalculated once, from
+            # the complete restored configuration rather than intermediate states.
+            controls = (window, smooth, poly, distance, mode, prominence, relative, interpolated)
+            previous_block_states = [control.blockSignals(True) for control in controls]
+            try:
+                mode_values.update(_PEAK_PROMINENCE_MODE_DEFAULTS)
+                window.setValue(_PEAK_FORM_DEFAULTS["window_size"])
+                smooth.setValue(_PEAK_FORM_DEFAULTS["smooth_window"])
+                poly.setMaximum(max(0, min(10, smooth.value() - 1)))
+                poly.setValue(_PEAK_FORM_DEFAULTS["smooth_polyorder"])
+                distance.setValue(_PEAK_FORM_DEFAULTS["min_distance"])
+                mode.setCurrentIndex(mode.findData(_PEAK_FORM_DEFAULTS["prominence_mode"]))
+                prominence.setRange(0.0001, 1000.0)
+                prominence.setDecimals(4)
+                prominence.setSingleStep(0.1)
+                prominence.setSuffix(" σ")
+                prominence.setValue(_PEAK_FORM_DEFAULTS["prominence_value"])
+                relative.setValue(_PEAK_FORM_DEFAULTS["min_relative_prominence"])
+                interpolated.setChecked(_PEAK_FORM_DEFAULTS["use_interpolated_data"])
+            finally:
+                for control, was_blocked in zip(controls, previous_block_states):
+                    control.blockSignals(was_blocked)
+            refresh_preview()
+
+        smooth.valueChanged.connect(adapt_polynomial_limit)
+        for control in (window, smooth, poly, distance, relative):
+            control.valueChanged.connect(refresh_preview)
+        prominence.valueChanged.connect(remember_prominence)
+        mode.currentIndexChanged.connect(change_prominence_mode)
+        reset_button.clicked.connect(reset_peak_parameters)
+        layout.addRow("Эффект параметров:", preview)
         layout.addRow("", interpolated)
+        refresh_preview()
         self._forms["peaks.detect"].update(
             window_size=window, smooth_window=smooth, smooth_polyorder=poly,
             min_distance=distance, prominence_mode=mode, prominence_value=prominence,
             min_relative_prominence=relative, use_interpolated_data=interpolated,
+            preview=preview, reset_button=reset_button,
         )
 
     def _build_fit_form(self) -> None:
@@ -1731,7 +1879,43 @@ class ProcessingWorkbenchWidget(QWidget):
             "Число spike-точек", "Число пиков в локальной ROC-окрестности",
             "Число fitted-компонент",
         }
-        if map_title in overlay_titles:
+        peak_map_display = map_title == "Число пиков в локальной ROC-окрестности"
+        if peak_map_display:
+            # Keep the embedded Workbench QC map semantically identical to the
+            # main ROI Explorer map: hue = peak count, alpha = integrated I(θ).
+            scan_for_mask = ctx.get("scan")
+            valid_yxt = None
+            analysis_valid_yx = None
+            peak_input = np.asarray(data_yxt, dtype=float)
+            if scan_for_mask is not None:
+                valid_yxt = scan_for_mask.arrays.get("valid_mask_yxt")
+                analysis_valid_yx = scan_for_mask.arrays.get("analysis_valid_mask_yx")
+            if peaks is not None and bool(peaks.metadata.get("used_interpolated_data", False)):
+                if spikes is None or "clean_data_yxt" not in spikes.arrays:
+                    raise ValueError(
+                        "Поиск пиков выполнен на spike-interpolation, "
+                        "но QC карта не получила clean_data_yxt"
+                    )
+                peak_input = np.asarray(spikes.arrays["clean_data_yxt"], dtype=float)
+                valid_yxt = spikes.arrays.get(
+                    "detector_valid_mask_yxt", valid_yxt
+                )
+            intensity, valid_yx = integrated_intensity_map(
+                peak_input, theta, valid_mask_yxt=valid_yxt,
+                analysis_valid_mask_yx=analysis_valid_yx,
+            )
+            rgba, _ = peak_count_rgba(
+                map_data, intensity, theme=self._theme, valid_mask_yx=valid_yx
+            )
+            self.ax_map.imshow(
+                rgba, origin="lower", interpolation="nearest", aspect="auto"
+            )
+            self.ax_map.text(
+                0.02, 0.02, "цвет: число пиков · прозрачность: ∫I dθ",
+                transform=self.ax_map.transAxes, fontsize=6.5,
+                va="bottom", ha="left", alpha=0.82,
+            )
+        elif map_title in overlay_titles:
             intensity = np.nansum(np.asarray(data_yxt, dtype=float), axis=-1)
             scan_for_mask = ctx.get("scan")
             if scan_for_mask is not None:
@@ -1980,6 +2164,8 @@ class ProcessingWorkbenchWidget(QWidget):
         self.pixel_label.setText(f"Пиксель: X={x}, Y={y}{suffix}")
         self.figure.tight_layout()
         self._style_matplotlib_figure(self.figure)
+        if peak_map_display:
+            self.ax_map.set_facecolor("#000000" if self._theme == "dark" else "#ffffff")
         self.canvas.draw_idle()
         self._current_map_data = np.asarray(map_data)
         self._current_curve_data = np.asarray(data_yxt)
