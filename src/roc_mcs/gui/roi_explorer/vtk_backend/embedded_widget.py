@@ -151,6 +151,13 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
         self._settings_timer.setSingleShot(True)
         self._settings_timer.setInterval(80)
         self._settings_timer.timeout.connect(self._apply_transfer_settings)
+        # Dedicated low-latency path for the colorbar drag.  Other staged
+        # display controls retain their existing settings-apply debounce.
+        self._volume_contrast_timer = QtCore.QTimer(self)
+        self._volume_contrast_timer.setSingleShot(True)
+        self._volume_contrast_timer.setInterval(25)
+        self._volume_contrast_timer.timeout.connect(self._apply_pending_volume_contrast)
+        self._pending_volume_contrast: tuple[float, float] | None = None
         self._roi_preview_timer = QtCore.QTimer(self)
         self._roi_preview_timer.setSingleShot(True)
         self._roi_preview_timer.setInterval(16)
@@ -898,7 +905,10 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
                 self.display = VTKVolumeDisplayWidget(self.viewport)
                 self.display.attach_settings_panel(self.display_panel)
                 self.display.bind_threshold_spins(self.low_threshold, self.high_threshold)
-                self.display.thresholds_changed.connect(self._queue_transfer_settings)
+                self.display.thresholds_changed.connect(self._queue_volume_contrast_preview)
+                self.display.thresholds_interaction_finished.connect(
+                    self._finish_volume_contrast_interaction
+                )
                 self.viewport_layout.addWidget(
                     self.display, 0, 0,
                     alignment=(QtCore.Qt.AlignmentFlag.AlignTop | QtCore.Qt.AlignmentFlag.AlignRight),
@@ -953,6 +963,60 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
             projection_palette=self.projection_palette.currentData(),
         )
 
+    def _queue_volume_contrast_preview(self, low: float, high: float) -> None:
+        """Queue a fast contrast-only update while the colorbar is dragged."""
+        if self._scene is None or self._payload is None or self._closed:
+            return
+        self._pending_volume_contrast = (float(low), float(high))
+        if not self._volume_contrast_timer.isActive():
+            self._volume_contrast_timer.start()
+
+    def _finish_volume_contrast_interaction(self) -> None:
+        """Ensure the final handle position is rendered immediately on release."""
+        if (
+            self._scene is None or self._payload is None or self._closed
+            or self._pending_volume_contrast is None
+        ):
+            return
+        if self._volume_contrast_timer.isActive():
+            self._volume_contrast_timer.stop()
+        QtCore.QTimer.singleShot(0, self._apply_pending_volume_contrast)
+
+    def _apply_pending_volume_contrast(self) -> None:
+        if (
+            self._scene is None
+            or self._payload is None
+            or self._closed
+            or self._pending_volume_contrast is None
+        ):
+            return
+        if self._volume_contrast_timer.isActive():
+            self._volume_contrast_timer.stop()
+        low, high = self._pending_volume_contrast
+        self._pending_volume_contrast = None
+        try:
+            info = self._scene.update_volume_contrast(
+                float(low) / 100.0,
+                float(high) / 100.0,
+                render=False,
+            )
+            self._transfer = replace(
+                self._transfer,
+                lower_fraction=float(low) / 100.0,
+                upper_fraction=float(high) / 100.0,
+                lower_percentile=None,
+                upper_percentile=None,
+            )
+            self.display.set_thresholds(
+                float(low), float(high),
+                absolute_low=info.get("threshold_min"),
+                absolute_high=info.get("threshold_max"),
+                reference=info.get("threshold_reference"),
+            )
+            self._render()
+        except Exception as exc:
+            self.status.setText(f"Не удалось обновить контраст объёма: {exc}")
+
     def _queue_transfer_settings(self, *_args):
         if self._scene is not None:
             self._settings_timer.start()
@@ -960,6 +1024,9 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
     def _apply_transfer_settings(self):
         if self._scene is None or self._payload is None:
             return
+        if self._volume_contrast_timer.isActive():
+            self._volume_contrast_timer.stop()
+        self._pending_volume_contrast = None
         try:
             self._transfer = self._transfer_settings()
             info = self._scene.update_transfer_functions(self._transfer, render=False)
@@ -1401,6 +1468,7 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
             self._closed = True
             self._roi_preview_timer.stop()
             self._settings_timer.stop()
+            self._volume_contrast_timer.stop()
             self._init_pending = False
             self._init_generation += 1
             self._generation += 1
@@ -1409,6 +1477,7 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
             except RuntimeError:
                 pass
             self._active_worker = None
+            self._pending_volume_contrast = None
             if self.display is not None:
                 try:
                     self.display.prepare_for_shutdown(final=True)
@@ -1421,12 +1490,14 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
         try:
             self._roi_preview_timer.stop()
             self._settings_timer.stop()
+            self._volume_contrast_timer.stop()
             self._init_pending = False
             self._init_generation += 1
             self._generation += 1
             self._pending_request = None
             self._dataset_request = None
             self._payload = None
+            self._pending_volume_contrast = None
             self._roi_preview = None
 
             # Инвалидируем незавершённые CPU-задачи; не завершаем потоки насильно.

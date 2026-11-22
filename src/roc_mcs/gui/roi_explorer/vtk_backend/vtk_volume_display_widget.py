@@ -6,7 +6,9 @@ The dual-range slider reuses ROI Explorer's map slider implementation.
 """
 from __future__ import annotations
 
-from PyQt6.QtCore import QLineF, QPoint, QPointF, QRectF, QEvent, Qt, pyqtSignal
+import math
+
+from PyQt6.QtCore import QEvent, QLineF, QPoint, QPointF, QRectF, QTimer, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QFont, QLinearGradient, QPainter, QPen, QPalette
 from PyQt6.QtWidgets import (
     QApplication,
@@ -30,18 +32,40 @@ from roc_mcs.gui.roi_explorer.theme import (
 
 
 class _VolumeContrastRangeSlider(QRangeSlider):
-    """Theme-explicit slider used only by the VTK volume HUD.
+    """Volume-only dual range slider with stable pointer capture.
 
-    The shared map slider keeps its existing palette-driven painting. This
-    dedicated subclass paints every surface from ROI Explorer's resolved theme
-    so Windows native QMenu/QWidgetAction palette inheritance cannot make the
-    dark VTK HUD look like a light widget.
+    The shared map slider deliberately keeps its existing interaction.  The
+    VTK HUD uses a wider *invisible* hit area, preserves the pointer-to-handle
+    offset while dragging, and snaps to the precision of its numeric editors
+    (tenths in embedded mode, hundredths in the desktop viewer).  This prevents
+    a click on the edge of a tiny handle
+    from moving the threshold before the drag even begins.
     """
+
+    interactionFinished = pyqtSignal()
+
+    DISPLAY_DECIMALS = 1
+    VALUE_STEP = 10.0 ** -DISPLAY_DECIMALS
+    HANDLE_HIT_RADIUS = 7.0
 
     def __init__(self, *args, **kwargs):
         self._theme = "light"
         self._theme_palette = theme_colors(self._theme)
+        self._drag_offset = 0.0
+        self._last_active_handle = "low"
+        self._gesture_active = False
+        self._gesture_changed = False
         super().__init__(*args, **kwargs)
+        # The painted track remains narrow and centered.  Extra width is only
+        # an interaction target, not a thicker visual control.
+        self.setFixedSize(14, 154)
+        self.setMouseTracking(True)
+        # This widget is painted over a native QVTK sibling.  Declare the
+        # surface opaque and paint its background explicitly on every expose;
+        # transparent child painting can otherwise retain old handle pixels
+        # in the native overlay backing store until a parent resize occurs.
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
+        self.setAutoFillBackground(False)
 
     def set_theme(self, theme: str) -> None:
         active = str(theme).lower()
@@ -49,48 +73,182 @@ class _VolumeContrastRangeSlider(QRangeSlider):
         self._theme_palette = theme_colors(self._theme)
         self.update()
 
-    def paintEvent(self, _event):
+    def set_display_decimals(self, decimals: int) -> None:
+        """Match the precision of the two numeric editors bound to this slider."""
+        precision = max(0, min(4, int(decimals)))
+        self.DISPLAY_DECIMALS = precision
+        self.VALUE_STEP = 10.0 ** -precision if precision else 1.0
+        self._minimum_gap = min(self.VALUE_STEP, max(0.0, self._max - self._min))
+        self.setValues(self._low, self._high)
+
+    def setValues(self, low: float, high: float) -> None:
+        """Keep programmatic values aligned with the bound numeric editors."""
+        low = round(float(low), self.DISPLAY_DECIMALS)
+        high = round(float(high), self.DISPLAY_DECIMALS)
+        super().setValues(low, high)
+
+    def mousePressEvent(self, event):
+        if event.button() != Qt.MouseButton.LeftButton:
+            event.ignore()
+            return
+
+        self._gesture_active = True
+        self._gesture_changed = False
+        coordinate = self._coordinate(event)
+        low_position = self._val_to_pos(self._low)
+        high_position = self._val_to_pos(self._high)
+        low_distance = abs(coordinate - low_position)
+        high_distance = abs(coordinate - high_position)
+
+        low_hit = low_distance <= self.HANDLE_HIT_RADIUS
+        high_hit = high_distance <= self.HANDLE_HIT_RADIUS
+
+        if low_hit and high_hit:
+            # When the two handles are close, their enlarged hit regions
+            # overlap.  Select by the side of the midpoint; on an exact tie,
+            # retain the last handle so repeated clicks remain deterministic.
+            midpoint = (low_position + high_position) * 0.5
+            if coordinate < midpoint - 0.05:
+                active = "high" if self._orientation == Qt.Orientation.Vertical else "low"
+            elif coordinate > midpoint + 0.05:
+                active = "low" if self._orientation == Qt.Orientation.Vertical else "high"
+            else:
+                active = self._last_active_handle
+            self._active_handle = active
+            handle_position = high_position if active == "high" else low_position
+            self._drag_offset = coordinate - handle_position
+        elif low_hit or high_hit:
+            active = "low" if low_hit and (not high_hit or low_distance <= high_distance) else "high"
+            self._active_handle = active
+            handle_position = low_position if active == "low" else high_position
+            # Keep the exact grab offset: grabbing the top/bottom edge of a
+            # handle must not make it jump to the pointer's centre.
+            self._drag_offset = coordinate - handle_position
+        else:
+            # A click on the track (outside either handle's hit zone) moves
+            # the nearest bound to the clicked position, as expected.
+            active = "low" if low_distance <= high_distance else "high"
+            self._active_handle = active
+            self._drag_offset = 0.0
+            self._set_position(coordinate)
+
+        self._last_active_handle = self._active_handle
+        self.setFocus(Qt.FocusReason.MouseFocusReason)
+        event.accept()
+
+    def mouseMoveEvent(self, event):
+        if self._active_handle is None:
+            event.ignore()
+            return
+        self._set_position(self._coordinate(event) - self._drag_offset)
+        # The widget is only 14 px wide; repainting the complete track is cheap
+        # and guarantees the previous handle locations are erased as well.
+        self.update()
+        event.accept()
+
+    def cancel_drag(self) -> None:
+        """Cancel a pointer grab before the native viewport changes geometry."""
+        self._active_handle = None
+        self._drag_offset = 0.0
+
+    def mouseReleaseEvent(self, event):
+        if event.button() != Qt.MouseButton.LeftButton:
+            event.ignore()
+            return
+        gesture_changed = self._gesture_active and self._gesture_changed
+        self._gesture_active = False
+        self._gesture_changed = False
+        self.cancel_drag()
+        if gesture_changed:
+            self.interactionFinished.emit()
+        self.update()
+        event.accept()
+
+    def resizeEvent(self, event):
+        # The handle positions are calculated from the current widget height.
+        # A resize invalidates an in-progress pointer offset, so never continue
+        # a drag using coordinates from the previous viewport geometry.
+        if event.oldSize() != event.size():
+            self.cancel_drag()
+        super().resizeEvent(event)
+        self.update()
+
+    def _set_position(self, position: float) -> None:
+        if self._active_handle not in ("low", "high"):
+            return
+        value = round(self._pos_to_val(float(position)), self.DISPLAY_DECIMALS)
+        old_values = (self._low, self._high)
+        if self._active_handle == "low":
+            self.setLow(min(99.0, max(0.0, value)))
+        else:
+            self.setHigh(min(100.0, max(1.0, value)))
+        new_values = (self._low, self._high)
+        if new_values != old_values:
+            if self._gesture_active:
+                self._gesture_changed = True
+            self.valueChanged.emit(self._low, self._high)
+
+    def event(self, event):
+        # If the OS interrupts a drag (for example, focus changes while the
+        # pointer is outside the viewport), never leave a stale active handle.
+        if event.type() in (QEvent.Type.UngrabMouse, QEvent.Type.FocusOut):
+            self._active_handle = None
+            self._drag_offset = 0.0
+        return super().event(event)
+
+    def paintEvent(self, event):
         painter = QPainter(self)
         if not painter.isActive():
             return
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        colors = self._theme_palette
-        is_dark = self._theme == "dark"
-        track = QColor(colors["border"])
-        active = QColor("#76A9D5" if is_dark else "#477FA8")
-        handle_fill = QColor(colors["button"] if is_dark else colors["base"])
-        handle_edge = QColor(colors["text"] if is_dark else colors["border"])
+        try:
+            # The slider sits on an opaque HUD whose surface colour matches
+            # the VTK renderer clear colour.  Clearing before drawing removes
+            # every previous anti-aliased handle/track pixel, even when Qt
+            # delivers only a partial paint event after mouse movement.
+            background = self.palette().color(QPalette.ColorRole.Window)
+            # Clear the complete slider surface. QPainter's system clip still
+            # honours Qt's expose region, while update() below invalidates the
+            # whole 14 px widget for each pointer movement.
+            painter.fillRect(self.rect(), background)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            colors = self._theme_palette
+            is_dark = self._theme == "dark"
+            track = QColor(colors["border"])
+            active = QColor("#76A9D5" if is_dark else "#477FA8")
+            handle_fill = QColor(colors["button"] if is_dark else colors["base"])
+            handle_edge = QColor(colors["text"] if is_dark else colors["border"])
 
-        # Leave the track canvas transparent so the compact HUD reads as one
-        # integrated overlay rather than a framed panel.
-        if self._orientation == Qt.Orientation.Vertical:
-            x = self.width() * 0.5
-            low_y = self._val_to_pos(self._low)
-            high_y = self._val_to_pos(self._high)
-            painter.setPen(QPen(track, 2.6, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-            painter.drawLine(QLineF(x, 6.0, x, self.height() - 6.0))
-            painter.setPen(QPen(active, 2.8, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-            painter.drawLine(QLineF(x, high_y, x, low_y))
-            for y in (low_y, high_y):
-                handle = QRectF(x - 3.4, y - 2.2, 6.8, 4.4)
-                painter.setPen(QPen(handle_edge, 0.85))
-                painter.setBrush(handle_fill)
-                painter.drawRoundedRect(handle, 1.1, 1.1)
-                painter.setPen(QPen(active, 0.9, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-                painter.drawLine(QLineF(x - 2.0, y, x + 2.0, y))
-        else:
-            y = self.height() * 0.5
-            low_x = self._val_to_pos(self._low)
-            high_x = self._val_to_pos(self._high)
-            painter.setPen(QPen(track, 2.6, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-            painter.drawLine(QLineF(6.0, y, self.width() - 6.0, y))
-            painter.setPen(QPen(active, 2.8, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-            painter.drawLine(QLineF(low_x, y, high_x, y))
-            for x in (low_x, high_x):
-                painter.setPen(QPen(handle_edge, 0.85))
-                painter.setBrush(handle_fill)
-                painter.drawEllipse(QPointF(x, y), 4.2, 4.2)
-        painter.end()
+            # The cleared surface uses the exact HUD/renderer background, so
+            # the track remains visually integrated without stale alpha pixels.
+            if self._orientation == Qt.Orientation.Vertical:
+                x = self.width() * 0.5
+                low_y = self._val_to_pos(self._low)
+                high_y = self._val_to_pos(self._high)
+                painter.setPen(QPen(track, 2.6, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+                painter.drawLine(QLineF(x, 6.0, x, self.height() - 6.0))
+                painter.setPen(QPen(active, 2.8, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+                painter.drawLine(QLineF(x, high_y, x, low_y))
+                for y in (low_y, high_y):
+                    handle = QRectF(x - 3.4, y - 2.2, 6.8, 4.4)
+                    painter.setPen(QPen(handle_edge, 0.85))
+                    painter.setBrush(handle_fill)
+                    painter.drawRoundedRect(handle, 1.1, 1.1)
+                    painter.setPen(QPen(active, 0.9, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+                    painter.drawLine(QLineF(x - 2.0, y, x + 2.0, y))
+            else:
+                y = self.height() * 0.5
+                low_x = self._val_to_pos(self._low)
+                high_x = self._val_to_pos(self._high)
+                painter.setPen(QPen(track, 2.6, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+                painter.drawLine(QLineF(6.0, y, self.width() - 6.0, y))
+                painter.setPen(QPen(active, 2.8, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+                painter.drawLine(QLineF(low_x, y, high_x, y))
+                for x in (low_x, high_x):
+                    painter.setPen(QPen(handle_edge, 0.85))
+                    painter.setBrush(handle_fill)
+                    painter.drawEllipse(QPointF(x, y), 4.2, 4.2)
+        finally:
+            painter.end()
 
 
 class _VerticalColorRamp(QWidget):
@@ -99,7 +257,8 @@ class _VerticalColorRamp(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._name = "inferno"
-        self.setFixedSize(8, 154)
+        self.setFixedWidth(8)
+        self.setFixedHeight(154)
         self.setToolTip("Интенсивность")
         self.setAccessibleName("Цветовая шкала интенсивности объёма")
 
@@ -133,6 +292,7 @@ class VTKVolumeDisplayWidget(QFrame):
     """Pinned volume colorbar, dual contrast slider and parameter flyout."""
 
     thresholds_changed = pyqtSignal(float, float)
+    thresholds_interaction_finished = pyqtSignal()
 
     @staticmethod
     def _root_window_widget(widget: QWidget) -> QWidget:
@@ -152,6 +312,14 @@ class VTKVolumeDisplayWidget(QFrame):
         self.setFont(self._menu_font)
         self._viewport = viewport
         self._viewport_layout = viewport.layout()
+        self._window_owner = self._root_window_widget(viewport)
+        # A restore/maximize transition can deliver several native resize
+        # notifications before Qt has finished laying out the viewport.  A
+        # single-shot timer coalesces them and measures the final geometry.
+        self._viewport_sync_timer = QTimer(self)
+        self._viewport_sync_timer.setSingleShot(True)
+        self._viewport_sync_timer.setInterval(0)
+        self._viewport_sync_timer.timeout.connect(self._sync_viewport_geometry)
         self._theme = "light"
         self._scene_available = False
         self._show_colorbar = True
@@ -209,15 +377,22 @@ class VTKVolumeDisplayWidget(QFrame):
             max_val=100.0,
             parent=self,
             orientation=Qt.Orientation.Vertical,
-            minimum_gap=0.01,
+            # The bound editors select the actual precision on bind:
+            # 0.1 pp in embedded mode, 0.01 pp in standalone mode.
+            minimum_gap=0.1,
         )
         self.range_slider.setObjectName("vtkVolumeContrastRangeSlider")
-        self.range_slider.setFixedSize(7, 154)
+        # The subclass paints a 7 px visual track inside this 14 px hit area.
+        self.range_slider.setFixedWidth(14)
+        self.range_slider.setFixedHeight(154)
         self.range_slider.setToolTip(
             "Ползунки задают проценты от положительного p99.9. "
             "Абсолютные значения min/max показаны над и под шкалой."
         )
         self.range_slider.valueChanged.connect(self._on_slider_changed)
+        self.range_slider.interactionFinished.connect(
+            self.thresholds_interaction_finished.emit
+        )
         scale_row.addWidget(self.range_slider, 0, Qt.AlignmentFlag.AlignVCenter)
 
         self.color_ramp = _VerticalColorRamp(self)
@@ -257,15 +432,15 @@ class VTKVolumeDisplayWidget(QFrame):
         self._settings_action: QWidgetAction | None = None
 
         viewport.installEventFilter(self)
+        if self._window_owner is not viewport:
+            self._window_owner.installEventFilter(self)
         self._apply_overlay_theme(self._theme)
         # Materialize both dimensions before the HUD is inserted into the
         # shared viewport grid. A fixed width alone leaves a QWidget at its
         # default height and clips the color ramp; QGridLayout owns final
         # top-right placement once the widget is registered in that layout.
         self.ensurePolished()
-        self.adjustSize()
-        content_height = max(190, int(self.sizeHint().height()))
-        self.setFixedSize(44, content_height)
+        self._fit_to_viewport()
         self._position_overlay()
         self.hide()
 
@@ -275,8 +450,10 @@ class VTKVolumeDisplayWidget(QFrame):
             return
         self.settings_menu.close()
         self.hide()
+        self._viewport_sync_timer.stop()
         old_viewport = self._viewport
         old_layout = self._viewport_layout
+        old_window_owner = self._window_owner
         if old_layout is not None:
             try:
                 old_layout.removeWidget(self)
@@ -287,8 +464,14 @@ class VTKVolumeDisplayWidget(QFrame):
                 old_viewport.removeEventFilter(self)
             except RuntimeError:
                 pass
+        if old_window_owner is not None and old_window_owner is not old_viewport:
+            try:
+                old_window_owner.removeEventFilter(self)
+            except RuntimeError:
+                pass
         self._viewport = viewport
         self._viewport_layout = viewport.layout()
+        self._window_owner = self._root_window_widget(viewport)
         self.setParent(viewport)
         if not self._native_shutdown_prepared:
             new_popup_owner = self._root_window_widget(viewport)
@@ -300,31 +483,118 @@ class VTKVolumeDisplayWidget(QFrame):
         self.setAttribute(Qt.WidgetAttribute.WA_AlwaysStackOnTop, True)
         self.winId()
         viewport.installEventFilter(self)
+        if self._window_owner is not viewport:
+            self._window_owner.installEventFilter(self)
         if isinstance(self._viewport_layout, QGridLayout):
             self._viewport_layout.addWidget(
                 self, 0, 0, alignment=Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignRight
             )
         self.ensurePolished()
-        self.adjustSize()
-        self.setFixedSize(44, max(190, int(self.sizeHint().height())))
+        self._fit_to_viewport()
         self._position_overlay()
+        self._schedule_viewport_sync()
         if self._scene_available and self._show_colorbar:
             self.show()
             self.raise_()
 
     def eventFilter(self, watched, event):
-        # Geometry events are infrequent and are the only times the overlay
-        # needs repositioning.  LayoutRequest can be generated by the HUD's
-        # own popup and controls; reacting to it would create an unnecessary
-        # layout/raise feedback loop.
-        if watched is self._viewport and event.type() in (
+        # Resize is observed before the target widget's own resize handler and
+        # before every dependent layout has necessarily settled.  Defer the
+        # actual measurement until the event loop has completed that pass.
+        # Also watch the owning window: some window managers report a
+        # maximize/restore state change before the QVTK child receives its
+        # final native resize notification.
+        viewport_events = (
             QEvent.Type.Resize,
             QEvent.Type.Show,
-        ):
-            self._position_overlay()
-            if self.isVisible():
-                self.raise_()
+            QEvent.Type.ShowToParent,
+            QEvent.Type.WinIdChange,
+        )
+        window_events = (
+            QEvent.Type.Resize,
+            QEvent.Type.Show,
+            QEvent.Type.ShowToParent,
+            QEvent.Type.WindowStateChange,
+        )
+        if watched is self._viewport and event.type() in viewport_events:
+            self._schedule_viewport_sync()
+        elif watched is self._window_owner and event.type() in window_events:
+            self._schedule_viewport_sync()
         return super().eventFilter(watched, event)
+
+    def _schedule_viewport_sync(self) -> None:
+        """Coalesce native resize/state events into one post-layout sync."""
+        if self._native_shutdown_prepared:
+            return
+        if not self._viewport_sync_timer.isActive():
+            self._viewport_sync_timer.start()
+
+    def _sync_viewport_geometry(self) -> None:
+        """Re-read settled viewport geometry and repaint the percentage handles."""
+        if self._native_shutdown_prepared or self._viewport is None:
+            return
+        self.ensurePolished()
+        self._fit_to_viewport()
+        self._position_overlay()
+        if self._scene_available and self._show_colorbar and self.isVisible():
+            self.raise_()
+        self.update()
+        self.range_slider.update()
+        self.color_ramp.update()
+
+    def _fit_to_viewport(self) -> None:
+        """Fit the HUD and both vertical scales inside the current viewport.
+
+        The former 154 px slider/ramp plus a hard 190 px HUD minimum were
+        clipped in a restored (non-maximized) MDI window whose viewport was
+        shorter than the overlay.  Keep the designed 154 px scale when there
+        is room; otherwise shrink slider and ramp together so percentage
+        positions remain visible and use the same pixel geometry.
+        """
+        viewport = self._viewport
+        viewport_height = int(viewport.contentsRect().height()) if viewport is not None else 0
+        current_track_height = max(1, int(self.range_slider.height()))
+
+        # A parent/window geometry change invalidates the local pointer offset
+        # even when the compact track remains at its preferred 154 px height.
+        # Keep the editors as the authoritative percentage state and discard
+        # any unfinished pointer gesture before projecting it into new geometry.
+        self.range_slider.cancel_drag()
+
+        if viewport_height > 0:
+            layout = self.layout()
+            content_height = int(layout.sizeHint().height()) if layout is not None else current_track_height + 37
+            chrome_height = max(0, content_height - current_track_height)
+            track_height = max(
+                56,
+                min(154, viewport_height - chrome_height),
+            )
+        else:
+            track_height = 154
+
+        if track_height != current_track_height:
+            self.range_slider.setFixedHeight(track_height)
+            self.color_ramp.setFixedHeight(track_height)
+
+        # The spin boxes are the canonical displayed percentages. Reapply
+        # them after a viewport resize so the handles are projected from the
+        # current values, never from an intermediate pointer coordinate.
+        if self._low_spin is not None and self._high_spin is not None:
+            low, high = self._normalise_threshold_pair(
+                float(self._low_spin.value()), float(self._high_spin.value())
+            )
+            self.range_slider.setValues(low, high)
+        self.range_slider.updateGeometry()
+        self.color_ramp.updateGeometry()
+        self.range_slider.update()
+        self.color_ramp.update()
+
+        self.adjustSize()
+        target_height = max(1, int(self.sizeHint().height()))
+        if viewport_height > 0:
+            target_height = min(target_height, viewport_height)
+        if self.width() != 44 or self.height() != target_height:
+            self.setFixedSize(44, target_height)
 
     def _position_overlay(self) -> None:
         if self._viewport is None:
@@ -365,28 +635,71 @@ class VTKVolumeDisplayWidget(QFrame):
         """Keep precise percentage editors and the viewport slider synchronized."""
         self._low_spin = low_spin
         self._high_spin = high_spin
+        # The embedded ROI Explorer editors display tenths; the separate
+        # desktop viewer displays hundredths.  The slider must use the shared
+        # precision, otherwise a debounced update rounds its handles back.
+        precision = min(int(low_spin.decimals()), int(high_spin.decimals()))
+        self.range_slider.set_display_decimals(precision)
         low_spin.valueChanged.connect(self._on_spin_changed)
         high_spin.valueChanged.connect(self._on_spin_changed)
         self.set_thresholds(float(low_spin.value()), float(high_spin.value()))
 
+    @staticmethod
+    def _restore_blocked(widget: QWidget, previous_state: bool) -> None:
+        """Restore the exact signal-blocking state that was active before a sync."""
+        widget.blockSignals(previous_state)
+
+    def _normalise_threshold_pair(
+        self, low: float, high: float, *, moved: str | None = None
+    ) -> tuple[float, float]:
+        """Return bounds representable by the 0.1 %-precision editors."""
+        gap = float(self.range_slider.minimum_gap)
+        precision = int(self.range_slider.DISPLAY_DECIMALS)
+        low = round(max(0.0, min(99.0, float(low))), precision)
+        high = round(max(1.0, min(100.0, float(high))), precision)
+        if high - low < gap - 1e-9:
+            if moved == "high":
+                low = round(max(0.0, high - gap), precision)
+            else:
+                high = round(min(100.0, low + gap), precision)
+        # Boundary-safe fallback.  With the configured [0, 99] / [1, 100]
+        # editor ranges, a 0.1 gap is always representable.
+        if high - low < gap - 1e-9:
+            low = round(max(0.0, min(99.0, high - gap)), precision)
+            high = round(min(100.0, low + gap), precision)
+        return low, high
+
     def _on_spin_changed(self, *_args) -> None:
         if self._syncing_thresholds or self._low_spin is None or self._high_spin is None:
             return
+
+        moved = "low" if self.sender() is self._low_spin else "high"
+        low, high = self._normalise_threshold_pair(
+            self._low_spin.value(), self._high_spin.value(), moved=moved
+        )
+
+        self._syncing_thresholds = True
+        low_blocked = high_blocked = slider_blocked = None
+        try:
+            low_blocked = self._low_spin.blockSignals(True)
+            high_blocked = self._high_spin.blockSignals(True)
+            slider_blocked = self.range_slider.blockSignals(True)
+            self._low_spin.setValue(low)
+            self._high_spin.setValue(high)
+            self.range_slider.setValues(low, high)
+        finally:
+            if slider_blocked is not None:
+                self._restore_blocked(self.range_slider, slider_blocked)
+            if high_blocked is not None:
+                self._restore_blocked(self._high_spin, high_blocked)
+            if low_blocked is not None:
+                self._restore_blocked(self._low_spin, low_blocked)
+            self._syncing_thresholds = False
+
+        # Read the values back from the actual editors so the signal, cbar,
+        # transfer settings and displayed numbers all share the same values.
         low = float(self._low_spin.value())
         high = float(self._high_spin.value())
-        if low >= high:
-            self._syncing_thresholds = True
-            if self.sender() is self._low_spin:
-                high = min(100.0, low + self.range_slider.minimum_gap)
-                self._high_spin.setValue(high)
-            else:
-                low = max(0.0, high - self.range_slider.minimum_gap)
-                self._low_spin.setValue(low)
-            self._syncing_thresholds = False
-        self.range_slider.blockSignals(True)
-        self.range_slider.setValues(low, high)
-        self.range_slider.blockSignals(False)
-        low, high = self.range_slider.low(), self.range_slider.high()
         self._last_low, self._last_high = low, high
         self._update_bound_labels(
             self._absolute_from_percent(low), self._absolute_from_percent(high)
@@ -396,24 +709,41 @@ class VTKVolumeDisplayWidget(QFrame):
     def _on_slider_changed(self, low: float, high: float) -> None:
         if self._syncing_thresholds:
             return
+        moved = getattr(self.range_slider, "_active_handle", None)
+        low, high = self._normalise_threshold_pair(low, high, moved=moved)
+
         self._syncing_thresholds = True
+        low_blocked = high_blocked = slider_blocked = None
         try:
+            slider_blocked = self.range_slider.blockSignals(True)
+            self.range_slider.setValues(low, high)
             if self._low_spin is not None:
-                self._low_spin.blockSignals(True)
-                self._low_spin.setValue(round(float(low), 2))
-                self._low_spin.blockSignals(False)
+                low_blocked = self._low_spin.blockSignals(True)
+                self._low_spin.setValue(low)
             if self._high_spin is not None:
-                self._high_spin.blockSignals(True)
-                self._high_spin.setValue(round(float(high), 2))
-                self._high_spin.blockSignals(False)
+                high_blocked = self._high_spin.blockSignals(True)
+                self._high_spin.setValue(high)
         finally:
+            if self._high_spin is not None and high_blocked is not None:
+                self._restore_blocked(self._high_spin, high_blocked)
+            if self._low_spin is not None and low_blocked is not None:
+                self._restore_blocked(self._low_spin, low_blocked)
+            if slider_blocked is not None:
+                self._restore_blocked(self.range_slider, slider_blocked)
             self._syncing_thresholds = False
-        self._last_low, self._last_high = float(low), float(high)
+
+        # Use editor values, not the pre-rounded mouse coordinates.  This
+        # prevents the slider from being pulled back by the debounced VTK
+        # settings update after every drag.
+        if self._low_spin is not None:
+            low = float(self._low_spin.value())
+        if self._high_spin is not None:
+            high = float(self._high_spin.value())
+        self._last_low, self._last_high = low, high
         self._update_bound_labels(
-            self._absolute_from_percent(float(low)),
-            self._absolute_from_percent(float(high)),
+            self._absolute_from_percent(low), self._absolute_from_percent(high)
         )
-        self.thresholds_changed.emit(float(low), float(high))
+        self.thresholds_changed.emit(low, high)
 
     def set_thresholds(
         self,
@@ -424,25 +754,41 @@ class VTKVolumeDisplayWidget(QFrame):
         absolute_high: float | None = None,
         reference: float | None = None,
     ) -> None:
+        low, high = self._normalise_threshold_pair(low, high)
         self._syncing_thresholds = True
+        low_blocked = high_blocked = slider_blocked = None
         try:
-            low = max(0.0, min(100.0 - self.range_slider.minimum_gap, float(low)))
-            high = max(low + self.range_slider.minimum_gap, min(100.0, float(high)))
-            self.range_slider.blockSignals(True)
+            slider_blocked = self.range_slider.blockSignals(True)
             self.range_slider.setValues(low, high)
-            self.range_slider.blockSignals(False)
             if self._low_spin is not None:
-                self._low_spin.blockSignals(True)
+                low_blocked = self._low_spin.blockSignals(True)
                 self._low_spin.setValue(low)
-                self._low_spin.blockSignals(False)
             if self._high_spin is not None:
-                self._high_spin.blockSignals(True)
+                high_blocked = self._high_spin.blockSignals(True)
                 self._high_spin.setValue(high)
-                self._high_spin.blockSignals(False)
         finally:
+            if self._high_spin is not None and high_blocked is not None:
+                self._restore_blocked(self._high_spin, high_blocked)
+            if self._low_spin is not None and low_blocked is not None:
+                self._restore_blocked(self._low_spin, low_blocked)
+            if slider_blocked is not None:
+                self._restore_blocked(self.range_slider, slider_blocked)
             self._syncing_thresholds = False
+
+        if self._low_spin is not None:
+            low = float(self._low_spin.value())
+        if self._high_spin is not None:
+            high = float(self._high_spin.value())
         self._last_low, self._last_high = low, high
-        self._threshold_reference = float(reference) if reference is not None else None
+        try:
+            reference_value = float(reference) if reference is not None else None
+        except (TypeError, ValueError):
+            reference_value = None
+        self._threshold_reference = (
+            reference_value
+            if reference_value is not None and math.isfinite(reference_value)
+            else None
+        )
         if absolute_low is None and self._threshold_reference is not None:
             absolute_low = self._threshold_reference * low / 100.0
         if absolute_high is None and self._threshold_reference is not None:
@@ -451,6 +797,8 @@ class VTKVolumeDisplayWidget(QFrame):
 
     def _absolute_from_percent(self, value: float) -> float | None:
         if self._threshold_reference is None:
+            return None
+        if not math.isfinite(self._threshold_reference):
             return None
         return float(self._threshold_reference) * float(value) / 100.0
 
@@ -471,7 +819,11 @@ class VTKVolumeDisplayWidget(QFrame):
     def _format_value(value: float | None) -> str:
         if value is None:
             return "—"
-        return f"{float(value):.3g}"
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return "—"
+        return f"{numeric:.3g}" if math.isfinite(numeric) else "—"
 
     def set_colormap(self, name: str) -> None:
         self.color_ramp.set_colormap(str(name))
@@ -494,6 +846,7 @@ class VTKVolumeDisplayWidget(QFrame):
         if final and self._native_shutdown_prepared:
             return
         self._scene_available = False
+        self._viewport_sync_timer.stop()
         try:
             self.settings_menu.close()
         except RuntimeError:
@@ -506,10 +859,17 @@ class VTKVolumeDisplayWidget(QFrame):
 
         if final:
             self._native_shutdown_prepared = True
+            self._viewport_sync_timer.stop()
             viewport = self._viewport
             if viewport is not None:
                 try:
                     viewport.removeEventFilter(self)
+                except RuntimeError:
+                    pass
+            window_owner = self._window_owner
+            if window_owner is not None and window_owner is not viewport:
+                try:
+                    window_owner.removeEventFilter(self)
                 except RuntimeError:
                     pass
             try:
@@ -528,12 +888,12 @@ class VTKVolumeDisplayWidget(QFrame):
 
         # Recompute the non-zero layout-derived height before the first show.
         self.ensurePolished()
-        self.adjustSize()
-        self.setFixedSize(44, max(190, int(self.sizeHint().height())))
+        self._fit_to_viewport()
         self._position_overlay()
         if not was_visible:
             self.show()
             self.raise_()
+        self._schedule_viewport_sync()
 
     def restack_over_viewport(self) -> None:
         """Reposition and restack this native HUD above a paint-on-screen viewport."""
@@ -622,6 +982,9 @@ class VTKVolumeDisplayWidget(QFrame):
         palette.setColor(QPalette.ColorRole.Window, QColor(surface))
         palette.setColor(QPalette.ColorRole.WindowText, QColor(c["text"]))
         self.setPalette(palette)
+        slider_palette = self.range_slider.palette()
+        slider_palette.setColor(QPalette.ColorRole.Window, QColor(surface))
+        self.range_slider.setPalette(slider_palette)
         self.setStyleSheet(f"""
             QFrame#VTKVolumeDisplayOverlay {{
                 background-color: {surface}; color: {c['text']};
@@ -661,6 +1024,7 @@ class VTKVolumeDisplayWidget(QFrame):
         self._apply_overlay_theme(active)
 
     def closeEvent(self, event):
+        self._viewport_sync_timer.stop()
         try:
             self.settings_menu.close()
         except RuntimeError:
@@ -669,6 +1033,12 @@ class VTKVolumeDisplayWidget(QFrame):
         if viewport is not None:
             try:
                 viewport.removeEventFilter(self)
+            except RuntimeError:
+                pass
+        window_owner = self._window_owner
+        if window_owner is not None and window_owner is not viewport:
+            try:
+                window_owner.removeEventFilter(self)
             except RuntimeError:
                 pass
         super().closeEvent(event)

@@ -277,8 +277,11 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
             # mouse-move events before rebuilding the transfer functions.
             self._volume_display_update_timer = QtCore.QTimer(self)
             self._volume_display_update_timer.setSingleShot(True)
-            self._volume_display_update_timer.setInterval(55)
+            # Smooth, bounded live Vmin/Vmax preview (up to ~40 Hz).  Transfer
+            # curves are now updated through the dedicated lightweight scene path.
+            self._volume_display_update_timer.setInterval(25)
             self._volume_display_update_timer.timeout.connect(self._apply_pending_volume_display)
+            self._pending_volume_thresholds: tuple[float, float] | None = None
             # IMPORTANT: construct the QVTK child BEFORE the top-level window is
             # shown. The production-scene diagnostic that successfully rendered
             # the real H5 payload creates QVTK in this order. The previous viewer
@@ -896,41 +899,48 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
                     self.volume_display_widget.set_colormap(str(name))
 
         def _on_volume_thresholds_changed(self, low: float, high: float):
+            if self.payload is None or self.scene is None or self._busy:
+                return
             self._pending_volume_thresholds = (float(low), float(high))
             timer = getattr(self, "_volume_display_update_timer", None)
-            if timer is not None and self.payload is not None and not self._busy:
-                if not timer.isActive():
-                    timer.start()
+            if timer is not None and not timer.isActive():
+                timer.start()
+
+        def _finish_volume_threshold_interaction(self):
+            """Flush the last pointer value after the user releases the handle."""
+            timer = getattr(self, "_volume_display_update_timer", None)
+            if (
+                timer is None or self.payload is None or self.scene is None or self._busy
+                or self._pending_volume_thresholds is None
+            ):
+                return
+            if timer.isActive():
+                timer.stop()
+            QtCore.QTimer.singleShot(0, self._apply_pending_volume_display)
 
         def _apply_pending_volume_display(self):
             """Apply only the live Vmin/Vmax gesture, preserving staged options."""
             if self.payload is None or self.scene is None or self._busy:
                 return
-            low, high = getattr(
-                self, "_pending_volume_thresholds",
-                (float(self.low_pct.value()), float(self.high_pct.value())),
-            )
-            current = self.scene.settings
-            # The viewport rail is an immediate contrast control. Do not commit
-            # palette/gamma/opacity values that may still be edited in the
-            # ellipsis panel and are intentionally waiting for Apply.
-            settings = replace(
-                current,
-                lower_fraction=float(low) / 100.0,
-                upper_fraction=float(high) / 100.0,
-                lower_percentile=None,
-                upper_percentile=None,
-            )
+            pending = self._pending_volume_thresholds
+            if pending is None:
+                return
+            if self._volume_display_update_timer.isActive():
+                self._volume_display_update_timer.stop()
+            low, high = pending
+            self._pending_volume_thresholds = None
             try:
-                info = self.scene.update_transfer_functions(settings, render=False)
+                info = self.scene.update_volume_contrast(
+                    float(low) / 100.0,
+                    float(high) / 100.0,
+                    render=True,
+                )
                 self.volume_display_widget.set_thresholds(
                     float(low), float(high),
                     absolute_low=info.get("threshold_min"),
                     absolute_high=info.get("threshold_max"),
                     reference=info.get("threshold_reference"),
                 )
-                if self.vtk_widget is not None:
-                    self.vtk_widget.Render()
                 self.status_label.setText(
                     f"Диапазон контраста обновлён: Vmin={info['threshold_min']:.5g}; "
                     f"Vmax={info['threshold_max']:.5g} "
@@ -1596,6 +1606,9 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
             self.volume_display_widget.attach_settings_panel(self.volume_render_settings_panel)
             self.volume_display_widget.bind_threshold_spins(self.low_pct, self.high_pct)
             self.volume_display_widget.thresholds_changed.connect(self._on_volume_thresholds_changed)
+            self.volume_display_widget.thresholds_interaction_finished.connect(
+                self._finish_volume_threshold_interaction
+            )
             self.volume_display_widget.set_colormap(str(self.palette_combo.currentData()))
             self.volume_display_widget.apply_theme(self._theme)
             self.volume_display_widget.set_scene_available(False)
@@ -1761,7 +1774,9 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
                 self.scene = VTKVolumeScene(
                     self.render_window,
                     self.interactor,
-                    render_callback=self.vtk_widget.Render,
+                    # Let QVTK render from its normal Qt paint event.  This
+                    # coalesces rapid contrast updates and avoids nested Render().
+                    render_callback=self.vtk_widget.update,
                 )
                 self.scene.set_theme(self._theme)
                 self.tools_widget.set_scene_available(True)
@@ -1806,6 +1821,9 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
             self._initial_scan_key = None
             self.placeholder_label.hide()
             _trace("H5_OPENED", path=str(loader.h5_path), scan_keys=keys)
+            if self._volume_display_update_timer.isActive():
+                self._volume_display_update_timer.stop()
+            self._pending_volume_thresholds = None
             self.payload = None
             self._reset_theta_slice_controls()
             self._roi_geometry_initialized = False
@@ -1849,6 +1867,9 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
             previous_scan = self._active_roi_scan_key
             if previous_scan and self._roi_geometry_initialized:
                 self._roi_by_scan[previous_scan] = self._current_roi_geometry()
+            if self._volume_display_update_timer.isActive():
+                self._volume_display_update_timer.stop()
+            self._pending_volume_thresholds = None
             self.payload = None
             self._reset_theta_slice_controls()
             self._roi_geometry_initialized = False
@@ -2341,6 +2362,7 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
             try:
                 if self._volume_display_update_timer.isActive():
                     self._volume_display_update_timer.stop()
+                self._pending_volume_thresholds = None
                 settings = self._transfer_settings()
                 self.scene.set_theme(self._theme)
                 self.tools_widget.apply_theme(self._theme)
@@ -2533,6 +2555,9 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
             QtWidgets.QMessageBox.critical(parent, title, text)
 
         def closeEvent(self, event):
+            if self._volume_display_update_timer.isActive():
+                self._volume_display_update_timer.stop()
+            self._pending_volume_thresholds = None
             if self._thread is not None:
                 self._closing = True
                 if self._thread.isRunning():

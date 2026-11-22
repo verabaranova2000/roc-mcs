@@ -1,7 +1,7 @@
 """VTK GPU volume scene for the ROI Explorer HDF5 adapter."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 import logging
 
@@ -674,6 +674,8 @@ class VTKVolumeScene:
         self.settings = TransferSettings()
         self.theme = "dark"
         self._finite_sample = None
+        self._positive_reference_999: float | None = None
+        self._positive_max: float | None = None
         self._percentile_sample_stride = 1
         self._min_spacing = 1.0
         self._physical_theta = None
@@ -2415,8 +2417,20 @@ class VTKVolumeScene:
         new_finite_sample = new_sample[np.isfinite(new_sample)]
         if new_finite_sample.size == 0:
             raise ValueError("Нет конечных значений для настройки transfer function.")
-        if settings.lower_percentile is None and not np.any(new_finite_sample > 0):
+        # p99.9 is invariant while the user moves Vmin/Vmax.  Compute it once
+        # per payload instead of filtering and percentile-sorting up to eight
+        # million samples on every slider tick.
+        new_positive_sample = new_finite_sample[new_finite_sample > 0]
+        if settings.lower_percentile is None and new_positive_sample.size == 0:
             raise ValueError("В объёме нет положительных конечных интенсивностей для p99.9 reference.")
+        if new_positive_sample.size:
+            new_positive_reference_999 = float(np.percentile(new_positive_sample, 99.9))
+            new_positive_max = float(np.max(new_positive_sample))
+        else:
+            # Preserve the legacy percentile-mode fallback for all-nonpositive
+            # volumes; fraction mode has already rejected this input above.
+            new_positive_reference_999 = float(np.max(new_finite_sample))
+            new_positive_max = None
 
         # vtkRenderer.RemoveVolume/RemoveActor already call MakeCurrent() and
         # ReleaseGraphicsResources() on the removed prop. Do not manually
@@ -2539,6 +2553,8 @@ class VTKVolumeScene:
 
         self._percentile_sample_stride = new_sample_stride
         self._finite_sample = new_finite_sample
+        self._positive_reference_999 = new_positive_reference_999
+        self._positive_max = new_positive_max
         self._physical_x = np.asarray(payload.x, dtype=np.float64).copy()
         self._physical_y = np.asarray(payload.y, dtype=np.float64).copy()
         self._physical_theta = np.asarray(payload.theta, dtype=np.float64).copy()
@@ -3115,24 +3131,36 @@ class VTKVolumeScene:
             raise ValueError("opacity_unit_distance_factor должен лежать в [0.05,20].")
 
     def _resolve_thresholds(self, settings: TransferSettings) -> tuple[float, float, float]:
-        """Return absolute scalar bounds and the p99.9 positive reference."""
+        """Return absolute scalar bounds and the cached p99.9 positive reference."""
         finite = self._finite_sample
         if finite is None or finite.size == 0:
             raise ValueError("Нет конечных значений для настройки transfer function.")
+
+        reference = self._positive_reference_999
+        positive_max = self._positive_max
+        if reference is None:
+            # Defensive fallback for a scene restored from an older serialized
+            # state or a test fixture that assigned _finite_sample directly.
+            positive = finite[finite > 0]
+            if positive.size:
+                reference = float(np.percentile(positive, 99.9))
+                positive_max = float(np.max(positive))
+            else:
+                reference = float(np.max(finite))
+                positive_max = None
+
         if settings.lower_percentile is not None:
             low, high = np.percentile(
                 finite,
                 [float(settings.lower_percentile), float(settings.upper_percentile)],
             )
-            reference = float(np.percentile(finite[finite > 0], 99.9)) if np.any(finite > 0) else float(np.max(finite))
         else:
-            positive = finite[finite > 0]
-            if positive.size == 0:
+            if positive_max is None:
                 raise ValueError("В объёме нет положительных конечных интенсивностей для p99.9 reference.")
-            reference = float(np.percentile(positive, 99.9))
-            reference = max(reference, float(np.max(positive)) * 1e-9, 1e-12)
+            reference = max(float(reference), float(positive_max) * 1e-9, 1e-12)
             low = reference * float(settings.lower_fraction)
             high = reference * float(settings.upper_fraction)
+
         low, high = float(low), float(high)
         if not (np.isfinite(low) and np.isfinite(high) and np.isfinite(reference)):
             raise ValueError("Пороговые значения или p99.9 reference не конечны.")
@@ -3143,18 +3171,13 @@ class VTKVolumeScene:
             high += delta
         return low, high, float(reference)
 
-    def update_transfer_functions(self, settings: TransferSettings, *, render: bool = True) -> dict:
-        if self.payload is None or self._finite_sample is None:
-            raise RuntimeError("Сначала загрузите объём.")
-        self._validate_transfer_settings(settings)
-        low, high, reference = self._resolve_thresholds(settings)
-
+    def _apply_volume_threshold_curves(
+        self, settings: TransferSettings, low: float, high: float
+    ) -> tuple[dict[str, int], dict[str, int]]:
+        """Update only the scalar colour/opacity functions used by the volume."""
         value_min = float(self.grid_info["scalar_min"])
         value_max = float(self.grid_info["scalar_max"])
         sentinel = float(self.grid_info["invalid_sentinel"])
-        # Match colour contrast to the same robust intensity interval as the
-        # opacity ramp. Rare hot pixels remain in the data/diagnostics but can
-        # no longer stretch the entire transfer function and flatten the volume.
         color_low, color_high = float(low), float(high)
         if color_high <= color_low:
             color_high = color_low + max(abs(color_low) * 1e-6, 1e-6)
@@ -3167,26 +3190,79 @@ class VTKVolumeScene:
             value_max,
             self.vtk.vtkMath,
         )
-
-        # Preserve the original 17-knot gamma ramp unless its estimated GPU
-        # opacity LUT exceeds the driver's 16384-texel limit.  In that case
-        # reduce only redundant interpolation knots; scalar thresholds and the
-        # exact max-opacity/gamma parameters remain unchanged.
         opacity_table_info = _set_adaptive_volume_opacity(
             self.opacity_function,
             sentinel,
             value_min,
             value_max,
-            low,
-            high,
+            float(low),
+            float(high),
             float(settings.max_opacity),
             float(settings.gamma),
             self.vtk.vtkMath,
         )
-
         self.settings = settings
         self._update_theta_slice_shader_uniforms(low, high)
-        
+        self.color_function.Modified()
+        self.opacity_function.Modified()
+        self.volume_property.Modified()
+        return color_table_info, opacity_table_info
+
+    def update_volume_contrast(
+        self,
+        lower_fraction: float,
+        upper_fraction: float,
+        *,
+        render: bool = True,
+    ) -> dict:
+        """Apply a live Vmin/Vmax gesture without rebuilding unrelated settings.
+
+        The positive p99.9 reference is cached per payload.  This path touches
+        only the two transfer functions and the theta shader's range uniforms;
+        ray sampling, projection LUTs, opacity unit distance and other staged
+        display options are left untouched.
+        """
+        if self.payload is None or self._finite_sample is None:
+            raise RuntimeError("Сначала загрузите объём.")
+        settings = replace(
+            self.settings,
+            lower_fraction=float(lower_fraction),
+            upper_fraction=float(upper_fraction),
+            lower_percentile=None,
+            upper_percentile=None,
+        )
+        self._validate_transfer_settings(settings)
+        low, high, reference = self._resolve_thresholds(settings)
+        color_info, opacity_info = self._apply_volume_threshold_curves(
+            settings, low, high
+        )
+        # Preserve the last full-settings diagnostics while replacing values
+        # that belong to the live contrast range.
+        result = dict(self._last_transfer_info)
+        result.update({
+            "threshold_min": low,
+            "threshold_max": high,
+            "threshold_reference": reference,
+            "color_table_control_points": int(color_info["control_points"]),
+            "color_table_estimated_width": int(color_info["estimated_texture_width"]),
+            "opacity_table_control_points": int(opacity_info["control_points"]),
+            "opacity_table_estimated_width": int(opacity_info["estimated_texture_width"]),
+        })
+        self._last_transfer_info = result
+        if render:
+            self._request_render()
+        return result
+
+    def update_transfer_functions(self, settings: TransferSettings, *, render: bool = True) -> dict:
+        if self.payload is None or self._finite_sample is None:
+            raise RuntimeError("Сначала загрузите объём.")
+        self._validate_transfer_settings(settings)
+        low, high, reference = self._resolve_thresholds(settings)
+
+        color_table_info, opacity_table_info = self._apply_volume_threshold_curves(
+            settings, low, high
+        )
+
         if self.projection_lut is not None:
             self._update_projection_palette()
         if self.projection_actor is not None:
@@ -3198,9 +3274,9 @@ class VTKVolumeScene:
         )
         self.mapper.SetSampleDistance(float(sample_distance))
         self.volume_property.SetScalarOpacityUnitDistance(float(opacity_unit_distance))
-        self.color_function.Modified()
-        self.opacity_function.Modified()
-        self.volume_property.Modified()
+        # _apply_volume_threshold_curves() has already marked the transfer
+        # functions and volume property modified.  The mapper itself changes
+        # here because its ray-sampling distance may also have changed.
         self.mapper.Modified()
         result = {
             "threshold_min": low,
@@ -3638,6 +3714,8 @@ class VTKVolumeScene:
         self.projection_lut = None
         self.projection_info = None
         self._finite_sample = None
+        self._positive_reference_999 = None
+        self._positive_max = None
         self._percentile_sample_stride = 1
         self._projection_base_z = None
         self._theta_scale = 1.0
