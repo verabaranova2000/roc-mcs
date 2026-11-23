@@ -1099,7 +1099,7 @@ class RockingCurveExplorerWindow(QMainWindow):
     def _set_peak_pixel_pick_mode(
         self, enabled: bool, parent_node_id: str, use_interpolated_data: bool = False
     ) -> None:
-        """Switch the map into one-shot detector-pixel picking for peak QC."""
+        """Enable persistent detector-pixel picking for peak-preview QC."""
         if not enabled:
             self.map_widget.set_pixel_pick_mode(False)
             return
@@ -1125,7 +1125,7 @@ class RockingCurveExplorerWindow(QMainWindow):
         self.set_analysis_map_layer(input_map_key)
         self.map_widget.set_pixel_pick_mode(True)
         self.status.showMessage(
-            "Выбор пикселя для превью ROC: щёлкните левой кнопкой по нужной точке 2D-карты. "
+            "Выбор пикселя активен: щёлкайте по 2D-карте, чтобы менять реальную ROC. "
             "Закройте окно параметров кнопкой × или Esc, чтобы отменить выбор.",
             10000,
         )

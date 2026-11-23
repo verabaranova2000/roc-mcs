@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import numpy as np
 from PyQt6.QtCore import Qt, QSize, QRectF, QPointF
-from PyQt6.QtGui import QColor, QPainter, QPen, QPalette, QPolygonF
+from PyQt6.QtGui import QColor, QFontMetrics, QPainter, QPen, QPalette, QPolygonF
 from PyQt6.QtWidgets import QWidget, QSizePolicy
 
 
@@ -46,6 +46,7 @@ class PeakDetectionPreview(QWidget):
         self._noise_sigma = float("nan")
         self._relative_cutoff = float("nan")
         self._error = ""
+        self._pixel_pick_button = None
         self._recalculate()
         self.setMinimumSize(270, 142)
         self.setMaximumHeight(168)
@@ -96,6 +97,29 @@ class PeakDetectionPreview(QWidget):
 
     def sizeHint(self) -> QSize:
         return QSize(360, 150)
+
+    def set_pixel_pick_button(self, button) -> None:
+        """Place the small map-pick control inside the preview header.
+
+        It overlays the reserved title strip instead of consuming chart width.
+        """
+        self._pixel_pick_button = button
+        button.setParent(self)
+        button.show()
+        button.raise_()
+        self._position_pixel_pick_button()
+
+    def _position_pixel_pick_button(self) -> None:
+        button = self._pixel_pick_button
+        if button is None:
+            return
+        margin = 3
+        button.move(max(margin, self.width() - button.width() - margin), margin)
+        button.raise_()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._position_pixel_pick_button()
 
     @property
     def has_real_input(self) -> bool:
@@ -306,14 +330,19 @@ class PeakDetectionPreview(QWidget):
         title_font.setBold(True)
         title_font.setPointSizeF(max(7.0, title_font.pointSizeF() - 0.5))
         painter.setFont(title_font)
+        title_text = (
+            f"РЕАЛЬНАЯ ROC · {self._real_pixel_label} · {self._active_source_label}"
+            if self._real_input is not None
+            else "СХЕМА ПОИСКА · синтетическая ROC"
+        )
+        title_rect = QRectF(8, 3, max(20, width - 16 - (30 if self._pixel_pick_button else 0)), 17)
+        title_text = QFontMetrics(title_font).elidedText(
+            title_text, Qt.TextElideMode.ElideRight, int(title_rect.width())
+        )
         painter.drawText(
-            QRectF(8, 3, width - 16, 17),
+            title_rect,
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-            (
-                f"РЕАЛЬНАЯ ROC · {self._real_pixel_label} · {self._active_source_label}"
-                if self._real_input is not None
-                else "СХЕМА ПОИСКА · синтетическая ROC"
-            ),
+            title_text,
         )
 
         painter.setPen(QPen(grid, 0.6, Qt.PenStyle.DotLine))

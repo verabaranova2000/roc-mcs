@@ -62,6 +62,36 @@ CONTRAST_BUTTON_HIT_WIDTH = 14
 CONTRAST_BUTTON_HIT_HEIGHT = 12
 
 
+class _ElidedLabel(QLabel):
+    """Single-line label that preserves its full value in the tooltip.
+
+    The visible text is elided to the current allocation, so adjacent footer
+    fields never overlap when the 2D pane is narrowed.
+    """
+
+    def __init__(self, text: str = "", parent=None, *, mode=Qt.TextElideMode.ElideMiddle):
+        self._full_text = ""
+        self._elide_mode = mode
+        super().__init__(parent)
+        self.setText(text)
+
+    def setText(self, text: str) -> None:  # noqa: N802 - Qt API
+        self._full_text = str(text or "")
+        self.setToolTip(self._full_text)
+        self._refresh_elided_text()
+
+    def _refresh_elided_text(self) -> None:
+        width = max(0, self.contentsRect().width())
+        visible = self.fontMetrics().elidedText(
+            self._full_text, self._elide_mode, width
+        )
+        QLabel.setText(self, visible)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt API
+        super().resizeEvent(event)
+        self._refresh_elided_text()
+
+
 class _ThetaRailSlider(QSlider):
     """Одна горизонтальная засечка в точном стиле вертикальной QRangeSlider.
 
@@ -231,6 +261,8 @@ class MapPlotWidget(QWidget):
         self._theme = "light"
         self.cbar = None
         self.map_image = None
+        # Scalar source for hover readout; peak-count rendering itself is RGBA.
+        self._cursor_intensity_map = None
         self.roi_right_click_callback = None
         self.cax = None
         self._divider = None
@@ -350,19 +382,44 @@ class MapPlotWidget(QWidget):
         # ========================================================
         # ЭТАЖ 3: Строка координат мыши (x,y)
         # ========================================================
-        self.coord_label = QLabel("")
-        self.coord_label.setObjectName("MapCoordLabel")   # имя для селектора стилей 
-        self.coord_label.setStyleSheet(STYLE_COORD_LABEL) # применяем константу стилей
-        self.coord_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)   # Выравниваем текст по правому краю, чтобы он был аккуратно под графиком
-        
+        self.map_title_label = _ElidedLabel(
+            "", mode=Qt.TextElideMode.ElideRight
+        )
+        self.map_title_label.setObjectName("MapDescriptionLabel")
+        self.map_title_label.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+        )
+        self.map_title_label.setMinimumWidth(0)
+        self.map_title_label.setStyleSheet(
+            "QLabel#MapDescriptionLabel { font-size:9px; font-weight:600; "
+            "color:palette(placeholderText); padding:1px 5px; background:transparent; }"
+        )
+
+        self.coord_label = _ElidedLabel("", mode=Qt.TextElideMode.ElideMiddle)
+        self.coord_label.setObjectName("MapCoordLabel")
+        self.coord_label.setStyleSheet(STYLE_COORD_LABEL)
+        self.coord_label.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        self.coord_label.setMinimumWidth(0)
+
+        footer_widget = QWidget(self)
+        footer_widget.setObjectName("MapFooter")
+        footer_layout = QHBoxLayout(footer_widget)
+        footer_layout.setContentsMargins(0, 0, 0, 0)
+        footer_layout.setSpacing(4)
+        footer_layout.addWidget(self.map_title_label, 2)
+        footer_layout.addWidget(self.coord_label, 3)
+        footer_widget.setFixedHeight(18)
+        self.footer_widget = footer_widget
+
         # ========================================================
         # СБОРКА ГЛАВНОГО СЛОЯ (main_layout)
         # ========================================================
         self.main_layout.addWidget(self.toolbar, 0)
         self.main_layout.addWidget(self.header_widget, 0)
         self.main_layout.addWidget(self.canvas, 1)
-        self.main_layout.addWidget(self.coord_label, 0)
-        self.coord_label.setFixedHeight(18)
+        self.main_layout.addWidget(self.footer_widget, 0)
 
  
         # ========================================================
@@ -729,6 +786,20 @@ class MapPlotWidget(QWidget):
         j = int(np.searchsorted(a, coordinate).clip(0, len(a) - 1))
         if j and abs(a[j - 1] - coordinate) <= abs(a[j] - coordinate): j -= 1
         return j
+
+    @staticmethod
+    def _format_hover_intensity(value) -> str:
+        """Format one scalar map sample without accepting RGBA/vector values."""
+        try:
+            if value is None or np.ma.is_masked(value):
+                return "N/A"
+            scalar = np.asarray(value)
+            if scalar.size != 1:
+                return "N/A"
+            number = float(scalar.reshape(-1)[0])
+            return f"{number:.1f}" if np.isfinite(number) else "N/A"
+        except (TypeError, ValueError, OverflowError):
+            return "N/A"
         
 
     def draw_peak_count_map(
@@ -754,6 +825,8 @@ class MapPlotWidget(QWidget):
         rgba, intensity_range = peak_count_rgba(
             counts, intensity, theme=self._theme, valid_mask_yx=valid_mask_yx
         )
+        self._cursor_intensity_map = intensity
+        self.map_title_label.setText(str(title))
         self._x_coords, x_edges = self._axis_centers(x_coords, counts.shape[1], "x_coords")
         self._y_coords, y_edges = self._axis_centers(y_coords, counts.shape[0], "y_coords")
         extent = (x_edges[0], x_edges[1], y_edges[0], y_edges[1])
@@ -783,7 +856,7 @@ class MapPlotWidget(QWidget):
 
         self.ax.set_xlabel("Detector X (source pixels)")
         self.ax.set_ylabel("Detector Y (source pixels)")
-        self.ax.set_title(str(title), pad=7)
+        self.ax.set_title("")
         self.ax.xaxis.set_major_locator(MaxNLocator(nbins=5, integer=True))
         self.ax.yaxis.set_major_locator(MaxNLocator(nbins=5, integer=True))
         self.ax.set_aspect("equal", adjustable="box")
@@ -822,6 +895,8 @@ class MapPlotWidget(QWidget):
         img = np.asarray(img)
         if img.ndim != 2:
             raise ValueError(f"Ожидалась 2D-карта, получена форма {img.shape}")
+        self._cursor_intensity_map = img
+        self.map_title_label.setText(str(title))
         self._x_coords, x_edges = self._axis_centers(x_coords, img.shape[1], "x_coords")
         self._y_coords, y_edges = self._axis_centers(y_coords, img.shape[0], "y_coords")
         extent = (x_edges[0], x_edges[1], y_edges[0], y_edges[1])
@@ -831,7 +906,7 @@ class MapPlotWidget(QWidget):
             self.ax.clear()
             self.ax.set_xlabel("Detector X (source pixels)")
             self.ax.set_ylabel("Detector Y (source pixels)")
-            self.ax.set_title(str(title), pad=7)
+            self.ax.set_title("")
             self.ax.grid(False)
             self.ax.xaxis.set_major_locator(MaxNLocator(nbins=5, integer=True)); self.ax.yaxis.set_major_locator(MaxNLocator(nbins=5, integer=True))
             self.ax.set_aspect("equal", adjustable="box"); self.ax.set_anchor("N")
@@ -851,7 +926,7 @@ class MapPlotWidget(QWidget):
                 self.map_image.autoscale()
             self.ax.set_xlabel("Detector X (source pixels)")
             self.ax.set_ylabel("Detector Y (source pixels)")
-            self.ax.set_title(str(title), pad=7)
+            self.ax.set_title("")
             self.ax.grid(False)
             self.ax.xaxis.set_major_locator(MaxNLocator(nbins=5, integer=True)); self.ax.yaxis.set_major_locator(MaxNLocator(nbins=5, integer=True))
             self.ax.set_aspect("equal", adjustable="box"); self.ax.set_anchor("N")
@@ -976,8 +1051,8 @@ class MapPlotWidget(QWidget):
     def set_pixel_pick_mode(self, enabled: bool) -> None:
         """Temporarily reserve a left click for selecting a detector pixel.
 
-        The existing ROI selector is paused, not destroyed, and is restored
-        after selection or cancellation. This preserves its in-progress state.
+        The existing ROI selector is paused, not destroyed, while picking is
+        active and restored when the user turns the mode off.
         """
         enabled = bool(enabled)
         if enabled == self._pixel_pick_mode:
@@ -999,14 +1074,6 @@ class MapPlotWidget(QWidget):
             selector.set_active(True)
         self.canvas.draw_idle()
 
-    def _restore_selector_after_pixel_pick(self) -> None:
-        """Restore ROI interaction after Matplotlib dispatches the pick click."""
-        selector = self._pixel_pick_paused_selector
-        self._pixel_pick_paused_selector = None
-        if selector is not None and selector is self._current_selector:
-            selector.set_active(True)
-        self.canvas.draw_idle()
-
     # ========================================================
     # ЕДИНЫЕ ОБРАБОТЧИКИ СОБЫТИЙ МЫШИ
     # ========================================================
@@ -1014,12 +1081,10 @@ class MapPlotWidget(QWidget):
         """Единый обработчик мыши; не запускает создание точки по контуру сохранённой ROI."""
         if event.inaxes != self.ax: return
         if self._pixel_pick_mode and event.button == 1 and event.xdata is not None and event.ydata is not None:
-            # Keep the selector paused until all canvas callbacks for this click
-            # have returned; otherwise the same click could create a new ROI.
-            self._pixel_pick_mode = False
-            self.canvas.setCursor(Qt.CursorShape.ArrowCursor)
+            # Persistent mode: keep the ROI selector paused across clicks so a
+            # user can sample several pixels without re-arming the tool.
+            self.canvas.setCursor(Qt.CursorShape.CrossCursor)
             self.pixel_pick_selected.emit(float(event.xdata), float(event.ydata))
-            QTimer.singleShot(0, self._restore_selector_after_pixel_pick)
             return
         if event.button == 1 and self._current_roi_type == "point" and self._current_selector is not None:
             for artist in reversed(tuple(self.ax.patches)+tuple(self.ax.lines)):
@@ -1062,17 +1127,22 @@ class MapPlotWidget(QWidget):
         # 1. ЛОГИКА ТЕКСТА КООРДИНАТ (работает всегда) (X, Y и интенсивность Z под курсором)
         x, y = event.xdata, event.ydata   
         z_str = ""
-        if hasattr(self, 'map_image') and self.map_image is not None:
-            arr = self.map_image.get_array()
-            x_axis = getattr(self, "_x_coords", np.arange(arr.shape[1], dtype=float))
-            y_axis = getattr(self, "_y_coords", np.arange(arr.shape[0], dtype=float))
-            ix = self._nearest_axis_index(x_axis, x); iy = self._nearest_axis_index(y_axis, y)
-            if ix is not None and iy is not None:
-                z_val = arr[iy, ix]
-                if z_val is np.ma.masked or z_val is None:
-                    z_str = "  |  Int: N/A"
-                else:
-                    z_str = f"  |  Int: {float(z_val):.1f}"
+        if self.map_image is not None:
+            # Peak-count maps are displayed as RGBA pixels. The hover readout
+            # must use the original scalar intensity layer, never the 4-channel
+            # rendered color at that pixel.
+            arr = self._cursor_intensity_map
+            if arr is None:
+                arr = self.map_image.get_array()
+            arr = np.ma.asarray(arr)
+            if arr.ndim >= 2:
+                x_axis = getattr(self, "_x_coords", np.arange(arr.shape[1], dtype=float))
+                y_axis = getattr(self, "_y_coords", np.arange(arr.shape[0], dtype=float))
+                ix = self._nearest_axis_index(x_axis, x)
+                iy = self._nearest_axis_index(y_axis, y)
+                if ix is not None and iy is not None and iy < arr.shape[0] and ix < arr.shape[1]:
+                    z_val = arr[iy, ix]
+                    z_str = f"  |  Int: {self._format_hover_intensity(z_val)}"
         coord_text = f"X: {x:.1f}   Y: {y:.1f}{z_str}"
         self.coord_label.setText(coord_text)
         # Передаём только два скалярных координатных значения; тяжёлые расчёты

@@ -40,6 +40,7 @@ class _AlphaGradientRows(QWidget):
         super().__init__(parent)
         self.rows = tuple(rows)
         self.axis_label = str(axis_label)
+        self.font_scale = 0.84
         self.setMinimumWidth(188)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.setMinimumHeight(142)
@@ -62,9 +63,11 @@ class _AlphaGradientRows(QWidget):
         strip_width = strip_right - strip_left
 
         painter.setPen(text_color)
-        heading_font = painter.font()
+        base_font = painter.font()
+        base_font.setPointSizeF(max(6.0, base_font.pointSizeF() * self.font_scale))
+        heading_font = base_font
         heading_font.setBold(True)
-        heading_font.setPointSizeF(max(7.0, heading_font.pointSizeF() - 0.5))
+        heading_font.setPointSizeF(max(6.5, heading_font.pointSizeF() - 0.2))
         painter.setFont(heading_font)
         painter.drawText(QRect(8, 5, width - 16, 17), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
                          "ИНТЕГРАЛЬНАЯ ИНТЕНСИВНОСТЬ  →")
@@ -72,7 +75,7 @@ class _AlphaGradientRows(QWidget):
         row_top = 27
         row_height = 13
         row_gap = 5
-        painter.setFont(self.font())
+        painter.setFont(base_font)
         for index, entry in enumerate(self.rows):
             y = row_top + index * (row_height + row_gap)
             painter.setPen(text_color)
@@ -94,8 +97,8 @@ class _AlphaGradientRows(QWidget):
 
         labels_y = row_top + len(self.rows) * (row_height + row_gap) + 1
         painter.setPen(muted_color)
-        small_font = painter.font()
-        small_font.setPointSizeF(max(6.5, small_font.pointSizeF() - 1.0))
+        small_font = base_font
+        small_font.setPointSizeF(max(5.8, small_font.pointSizeF() - 0.6))
         painter.setFont(small_font)
         painter.drawText(QRect(strip_left, labels_y, strip_width // 2, 15),
                          Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, "низкая")
@@ -114,6 +117,8 @@ class _LegendEntryList(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(7, 6, 7, 6)
         layout.setSpacing(4)
+        self._entry_labels: list[tuple[QLabel, QLabel | None]] = []
+        self.font_scale = 0.84
         for entry in entries:
             row = QHBoxLayout()
             row.setContentsMargins(0, 0, 0, 0)
@@ -131,15 +136,27 @@ class _LegendEntryList(QWidget):
             label = QLabel(entry.label, self)
             label.setWordWrap(True)
             text_column.addWidget(label)
+            detail = None
             if entry.detail:
                 detail = QLabel(entry.detail, self)
                 detail.setWordWrap(True)
-                detail.setStyleSheet("color: palette(placeholderText); font-size: 9px;")
                 text_column.addWidget(detail)
+            self._entry_labels.append((label, detail))
             row.addLayout(text_column, 1)
             layout.addLayout(row)
         layout.addStretch(1)
         self.setMinimumWidth(178)
+        self.set_font_scale(self.font_scale)
+
+    def set_font_scale(self, scale: float) -> None:
+        self.font_scale = max(0.70, min(1.20, float(scale)))
+        for label, detail in self._entry_labels:
+            label.setStyleSheet(f"font-size:{9.0 * self.font_scale:.1f}pt;")
+            if detail is not None:
+                detail.setStyleSheet(
+                    "color: palette(placeholderText); "
+                    f"font-size:{7.5 * self.font_scale:.1f}pt;"
+                )
 
 
 class _DragHeader(QFrame):
@@ -247,6 +264,7 @@ class FloatingLegendPanel(QFrame):
         self._user_moved = False
         self._collapsed = False
         self._content_widget: QWidget | None = None
+        self._font_scale = 0.84
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setStyleSheet(
             "QFrame#FloatingLegendPanel { background: palette(window); "
@@ -259,6 +277,10 @@ class FloatingLegendPanel(QFrame):
             "min-width: 20px; max-width: 20px; min-height: 20px; "
             "color: palette(window-text); background: transparent; }"
             "QToolButton#floatingLegendCollapse:hover { background: palette(midlight); border-radius: 3px; }"
+            "QToolButton#floatingLegendFontButton { border:0; padding:0; min-width:19px; max-width:19px; "
+            "min-height:19px; max-height:19px; font-size:8px; color:palette(window-text); "
+            "background:transparent; }"
+            "QToolButton#floatingLegendFontButton:hover { background:palette(midlight); border-radius:3px; }"
             "QScrollArea { border: 0; background: transparent; }"
         )
 
@@ -273,6 +295,22 @@ class FloatingLegendPanel(QFrame):
         self.title_label.setObjectName("floatingLegendTitle")
         self.title_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         header_layout.addWidget(self.title_label, 1)
+        self.font_decrease_button = QToolButton(self.header)
+        self.font_decrease_button.setObjectName("floatingLegendFontButton")
+        self.font_decrease_button.setText("A−")
+        self.font_decrease_button.setToolTip("Уменьшить шрифт легенды")
+        self.font_decrease_button.clicked.connect(
+            lambda: self.set_legend_font_scale(self._font_scale - 0.08)
+        )
+        header_layout.addWidget(self.font_decrease_button)
+        self.font_increase_button = QToolButton(self.header)
+        self.font_increase_button.setObjectName("floatingLegendFontButton")
+        self.font_increase_button.setText("A+")
+        self.font_increase_button.setToolTip("Увеличить шрифт легенды")
+        self.font_increase_button.clicked.connect(
+            lambda: self.set_legend_font_scale(self._font_scale + 0.08)
+        )
+        header_layout.addWidget(self.font_increase_button)
         self.collapse_button = QToolButton(self.header)
         self.collapse_button.setObjectName("floatingLegendCollapse")
         self.collapse_button.setText("−")
@@ -296,6 +334,7 @@ class FloatingLegendPanel(QFrame):
         outer.addLayout(body_row, 1)
 
         self.resize(default_size)
+        self.set_legend_font_scale(self._font_scale)
         parent.installEventFilter(self)
         self._place_initially()
         self.hide()
@@ -317,11 +356,32 @@ class FloatingLegendPanel(QFrame):
         *,
         axis_label: str = "Интенсивность",
     ) -> None:
-        self.set_content_widget(_AlphaGradientRows(rows, axis_label))
+        content = _AlphaGradientRows(rows, axis_label)
+        content.font_scale = self._font_scale
+        self.set_content_widget(content)
 
     def set_entries(self, entries: Iterable[LegendEntry]) -> None:
         """Set a scrollable categorical list (e.g. diffraction branch IDs)."""
-        self.set_content_widget(_LegendEntryList(entries))
+        content = _LegendEntryList(entries)
+        content.set_font_scale(self._font_scale)
+        self.set_content_widget(content)
+
+    @property
+    def legend_font_scale(self) -> float:
+        return self._font_scale
+
+    def set_legend_font_scale(self, scale: float) -> None:
+        """Set content text scale independently of the panel geometry."""
+        self._font_scale = max(0.70, min(1.20, round(float(scale), 2)))
+        if self._content_widget is not None:
+            setter = getattr(self._content_widget, "set_font_scale", None)
+            if callable(setter):
+                setter(self._font_scale)
+            elif isinstance(self._content_widget, _AlphaGradientRows):
+                self._content_widget.font_scale = self._font_scale
+                self._content_widget.update()
+        self.font_decrease_button.setEnabled(self._font_scale > 0.70)
+        self.font_increase_button.setEnabled(self._font_scale < 1.20)
 
     @property
     def is_collapsed(self) -> bool:
@@ -361,6 +421,8 @@ class FloatingLegendPanel(QFrame):
         self.header.setPalette(palette)
         self.title_label.setPalette(palette)
         self.collapse_button.setPalette(palette)
+        self.font_decrease_button.setPalette(palette)
+        self.font_increase_button.setPalette(palette)
         if self._content_widget is not None:
             self._content_widget.setPalette(palette)
         self.update()

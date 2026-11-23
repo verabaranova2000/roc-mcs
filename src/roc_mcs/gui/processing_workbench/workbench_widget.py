@@ -11,7 +11,7 @@ from PyQt6.QtCore import Qt, QObject, QRunnable, QThreadPool, pyqtSignal, QEvent
 from PyQt6.QtGui import QCursor, QPalette
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QSplitter, QFormLayout, QComboBox,
-    QSpinBox, QDoubleSpinBox, QCheckBox, QLineEdit, QPushButton, QLabel,
+    QSpinBox, QDoubleSpinBox, QAbstractSpinBox, QCheckBox, QLineEdit, QPushButton, QLabel,
     QPlainTextEdit, QTabWidget, QStackedWidget, QProgressBar, QMessageBox,
     QSizePolicy, QFrame, QMenu, QScrollArea, QToolButton, QWidgetAction,
 )
@@ -268,6 +268,8 @@ class ProcessingWorkbenchWidget(QWidget):
         self._active_task: _RunNodeTask | None = None
         self._active_preview_task: _PreviewNodeTask | None = None
         self._active_peak_input_task: _PeakPixelInputTask | None = None
+        self._pending_peak_pixel_coordinates: tuple[float, float] | None = None
+        self._discard_active_peak_input = False
         self._preview_context: dict[str, Any] | None = None
         self._map_click_connection = None
         self._branch_parent_id: str | None = None
@@ -801,27 +803,35 @@ class ProcessingWorkbenchWidget(QWidget):
         preview_row = QWidget()
         preview_row_layout = QHBoxLayout(preview_row)
         preview_row_layout.setContentsMargins(0, 2, 0, 2)
-        preview_row_layout.setSpacing(5)
+        preview_row_layout.setSpacing(0)
         preview.setMinimumWidth(270)
         preview_row_layout.addWidget(preview, 1)
-        pick_button = QToolButton(preview_row)
+        pick_button = QToolButton(preview)
         pick_button.setObjectName("peakPreviewPixelPickButton")
         pick_button.setCheckable(True)
-        pick_button.setAutoRaise(False)
-        pick_button.setFixedSize(27, 27)
+        pick_button.setAutoRaise(True)
+        pick_button.setFixedSize(19, 19)
         pick_button.setIcon(svg_icon(ICON_DIR / "roi_point.svg", widget=pick_button))
-        pick_button.setIconSize(QSize(17, 17))
-        pick_button.setToolTip(
-            "Выбрать пиксель на 2D-карте и показать реальную локальную ROC-кривую "
-            "из входных данных этой ветви workflow. Нажмите ещё раз, чтобы отменить выбор."
+        pick_button.setIconSize(QSize(13, 13))
+        pick_button.setStyleSheet(
+            "QToolButton#peakPreviewPixelPickButton { border:1px solid palette(mid); "
+            "border-radius:3px; padding:0; background:palette(window); } "
+            "QToolButton#peakPreviewPixelPickButton:hover { border-color:palette(highlight); } "
+            "QToolButton#peakPreviewPixelPickButton:checked { "
+            "background:palette(highlight); border-color:palette(highlight); }"
         )
-        pick_button.setAccessibleName("Выбрать пиксель для реальной ROC-кривой")
+        pick_button.setToolTip(
+            "ВЫКЛ.: синтетическая ROC. ВКЛ.: режим выбора пикселя — можно щёлкать "
+            "по 2D-карте сколько угодно раз, чтобы менять реальную ROC. "
+            "Выключите кнопку, чтобы вернуться к синтетической схеме."
+        )
+        pick_button.setAccessibleName("Выбор реальной ROC по пикселю 2D-карты")
         pick_button.setEnabled(self.embedded)
         if not self.embedded:
             pick_button.setToolTip(
                 "Выбор пикселя доступен при открытии Workbench внутри ROI Explorer."
             )
-        preview_row_layout.addWidget(pick_button, 0, Qt.AlignmentFlag.AlignVCenter)
+        preview.set_pixel_pick_button(pick_button)
 
         def refresh_preview(*_args) -> None:
             preview.set_parameters(
@@ -888,8 +898,6 @@ class ProcessingWorkbenchWidget(QWidget):
                 for control, was_blocked in zip(controls, previous_block_states):
                     control.blockSignals(was_blocked)
             refresh_preview()
-            if pick_button.isChecked():
-                self._request_peak_pixel_pick(True)
 
         def input_source_changed(_checked: bool) -> None:
             refresh_preview()
@@ -902,7 +910,18 @@ class ProcessingWorkbenchWidget(QWidget):
         prominence.valueChanged.connect(remember_prominence)
         mode.currentIndexChanged.connect(change_prominence_mode)
         interpolated.toggled.connect(input_source_changed)
-        pick_button.toggled.connect(self._request_peak_pixel_pick)
+
+        def on_pixel_pick_toggled(checked: bool) -> None:
+            pick_button.setToolTip(
+                "Режим выбора активен: щёлкайте по 2D-карте, чтобы выбрать или сменить "
+                "пиксель. Выключите кнопку, чтобы вернуться к синтетической ROC."
+                if checked else
+                "Сейчас показана синтетическая ROC. Нажмите, чтобы включить выбор "
+                "реального пикселя на 2D-карте."
+            )
+            self._request_peak_pixel_pick(checked)
+
+        pick_button.toggled.connect(on_pixel_pick_toggled)
         layout.addRow(preview_row)
         layout.addRow("", interpolated)
         refresh_preview()
@@ -1239,8 +1258,14 @@ class ProcessingWorkbenchWidget(QWidget):
         scroll.setWidget(page)
         for widget_type in (QSpinBox, QDoubleSpinBox, QComboBox, QLineEdit):
             for field in page.findChildren(widget_type):
-                field.setMinimumHeight(21)
-                field.setMaximumHeight(25)
+                compact_peak_control = (
+                    operation_id == "peaks.detect"
+                    and isinstance(field, QAbstractSpinBox)
+                )
+                field.setMinimumHeight(18 if compact_peak_control else 21)
+                field.setMaximumHeight(20 if compact_peak_control else 25)
+                if compact_peak_control:
+                    field.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
                 if isinstance(field, QDoubleSpinBox):
                     field.setMinimumWidth(82)
                 elif isinstance(field, QSpinBox):
@@ -1253,9 +1278,11 @@ class ProcessingWorkbenchWidget(QWidget):
             label.setStyleSheet("QLabel { font-size: 10px; }")
         page_layout = form_info.get("layout")
         if page_layout is not None:
-            page_layout.setContentsMargins(4, 4, 4, 4)
-            page_layout.setVerticalSpacing(5)
-            page_layout.setHorizontalSpacing(8)
+            compact_peak_form = operation_id == "peaks.detect"
+            margin = 3 if compact_peak_form else 4
+            page_layout.setContentsMargins(margin, margin, margin, margin)
+            page_layout.setVerticalSpacing(3 if compact_peak_form else 5)
+            page_layout.setHorizontalSpacing(7 if compact_peak_form else 8)
         root.addWidget(scroll, 1)
 
         footer = QHBoxLayout()
@@ -1264,12 +1291,15 @@ class ProcessingWorkbenchWidget(QWidget):
         footer.addStretch(1)
         reset_button = None
         if operation_id == "peaks.detect":
-            reset_button = QPushButton("↺ По умолчанию", popup)
+            reset_button = QToolButton(popup)
+            reset_button.setText("↺")
+            reset_button.setAutoRaise(True)
+            reset_button.setFixedSize(25, 24)
             reset_button.setToolTip(
-                "Восстановить исходные параметры поиска пиков. "
+                "Восстановить заводские значения параметров поиска пиков. "
                 "Уже добавленные этапы workflow не изменяются."
             )
-            reset_button.setMinimumHeight(24)
+            reset_button.setAccessibleName("Сбросить параметры поиска пиков")
             reset_button.clicked.connect(form_info["reset_parameters"])
             footer.addWidget(reset_button)
         cancel_button = QPushButton("Отмена", popup)
@@ -1283,11 +1313,15 @@ class ProcessingWorkbenchWidget(QWidget):
 
         apply_popup_theme(popup, self._theme)
         apply_widget_palette(popup, self._theme)
+        spin_min_height = 18 if operation_id == "peaks.detect" else 21
+        spin_max_height = 20 if operation_id == "peaks.detect" else 25
         popup.setStyleSheet(
             "QFrame#processingStagePopup { background:palette(window); color:palette(window-text); "
             "border:1px solid palette(mid); border-radius:5px; }"
             "QFrame#processingStagePopup QLabel { background:transparent; color:palette(window-text); font-size:10px; }"
-            "QFrame#processingStagePopup QSpinBox, QFrame#processingStagePopup QDoubleSpinBox, "
+            "QFrame#processingStagePopup QSpinBox, QFrame#processingStagePopup QDoubleSpinBox { "
+            f"font-size:10px; min-height:{spin_min_height}px; max-height:{spin_max_height}px; padding:0px 3px; "
+            "background:palette(base); color:palette(text); border:1px solid palette(mid); border-radius:3px; }"
             "QFrame#processingStagePopup QComboBox, QFrame#processingStagePopup QLineEdit { "
             "font-size:10px; min-height:21px; max-height:25px; padding:1px 3px; "
             "background:palette(base); color:palette(text); border:1px solid palette(mid); border-radius:3px; }"
@@ -1337,6 +1371,9 @@ class ProcessingWorkbenchWidget(QWidget):
                 self._active_stage_operation = None
             if operation_id == "peaks.detect":
                 self._pending_peak_map_parent_id = None
+                self._pending_peak_pixel_coordinates = None
+                if self._active_peak_input_task is not None:
+                    self._discard_active_peak_input = True
                 pick_button = form_info.get("pick_button")
                 if pick_button is not None:
                     was_blocked = pick_button.blockSignals(True)
@@ -1391,7 +1428,8 @@ class ProcessingWorkbenchWidget(QWidget):
             self._pending_peak_map_parent_id = None
             pick_button.setEnabled(True)
             pick_button.setToolTip(
-                "Выбрать пиксель на 2D-карте и показать реальную локальную ROC из входа этой ветви."
+                "Режим выбора пикселя: щёлкайте по 2D-карте, чтобы менять реальную ROC. "
+                "Выключите кнопку, чтобы вернуться к синтетической схеме."
             )
             return
         self._pending_peak_map_parent_id = parent_id
@@ -1417,6 +1455,13 @@ class ProcessingWorkbenchWidget(QWidget):
             self._forms.get("peaks.detect", {}).get("use_interpolated_data")
             and self._forms["peaks.detect"]["use_interpolated_data"].isChecked()
         )
+        if not enabled:
+            self._pending_peak_pixel_coordinates = None
+            if self._active_peak_input_task is not None:
+                self._discard_active_peak_input = True
+            preview = self._forms.get("peaks.detect", {}).get("preview")
+            if preview is not None:
+                preview.clear_real_input()
         self.pixel_pick_mode_requested.emit(bool(enabled), parent_id, use_interpolated)
 
     def cancel_peak_pixel_pick_mode(self) -> None:
@@ -1426,48 +1471,87 @@ class ProcessingWorkbenchWidget(QWidget):
             button.setChecked(False)
 
     def set_peak_preview_pixel(self, detector_x: float, detector_y: float) -> None:
-        """Queue a real-pixel preview from the exact input artifacts of this branch."""
+        """Queue the latest selected pixel from the exact input of this branch."""
         if self._active_stage_popup is None or self._active_stage_operation != "peaks.detect":
+            return
+        pick_button = self._forms.get("peaks.detect", {}).get("pick_button")
+        if pick_button is None or not pick_button.isChecked():
+            return
+        self._pending_peak_pixel_coordinates = (float(detector_x), float(detector_y))
+        if self._active_peak_input_task is not None:
+            self.status_label.setText(
+                f"Пиксель ({float(detector_x):.4g}, {float(detector_y):.4g}) выбран; "
+                "после текущей загрузки будет показана последняя выбранная точка…"
+            )
+            return
+        self._start_pending_peak_pixel_input()
+
+    def _start_pending_peak_pixel_input(self) -> None:
+        """Start loading the most recently requested real-pixel preview."""
+        if self._active_peak_input_task is not None:
+            return
+        coordinates = self._pending_peak_pixel_coordinates
+        if coordinates is None:
+            return
+        if self._active_stage_popup is None or self._active_stage_operation != "peaks.detect":
+            self._pending_peak_pixel_coordinates = None
+            return
+        pick_button = self._forms.get("peaks.detect", {}).get("pick_button")
+        if pick_button is None or not pick_button.isChecked():
+            self._pending_peak_pixel_coordinates = None
             return
         parent_id = self._branch_parent_id
         if not parent_id:
+            self._pending_peak_pixel_coordinates = None
             return
-        form_info = self._forms.get("peaks.detect", {})
-        pick_button = form_info.get("pick_button")
-        if pick_button is not None:
-            QTimer.singleShot(0, lambda button=pick_button: button.setChecked(False))
-        if self._active_peak_input_task is not None:
-            self.status_label.setText("Загрузка данных для выбранного пикселя уже выполняется")
-            return
+        self._pending_peak_pixel_coordinates = None
+        detector_x, detector_y = coordinates
         try:
             task = _PeakPixelInputTask(
                 parent_id,
                 WorkflowHistory(list(self.project.history.nodes)),
                 str(self.project.artifact_store.directory),
-                float(detector_x), float(detector_y),
+                detector_x, detector_y,
             )
             task.signals.succeeded.connect(self._on_peak_pixel_input_ready)
             task.signals.failed.connect(self._on_peak_pixel_input_failed)
             self._active_peak_input_task = task
-            self.status_label.setText("Загрузка реальной ROC выбранного пикселя…")
+            self._discard_active_peak_input = False
+            self.status_label.setText(
+                f"Загрузка ROC пикселя ({detector_x:.4g}, {detector_y:.4g})…"
+            )
             self._log(
-                f"Выбран detector-пиксель X={float(detector_x):.6g}, Y={float(detector_y):.6g}; "
+                f"Выбран detector-пиксель X={detector_x:.6g}, Y={detector_y:.6g}; "
                 "загружаются точные Scan/Spike-входы ветви."
             )
             self.thread_pool.start(task)
         except Exception as exc:
+            self._active_peak_input_task = None
             self.status_label.setText(f"Не удалось подготовить пиксель: {exc}")
             self._log(traceback.format_exc())
 
     def _on_peak_pixel_input_ready(self, parent_id: str, payload: dict[str, Any]) -> None:
         self._active_peak_input_task = None
+        discard_result = self._discard_active_peak_input
+        self._discard_active_peak_input = False
         if (
             self._active_stage_popup is None
             or self._active_stage_operation != "peaks.detect"
             or parent_id != self._branch_parent_id
         ):
+            self._pending_peak_pixel_coordinates = None
+            return
+        # If the user selected another pixel while this payload was loading,
+        # display the newest request directly rather than flashing stale data.
+        if self._pending_peak_pixel_coordinates is not None:
+            self._start_pending_peak_pixel_input()
+            return
+        if discard_result:
             return
         form_info = self._forms.get("peaks.detect", {})
+        pick_button = form_info.get("pick_button")
+        if pick_button is None or not pick_button.isChecked():
+            return
         preview = form_info.get("preview")
         if preview is None:
             return
@@ -1486,12 +1570,18 @@ class ProcessingWorkbenchWidget(QWidget):
 
     def _on_peak_pixel_input_failed(self, parent_id: str, error: str) -> None:
         self._active_peak_input_task = None
+        self._discard_active_peak_input = False
         if parent_id != self._branch_parent_id:
+            self._pending_peak_pixel_coordinates = None
+            return
+        if self._pending_peak_pixel_coordinates is not None:
+            self._start_pending_peak_pixel_input()
+            return
+        pick_button = self._forms.get("peaks.detect", {}).get("pick_button")
+        if pick_button is None or not pick_button.isChecked():
             return
         self.status_label.setText("Не удалось загрузить реальную ROC выбранного пикселя")
         self._log(error)
-        # Keep the popup and any previously selected real trace intact; a user
-        # can choose another pixel without reopening the parameter form.
 
     def _on_graph_preview_requested(self, node_id: str) -> None:
         self.graph.select_node(node_id)

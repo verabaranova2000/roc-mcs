@@ -20,6 +20,11 @@ def test_floating_legend_switches_between_gradient_and_scrollable_entries():
     panel.show_on_canvas()
     assert panel.isVisible()
     assert not panel.is_collapsed
+    initial_scale = panel.legend_font_scale
+    panel.font_decrease_button.click()
+    assert panel.legend_font_scale < initial_scale
+    panel.font_increase_button.click()
+    assert panel.legend_font_scale == initial_scale
 
     panel.toggle_collapsed()
     assert panel.is_collapsed
