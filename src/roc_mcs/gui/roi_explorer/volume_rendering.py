@@ -220,6 +220,7 @@ def _regrid_rotated_volume_to_detector(rv: ROIVolume, roi):
 
 
 def build_volume_figure(rv: ROIVolume, settings: dict, theme="light", *, peak_catalog=None,
+                        peak_x_coords=None, peak_y_coords=None, peak_display=None,
                         full_projection=None, detector_x=None, detector_y=None, overlay_roi=None):
     """Стиль лабораторного Plotly-builder; опционально показывает ROI-объём на полном XY-детекторе."""
     import plotly.graph_objects as go
@@ -286,14 +287,112 @@ def build_volume_figure(rv: ROIVolume, settings: dict, theme="light", *, peak_ca
                     visible=bool(settings.get("show_projection",True))))
         except (AttributeError,TypeError,ValueError):
             pass
-    if peak_catalog is not None and getattr(peak_catalog,"empty",True) is False:
-        cat=peak_catalog.copy(); required={"x","y","theta"}
+    display = dict(peak_display or {})
+    show_peaks = bool(display.get("show", True))
+    if show_peaks and peak_catalog is not None and getattr(peak_catalog, "empty", True) is False:
+        cat = peak_catalog.copy()
+        required = {"x", "y", "theta"}
         if required.issubset(cat.columns):
-            px0,py0,ptheta=cat["x"].to_numpy(float),cat["y"].to_numpy(float),cat["theta"].to_numpy(float)
-            px,py=rv.roi.to_local(px0,py0) if rv.coord_system=="uv" and rv.roi is not None else (px0,py0)
-            inside=rv.roi.contains(px0,py0) if rv.roi is not None else np.ones(px0.shape,dtype=bool)
-            inside=np.asarray(inside)&np.isfinite(px)&np.isfinite(py)&np.isfinite(ptheta)
-            fig.add_trace(go.Scatter3d(x=np.asarray(px)[inside],y=np.asarray(py)[inside],z=ptheta[inside],mode="markers",name="Пики",marker=dict(size=2,opacity=1,color="#ffb347")))
+            xi = np.asarray(cat["x"], dtype=np.float64)
+            yi = np.asarray(cat["y"], dtype=np.float64)
+            ptheta = np.asarray(cat["theta"], dtype=np.float64)
+            if peak_x_coords is not None or peak_y_coords is not None:
+                if peak_x_coords is None or peak_y_coords is None:
+                    raise ValueError("Для центров пиков нужно одновременно передать peak_x_coords и peak_y_coords")
+                gx = np.asarray(peak_x_coords, dtype=np.float64)
+                gy = np.asarray(peak_y_coords, dtype=np.float64)
+                if not (np.isfinite(xi).all() and np.isfinite(yi).all()):
+                    raise ValueError("Индексные координаты peak_catalog должны быть конечными")
+                if not (np.all(np.abs(xi - np.rint(xi)) < 1e-8) and np.all(np.abs(yi - np.rint(yi)) < 1e-8)):
+                    raise ValueError("Индексные координаты x/y peak_catalog должны быть целочисленными")
+                x_index = np.rint(xi).astype(np.int64)
+                y_index = np.rint(yi).astype(np.int64)
+                if np.any((x_index < 0) | (x_index >= gx.size) | (y_index < 0) | (y_index >= gy.size)):
+                    raise ValueError("Центры пиков выходят за границы координатной сетки текущего Scan")
+                px0, py0 = gx[x_index], gy[y_index]
+            else:
+                # Compatibility for callers which already provide physical XY.
+                px0, py0 = xi, yi
+            px, py = (
+                rv.roi.to_local(px0, py0)
+                if rv.coord_system == "uv" and rv.roi is not None
+                else (px0, py0)
+            )
+            inside = rv.roi.contains(px0, py0) if rv.roi is not None else np.ones(px0.shape, dtype=bool)
+            inside = np.asarray(inside, dtype=bool)
+            inside &= np.isfinite(px) & np.isfinite(py) & np.isfinite(ptheta)
+            inside &= (px >= min(float(np.min(x)), float(np.max(x)))) & (px <= max(float(np.min(x)), float(np.max(x))))
+            inside &= (py >= min(float(np.min(y)), float(np.max(y)))) & (py <= max(float(np.min(y)), float(np.max(y))))
+            inside &= (ptheta >= min(z_min, z_max)) & (ptheta <= max(z_min, z_max))
+            rows = np.flatnonzero(inside)
+            if rows.size:
+                max_markers = max(1, int(display.get("max_points", 150_000)))
+                original_count = int(rows.size)
+                if rows.size > max_markers:
+                    step = int(np.ceil(rows.size / max_markers))
+                    rows = rows[::step]
+                branch_values = (
+                    np.asarray(cat["branch_id"], dtype=object)[rows]
+                    if "branch_id" in cat.columns else np.full(rows.size, None, dtype=object)
+                )
+                peak_ids = (
+                    np.asarray(cat["peak_id"], dtype=object)[rows]
+                    if "peak_id" in cat.columns else rows.astype(object)
+                )
+                color_mode = str(display.get("color_mode", "single"))
+                branch_colors = dict(display.get("branch_colors", {}) or {})
+                if color_mode == "branch" and "branch_id" in cat.columns:
+                    import colorsys
+                    colors = []
+                    import pandas as pd
+                    for branch_value in branch_values:
+                        try:
+                            branch_missing = bool(pd.isna(branch_value))
+                        except (TypeError, ValueError):
+                            branch_missing = branch_value is None
+                        if branch_missing:
+                            colors.append(str(display.get("color", "#ffb347")))
+                            continue
+                        branch_key = str(int(branch_value))
+                        if branch_key in branch_colors:
+                            colors.append(str(branch_colors[branch_key]))
+                        else:
+                            hue = (int(branch_key) * 0.6180339887498949) % 1.0
+                            rgb = colorsys.hsv_to_rgb(hue, 0.68, 0.92)
+                            colors.append("#%02x%02x%02x" % tuple(round(channel * 255) for channel in rgb))
+                    marker_color = colors
+                else:
+                    marker_color = str(display.get("color", "#ffb347"))
+                import pandas as pd
+                branch_hover = []
+                for value in branch_values:
+                    missing_branch = bool(pd.isna(value))
+                    branch_hover.append("—" if missing_branch else str(int(value)))
+                custom = np.empty((rows.size, 4), dtype=object)
+                custom[:, 0] = peak_ids.astype(str)
+                custom[:, 1] = branch_hover
+                custom[:, 2] = xi[rows]
+                custom[:, 3] = yi[rows]
+                position_label = "после Fit" if str(display.get("position_kind", "detected")) == "fitted" else "после поиска пиков"
+                point_name = f"Центры пиков · {position_label}"
+                if original_count > rows.size:
+                    point_name += f" · показано {rows.size:,}/{original_count:,}"
+                fig.add_trace(go.Scatter3d(
+                    x=np.asarray(px)[rows], y=np.asarray(py)[rows], z=ptheta[rows],
+                    mode="markers", name=point_name, showlegend=False,
+                    marker=dict(
+                        size=float(display.get("size", 3.0)),
+                        opacity=float(display.get("opacity", 1.0)),
+                        color=marker_color, symbol="circle",
+                        line=dict(color="rgba(20,20,20,0.55)", width=0.35),
+                    ),
+                    customdata=custom,
+                    hovertemplate=(
+                        "x=%{x:.4g}<br>y=%{y:.4g}<br>θ=%{z:.5g}<br>"
+                        "peak_id=%{customdata[0]}<br>branch_id=%{customdata[1]}<br>"
+                        "индекс пикселя=(%{customdata[2]:.0f}, %{customdata[3]:.0f})<extra></extra>"
+                    ),
+                ))
     camera=settings.get("camera") if isinstance(settings.get("camera"),dict) else None
     if not camera:camera=dict(eye=dict(x=1.6,y=-1.9,z=1.25),center=dict(x=0,y=0,z=0),up=dict(x=0,y=0,z=1))
     else:camera=dict(camera)

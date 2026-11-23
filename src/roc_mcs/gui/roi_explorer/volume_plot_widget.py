@@ -324,13 +324,18 @@ class _WorkerSignals(QObject):
 class _RenderWorker(QRunnable):
     def __init__(self, token, raw, th, axis, x, y, roi, settings, theme, cache_key,
                  cached_volume=None, cached_input_stride=1, overlay_full_detector=False,
-                 cached_projection=None, valid_mask=None):
+                 cached_projection=None, valid_mask=None, peak_catalog=None,
+                 peak_x_coords=None, peak_y_coords=None, peak_display=None):
         super().__init__(); self.token=token; self.raw=raw; self.th=th; self.axis=axis
         self.x=x; self.y=y; self.roi=roi; self.settings=settings; self.theme=theme
         self.cache_key=cache_key; self.cached_volume=cached_volume
         self.cached_input_stride=max(1,int(cached_input_stride))
         self.overlay_full_detector=bool(overlay_full_detector)
         self.cached_projection=cached_projection; self.valid_mask=valid_mask
+        self.peak_catalog = peak_catalog
+        self.peak_x_coords = peak_x_coords
+        self.peak_y_coords = peak_y_coords
+        self.peak_display = dict(peak_display or {})
         self.signals=_WorkerSignals()
 
     def run(self):
@@ -371,9 +376,17 @@ class _RenderWorker(QRunnable):
                     full_projection=masked_detector_projection(
                         self.raw, self.axis, self.valid_mask, chunk_rows=32,
                     ).astype(np.float32)
-            fig=build_volume_figure(rv,settings,self.theme,full_projection=full_projection,
-                detector_x=self.x if full_projection is not None else None,detector_y=self.y if full_projection is not None else None,
-                overlay_roi=self.roi if full_projection is not None else None)
+            peak_settings = dict(self.peak_display)
+            peak_settings.setdefault("position_kind", "detected")
+            fig=build_volume_figure(
+                rv, settings, self.theme, peak_catalog=self.peak_catalog,
+                peak_x_coords=self.peak_x_coords, peak_y_coords=self.peak_y_coords,
+                peak_display=peak_settings,
+                full_projection=full_projection,
+                detector_x=self.x if full_projection is not None else None,
+                detector_y=self.y if full_projection is not None else None,
+                overlay_roi=self.roi if full_projection is not None else None,
+            )
             import plotly.io as pio
             payload=pio.to_json(fig,validate=False,pretty=False,remove_uids=False)
             volume_trace=next((tr for tr in fig.data if getattr(tr,"type","")=="volume"),None)
@@ -454,6 +467,8 @@ class VolumePlotWidget(QWidget):
         self._volume_cache_input_stride = 1
         self._projection_cache_key = None
         self._projection_cache = None
+        self._peak_catalog = None
+        self._peak_position_kind = "detected"
 
         self._transfer_id = 0
         self._transfer_payload = None
@@ -528,6 +543,7 @@ class VolumePlotWidget(QWidget):
         self.toolbar.align_xy_requested.connect(lambda: self._command("align", axis="xy"))
         self.toolbar.view_axis_requested.connect(lambda axis: self._command("align", axis=axis))
         self.toolbar.rotation_lock_toggled.connect(self._on_rotation_lock)
+        self.toolbar.peak_display_changed.connect(self._on_peak_display_changed)
         self.toolbar.colormap_changed.connect(self._on_colormap_changed)
         self.toolbar.opacity_mode_changed.connect(self._on_opacity_mode_changed)
         self.toolbar.contrast_changed.connect(self._on_contrast_changed)
@@ -884,7 +900,11 @@ class VolumePlotWidget(QWidget):
         if not self.bridge or not self._page_ready:return
         self.bridge.commandChanged.emit(json.dumps({"type":kind,**payload},separators=(",",":")))
 
-    def set_dataset(self, raw, th, axis, x_coords, y_coords, saved_rois, *, scan_label="", view_label="", valid_mask=None):
+    def _on_peak_display_changed(self, _settings=None):
+        if self._raw is not None:
+            self.refresh(force=True)
+
+    def set_dataset(self, raw, th, axis, x_coords, y_coords, saved_rois, *, scan_label="", view_label="", valid_mask=None, peak_catalog=None, peak_position_kind="detected"):
         self._last_map_cursor = None; self._map_cursor_timer.stop()
         if self._cursor_line_enabled and self._page_ready:
             self._command("cursorReset")
@@ -893,6 +913,14 @@ class VolumePlotWidget(QWidget):
         if mask is not None and mask.shape!=data.shape:
             raise ValueError(f"valid_mask shape={mask.shape} не совпадает с raw shape={data.shape}")
         self._dataset_generation+=1; self._volume_cache_key=None; self._volume_cache=None; self._volume_cache_input_stride=1; self._projection_cache_key=None; self._projection_cache=None; self._raw=data; self._valid_mask=mask; self._th=np.asarray(th,dtype=float); self._axis=int(axis); self._x=np.asarray(x_coords,dtype=float); self._y=np.asarray(y_coords,dtype=float); self._scan_label=str(scan_label); self._view_label=str(view_label); self._rois=[]
+        self._peak_catalog = peak_catalog.copy() if peak_catalog is not None and getattr(peak_catalog, "empty", True) is False else None
+        self._peak_position_kind = str(peak_position_kind or "detected")
+        branch_ids = (
+            self._peak_catalog["branch_id"].dropna().tolist()
+            if self._peak_catalog is not None and "branch_id" in self._peak_catalog.columns
+            else []
+        )
+        self.toolbar.set_peak_branch_ids(branch_ids)
         for saved in (saved_rois or []):
             try:
                 normalize_rectangular_roi(saved.roi)
@@ -922,6 +950,9 @@ class VolumePlotWidget(QWidget):
         self._render_timer.stop()
         self._pending_render = None
         self._raw = self._th = self._x = self._y = self._valid_mask = None
+        self._peak_catalog = None
+        self._peak_position_kind = "detected"
+        self.toolbar.set_peak_branch_ids([])
         self._rois = []
         self._pending_roi_overlay_color = None
         self._last_key = None
@@ -965,8 +996,12 @@ class VolumePlotWidget(QWidget):
             for key in DATA_RENDER_SETTINGS
             if key in settings
         }
+        peak_display = self.toolbar.peak_display_settings
+        peak_display["position_kind"] = self._peak_position_kind
+        peak_render_key = json.dumps(peak_display, sort_keys=True, default=str)
         key = (
             self._scan_label, self._view_label, self.toolbar.current_source(), overlay,
+            peak_render_key,
             round(roi.cx, 8), round(roi.cy, 8), round(roi.width, 8),
             round(roi.height, 8), round(roi.angle, 8), self._theme,
             json.dumps(render_settings, sort_keys=True, default=str),
@@ -985,6 +1020,7 @@ class VolumePlotWidget(QWidget):
         self._pending_render = (
             token, self._raw, self._th, self._axis, self._x, self._y,
             roi, settings, self._theme, cache_key, overlay, self._valid_mask,
+            self._peak_catalog, self._x, self._y, peak_display,
         )
         self._update_status(
             "Расчёт 3D-объёма: задача поставлена в очередь",
@@ -996,7 +1032,8 @@ class VolumePlotWidget(QWidget):
     def _start_latest_render(self):
         if self._worker_active or self._pending_render is None:
             return
-        token, raw, th, axis, x, y, roi, settings, theme, cache_key, overlay, valid_mask = self._pending_render
+        (token, raw, th, axis, x, y, roi, settings, theme, cache_key, overlay,
+         valid_mask, peak_catalog, peak_x_coords, peak_y_coords, peak_display) = self._pending_render
         self._pending_render = None
         self._worker_active = True
         self._render_elapsed.start()
@@ -1010,6 +1047,7 @@ class VolumePlotWidget(QWidget):
         worker = _RenderWorker(
             token, raw, th, axis, x, y, roi, settings, theme, cache_key,
             cached, self._volume_cache_input_stride, overlay, projection, valid_mask,
+            peak_catalog, peak_x_coords, peak_y_coords, peak_display,
         )
         worker.signals.done.connect(self._render_ready)
         worker.signals.failed.connect(self._render_failed)

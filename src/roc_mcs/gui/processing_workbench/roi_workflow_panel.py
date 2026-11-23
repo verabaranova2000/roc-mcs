@@ -151,7 +151,8 @@ class ProcessingStepsPanel(QWidget):
             self.project_label.setText(project.directory.name)
             self.project_label.setToolTip(str(project.directory))
             self._set_status(
-                "Открыта сохранённая сессия; контейнер HDF5 изменился, но идентификатор скана совпадает."
+                "Сохранённая сессия открыта. Контейнер HDF5 пополнился или изменился; "
+                "выбранный scan_key проверяется отдельно и не инвалидируется добавлением других сканов."
                 if container_revision_changed else
                 "История workflow готова. Выберите узел; глаз открывает результат, + добавляет этап."
             )

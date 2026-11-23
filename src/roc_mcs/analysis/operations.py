@@ -963,6 +963,81 @@ def _run_fit(inputs: Mapping[str, ArtifactBundle], parameters: Mapping[str, Any]
     )
 
 
+
+def _validate_branches(parameters: Mapping[str, Any]) -> dict[str, Any]:
+    try:
+        theta_gate = float(parameters.get("theta_gate", 60.0))
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("theta_gate должен быть положительным числом в единицах оси θ") from exc
+    if not np.isfinite(theta_gate) or theta_gate <= 0:
+        raise ValueError("theta_gate должен быть конечным положительным числом")
+    return {"theta_gate": theta_gate, "algorithm": "4-connected one-to-one minimum-|Δθ|"}
+
+
+def _run_branches(inputs: Mapping[str, ArtifactBundle], parameters: Mapping[str, Any]) -> OperationResult:
+    import pandas as pd
+    from roc_mcs.peaks.branches import (
+        build_peak_branch_graph, label_peak_branches, summarize_peak_spacing,
+        fitted_peak_positions,
+    )
+
+    positions = inputs["positions"]
+    position_kind = str(positions.metadata.get("position_kind", "detected"))
+    if "fitted_peak_catalog" in positions.tables and "peak_catalog" in positions.tables:
+        catalog = fitted_peak_positions(positions)
+        position_kind = "fitted"
+    else:
+        source_catalog = positions.tables.get("peak_catalog")
+        if source_catalog is None:
+            raise ValueError("В позициионном артефакте отсутствует peak_catalog")
+        catalog = source_catalog.copy()
+        position_kind = "detected"
+    if catalog.empty:
+        raise ValueError("Каталог не содержит peak-events; определение ветвей невозможно")
+    spacing = summarize_peak_spacing(catalog)
+    edges, edge_deltas = build_peak_branch_graph(catalog, theta_gate=parameters["theta_gate"])
+    n_branches, labels = label_peak_branches(catalog, edges)
+    catalog = catalog.copy()
+    catalog["branch_id"] = labels.astype(np.int32)
+    catalog["branch_position_kind"] = position_kind
+
+    edges_frame = pd.DataFrame(
+        [(int(a), int(b), float(delta)) for (a, b), delta in zip(edges, edge_deltas)],
+        columns=["peak_id_a", "peak_id_b", "delta_theta"],
+    )
+    spacing_rows = pd.DataFrame(spacing.get("internal_gap_by_n", ()))
+    branch_sizes = catalog.groupby("branch_id", sort=True).size().rename("event_count").reset_index()
+    metadata = dict(positions.metadata)
+    metadata.update({
+        "operation": "spatial diffraction peak-branch assignment",
+        "grid_id": positions.metadata.get("grid_id"),
+        "position_kind": position_kind,
+        "branch_algorithm": parameters["algorithm"],
+        "theta_gate": float(parameters["theta_gate"]),
+        "theta_unit": spacing.get("theta_unit", "arcsec"),
+        "n_peak_events": int(len(catalog)),
+        "n_branches": int(n_branches),
+        "n_edges": int(len(edges)),
+        "spacing_diagnostics": spacing,
+    })
+    return OperationResult(
+        bundle=ArtifactBundle(
+            tables={
+                "branch_catalog": catalog,
+                "branch_edges": edges_frame,
+                "branch_spacing": spacing_rows,
+                "branch_sizes": branch_sizes,
+            },
+            metadata=metadata,
+        ),
+        output_ports=("branches",),
+        summary=(
+            f"Ветви определены: событий={len(catalog):,}; ветвей={n_branches:,}; "
+            f"связей={len(edges):,}; θ-gate={parameters['theta_gate']:g}″; "
+            f"позиции={'после Fit' if position_kind == 'fitted' else 'после детектора пиков'}"
+        ),
+    )
+
 def _grid_signature(parent_grid: str, operation_signature: str) -> str:
     import hashlib
 
@@ -1016,5 +1091,17 @@ def default_registry() -> OperationRegistry:
         output_ports=("fit",),
         execute=_run_fit,
         validate=_validate_fit,
+    ))
+    registry.register(OperationSpec(
+        operation_id="peaks.branches",
+        label="Определение дифракционных ветвей",
+        description=(
+            "Группирует peak-events в пространственно связанные ветви по 4-связности "
+            "и one-to-one соответствию соседних ROC-пиков в пределах theta_gate. "
+            "Работает по детектированным или fitted-центрам."
+        ),
+        output_ports=("branches",),
+        execute=_run_branches,
+        validate=_validate_branches,
     ))
     return registry

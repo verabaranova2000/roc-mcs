@@ -1362,7 +1362,7 @@ class VTKToolsWidget(QWidget):
     # Additional scene objects — persistent icon rail + independent popups
     # ------------------------------------------------------------------
     def _build_overlays_menu(self) -> None:
-        """Show three adjacent, equally sized scene-object tool buttons."""
+        """Show compact, equally sized scene-object tool buttons."""
         self._overlays_panel = QWidget(self.overlays_menu)
         self._overlays_panel.setObjectName("VTKOverlayIconRow")
         row = QHBoxLayout(self._overlays_panel)
@@ -1424,6 +1424,14 @@ class VTKToolsWidget(QWidget):
             f"vtk_roi_preview_{roi_icon_variant}.svg",
             "Предпросмотр ROI и выделение соответствующей части облака · ЛКМ — показать/скрыть, ПКМ — параметры",
             settings_title="ПРЕДПРОСМОТР ROI",
+            monochrome=True,
+            icon_size=18,
+        )
+        self.peak_markers_button = self.register_overlay_tool(
+            "peaks",
+            "roi_point.svg",
+            "Центры найденных пиков в 3D · ЛКМ — показать/скрыть, ПКМ — параметры",
+            settings_title="ЦЕНТРЫ ПИКОВ",
             monochrome=True,
             icon_size=18,
         )
@@ -1612,6 +1620,7 @@ class VTKToolsWidget(QWidget):
         theta_slice: QWidget | None = None,
         projection: QWidget | None = None,
         roi_preview: QWidget | None = None,
+        peaks: QWidget | None = None,
     ) -> None:
         if cursor_line is not None:
             self.set_overlay_settings_widget(
@@ -1628,6 +1637,10 @@ class VTKToolsWidget(QWidget):
         if roi_preview is not None:
             self.set_overlay_settings_widget(
                 "roi_preview", roi_preview, settings_title="ПРЕДПРОСМОТР ROI"
+            )
+        if peaks is not None:
+            self.set_overlay_settings_widget(
+                "peaks", peaks, settings_title="ЦЕНТРЫ ПИКОВ"
             )
 
     def _popup_position_below(self, anchor: QWidget, popup_size: QSize) -> QPoint:
@@ -2019,6 +2032,10 @@ class VTKToolsWidget(QWidget):
             button.setChecked(bool(checked))
             button.blockSignals(False)
 
+    def is_overlay_tool_checked(self, key: str) -> bool:
+        button = self._overlay_buttons.get(str(key))
+        return bool(button.isChecked()) if button is not None else False
+
     def set_cursor_line_enabled(self, enabled: bool) -> None:
         self.set_overlay_tool_checked("cursor", enabled)
 
@@ -2049,15 +2066,16 @@ class VTKToolsWidget(QWidget):
 
     def set_overlay_controls_enabled(
         self, *, cursor: bool, theta: bool, projection: bool = True,
-        roi_preview: bool = True,
+        roi_preview: bool = True, peaks: bool = False,
     ) -> None:
         self.set_overlay_tool_enabled("cursor", cursor)
         self.set_overlay_tool_enabled("theta", theta)
         self.set_overlay_tool_enabled("projection", projection)
         self.set_overlay_tool_enabled("roi_preview", roi_preview)
+        self.set_overlay_tool_enabled("peaks", peaks)
         for key, available in (
             ("cursor", cursor), ("theta", theta), ("projection", projection),
-            ("roi_preview", roi_preview),
+            ("roi_preview", roi_preview), ("peaks", peaks),
         ):
             widget = self._overlay_settings.get(key)
             if widget is not None:

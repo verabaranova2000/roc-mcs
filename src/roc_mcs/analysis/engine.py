@@ -50,7 +50,7 @@ def create_source_node(
     h5_path: str | Path,
     scan_key: str,
 ) -> ProcessingNode:
-    """Registers an external immutable source reference; raw HDF5 is not copied."""
+    """Register an external reference to one immutable scan inside an append-only HDF5 container."""
     from roc_mcs.roi.h5_scan_repository import H5ScanRepository
 
     repository = H5ScanRepository(h5_path)
@@ -78,9 +78,10 @@ def create_source_node(
     theta_axis = int(candidates[0])
     source_shape_yx = raw_shape[1:] if theta_axis == 0 else raw_shape[:2]
     theta_hash = hashlib.sha256(np.asarray(theta).tobytes()).hexdigest()[:16]
+    # grid_id describes the detector lattice, not the enclosing HDF5 file
+    # revision. Appending another scan must not change the identity of this grid.
     signature_text = (
-        f"{fingerprint['path']}|{fingerprint['size_bytes']}|{fingerprint['mtime_ns']}|"
-        f"{scan_key}|{raw_shape}|{raw_dtype.str}|{theta_hash}"
+        f"{fingerprint['path']}|{scan_key}|{raw_shape}|{raw_dtype.str}|{theta_hash}"
     )
     signature = hashlib.sha256(signature_text.encode("utf-8")).hexdigest()[:24]
     metadata = {
@@ -94,6 +95,7 @@ def create_source_node(
         "source_shape": list(raw_shape),
         "source_shape_yx": list(map(int, source_shape_yx)),
         "theta_count": int(theta.size),
+        "theta_hash": theta_hash,
         "theta_min": float(np.nanmin(theta)),
         "theta_max": float(np.nanmax(theta)),
         "grid_id": signature,
@@ -175,29 +177,73 @@ class WorkflowExecutor:
             summary=result.summary,
         )
 
-    @staticmethod
-    def _load_external_scan(source_node: ProcessingNode) -> ArtifactBundle:
-        from roc_mcs.roi.h5_scan_repository import H5ScanRepository
+    def _load_external_scan(self, source_node: ProcessingNode) -> ArtifactBundle:
+        """Read the referenced scan directly from its HDF5 group.
 
+        The source container is treated as append-only: adding new scan groups
+        may change its file size and mtime, but does not invalidate a previously
+        registered scan. Only the selected group's structural signature is
+        checked. Source arrays are returned in memory and are never copied to
+        the Analysis Project's ``artifacts/`` directory.
+        """
         metadata = source_node.metadata
-        path = Path(metadata["source_file"])
-        current = source_fingerprint(path)
-        expected = {
-            "path": metadata["source_file"],
-            "size_bytes": int(metadata["source_size_bytes"]),
-            "mtime_ns": int(metadata["source_mtime_ns"]),
-        }
-        if current != expected:
+        path = Path(metadata["source_file"]).expanduser().resolve()
+        return self._read_external_scan_bundle(path, metadata)
+
+    @staticmethod
+    def _read_external_scan_bundle(path: Path, metadata: Mapping[str, Any]) -> ArtifactBundle:
+        from roc_mcs.roi.h5_scan_repository import H5ScanRepository
+        import h5py
+
+        if not path.is_file():
+            raise FileNotFoundError(f"Исходный HDF5 не найден: {path}")
+        scan_key = str(metadata["scan_key"])
+        repository = H5ScanRepository(path)
+        if scan_key not in repository.scans:
+            raise KeyError(
+                f"В HDF5 больше нет скана {scan_key!r}. Добавление других сканов допустимо, "
+                "но исходный scan_key должен оставаться доступным."
+            )
+        info = repository.scans[scan_key]
+        with h5py.File(path, "r") as handle:
+            raw = handle[info.raw_path]
+            current_shape = tuple(map(int, raw.shape))
+            current_dtype = np.dtype(raw.dtype).str
+            theta = np.asarray(repository._theta_1d(np.asarray(handle[info.th_path])), dtype=float)
+        expected_shape = tuple(int(v) for v in metadata.get("source_shape", ()))
+        if expected_shape and current_shape != expected_shape:
             raise RuntimeError(
-                "Исходный HDF5 изменился после создания узла источника. "
-                "Создайте новую Analysis Session для актуального файла."
+                f"Структура выбранного скана {scan_key!r} изменилась: "
+                f"shape было {expected_shape}, стало {current_shape}. "
+                "Изменение других scan-групп этому не мешает."
+            )
+        expected_dtype = metadata.get("dtype")
+        if expected_dtype and np.dtype(expected_dtype).str != current_dtype:
+            raise RuntimeError(
+                f"Тип данных выбранного скана {scan_key!r} изменился: "
+                f"{expected_dtype} → {current_dtype}."
+            )
+        expected_theta_count = metadata.get("theta_count")
+        if expected_theta_count is not None and int(expected_theta_count) != int(theta.size):
+            raise RuntimeError(
+                f"Число θ-отсчётов выбранного скана {scan_key!r} изменилось: "
+                f"{expected_theta_count} → {theta.size}."
+            )
+        theta_hash = hashlib.sha256(np.asarray(theta).tobytes()).hexdigest()[:16]
+        expected_theta_hash = metadata.get("theta_hash")
+        if expected_theta_hash and str(expected_theta_hash) != theta_hash:
+            raise RuntimeError(
+                f"Ось θ выбранного скана {scan_key!r} изменилась. "
+                "Это не связано с добавлением других сканов в HDF5."
             )
 
-        repository = H5ScanRepository(path)
-        scan_key = str(metadata["scan_key"])
         scan = repository.load_source(scan_key)
         x_coords, y_coords = repository.centers_xy(scan_key)
         data_yxt = np.asarray(scan.yxt)
+        if data_yxt.ndim != 3 or data_yxt.shape[:2] != tuple(metadata.get("source_shape_yx", data_yxt.shape[:2])):
+            raise RuntimeError(
+                f"После чтения скана {scan_key!r} пространственная форма не соответствует сохранённой сессии."
+            )
         arrays = {
             "data_yxt": data_yxt,
             "theta": np.asarray(scan.th, dtype=float),
@@ -211,6 +257,8 @@ class WorkflowExecutor:
             "theta_axis": int(scan.axis),
             "pool": {"size": 1, "stride": 1},
             "pool_signature": "raw",
+            "source_reference": True,
+            "source_snapshot": False,
         })
         return ArtifactBundle(arrays=arrays, metadata=source_meta)
 
@@ -335,6 +383,16 @@ def build_input_refs(
                 if spikes.status != NodeStatus.SUCCEEDED:
                     raise ValueError("Spike detection должен быть успешно завершён")
                 refs["spikes"] = {"node_id": spikes.id, "output": "spikes"}
+    elif operation_id == "peaks.branches":
+        if selected.operation_id == "peaks.detect" and "peaks" in selected.output_refs:
+            refs["positions"] = {"node_id": selected.id, "output": "peaks"}
+        elif selected.operation_id == "fit.scan" and "fit" in selected.output_refs:
+            refs["positions"] = {"node_id": selected.id, "output": "fit"}
+        else:
+            raise ValueError(
+                "Определение ветвей можно создать от принятого результата «Поиск пиков» "
+                "или «Fit». Выберите один из этих узлов."
+            )
     else:
         raise KeyError(f"Для операции {operation_id!r} не определены входы")
     return refs
@@ -355,4 +413,6 @@ def make_operation_label(operation_id: str, parameters: Mapping[str, Any]) -> st
         )
     if operation_id == "fit.scan":
         return f"Fit · {parameters['model']} · {parameters['backend']}"
+    if operation_id == "peaks.branches":
+        return f"Ветви · θ-gate {parameters['theta_gate']:g}″"
     return operation_id

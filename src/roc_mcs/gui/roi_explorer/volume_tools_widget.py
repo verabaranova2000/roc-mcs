@@ -1,13 +1,14 @@
 """Компактная панель управления интерактивным 3D-экраном."""
 from __future__ import annotations
-from PyQt6.QtCore import QSize, Qt, pyqtSignal
+from PyQt6.QtCore import QSize, Qt, QPoint, pyqtSignal
 from PyQt6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap, QPalette, QActionGroup
-from PyQt6.QtWidgets import QApplication, QGridLayout, QMenu, QToolButton, QWidget, QWidgetAction, QHBoxLayout, QDialog, QDoubleSpinBox, QLabel, QPushButton
+from PyQt6.QtWidgets import QApplication, QGridLayout, QMenu, QToolButton, QWidget, QWidgetAction, QHBoxLayout, QDialog, QDoubleSpinBox, QSpinBox, QCheckBox, QComboBox, QFormLayout, QLabel, QPushButton
 from roc_mcs.gui.components.icon_provider import svg_icon
 from roc_mcs.gui.roi_explorer.plot_toolbar_style import ICON_DIR, COMPACT_PLOT_TOOLBAR_STYLE
 from roc_mcs.gui.roi_explorer.theme import apply_popup_theme, apply_widget_palette, theme_colors
 from roc_mcs.gui.roi_explorer.colormap_catalog import NAPARI_STYLE_COLORMAPS, colormap_icon
 from roc_mcs.gui.roi_explorer.map_tools_widget import SmartDropdownButton
+from roc_mcs.gui.roi_explorer.hex_color_picker import CompactColorPicker, _place_popup
 
 class VolumeToolsWidget(QWidget):
     roi_source_changed = pyqtSignal(object)
@@ -25,6 +26,7 @@ class VolumeToolsWidget(QWidget):
     contrast_changed = pyqtSignal(float, float)
     contrast_auto_requested = pyqtSignal()
     cursor_line_toggled = pyqtSignal(bool)
+    peak_display_changed = pyqtSignal(object)
 
     def __init__(self, parent=None):
         super().__init__(parent); self.setObjectName("VolumeToolBar"); self.setFixedHeight(max(30, self._icon_size()+10)); self._theme = "light"; self._source_key = "full"; self._choices = []; self._rotation_lock = False; self._show_roi_on_full_detector = False
@@ -47,6 +49,18 @@ class VolumeToolsWidget(QWidget):
         self.cursor_line_action.setToolTip("Показывать вертикальную линию по координатам курсора на карте или при наведении на 3D-объём")
         self.cursor_line_action.toggled.connect(self.cursor_line_toggled.emit)
         self.overlays_btn.setMenu(self.overlays_menu); row.addWidget(self.overlays_btn)
+        self.peaks_btn = QToolButton(self)
+        self.peaks_btn.setAutoRaise(True)
+        self.peaks_btn.setToolTip("Настройки отображения центров пиков в 3D")
+        self.peaks_btn.clicked.connect(self._open_peak_display_dialog)
+        row.addWidget(self.peaks_btn)
+        self._peak_display = {
+            "show": True, "size": 3.0, "opacity": 1.0,
+            "color_mode": "branch", "color": "#ffb347", "branch_colors": {},
+        }
+        self._peak_branch_ids = []
+        self._peak_color_picker = None
+        self._peak_display_dialog = self._build_peak_display_dialog()
         self.color_btn = SmartDropdownButton(self); self.color_btn.setToolTip("Контраст и цветовая карта 3D"); self.color_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup); self.color_menu=QMenu(self.color_btn); self.color_btn.setMenu(self.color_menu); row.addWidget(self.color_btn)
         self._cmap_actions={}
         self._cmap_action_group=QActionGroup(self.color_menu); self._cmap_action_group.setExclusive(True)
@@ -76,6 +90,190 @@ class VolumeToolsWidget(QWidget):
         self.info_btn = QToolButton(self); self.info_btn.setToolTip("Справка по управлению 3D"); self.info_btn.clicked.connect(self.info_requested.emit); row.addWidget(self.info_btn)
         self.settings_btn = QToolButton(self); self.settings_btn.setToolTip("Настройки всех экранов ROI Explorer"); self.settings_btn.clicked.connect(self.settings_requested.emit); self.settings_btn.hide()
         self.set_roi_choices([]); self.apply_theme("light")
+
+    def _build_peak_display_dialog(self):
+        dialog = QDialog(self, Qt.WindowType.Tool)
+        dialog.setWindowTitle("Центры пиков в 3D")
+        dialog.setMinimumWidth(250)
+        form = QFormLayout(dialog)
+        form.setContentsMargins(9, 8, 9, 8)
+        form.setHorizontalSpacing(8)
+        form.setVerticalSpacing(6)
+        show = QCheckBox("Показывать центры пиков", dialog)
+        show.setChecked(bool(self._peak_display["show"]))
+        size = QDoubleSpinBox(dialog)
+        size.setRange(0.5, 12.0); size.setDecimals(1); size.setSingleStep(0.5); size.setSuffix(" px")
+        size.setValue(float(self._peak_display["size"])); size.setButtonSymbols(QDoubleSpinBox.ButtonSymbols.NoButtons)
+        opacity = QDoubleSpinBox(dialog)
+        opacity.setRange(0.05, 1.0); opacity.setDecimals(2); opacity.setSingleStep(0.05)
+        opacity.setValue(float(self._peak_display["opacity"])); opacity.setButtonSymbols(QDoubleSpinBox.ButtonSymbols.NoButtons)
+        mode = QComboBox(dialog)
+        mode.addItem("Один цвет", "single")
+        mode.addItem("Цвет по branch_id", "branch")
+        mode.setCurrentIndex(mode.findData(self._peak_display["color_mode"]))
+        branch = QComboBox(dialog)
+        branch_color = QToolButton(dialog)
+        branch_color.setFixedSize(29, 23)
+        branch_color.setToolTip("Выбрать цвет для выбранной ветви")
+        global_color = QToolButton(dialog)
+        global_color.setFixedSize(29, 23)
+        global_color.setToolTip("Выбрать общий цвет центров пиков")
+        form.addRow("", show)
+        form.addRow("Размер маркера:", size)
+        form.addRow("Непрозрачность:", opacity)
+        form.addRow("Окраска:", mode)
+        form.addRow("Ветвь:", branch)
+        form.addRow("Цвет ветви:", branch_color)
+        form.addRow("Общий цвет:", global_color)
+        hint = QLabel(
+            "Цвета ветвей назначаются независимо и сохраняются в настройках текущего окна 3D. "
+            "Наведение на маркер показывает peak_id и branch_id."
+        , dialog)
+        hint.setWordWrap(True)
+        form.addRow(hint)
+        close = QPushButton("Закрыть", dialog)
+        close.clicked.connect(dialog.hide)
+        form.addRow(close)
+        self._peak_show_check = show
+        self._peak_size_spin = size
+        self._peak_opacity_spin = opacity
+        self._peak_mode_combo = mode
+        self._peak_branch_combo = branch
+        self._peak_branch_color_button = branch_color
+        self._peak_global_color_button = global_color
+        show.toggled.connect(lambda value: self._update_peak_display(show=value))
+        size.valueChanged.connect(lambda value: self._update_peak_display(size=float(value)))
+        opacity.valueChanged.connect(lambda value: self._update_peak_display(opacity=float(value)))
+        mode.currentIndexChanged.connect(lambda *_: self._update_peak_display(color_mode=mode.currentData()))
+        branch.currentIndexChanged.connect(self._update_peak_branch_swatch)
+        branch_color.clicked.connect(self._open_branch_color_picker)
+        global_color.clicked.connect(self._open_global_peak_color_picker)
+        self._update_peak_branch_swatch()
+        self._update_peak_color_buttons()
+        return dialog
+
+    @property
+    def peak_display_settings(self):
+        return {
+            **self._peak_display,
+            "branch_colors": dict(self._peak_display.get("branch_colors", {})),
+        }
+
+    def set_peak_branch_ids(self, branch_ids):
+        normalized = set()
+        for value in branch_ids or []:
+            try:
+                import math
+                numeric = float(value)
+                if math.isfinite(numeric) and numeric.is_integer():
+                    normalized.add(int(numeric))
+            except (TypeError, ValueError, OverflowError):
+                continue
+        ids = sorted(normalized)
+        current = self._peak_branch_combo.currentData() if hasattr(self, "_peak_branch_combo") else None
+        self._peak_branch_ids = ids
+        if not hasattr(self, "_peak_branch_combo"):
+            return
+        self._peak_branch_combo.blockSignals(True)
+        self._peak_branch_combo.clear()
+        for branch_id in ids:
+            self._peak_branch_combo.addItem(f"Ветвь {branch_id}", str(branch_id))
+        if current is not None:
+            idx = self._peak_branch_combo.findData(str(current))
+            if idx >= 0:
+                self._peak_branch_combo.setCurrentIndex(idx)
+        self._peak_branch_combo.blockSignals(False)
+        has_branches = bool(ids)
+        self._peak_mode_combo.setEnabled(has_branches)
+        self._peak_branch_combo.setEnabled(has_branches and self._peak_display.get("color_mode") == "branch")
+        self._peak_branch_color_button.setEnabled(has_branches and self._peak_display.get("color_mode") == "branch")
+        self._update_peak_branch_swatch()
+
+    def _update_peak_display(self, **updates):
+        self._peak_display.update(updates)
+        if not self._peak_branch_ids and self._peak_display.get("color_mode") == "branch":
+            self._peak_display["color_mode"] = "single"
+            self._peak_mode_combo.blockSignals(True)
+            self._peak_mode_combo.setCurrentIndex(self._peak_mode_combo.findData("single"))
+            self._peak_mode_combo.blockSignals(False)
+        branch_mode = bool(self._peak_branch_ids) and self._peak_display.get("color_mode") == "branch"
+        self._peak_branch_combo.setEnabled(branch_mode)
+        self._peak_branch_color_button.setEnabled(branch_mode)
+        self._update_peak_color_buttons()
+        self.peak_display_changed.emit(self.peak_display_settings)
+
+    def _update_peak_color_buttons(self):
+        color = str(self._peak_display.get("color", "#ffb347"))
+        self._peak_global_color_button.setStyleSheet(
+            f"QToolButton {{ background:{color}; border:1px solid palette(mid); border-radius:3px; }}"
+        )
+        self._update_peak_branch_swatch()
+
+    def _selected_peak_branch(self):
+        value = self._peak_branch_combo.currentData()
+        return None if value is None else str(value)
+
+    def _update_peak_branch_swatch(self, *_args):
+        if not hasattr(self, "_peak_branch_color_button"):
+            return
+        branch_id = self._selected_peak_branch()
+        color = self._peak_display.get("branch_colors", {}).get(branch_id, self._default_branch_color(branch_id))
+        self._peak_branch_color_button.setStyleSheet(
+            f"QToolButton {{ background:{color}; border:1px solid palette(mid); border-radius:3px; }}"
+        )
+
+    @staticmethod
+    def _default_branch_color(branch_id):
+        if branch_id is None:
+            return "#ffb347"
+        # Stable default; the user may override any branch independently.
+        import colorsys
+        hue = (int(branch_id) * 0.6180339887498949) % 1.0
+        rgb = colorsys.hsv_to_rgb(hue, 0.68, 0.92)
+        return "#%02x%02x%02x" % tuple(round(channel * 255) for channel in rgb)
+
+    def _open_peak_color_picker(self, initial_color, anchor, callback):
+        if self._peak_color_picker is not None:
+            self._peak_color_picker.close()
+        picker = CompactColorPicker(initial_color, self)
+        self._peak_color_picker = picker
+        picker.destroyed.connect(lambda *_args, current=picker: self._clear_peak_color_picker(current))
+        picker.color_selected.connect(callback)
+        pos = anchor.mapToGlobal(QPoint(0, anchor.height() + 3))
+        _place_popup(picker, pos)
+        picker.show(); picker.raise_(); picker.activateWindow()
+
+    def _clear_peak_color_picker(self, picker) -> None:
+        # A closing older popup must not clear the reference to a newer picker.
+        if self._peak_color_picker is picker:
+            self._peak_color_picker = None
+
+    def _open_branch_color_picker(self):
+        branch_id = self._selected_peak_branch()
+        if branch_id is None:
+            return
+        color = self._peak_display.get("branch_colors", {}).get(branch_id, self._default_branch_color(branch_id))
+        self._open_peak_color_picker(color, self._peak_branch_color_button,
+                                     lambda selected, bid=branch_id: self._set_branch_color(bid, selected))
+
+    def _open_global_peak_color_picker(self):
+        self._open_peak_color_picker(
+            self._peak_display.get("color", "#ffb347"), self._peak_global_color_button,
+            lambda selected: self._update_peak_display(color=selected),
+        )
+
+    def _set_branch_color(self, branch_id, color):
+        colors = dict(self._peak_display.get("branch_colors", {}))
+        colors[str(branch_id)] = str(color)
+        self._update_peak_display(branch_colors=colors)
+        self._update_peak_branch_swatch()
+
+    def _open_peak_display_dialog(self):
+        apply_popup_theme(self._peak_display_dialog, self._theme)
+        self._peak_display_dialog.adjustSize()
+        self._peak_display_dialog.show()
+        self._peak_display_dialog.raise_()
+        self._peak_display_dialog.activateWindow()
 
     @staticmethod
     def _icon_size():
@@ -165,11 +363,12 @@ class VolumeToolsWidget(QWidget):
     def apply_theme(self, theme=None):
         self._theme = apply_widget_palette(self, theme); self.setFixedHeight(max(30, self._icon_size()+10)); c = theme_colors(self._theme); color = c["text"]
         self.reset_btn.setIcon(svg_icon(ICON_DIR / "zoom_out_map.svg", color=color, widget=self.reset_btn)); self.camera_btn.setIcon(svg_icon(ICON_DIR / "camera_1.svg", color=color, widget=self.camera_btn)); self.rotate_btn.setIcon(svg_icon(ICON_DIR / "refresh_variant_4_minimal.svg", color=color, widget=self.rotate_btn)); self.info_btn.setIcon(svg_icon(ICON_DIR / "info_circle_icon.svg", color=color, widget=self.info_btn)); self.settings_btn.setIcon(svg_icon(ICON_DIR / "setting_icon.svg", color=color, widget=self.settings_btn))
-        for button in (self.reset_btn, self.camera_btn, self.orientation_btn, self.rotate_btn, self.overlays_btn, self.info_btn, self.settings_btn): button.setIconSize(QSize(self._icon_size(), self._icon_size()))
+        self.peaks_btn.setIcon(svg_icon(ICON_DIR / "vtk_scene_objects.svg", color=color, widget=self.peaks_btn))
+        for button in (self.reset_btn, self.camera_btn, self.orientation_btn, self.rotate_btn, self.overlays_btn, self.peaks_btn, self.info_btn, self.settings_btn): button.setIconSize(QSize(self._icon_size(), self._icon_size()))
         for axis,action in self._axis_actions.items(): action.setIcon(svg_icon(ICON_DIR / f"view_axis_{axis}_1.svg", color=color, widget=self.orientation_btn))
         self.orientation_btn.setIcon(svg_icon(ICON_DIR / "view_orientation.svg", color=color, widget=self.orientation_btn))
         self.overlays_btn.setIcon(svg_icon(ICON_DIR / "curve_overlay_3.svg", color=color, widget=self.overlays_btn))
-        apply_popup_theme(self.orientation_menu,self._theme); apply_popup_theme(self.color_menu,self._theme); apply_popup_theme(self.overlays_menu,self._theme); apply_popup_theme(self._contrast_dialog,self._theme)
+        apply_popup_theme(self.orientation_menu,self._theme); apply_popup_theme(self.color_menu,self._theme); apply_popup_theme(self.overlays_menu,self._theme); apply_popup_theme(self._contrast_dialog,self._theme); apply_popup_theme(self._peak_display_dialog,self._theme)
         self._rebuild_roi_menu(); self._update_roi_button()
 
     def _on_rotation_lock(self, enabled):

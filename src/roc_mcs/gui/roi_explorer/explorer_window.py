@@ -1878,6 +1878,8 @@ class RockingCurveExplorerWindow(QMainWindow):
                     view_label=state.label, valid_mask=state.valid_mask_yxt,
                     source_path=self.current_file, operation_id=state.operation_id,
                     metadata=state.metadata,
+                    peak_catalog=state.peak_points,
+                    peak_position_kind=state.peak_position_kind,
                 )
             except Exception as exc:
                 self.volume_widget.clear_dataset(f"3D: {type(exc).__name__}: {exc}")

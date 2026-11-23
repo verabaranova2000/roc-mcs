@@ -672,19 +672,31 @@ class PoolOperationTests(unittest.TestCase):
             self.assertEqual(result.metadata["pool"], {"size": 3, "stride": 2})
             self.assertEqual(result.arrays["data_yxt"].shape[:2], expected.shape[:2])
 
-    def test_source_file_change_invalidates_registered_source(self):
+    def test_appending_another_scan_does_not_invalidate_registered_source_or_copy_raw_data(self):
         with tempfile.TemporaryDirectory() as tmp:
-            h5_path = Path(tmp) / "tiny.h5"
-            _make_synthetic_h5(h5_path)
+            root = Path(tmp)
+            h5_path = root / "tiny.h5"
+            original = _make_synthetic_h5(h5_path)
             history = WorkflowHistory()
             source = create_source_node(history, h5_path, "entry42")
+            store = ArtifactStore(root / "project" / "artifacts")
+
+            # Appending an unrelated scan changes container size/mtime, not the
+            # selected scan group's scientific data.
             with h5py.File(h5_path, "a") as handle:
+                handle.create_group("entry43")
                 handle.create_dataset("provenance_touch", data=np.arange(3))
-            executor = WorkflowExecutor(
-                history, ArtifactStore(Path(tmp) / "artifacts"), default_registry()
-            )
-            with self.assertRaisesRegex(RuntimeError, "HDF5 изменился"):
-                executor._load_external_scan(source)
+
+            executor = WorkflowExecutor(history, store, default_registry())
+            bundle = executor._load_external_scan(source)
+            expected = np.moveaxis(original, 0, -1)
+            np.testing.assert_array_equal(bundle.arrays["data_yxt"], expected)
+            self.assertTrue(bundle.metadata.get("source_reference"))
+            self.assertFalse(bundle.metadata.get("source_snapshot"))
+            # Resolving a source reference is an in-memory read. Only derived
+            # operation outputs are persisted as ArtifactStore files.
+            self.assertEqual(list(store.directory.glob("*.h5")), [])
+            self.assertFalse((store.directory / "source_snapshots").exists())
 
     def test_pool_branches_have_distinct_grid_ids(self):
         with tempfile.TemporaryDirectory() as tmp:

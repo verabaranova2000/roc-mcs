@@ -49,6 +49,8 @@ class WorkflowPreviewState:
     default_curve_key: str
     summary: str = ""
     analysis_valid_mask_yx: np.ndarray | None = None
+    peak_points: Any | None = None
+    peak_position_kind: str = "detected"
 
     def map_layer(self, key: str | None = None) -> PreviewMapLayer:
         selected = str(key or self.default_map_key)
@@ -375,6 +377,7 @@ def build_workflow_preview_state(
     spikes = context.get("spikes")
     peaks = context.get("peaks")
     fit = context.get("fit")
+    branches = context.get("branches")
 
     # At the spike-removal node, the node's primary result is the cleaned
     # signal.  The detector mask (not the post-detection valid mask) is the
@@ -501,6 +504,43 @@ def build_workflow_preview_state(
                      shape_yx=(ny, nx), group="Поиск пиков", unit=unit,
                      description=f"Пространственная агрегация {aggregate} по найденным пикам из peak_catalog.{column}.")
 
+    branch_catalog = _table(branches, "branch_catalog")
+    if branch_catalog is not None and not getattr(branch_catalog, "empty", True):
+        if {"x", "y", "branch_id"}.issubset(branch_catalog.columns):
+            branch_counts = np.full((ny, nx), np.nan, dtype=np.float64)
+            grouped = branch_catalog.groupby(["y", "x"], sort=False)["branch_id"].nunique()
+            for (y_value, x_value), count in grouped.items():
+                try:
+                    x_idx, y_idx = int(x_value), int(y_value)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if 0 <= x_idx < nx and 0 <= y_idx < ny:
+                    branch_counts[y_idx, x_idx] = float(count)
+            _add_map(
+                layers, key="branches.count", label="Число ветвей в пикселе",
+                value=branch_counts, shape_yx=(ny, nx), group="Дифракционные ветви",
+                unit="ветвей", description="Число различных branch_id среди пиков данного пикселя.",
+            )
+
+    peak_points = None
+    peak_position_kind = "detected"
+    if branch_catalog is not None and not getattr(branch_catalog, "empty", True):
+        peak_points = branch_catalog
+        peak_position_kind = str(getattr(branches, "metadata", {}).get("position_kind", "detected"))
+    elif fit is not None:
+        try:
+            from roc_mcs.peaks.branches import fitted_peak_positions
+            peak_points = fitted_peak_positions(fit)
+            peak_position_kind = "fitted"
+        except (ValueError, KeyError, TypeError):
+            # Fitting preview itself remains available even for older fit bundles
+            # whose component provenance is insufficient for a safe point overlay.
+            peak_points = None
+            peak_position_kind = "fitted_unavailable"
+    elif peaks is not None:
+        peak_points = _table(peaks, "peak_catalog")
+        peak_position_kind = "detected"
+
     curve_sources: list[PreviewCurveSource] = [PreviewCurveSource(
         key="scan.measured", label="Измеренные counts", data_yxt=data,
         theta=theta, valid_mask_yxt=scan_valid, group="Измеренный сигнал",
@@ -564,6 +604,8 @@ def build_workflow_preview_state(
         default_map = "peaks.count"
     elif node.operation_id == "fit.scan":
         default_map = next((key for key in ("fit.rmse", "fit.redchi", "fit.n_fitted", "fit.n_fitted_map") if any(layer.key == key for layer in layers)), default_map)
+    elif node.operation_id == "peaks.branches" and any(layer.key == "branches.count" for layer in layers):
+        default_map = "branches.count"
     default_curve = "scan.measured"
     if node.operation_id == "preprocess.spikes" and any(source.key == "spikes.interpolated" for source in curve_sources):
         default_curve = "spikes.interpolated"
@@ -582,4 +624,6 @@ def build_workflow_preview_state(
         default_map_key=default_map, default_curve_key=default_curve,
         summary=str(getattr(node, "summary", "") or ""),
         analysis_valid_mask_yx=analysis_valid,
+        peak_points=peak_points,
+        peak_position_kind=peak_position_kind,
     )

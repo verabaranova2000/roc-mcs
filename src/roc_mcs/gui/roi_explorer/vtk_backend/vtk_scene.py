@@ -656,6 +656,38 @@ class VTKVolumeScene:
         marker_property.SetLineWidth(1.5)
         self._theta_slice_marker_actor.SetVisibility(0)
         self.renderer.AddActor(self._theta_slice_marker_actor)
+
+        # Peak centres are a separate, lightweight point layer. They never
+        # alter the volume scalar array or its transfer function. The actor is
+        # persistent across payload refreshes; only its point data is replaced.
+        self._peak_marker_polydata = vtk.vtkPolyData()
+        self._peak_marker_points = vtk.vtkPoints()
+        self._peak_marker_points.SetDataTypeToDouble()
+        self._peak_marker_polydata.SetPoints(self._peak_marker_points)
+        self._peak_marker_mapper = vtk.vtkPolyDataMapper()
+        self._peak_marker_mapper.SetInputData(self._peak_marker_polydata)
+        self._peak_marker_mapper.SetScalarModeToUsePointData()
+        self._peak_marker_mapper.SetColorModeToDirectScalars()
+        self._peak_marker_mapper.ScalarVisibilityOn()
+        self._peak_marker_actor = vtk.vtkActor()
+        self._peak_marker_actor.SetMapper(self._peak_marker_mapper)
+        self._peak_marker_actor.SetUserMatrix(self._scene_user_matrix)
+        self._peak_marker_actor.PickableOff()
+        peak_property = self._peak_marker_actor.GetProperty()
+        peak_property.SetRepresentationToPoints()
+        peak_property.SetPointSize(5.0)
+        peak_property.SetOpacity(0.95)
+        peak_property.SetLighting(False)
+        if hasattr(peak_property, "SetRenderPointsAsSpheres"):
+            peak_property.SetRenderPointsAsSpheres(True)
+        self._peak_marker_actor.SetVisibility(0)
+        self.renderer.AddActor(self._peak_marker_actor)
+        self._peak_marker_positions_physical = np.empty((0, 3), dtype=np.float64)
+        self._peak_marker_colors = np.empty((0, 4), dtype=np.uint8)
+        self._peak_marker_size = 5.0
+        self._peak_marker_opacity = 0.95
+        self._peak_marker_visible = False
+
         # The map cursor is an independent, narrow optical marker inside the
         # volume ray. Unlike the previous RGB tint, it contributes its own
         # alpha even when the scalar transfer function is fully transparent.
@@ -2457,6 +2489,11 @@ class VTKVolumeScene:
                 self._theta_boundary_plane_opacity
             )
 
+        self._peak_marker_actor.SetVisibility(0)
+        self._peak_marker_polydata.Initialize()
+        self._peak_marker_positions_physical = np.empty((0, 3), dtype=np.float64)
+        self._peak_marker_colors = np.empty((0, 4), dtype=np.uint8)
+        self._peak_marker_visible = False
         self.payload = payload
         self.grid, self.grid_info = new_grid, new_grid_info
         self.projection_grid, self.projection_info = new_projection_grid, new_projection_info
@@ -2885,6 +2922,207 @@ class VTKVolumeScene:
         """Current GPU-preview crop; None represents the complete theta extent."""
         return self._theta_display_range_indices
 
+    @staticmethod
+    def _branch_rgba(branch_ids: np.ndarray) -> np.ndarray:
+        """Stable categorical RGBA colours keyed by integer branch_id."""
+        import colorsys
+
+        palette = np.empty((branch_ids.size, 4), dtype=np.uint8)
+        for row, value in enumerate(branch_ids):
+            hue = (int(value) * 0.618033988749895) % 1.0
+            red, green, blue = colorsys.hsv_to_rgb(hue, 0.72, 1.0)
+            palette[row] = (
+                int(round(red * 255)), int(round(green * 255)),
+                int(round(blue * 255)), 255,
+            )
+        return palette
+
+    def set_peak_markers(
+        self,
+        peak_catalog: Any | None,
+        x_coords: Any,
+        y_coords: Any,
+        *,
+        visible: bool = False,
+        point_size: float = 5.0,
+        opacity: float = 0.95,
+        color_by_branch: bool = True,
+        uniform_color: str = "#FFC857",
+        render: bool = True,
+    ) -> int:
+        """Set physical peak centres as a display-only VTK point layer.
+
+        Catalog x/y are integer indices into the source detector axes. They are
+        converted once to physical coordinates; display-only axis scaling is
+        reapplied from those immutable physical positions by
+        :meth:`_update_peak_marker_geometry`.
+        """
+        try:
+            point_size = float(point_size)
+            opacity = float(opacity)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("Размер и непрозрачность маркеров должны быть числами") from exc
+        if not np.isfinite(point_size) or not (1.0 <= point_size <= 20.0):
+            raise ValueError("Размер маркеров должен находиться в диапазоне 1–20 px")
+        if not np.isfinite(opacity) or not (0.05 <= opacity <= 1.0):
+            raise ValueError("Непрозрачность маркеров должна находиться в диапазоне 0.05–1.0")
+
+        self._peak_marker_size = point_size
+        self._peak_marker_opacity = opacity
+        self._peak_marker_actor.GetProperty().SetPointSize(point_size)
+        self._peak_marker_actor.GetProperty().SetOpacity(opacity)
+
+        if peak_catalog is None or getattr(peak_catalog, "empty", False):
+            physical = np.empty((0, 3), dtype=np.float64)
+            colors = np.empty((0, 4), dtype=np.uint8)
+        else:
+            columns = set(getattr(peak_catalog, "columns", ()))
+            required = {"x", "y", "theta"}
+            missing = required.difference(columns)
+            if missing:
+                raise ValueError(
+                    f"Каталог центров пиков не содержит столбцы {sorted(missing)}"
+                )
+            source_x = np.asarray(x_coords, dtype=np.float64)
+            source_y = np.asarray(y_coords, dtype=np.float64)
+            if source_x.ndim != 1 or source_y.ndim != 1:
+                raise ValueError("Координаты исходной детекторной сетки должны быть одномерными")
+            x_index = np.asarray(peak_catalog["x"], dtype=np.float64)
+            y_index = np.asarray(peak_catalog["y"], dtype=np.float64)
+            theta = np.asarray(peak_catalog["theta"], dtype=np.float64)
+            finite = np.isfinite(x_index) & np.isfinite(y_index) & np.isfinite(theta)
+            integer = (x_index == np.rint(x_index)) & (y_index == np.rint(y_index))
+            in_range = (
+                (x_index >= 0) & (x_index < source_x.size)
+                & (y_index >= 0) & (y_index < source_y.size)
+            )
+            valid = finite & integer & in_range
+            if not np.any(valid):
+                physical = np.empty((0, 3), dtype=np.float64)
+                colors = np.empty((0, 4), dtype=np.uint8)
+            else:
+                xi = np.rint(x_index[valid]).astype(np.int64)
+                yi = np.rint(y_index[valid]).astype(np.int64)
+                physical = np.column_stack((source_x[xi], source_y[yi], theta[valid]))
+                # An ROI-specific volume may expose a strict sub-grid. Do not
+                # place peaks outside the currently displayed spatial extent.
+                if self._physical_x is not None and self._physical_y is not None:
+                    spatial = (
+                        (physical[:, 0] >= self._physical_x[0])
+                        & (physical[:, 0] <= self._physical_x[-1])
+                        & (physical[:, 1] >= self._physical_y[0])
+                        & (physical[:, 1] <= self._physical_y[-1])
+                    )
+                    if self._physical_theta is not None:
+                        spatial &= (
+                            (physical[:, 2] >= self._physical_theta[0])
+                            & (physical[:, 2] <= self._physical_theta[-1])
+                        )
+                    physical = physical[spatial]
+                    valid_rows = np.flatnonzero(valid)[spatial]
+                else:
+                    valid_rows = np.flatnonzero(valid)
+                if color_by_branch and "branch_id" in columns and physical.size:
+                    branch_values = np.asarray(peak_catalog["branch_id"], dtype=np.float64)[valid_rows]
+                    branch_valid = np.isfinite(branch_values)
+                    physical = physical[branch_valid]
+                    branch_values = np.rint(branch_values[branch_valid]).astype(np.int64)
+                    colors = self._branch_rgba(branch_values)
+                else:
+                    raw_hex = str(uniform_color).strip().lstrip("#")
+                    if len(raw_hex) != 6:
+                        raise ValueError(f"Некорректный цвет маркеров: {uniform_color!r}")
+                    try:
+                        rgb = tuple(int(raw_hex[index:index + 2], 16) for index in (0, 2, 4))
+                    except ValueError as exc:
+                        raise ValueError(f"Некорректный цвет маркеров: {uniform_color!r}") from exc
+                    rgba = np.asarray([*rgb, 255], dtype=np.uint8)
+                    colors = np.repeat(rgba[None, :], physical.shape[0], axis=0)
+
+        if physical.shape[0] > 150_000:
+            # Deterministic display-only thinning. Scientific catalogues remain
+            # complete; this cap bounds VTK glyph/cell memory and frame time.
+            indices = np.linspace(0, physical.shape[0] - 1, 150_000, dtype=np.int64)
+            physical = physical[indices]
+            colors = colors[indices]
+
+        self._peak_marker_positions_physical = np.ascontiguousarray(physical, dtype=np.float64)
+        self._peak_marker_colors = np.ascontiguousarray(colors, dtype=np.uint8)
+        self._update_peak_marker_polydata()
+        self._peak_marker_visible = bool(visible and physical.shape[0] > 0)
+        self._peak_marker_actor.SetVisibility(self._peak_marker_visible)
+        if render:
+            self._request_render()
+        return int(physical.shape[0])
+
+    def _update_peak_marker_polydata(self) -> None:
+        """Replace VTK point and vertex buffers from retained physical arrays."""
+        vtk, numpy_to_vtk = _vtk()
+        physical = self._peak_marker_positions_physical
+        count = int(physical.shape[0])
+        if count == 0:
+            self._peak_marker_polydata.Initialize()
+            self._peak_marker_polydata.Modified()
+            return
+        display = physical.copy()
+        for column, axis, factor in zip(
+            range(3), (self._physical_x, self._physical_y, self._physical_theta),
+            self._axis_scales,
+        ):
+            center = 0.5 * (float(axis[0]) + float(axis[-1]))
+            display[:, column] = center + (display[:, column] - center) * float(factor)
+        vtk_points = vtk.vtkPoints()
+        vtk_points.SetData(numpy_to_vtk(np.ascontiguousarray(display), deep=True))
+        self._peak_marker_polydata.SetPoints(vtk_points)
+        cells = vtk.vtkCellArray()
+        from vtk.util.numpy_support import numpy_to_vtkIdTypeArray
+        if hasattr(cells, "SetData"):
+            # VTK 9.x offset/connectivity representation avoids the deprecated
+            # legacy packed-cell SetCells API.
+            offsets = numpy_to_vtkIdTypeArray(
+                np.arange(count + 1, dtype=np.int64), deep=True
+            )
+            connectivity = numpy_to_vtkIdTypeArray(
+                np.arange(count, dtype=np.int64), deep=True
+            )
+            cells.SetData(offsets, connectivity)
+        else:  # pragma: no cover - compatibility with older VTK releases
+            packed = np.empty((count, 2), dtype=np.int64)
+            packed[:, 0] = 1
+            packed[:, 1] = np.arange(count, dtype=np.int64)
+            cells.SetCells(count, numpy_to_vtkIdTypeArray(packed.ravel(), deep=True))
+        self._peak_marker_polydata.SetVerts(cells)
+        rgba = numpy_to_vtk(np.ascontiguousarray(self._peak_marker_colors), deep=True)
+        rgba.SetNumberOfComponents(4)
+        rgba.SetName("PeakMarkerRGBA")
+        self._peak_marker_polydata.GetPointData().SetScalars(rgba)
+        self._peak_marker_polydata.Modified()
+
+    def set_peak_markers_visible(self, visible: bool, *, render: bool = True) -> None:
+        self._peak_marker_visible = bool(visible and self._peak_marker_positions_physical.size)
+        self._peak_marker_actor.SetVisibility(self._peak_marker_visible)
+        if render:
+            self._request_render()
+
+    def set_peak_marker_settings(
+        self, *, point_size: float | None = None, opacity: float | None = None,
+        render: bool = True,
+    ) -> None:
+        if point_size is not None:
+            value = float(point_size)
+            if not np.isfinite(value) or not (1.0 <= value <= 20.0):
+                raise ValueError("Размер маркеров должен находиться в диапазоне 1–20 px")
+            self._peak_marker_size = value
+            self._peak_marker_actor.GetProperty().SetPointSize(value)
+        if opacity is not None:
+            value = float(opacity)
+            if not np.isfinite(value) or not (0.05 <= value <= 1.0):
+                raise ValueError("Непрозрачность маркеров должна находиться в диапазоне 0.05–1.0")
+            self._peak_marker_opacity = value
+            self._peak_marker_actor.GetProperty().SetOpacity(value)
+        if render:
+            self._request_render()
+
     def set_axis_scales(
         self,
         x_scale: float,
@@ -3030,6 +3268,7 @@ class VTKVolumeScene:
 
             self._update_theta_slice_shader_uniforms()
             self._update_theta_slice_marker_geometry()
+            self._update_peak_marker_polydata()
             self._update_cursor_line_shader_uniforms()
             self._apply_theta_display_crop()
             self._update_theta_boundary_planes()
@@ -3661,6 +3900,12 @@ class VTKVolumeScene:
         self._theta_slice_marker_enabled = False
         if self._theta_slice_marker_actor is not None:
             self._theta_slice_marker_actor.SetVisibility(0)
+        if self._peak_marker_actor is not None:
+            self._peak_marker_actor.SetVisibility(0)
+            self._peak_marker_polydata.Initialize()
+        self._peak_marker_positions_physical = np.empty((0, 3), dtype=np.float64)
+        self._peak_marker_colors = np.empty((0, 4), dtype=np.uint8)
+        self._peak_marker_visible = False
         self._cursor_line_enabled = False
         self._cursor_line_position = None
         self._cursor_line_radii = None
@@ -3705,6 +3950,7 @@ class VTKVolumeScene:
             self.grid_actor,
             self._theta_boundary_plane_actor,
             self._theta_slice_marker_actor,
+            self._peak_marker_actor,
         ):
             if prop is not None:
                 prop.SetVisibility(0)

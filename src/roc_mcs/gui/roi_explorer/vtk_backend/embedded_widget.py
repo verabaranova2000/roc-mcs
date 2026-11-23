@@ -123,6 +123,8 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
         self._scene = None
         self._display = None
         self._payload = None
+        self._peak_catalog = None
+        self._peak_position_kind = "detected"
         self._dataset_request: dict | None = None
         self._active_worker = None
         self._pending_request: tuple[int, dict] | None = None
@@ -241,7 +243,9 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
         self.source_button.setEnabled(False)
         self.tools.set_scene_available(False)
         self.tools.set_volume_source_available(False)
-        self.tools.set_overlay_controls_enabled(cursor=False, theta=False, projection=False, roi_preview=False)
+        self.tools.set_overlay_controls_enabled(
+            cursor=False, theta=False, projection=False, roi_preview=False, peaks=False
+        )
         self.apply_theme(self._theme)
 
     @property
@@ -365,7 +369,24 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
         for label, value in (("Внутри ROI", "inside"), ("Контекст", "context"), ("Только контур", "off")):
             self.roi_preview_mode.addItem(label, value)
         roi = self._settings_panel(("Непрозрачность", self.roi_preview_opacity), ("Подсветка", self.roi_preview_strength), ("Режим", self.roi_preview_mode))
-        self.tools.set_overlay_settings_widgets(cursor_line=cursor, theta_slice=theta, projection=projection, roi_preview=roi)
+
+        self.peak_marker_size = self._spin(1.0, 20.0, 5.0, 0, " px", step=1.0)
+        self.peak_marker_opacity = self._spin(0.05, 1.0, 0.95, 2, step=0.05)
+        self.peak_color_by_branch = QtWidgets.QCheckBox("Цвет по branch_id")
+        self.peak_color_by_branch.setChecked(True)
+        self.peak_color_by_branch.setToolTip(
+            "Каждая пространственно связная ветвь получает устойчивый отдельный цвет. "
+            "Для результатов поиска/fit без branch_id используется единый цвет."
+        )
+        peaks = self._settings_panel(
+            ("Размер", self.peak_marker_size),
+            ("Непрозрачность", self.peak_marker_opacity),
+        )
+        peaks.layout().addRow(self.peak_color_by_branch)
+        self.tools.set_overlay_settings_widgets(
+            cursor_line=cursor, theta_slice=theta, projection=projection,
+            roi_preview=roi, peaks=peaks,
+        )
 
         self.cursor_width.valueChanged.connect(self._update_cursor)
         self.cursor_density.valueChanged.connect(self._update_cursor_density)
@@ -380,6 +401,9 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
         self.roi_preview_opacity.valueChanged.connect(self._update_roi_preview)
         self.roi_preview_strength.valueChanged.connect(self._update_roi_preview)
         self.roi_preview_mode.currentIndexChanged.connect(self._update_roi_preview)
+        self.peak_marker_size.valueChanged.connect(self._apply_peak_marker_settings)
+        self.peak_marker_opacity.valueChanged.connect(self._apply_peak_marker_settings)
+        self.peak_color_by_branch.toggled.connect(self._apply_peak_marker_coloring)
 
         self.display_panel = QtWidgets.QWidget()
         form = QtWidgets.QFormLayout(self.display_panel)
@@ -508,7 +532,12 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
             getattr(scene, method)(*args)
             self._render()
 
-    def set_dataset(self, raw, th, axis, x_coords, y_coords, saved_rois, *, scan_label="", view_label="", valid_mask=None, source_path=None, operation_id="source.raw", metadata=None):
+    def set_dataset(
+        self, raw, th, axis, x_coords, y_coords, saved_rois, *,
+        scan_label="", view_label="", valid_mask=None, source_path=None,
+        operation_id="source.raw", metadata=None, peak_catalog=None,
+        peak_position_kind="detected",
+    ):
         """Передать выбранную версию ROI Explorer; отдельный HDF5 не открывается."""
         scan_key = str(scan_label)
         source_identity = f"{Path(source_path).expanduser().resolve() if source_path else ''}|{scan_key}"
@@ -529,6 +558,11 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
         self._rebuild_source_choices()
         details = dict(metadata or {})
         details.setdefault("view_label", str(view_label))
+        # The peak catalogue is a renderer overlay, not an input to
+        # build_volume_payload. Keep it out of the worker request to preserve
+        # the data-adapter contract and avoid copying the DataFrame.
+        self._peak_catalog = peak_catalog
+        self._peak_position_kind = str(peak_position_kind or "detected")
         self._dataset_request = {
             "raw": raw, "theta": th, "axis": axis, "x_coords": x_coords, "y_coords": y_coords,
             "valid_mask": valid_mask, "roi": self._selected_roi(), "scan_key": scan_key,
@@ -684,10 +718,40 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
             return
         settings = self._transfer_settings()
         info = self._scene.set_payload(payload, settings, axis_scales=self.tools.axis_scales)
+        request = self._dataset_request or {}
+        marker_error = None
+        try:
+            marker_count = self._scene.set_peak_markers(
+                self._peak_catalog,
+                request.get("x_coords", payload.x),
+                request.get("y_coords", payload.y),
+                visible=self.tools.is_overlay_tool_checked("peaks"),
+                point_size=float(self.peak_marker_size.value()),
+                opacity=float(self.peak_marker_opacity.value()),
+                color_by_branch=bool(self.peak_color_by_branch.isChecked()),
+                render=False,
+            )
+        except Exception as exc:
+            # Point overlays are optional presentation. A malformed/legacy
+            # peak table must never make a valid scientific volume disappear.
+            marker_error = exc
+            logger.exception("Не удалось построить дополнительный слой центров пиков")
+            self._scene.set_peak_markers(None, payload.x, payload.y, visible=False, render=False)
+            marker_count = 0
         self.tools.set_scene_available(True)
         self.tools.set_theta_axis_values(payload.theta)
         self.tools.set_axis_scales(*self._scene.axis_scales)
-        self.tools.set_overlay_controls_enabled(cursor=True, theta=len(payload.theta) > 2, projection=True, roi_preview=True)
+        has_peak_catalog = bool(
+            self._peak_catalog is not None
+            and not getattr(self._peak_catalog, "empty", False)
+            and marker_count > 0
+        )
+        self.tools.set_overlay_controls_enabled(
+            cursor=True, theta=len(payload.theta) > 2, projection=True,
+            roi_preview=True, peaks=has_peak_catalog,
+        )
+        if not has_peak_catalog:
+            self.tools.set_overlay_tool_checked("peaks", False)
         self.tools.set_projection_enabled(settings.show_projection)
         self._scene.set_theta_slice_palette(str(self.theta_palette.currentData() or "viridis"), render=False)
         self._scene.set_theta_slice_strength(float(self.theta_strength.value()), render=False)
@@ -716,7 +780,15 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
         if self._roi_preview is not None:
             self._update_roi_preview()
         self._render()
-        self.status.setText(f"{payload.scan_key} · {payload.view_mode} · {payload.shape} · {payload.scalar_dtype} · invalid {payload.invalid_count:,} · {info.get('point_count', 0):,} узлов")
+        marker_status = f" · центров пиков {marker_count:,} ({self._peak_position_kind})" if marker_count else ""
+        status_text = (
+            f"{payload.scan_key} · {payload.view_mode} · {payload.shape} · "
+            f"{payload.scalar_dtype} · invalid {payload.invalid_count:,} · "
+            f"{info.get('point_count', 0):,} узлов{marker_status}"
+        )
+        if marker_error is not None:
+            status_text += f" · центры пиков недоступны: {type(marker_error).__name__}"
+        self.status.setText(status_text)
 
     def _load_vtk_modules(self):
         # Регистрация OpenGL backend обязательна ДО создания QVTK.
@@ -1335,9 +1407,39 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
         self._queue_transfer_settings()
 
     def _toggle_overlay(self, key, enabled):
-        if key == "roi_preview" and self._scene is not None:
+        if self._scene is None:
+            return
+        if key == "roi_preview":
             self._scene.set_roi_preview_visible(bool(enabled), render=False)
             self._render()
+        elif key == "peaks":
+            self._scene.set_peak_markers_visible(bool(enabled), render=False)
+            self._render()
+
+    def _apply_peak_marker_settings(self, *_args):
+        if self._scene is not None:
+            self._scene.set_peak_marker_settings(
+                point_size=float(self.peak_marker_size.value()),
+                opacity=float(self.peak_marker_opacity.value()),
+                render=False,
+            )
+            self._render()
+
+    def _apply_peak_marker_coloring(self, *_args):
+        if self._scene is None or self._payload is None or self._dataset_request is None:
+            return
+        request = self._dataset_request
+        marker_count = self._scene.set_peak_markers(
+            self._peak_catalog,
+            request.get("x_coords", self._payload.x),
+            request.get("y_coords", self._payload.y),
+            visible=self.tools.is_overlay_tool_checked("peaks"),
+            point_size=float(self.peak_marker_size.value()),
+            opacity=float(self.peak_marker_opacity.value()),
+            color_by_branch=bool(self.peak_color_by_branch.isChecked()),
+            render=False,
+        )
+        self._render()
 
     def _set_roi_color(self, color):
         if self._scene is not None:
@@ -1434,6 +1536,9 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
         self._pending_request = None
         self._dataset_request = None
         self._payload = None
+        self._peak_catalog = None
+        self._peak_position_kind = "detected"
+        self.tools.set_overlay_tool_checked("peaks", False)
         self._rois.clear()
         self._source_scan_key = None
         self.source_combo.blockSignals(True)

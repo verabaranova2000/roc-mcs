@@ -5,7 +5,7 @@ forwards select / add / preview gestures to the owning QWidget.
 """
 from __future__ import annotations
 
-from PyQt6.QtCore import Qt, QRectF, QPointF, QSize, pyqtSignal
+from PyQt6.QtCore import Qt, QRectF, QPointF, QSize, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QBrush, QFont, QFontMetricsF, QPainter, QPainterPath, QPen, QPalette
 from PyQt6.QtWidgets import (
     QApplication, QAbstractScrollArea, QFrame, QGraphicsItem, QGraphicsObject,
@@ -224,6 +224,7 @@ class ProcessingGraphView(QGraphicsView):
         self._history: WorkflowHistory | None = None
         self._selected_id: str | None = None
         self._show_rejected = False
+        self._vertical_scroll_enabled = True
         self.setRenderHints(
             QPainter.RenderHint.Antialiasing
             | QPainter.RenderHint.TextAntialiasing
@@ -234,7 +235,7 @@ class ProcessingGraphView(QGraphicsView):
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
-        self.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        self.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
         # QGraphicsView::sizeHint() is derived from transform.mapRect(sceneRect()).
         # That means Ctrl+wheel zoom changes the widget's preferred size; in the
         # ROI sidebar this propagates through QSplitter -> Workbench -> QScrollArea
@@ -277,6 +278,7 @@ class ProcessingGraphView(QGraphicsView):
         if not visible_nodes:
             self._graph_scene.setSceneRect(QRectF(0, 0, 480, 240))
             self._selected_id = None
+            QTimer.singleShot(0, self.fit_graph)
             return
 
         positions_xy = vertical_dag_positions(
@@ -364,7 +366,7 @@ class ProcessingGraphView(QGraphicsView):
                 can_add=(
                     node.status == NodeStatus.SUCCEEDED
                     and node.review_status == ReviewStatus.ACCEPTED
-                    and node.operation_id != "fit.scan"
+                    and node.operation_id != "peaks.branches"
                 ),
                 is_selected=node.id == selected,
             )
@@ -384,6 +386,28 @@ class ProcessingGraphView(QGraphicsView):
             self.select_node(self._selected_id)
         else:
             self._selected_id = None
+        # Refit after the scene geometry is committed. The scroll/fit-all mode
+        # is retained, and the graph never forces a preferred-size change.
+        QTimer.singleShot(0, self.fit_graph)
+
+    @property
+    def vertical_scroll_enabled(self) -> bool:
+        return self._vertical_scroll_enabled
+
+    def set_vertical_scroll_enabled(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        if enabled == self._vertical_scroll_enabled:
+            return
+        self._vertical_scroll_enabled = enabled
+        self.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded if enabled
+            else Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded if enabled
+            else Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.fit_graph()
 
     def _on_item_selected(self, node_id: str) -> None:
         self._selected_id = node_id
@@ -401,15 +425,38 @@ class ProcessingGraphView(QGraphicsView):
             self.centerOn(self._items[node_id])
 
     def fit_graph(self) -> None:
-        """Подгоняет ширину схемы; длинная история остаётся вертикально прокручиваемой."""
+        """Fit graph width, optionally fitting its complete height as well.
+
+        Scroll mode keeps node text readable and leaves long histories vertically
+        scrollable. Fit-all mode scales the whole DAG into the viewport and hides
+        scroll bars; it never enlarges the graph beyond its native 100% scale.
+        """
         rect = self._graph_scene.sceneRect()
-        if not rect.isValid() or self.viewport().width() <= 0:
+        viewport = self.viewport()
+        if not rect.isValid() or viewport.width() <= 0 or viewport.height() <= 0:
             return
-        available = max(1, self.viewport().width() - 14)
-        scale = min(1.0, available / max(1.0, rect.width()))
         self.resetTransform()
+        available_w = max(1, viewport.width() - 12)
+        available_h = max(1, viewport.height() - 12)
+        scale_w = available_w / max(1.0, rect.width())
+        if self._vertical_scroll_enabled:
+            scale = min(1.0, scale_w)
+            self.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
+        else:
+            scale_h = available_h / max(1.0, rect.height())
+            scale = min(1.0, scale_w, scale_h)
+            self.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter)
         self.scale(scale, scale)
-        self.centerOn(rect.center().x(), self.mapToScene(self.viewport().rect().center()).y())
+        self.centerOn(rect.center())
+        if self._vertical_scroll_enabled:
+            # The first node remains at the top when the viewport is shorter
+            # than the graph; users can scroll through the complete history.
+            self.verticalScrollBar().setValue(self.verticalScrollBar().minimum())
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if not self._vertical_scroll_enabled:
+            QTimer.singleShot(0, self.fit_graph)
 
     def wheelEvent(self, event) -> None:
         if event.modifiers() & Qt.KeyboardModifier.ControlModifier:

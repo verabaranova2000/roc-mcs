@@ -14,6 +14,7 @@ from PyQt6.QtWidgets import (
     QSpinBox, QDoubleSpinBox, QAbstractSpinBox, QCheckBox, QLineEdit, QPushButton, QLabel,
     QPlainTextEdit, QTabWidget, QStackedWidget, QProgressBar, QMessageBox,
     QSizePolicy, QFrame, QMenu, QScrollArea, QToolButton, QWidgetAction,
+    QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
 )
 
 from matplotlib.figure import Figure
@@ -167,6 +168,29 @@ class _PreviewNodeTask(QRunnable):
                     "peaks": None,
                     "fit": None,
                 }
+            elif node.operation_id == "peaks.branches":
+                inputs = executor.resolve_node_inputs(node)
+                position_bundle = inputs["positions"]
+                parent_ref = node.input_refs["positions"]
+                position_node = self.history_snapshot.get(parent_ref["node_id"])
+                scan_node = self.history_snapshot.find_ancestor_output(node.id, "scan")
+                if scan_node is None or scan_node.status != NodeStatus.SUCCEEDED:
+                    raise RuntimeError("Для предпросмотра ветвей не найден исходный Scan-вход")
+                scan_bundle = executor.load_output(scan_node, "scan")
+                spike_node = self.history_snapshot.find_ancestor_output(node.id, "spikes")
+                spike_bundle = (
+                    executor.load_output(spike_node, "spikes")
+                    if spike_node is not None and spike_node.status == NodeStatus.SUCCEEDED
+                    else None
+                )
+                context = {
+                    "node": node,
+                    "scan": scan_bundle,
+                    "spikes": spike_bundle,
+                    "peaks": position_bundle if position_node.operation_id == "peaks.detect" else None,
+                    "fit": position_bundle if position_node.operation_id == "fit.scan" else None,
+                    "branches": executor.load_output(node, "branches"),
+                }
             else:
                 inputs = executor.resolve_node_inputs(node)
                 stage_output = executor.load_output(node, next(iter(node.output_refs)))
@@ -244,6 +268,35 @@ class _PeakPixelInputTask(QRunnable):
             self.signals.failed.emit(self.parent_id, traceback.format_exc())
 
 
+class _BranchStatsTask(QRunnable):
+    """Compute per-scan gate diagnostics from a completed peak/fit artifact."""
+
+    def __init__(self, parent_id: str, parent_operation: str, artifact_id: str, artifact_directory: str):
+        super().__init__()
+        self.parent_id = str(parent_id)
+        self.parent_operation = str(parent_operation)
+        self.artifact_id = str(artifact_id)
+        self.artifact_directory = str(artifact_directory)
+        self.signals = _WorkerSignals()
+
+    def run(self) -> None:
+        try:
+            from roc_mcs.peaks.branches import summarize_peak_spacing, fitted_peak_positions
+            bundle = ArtifactStore(self.artifact_directory).read(self.artifact_id)
+            if self.parent_operation == "fit.scan":
+                catalog = fitted_peak_positions(bundle)
+            else:
+                catalog = bundle.tables.get("peak_catalog")
+                if catalog is None:
+                    raise ValueError("В артефакте поиска пиков отсутствует peak_catalog")
+                if getattr(catalog, "empty", False):
+                    raise ValueError("Каталог пиков пуст: для диагностики ветвей нет peak-events")
+            stats = summarize_peak_spacing(catalog, reference_theta_gate=60.0)
+            self.signals.succeeded.emit(self.parent_id, stats)
+        except Exception:
+            self.signals.failed.emit(self.parent_id, traceback.format_exc())
+
+
 class ProcessingWorkbenchWidget(QWidget):
     """The workbench itself; host applications can embed it in a dock/dialog.
 
@@ -268,6 +321,9 @@ class ProcessingWorkbenchWidget(QWidget):
         self._active_task: _RunNodeTask | None = None
         self._active_preview_task: _PreviewNodeTask | None = None
         self._active_peak_input_task: _PeakPixelInputTask | None = None
+        self._active_branch_stats_task: _BranchStatsTask | None = None
+        self._branch_gate_values: dict[str, float] = {}
+        self._active_branch_stats_parent_id: str | None = None
         self._pending_peak_pixel_coordinates: tuple[float, float] | None = None
         self._discard_active_peak_input = False
         self._preview_context: dict[str, Any] | None = None
@@ -330,14 +386,29 @@ class ProcessingWorkbenchWidget(QWidget):
         )
         self.show_rejected_check.toggled.connect(self._rebuild_graph)
         graph_header.addWidget(self.show_rejected_check)
-        self.fit_graph_button = QPushButton("По ширине")
-        self.fit_graph_button.setToolTip("Подогнать схему по ширине; длинная история прокручивается по вертикали")
-        self.fit_graph_button.clicked.connect(lambda: self.graph.fit_graph())
+        self.fit_graph_button = QToolButton(self)
+        self.fit_graph_button.setObjectName("processingGraphFitButton")
+        self.fit_graph_button.setAutoRaise(True)
+        self.fit_graph_button.setToolTip("Вписать дерево обработки в область просмотра")
+        self.fit_graph_button.setAccessibleName("Вписать дерево обработки")
         graph_header.addWidget(self.fit_graph_button)
+        self.graph_scroll_button = QToolButton(self)
+        self.graph_scroll_button.setObjectName("processingGraphScrollModeButton")
+        self.graph_scroll_button.setAutoRaise(True)
+        self.graph_scroll_button.setCheckable(True)
+        self.graph_scroll_button.setChecked(True)
+        self.graph_scroll_button.setToolTip(
+            "Вертикальная прокрутка включена. Выключите, чтобы целиком вписать дерево по высоте."
+        )
+        self.graph_scroll_button.setAccessibleName("Переключить вертикальную прокрутку дерева")
+        graph_header.addWidget(self.graph_scroll_button)
         left_layout.addLayout(graph_header)
         self._left_graph_layout = left_layout
 
         self.graph = ProcessingGraphView(left)
+        self.fit_graph_button.clicked.connect(self.graph.fit_graph)
+        self.graph.set_vertical_scroll_enabled(self.graph_scroll_button.isChecked())
+        self.graph_scroll_button.toggled.connect(self._on_graph_scroll_mode_changed)
         self.graph.node_selected.connect(self._on_graph_node_selected)
         self.graph.add_stage_requested.connect(self._on_graph_add_stage_requested)
         self.graph.preview_requested.connect(self._on_graph_preview_requested)
@@ -371,7 +442,7 @@ class ProcessingWorkbenchWidget(QWidget):
         self.operation_combo = QComboBox()
         self._operation_ids = [
             "preprocess.detector_bad_pixels",
-            "preprocess.pool", "preprocess.spikes", "peaks.detect", "fit.scan"
+            "preprocess.pool", "preprocess.spikes", "peaks.detect", "fit.scan", "peaks.branches"
         ]
         for operation_id in self._operation_ids:
             self.operation_combo.addItem(self.registry.get(operation_id).label, operation_id)
@@ -392,6 +463,7 @@ class ProcessingWorkbenchWidget(QWidget):
         self._build_spike_form()
         self._build_peak_form()
         self._build_fit_form()
+        self._build_branch_form()
         operation_layout.addWidget(self.form_stack)
 
         actions = QHBoxLayout()
@@ -506,8 +578,6 @@ class ProcessingWorkbenchWidget(QWidget):
             self.tabs.hide()
             self.graph.setMinimumSize(280, 240)
             self.graph.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-            self.fit_graph_button.setText("Вписать")
-            self.fit_graph_button.setMaximumWidth(70)
 
             actions_top = QHBoxLayout()
             actions_top.setContentsMargins(0, 2, 0, 0)
@@ -545,6 +615,27 @@ class ProcessingWorkbenchWidget(QWidget):
 
         self._show_operation_form()
 
+    def _on_graph_scroll_mode_changed(self, enabled: bool) -> None:
+        self.graph.set_vertical_scroll_enabled(bool(enabled))
+        if enabled:
+            self.graph_scroll_button.setToolTip(
+                "Вертикальная прокрутка включена. Выключите, чтобы целиком вписать дерево по высоте."
+            )
+        else:
+            self.graph_scroll_button.setToolTip(
+                "Режим полного дерева включён: всё дерево вписано по высоте и ширине. "
+                "Включите, чтобы вернуть вертикальную прокрутку и более крупные узлы."
+            )
+
+    @staticmethod
+    def _global_icon_size() -> int:
+        app = QApplication.instance()
+        raw = app.property("rocMcsIconSize") if app is not None else None
+        try:
+            return max(12, min(20, int(raw)))
+        except (TypeError, ValueError, OverflowError):
+            return 16
+
     def _toggle_theme(self) -> None:
         self._apply_theme("dark" if self._theme == "light" else "light")
 
@@ -567,6 +658,14 @@ class ProcessingWorkbenchWidget(QWidget):
             target = "тёмную" if self._theme == "light" else "светлую"
             self.theme_button.setToolTip(f"Переключить Workbench на {target} тему")
             self.theme_button.setAccessibleName(f"Переключить Workbench на {target} тему")
+            icon_size = self._global_icon_size()
+            for button, name in (
+                (self.fit_graph_button, "zoom_out_map.svg"),
+                (self.graph_scroll_button, "vertical_scroll.svg"),
+            ):
+                button.setIcon(svg_icon(ICON_DIR / name, color=colors["text"], widget=button))
+                button.setIconSize(QSize(icon_size, icon_size))
+                button.setFixedSize(icon_size + 8, icon_size + 8)
             self.graph.setBackgroundBrush(self.graph.palette().color(QPalette.ColorRole.Base))
             self._style_matplotlib_figure(self.figure)
             self._style_matplotlib_figure(self.diagnostic_figure)
@@ -1003,6 +1102,181 @@ class ProcessingWorkbenchWidget(QWidget):
         # inspected. Re-evaluate it now that the actual availability is known.
         self._refresh_operation_availability()
 
+    def _build_branch_form(self) -> None:
+        layout = self._add_form_page("peaks.branches", "Определение дифракционных ветвей")
+        theta_gate = self._float_spin(0.001, 1_000_000.0, 60.0, 2)
+        theta_gate.setSuffix(" ″")
+        theta_gate.setSingleStep(1.0)
+        theta_gate.setToolTip(
+            "Максимальное |Δθ| для сопоставления пиков в 4-связных соседних пикселях. "
+            "Единицы совпадают с единицами оси θ; в текущем наборе исходных данных это угловые секунды."
+        )
+        layout.addRow("θ-gate:", theta_gate)
+
+        diagnostics = QLabel(
+            "Оценки выбранного скана. Q90 — 90-й процентиль Δθ среди принятых "
+            "соседних one-to-one связей при опорном gate 60″; min internal — "
+            "минимум пиксельных медиан расстояния между пиками внутри одного пикселя."
+        )
+        diagnostics.setWordWrap(True)
+        diagnostics.setToolTip(
+            "Q90 повторяет edge_deltas из метода в старом ноутбуке при опорном theta_gate=60″. "
+            "Рекомендация — эвристический старт между этим Q90 и минимальным типичным "
+            "внутренним расстоянием. Она не заменяет "
+            "sensitivity analysis и не является физической константой."
+        )
+        layout.addRow("Диагностика:", diagnostics)
+
+        stats_label = QLabel("Статистика выбранного скана загружается при открытии формы…")
+        stats_label.setWordWrap(True)
+        stats_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addRow("Оценка θ-gate:", stats_label)
+
+        table = QTableWidget(0, 6)
+        table.setHorizontalHeaderLabels(["N", "Пикс.", "Мед.", "Q25", "Q75", "Мин."])
+        table.verticalHeader().setVisible(False)
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        table.setAlternatingRowColors(True)
+        table.setMaximumHeight(142)
+        table.setMinimumHeight(96)
+        table.setToolTip(
+            "Для каждого N: распределение медианного внутреннего промежутка между "
+            "соседними пиками внутри одного пикселя. Единицы — угловые секунды."
+        )
+        header_tooltips = (
+            "N: число пиков в одном пространственном пикселе.",
+            "Пикс.: число пикселей с ровно N пиками и конечной внутренней медианой.",
+            "Мед.: медиана распределения пиксельных медианных внутренних промежутков.",
+            "Q25: 25-й процентиль (нижний квартиль) распределения пиксельных медиан.",
+            "Q75: 75-й процентиль (верхний квартиль) распределения пиксельных медиан.",
+            "Мин.: минимальная пиксельная медиана внутреннего промежутка среди пикселей с N пиками."
+        )
+        for column, tooltip in enumerate(header_tooltips):
+            item = table.horizontalHeaderItem(column)
+            item.setToolTip(tooltip)
+        header = table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        header.setStretchLastSection(True)
+        table.setStyleSheet("QTableWidget { font-size: 9px; } QHeaderView::section { padding: 2px 3px; font-size: 9px; }")
+        layout.addRow("Внутренние интервалы:", table)
+        hint = QLabel(
+            "Алгоритм: 4-связность по X/Y; one-to-one assignment по минимуму |Δθ|. "
+            "Каждый peak-event остаётся отдельным узлом графа; несвязанные события образуют одиночные ветви."
+        )
+        hint.setWordWrap(True)
+        layout.addRow("Метод:", hint)
+        self._forms["peaks.branches"].update(
+            theta_gate=theta_gate, stats_label=stats_label, stats_table=table,
+        )
+
+    def _request_branch_stats(self, parent_id: str) -> None:
+        node = self.project.history.get(parent_id)
+        form = self._forms.get("peaks.branches", {})
+        label = form.get("stats_label")
+        table = form.get("stats_table")
+        if table is not None:
+            # Never leave another scan's diagnostic rows visible while this
+            # parent's statistics are being computed or if loading fails.
+            table.setRowCount(0)
+        output_name = "fit" if node.operation_id == "fit.scan" else "peaks"
+        artifact_id = node.output_refs.get(output_name)
+        if not artifact_id:
+            if label is not None:
+                label.setText("У выбранного родителя нет сохранённого каталога пиков.")
+            return
+        task = _BranchStatsTask(
+            parent_id, node.operation_id, artifact_id,
+            str(self.project.artifact_store.directory),
+        )
+        task.signals.succeeded.connect(
+            lambda pid, stats, source_task=task:
+            self._on_branch_stats_ready(pid, stats, source_task)
+        )
+        task.signals.failed.connect(
+            lambda pid, error, source_task=task:
+            self._on_branch_stats_failed(pid, error, source_task)
+        )
+        self._active_branch_stats_task = task
+        self._active_branch_stats_parent_id = str(parent_id)
+        if label is not None:
+            label.setText("Вычисляется статистика θ для выбранной ветви…")
+        self.thread_pool.start(task)
+
+    def _on_branch_stats_ready(
+        self, parent_id: str, stats: dict[str, Any], source_task: _BranchStatsTask | None = None
+    ) -> None:
+        # Ignore a late result from a previous request (including a reopened
+        # popup for the same parent). A slow read must never overwrite current UI.
+        if (
+            str(parent_id) != self._active_branch_stats_parent_id
+            or (source_task is not None and source_task is not self._active_branch_stats_task)
+        ):
+            return
+        self._active_branch_stats_task = None
+        form = self._forms.get("peaks.branches", {})
+        label = form.get("stats_label")
+        table = form.get("stats_table")
+        if label is None or table is None:
+            return
+        q90 = stats.get("q90_neighbor_delta")
+        minimum = stats.get("min_internal_gap")
+        suggested = float(stats.get("recommended_theta_gate", 60.0))
+        q90_text = "н/д" if q90 is None else f"{q90:.2f}″"
+        min_text = "н/д" if minimum is None else f"{minimum:.2f}″"
+        edge_count = int(stats.get("neighbor_edge_count_reference_gate", 0))
+        reference_gate = float(stats.get("reference_theta_gate", 60.0))
+        label.setText(
+            f"Q90 Δθ: {q90_text} ({edge_count:,} связей при {reference_gate:g}″)  ·  "
+            f"min internal: {min_text}  ·  старт: {suggested:.2f}″"
+        )
+        label.setToolTip(str(stats.get("recommendation_status", "")))
+        rows = list(stats.get("internal_gap_by_n", ()))
+        table.setRowCount(len(rows))
+        column_names = ("n_peaks", "pixel_count", "median_gap", "q25_gap", "q75_gap", "min_pixel_median_gap")
+        unit_hint = "Угловые секунды (единицы θ текущего скана)."
+        for row_index, row in enumerate(rows):
+            values = (
+                str(row["n_peaks"]), str(row["pixel_count"]),
+                f"{row['median_gap']:.1f}", f"{row['q25_gap']:.1f}",
+                f"{row['q75_gap']:.1f}", f"{row['min_pixel_median_gap']:.1f}",
+            )
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                item.setToolTip(f"{value}; {unit_hint} {table.horizontalHeaderItem(column).toolTip()}")
+                table.setItem(row_index, column, item)
+        table.resizeColumnsToContents()
+        # Keep a separate working gate for each parent branch. A suggestion for
+        # scan B must not inherit the manually tuned value from scan A.
+        spin = form.get("theta_gate")
+        if spin is not None:
+            saved = self._branch_gate_values.get(str(parent_id))
+            if saved is None:
+                current = float(spin.value())
+                saved = suggested if abs(current - 60.0) < 1e-9 else current
+                self._branch_gate_values[str(parent_id)] = float(saved)
+            spin.setValue(min(spin.maximum(), max(spin.minimum(), float(saved))))
+
+    def _on_branch_stats_failed(
+        self, parent_id: str, error: str, source_task: _BranchStatsTask | None = None
+    ) -> None:
+        if (
+            str(parent_id) != self._active_branch_stats_parent_id
+            or (source_task is not None and source_task is not self._active_branch_stats_task)
+        ):
+            return
+        self._active_branch_stats_task = None
+        form = self._forms.get("peaks.branches", {})
+        label = form.get("stats_label")
+        table = form.get("stats_table")
+        if table is not None:
+            table.setRowCount(0)
+        if label is not None:
+            label.setText("Не удалось вычислить статистику θ; доступно исходное значение 60″.")
+            label.setToolTip(error)
+
     def _update_fit_backend_options(self, *_args) -> None:
         """Expose only installed backends implemented for the selected model."""
         model_name = self._fit_model_combo.currentText()
@@ -1132,6 +1406,8 @@ class ProcessingWorkbenchWidget(QWidget):
                 "use_spike_mask": form["use_spike_mask"].isChecked(),
                 "allow_center_shift": form["allow_center_shift"].isChecked(),
             }
+        if operation_id == "peaks.branches":
+            return {"theta_gate": form["theta_gate"].value()}
         raise KeyError(operation_id)
 
     def _selected_node_id(self) -> str | None:
@@ -1152,7 +1428,9 @@ class ProcessingWorkbenchWidget(QWidget):
         if node.operation_id == "preprocess.spikes":
             return ["peaks.detect"]
         if node.operation_id == "peaks.detect":
-            return ["fit.scan"]
+            return ["fit.scan", "peaks.branches"]
+        if node.operation_id == "fit.scan":
+            return ["peaks.branches"]
         return []
 
     def _on_graph_add_stage_requested(self, parent_id: str) -> None:
@@ -1204,6 +1482,10 @@ class ProcessingWorkbenchWidget(QWidget):
             self._active_stage_popup.close()
 
         self._branch_parent_id = parent_id
+        if operation_id == "peaks.branches":
+            gate_control = self._forms.get("peaks.branches", {}).get("theta_gate")
+            if gate_control is not None:
+                gate_control.setValue(float(self._branch_gate_values.get(str(parent_id), 60.0)))
         combo_index = self.operation_combo.findData(operation_id)
         if combo_index < 0:
             return
@@ -1361,6 +1643,10 @@ class ProcessingWorkbenchWidget(QWidget):
             if getattr(popup, "_stage_form_page_restored", False):
                 return
             popup._stage_form_page_restored = True
+            if operation_id == "peaks.branches":
+                gate_control = form_info.get("theta_gate")
+                if gate_control is not None:
+                    self._branch_gate_values[str(parent_id)] = float(gate_control.value())
             if scroll.widget() is page:
                 scroll.takeWidget()
             page.setParent(self.form_stack)
@@ -1412,6 +1698,8 @@ class ProcessingWorkbenchWidget(QWidget):
             if preview is not None:
                 preview.clear_real_input()
             self._ensure_peak_parent_preview(parent_id)
+        elif operation_id == "peaks.branches":
+            self._request_branch_stats(parent_id)
 
     def _ensure_peak_parent_preview(self, parent_id: str) -> None:
         """Ensure the host 2D map displays the exact selected branch input."""
@@ -1896,6 +2184,7 @@ class ProcessingWorkbenchWidget(QWidget):
         self.accept_button.setEnabled(not busy and accept_enabled)
         self.reject_button.setEnabled(not busy and reject_enabled)
         self.fit_graph_button.setEnabled(not busy)
+        self.graph_scroll_button.setEnabled(not busy)
         self.show_rejected_check.setEnabled(not busy)
         if self.embedded:
             self.embedded_run_button.setEnabled(not busy and runnable)
