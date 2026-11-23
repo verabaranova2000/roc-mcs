@@ -772,6 +772,7 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
         finally:
             self.theta_index.blockSignals(blocked)
         self._set_theta_index(int(self.theta_index.value()), notify_map=False)
+        self._restore_theta_slice_overlay_state(payload)
         self._refresh_theta_link_control()
         if self._first_payload:
             self._scene.reset_camera_fit_preserve_direction()
@@ -1250,6 +1251,30 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
         if self._scene is not None and self._payload is not None:
             self._scene.set_theta_slice_enabled(bool(enabled), render=False)
             self._render()
+
+    def _restore_theta_slice_overlay_state(self, payload) -> None:
+        """Restore the toolbar's theta emphasis state on a newly built volume."""
+        has_theta_frames = int(len(payload.theta)) > 2
+        requested = bool(self.tools.theta_slice_button.isChecked())
+        enabled = bool(has_theta_frames and requested)
+
+        # A scan with too few angular samples cannot provide a meaningful
+        # theta selection. Keep the toolbar and scene state consistent.
+        if not has_theta_frames and requested:
+            self.tools.set_theta_slice_enabled(False)
+
+        if self._scene is not None:
+            self._scene.set_theta_slice_enabled(enabled, render=False)
+
+        logger.debug(
+            "VTK theta-slice state restored after payload: scan=%s requested=%s "
+            "available=%s enabled=%s index=%s",
+            getattr(payload, "scan_key", ""),
+            requested,
+            has_theta_frames,
+            enabled,
+            getattr(self._scene, "theta_slice_index", None),
+        )
 
     def _apply_theta_index(self, index):
         self._set_theta_index(int(index), notify_map=True)
