@@ -121,6 +121,8 @@ class RockingCurveExplorerWindow(QMainWindow):
         self._analysis_curve_key = None
         self._analysis_display_identity = None
         self._analysis_display_preferences = {}
+        self._analysis_quantitative_contrast = False
+        self._analysis_contrast_snapshot: tuple[float, float] | None = None
 
         self._theta_render_timer = QTimer(self); self._theta_render_timer.setSingleShot(True); self._theta_render_timer.setInterval(35); self._theta_render_timer.timeout.connect(self.refresh_map)
         self._preview_timer = QTimer(self)
@@ -927,10 +929,14 @@ class RockingCurveExplorerWindow(QMainWindow):
     def _on_map_changed(self, *args) -> None:
         combo = self.map_widget.map_combo
         if combo.currentData() == "__theta_slice__":
-            self._theta_slice_mode = True; self._set_theta_axis_for_current_scan(); self.map_widget.set_theta_slice_mode(True); self.refresh_map()
+            self._theta_slice_mode = True
+            self._set_analysis_contrast_mode(None)
+            self._set_theta_axis_for_current_scan(); self.map_widget.set_theta_slice_mode(True); self.refresh_map()
             if self._show_theta_guide: self.curve_widget.set_theta_guide(self._current_theta_value())
             return
-        self._theta_slice_mode = False; self.map_widget.set_theta_slice_mode(False)
+        self._theta_slice_mode = False
+        self._set_analysis_contrast_mode(self._analysis_map_key if self._analysis_view is not None else None)
+        self.map_widget.set_theta_slice_mode(False)
         self._sync_volume_theta_context()
         if self._show_theta_guide: self.curve_widget.set_theta_guide(None)
         value = combo.currentData() or combo.currentText()
@@ -1071,6 +1077,49 @@ class RockingCurveExplorerWindow(QMainWindow):
             map_button.setToolTip("Выбрать пространственную карту текущего узла workflow")
             curve_button.setToolTip("Выбрать θ-зависимый сигнал текущего узла workflow")
 
+    @staticmethod
+    def _is_quantitative_analysis_map(key: str | None) -> bool:
+        """Numerical workflow result maps, excluding source intensities and the bespoke peak map."""
+        value = str(key or "")
+        return bool(value and not value.startswith("scan.") and value != "peaks.count")
+
+    def _set_contrast_percentiles(self, low: float, high: float) -> None:
+        """Update both spin boxes and the range rail without triggering duplicate redraws."""
+        widgets = (self.map_widget.low_pct, self.map_widget.high_pct, self.map_widget.range_slider)
+        previous = [widget.blockSignals(True) for widget in widgets]
+        try:
+            self.map_widget.low_pct.setValue(float(low))
+            self.map_widget.high_pct.setValue(float(high))
+            self.map_widget.range_slider.setLow(float(low))
+            self.map_widget.range_slider.setHigh(float(high))
+        finally:
+            for widget, was_blocked in zip(widgets, previous):
+                widget.blockSignals(was_blocked)
+
+    def _set_analysis_contrast_mode(self, key: str | None) -> None:
+        """Temporarily use full linear percentiles for workflow result metrics.
+
+        The user's previous source-map percentiles are captured once on entry
+        and restored when leaving numerical results.  peaks.count remains on
+        its dedicated hue/alpha renderer and is intentionally excluded.
+        """
+        quantitative = bool(
+            self._analysis_view is not None
+            and not self._theta_slice_mode
+            and self._is_quantitative_analysis_map(key)
+        )
+        if quantitative and not self._analysis_quantitative_contrast:
+            self._analysis_contrast_snapshot = (
+                float(self.map_widget.low_pct.value()),
+                float(self.map_widget.high_pct.value()),
+            )
+            self._set_contrast_percentiles(0.0, 100.0)
+        elif not quantitative and self._analysis_quantitative_contrast:
+            low, high = self._analysis_contrast_snapshot or (1.0, 99.0)
+            self._set_contrast_percentiles(low, high)
+            self._analysis_contrast_snapshot = None
+        self._analysis_quantitative_contrast = quantitative
+
     def set_analysis_map_layer(self, key: str) -> None:
         state = self._analysis_view
         if state is None or not hasattr(state, "map_layers"):
@@ -1078,6 +1127,7 @@ class RockingCurveExplorerWindow(QMainWindow):
         if not any(layer.key == str(key) for layer in state.map_layers):
             return
         self._analysis_map_key = str(key)
+        self._set_analysis_contrast_mode(self._analysis_map_key)
         self._remember_analysis_display_preferences()
         self._set_result_menu_checked(self.map_widget.tools.results_menu, self._analysis_map_key)
         self.refresh_map()
@@ -1161,6 +1211,7 @@ class RockingCurveExplorerWindow(QMainWindow):
         curve_keys = {source.key for source in getattr(state, "curve_sources", ())}
         self._analysis_map_key = saved[0] if saved[0] in map_keys else getattr(state, "default_map_key", None)
         self._analysis_curve_key = saved[1] if saved[1] in curve_keys else getattr(state, "default_curve_key", None)
+        self._set_analysis_contrast_mode(self._analysis_map_key)
         self._sync_analysis_result_menus(state)
         self._analysis_curve_cache.clear()
         self.selected_pixel = None
@@ -1176,6 +1227,7 @@ class RockingCurveExplorerWindow(QMainWindow):
         """Возвращает исходный HDF5-view и прежний spatial pooling."""
         self._remember_analysis_display_preferences()
         self._analysis_view = None
+        self._set_analysis_contrast_mode(None)
         self._analysis_map_key = None
         self._analysis_curve_key = None
         self._analysis_display_identity = None
@@ -1254,15 +1306,16 @@ class RockingCurveExplorerWindow(QMainWindow):
         self.map_widget.low_pct.blockSignals(True)
         self.map_widget.high_pct.blockSignals(True)
         
-        self.map_widget.low_pct.setValue(1.0)
-        self.map_widget.high_pct.setValue(99.0)
+        low, high = (0.0, 100.0) if self._analysis_quantitative_contrast else (1.0, 99.0)
+        self.map_widget.low_pct.setValue(low)
+        self.map_widget.high_pct.setValue(high)
         
         self.map_widget.low_pct.blockSignals(False)
         self.map_widget.high_pct.blockSignals(False)
         
         # Передаем обновленные значения в слайдер
-        self.map_widget.range_slider.setLow(1.0)
-        self.map_widget.range_slider.setHigh(99.0)
+        self.map_widget.range_slider.setLow(low)
+        self.map_widget.range_slider.setHigh(high)
         
         self.refresh_map()
 
@@ -1663,16 +1716,30 @@ class RockingCurveExplorerWindow(QMainWindow):
                 self._draw_pinned_rois(); self.map_widget.canvas.draw_idle()
                 return
 
-            p_lo = float(self.map_widget.low_pct.value()); p_hi = float(self.map_widget.high_pct.value())
+            quantitative = self._is_quantitative_analysis_map(self._analysis_map_key)
+            p_lo = float(self.map_widget.low_pct.value())
+            p_hi = float(self.map_widget.high_pct.value())
             try:
-                finite = np.asarray(img)[np.isfinite(img)]
+                finite = np.asarray(img, dtype=float)
+                finite = finite[np.isfinite(finite)]
                 vmin, vmax = np.percentile(finite, [p_lo, p_hi]) if finite.size else (None, None)
+                if quantitative and self._analysis_map_key in {
+                    "spikes.count", "branches.count", "fit.n_detected", "fit.n_fitted", "fit.n_fitted_map",
+                }:
+                    # Count maps have a real zero baseline. Do not let an
+                    # automatic percentile shift black to the value 1 or higher.
+                    vmin = 0.0
+                    if vmax is None or not np.isfinite(vmax) or vmax <= 0.0:
+                        vmax = 1.0
                 if vmin is not None and vmax is not None and vmin >= vmax:
                     vmax = vmin + max(abs(float(vmin)) * 1e-9, 1e-12)
             except Exception:
                 vmin = vmax = None
-            self.map_widget.draw_map(img, title, self.map_widget.current_cmap, vmin, vmax,
-                                     x_coords=state.x_coords, y_coords=state.y_coords)
+            self.map_widget.draw_map(
+                img, title, self.map_widget.current_cmap, vmin, vmax,
+                x_coords=state.x_coords, y_coords=state.y_coords,
+                colorbar_mode="quantitative" if quantitative else "continuous",
+            )
             self._draw_pinned_rois(); self.map_widget.canvas.draw_idle()
             return
         if self.repo is None or self.selected_scan is None or (self.selected_map is None and not self._theta_slice_mode):
@@ -1880,6 +1947,7 @@ class RockingCurveExplorerWindow(QMainWindow):
                     metadata=state.metadata,
                     peak_catalog=state.peak_points,
                     peak_position_kind=state.peak_position_kind,
+                    branch_edges=getattr(state, "branch_edges", None),
                 )
             except Exception as exc:
                 self.volume_widget.clear_dataset(f"3D: {type(exc).__name__}: {exc}")

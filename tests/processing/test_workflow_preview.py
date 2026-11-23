@@ -147,3 +147,33 @@ def test_spike_input_offers_measured_intensity_map_for_peak_configuration():
     # the same combined validity mask as peaks.detect when a point is selected.
     assert measured_layer.data_yx[0, 0] == 104.0
     assert state.map_layer("scan.intensity_sum").data_yx[0, 0] == 6.0
+
+
+def test_branch_map_uses_zero_for_valid_pixels_without_branch_and_preserves_edges():
+    import pandas as pd
+
+    raw = np.ones((2, 2, 3), dtype=float)
+    scan = SimpleNamespace(arrays={
+        "data_yxt": raw,
+        "theta": np.array([0.0, 1.0, 2.0]),
+        "x_coords": np.array([0.0, 1.0]),
+        "y_coords": np.array([0.0, 1.0]),
+        "valid_mask_yxt": np.ones(raw.shape, dtype=bool),
+        "analysis_valid_mask_yx": np.array([[True, True], [True, False]]),
+    }, metadata={})
+    catalog = pd.DataFrame([
+        {"peak_id": 10, "x": 0, "y": 0, "theta": 0.5, "branch_id": 0},
+        {"peak_id": 11, "x": 1, "y": 0, "theta": 0.6, "branch_id": 0},
+    ])
+    edges = pd.DataFrame([{"peak_id_a": 10, "peak_id_b": 11, "delta_theta": 0.1}])
+    branches = SimpleNamespace(tables={"branch_catalog": catalog, "branch_edges": edges}, metadata={})
+
+    state = build_workflow_preview_state(
+        _node("peaks.branches"), {"scan": scan, "branches": branches}
+    )
+    np.testing.assert_allclose(
+        state.map_layer("branches.count").data_yx,
+        [[1.0, 1.0], [0.0, np.nan]],
+        equal_nan=True,
+    )
+    assert state.branch_edges is edges

@@ -31,6 +31,7 @@ from .presenter import ArtifactPreviewRequest
 from roc_mcs.analysis.workflow_preview import build_workflow_preview_state
 from .graph_canvas import ProcessingGraphView
 from .peak_detection_preview import PeakDetectionPreview
+from .branch_detection_preview import BranchDetectionPreview
 from roc_mcs.visualization.peak_count_map import integrated_intensity_map, peak_count_rgba
 from roc_mcs.gui.components.icon_provider import svg_icon
 from roc_mcs.gui.roi_explorer.plot_toolbar_style import ICON_DIR
@@ -1104,33 +1105,48 @@ class ProcessingWorkbenchWidget(QWidget):
 
     def _build_branch_form(self) -> None:
         layout = self._add_form_page("peaks.branches", "Определение дифракционных ветвей")
+        # Keep the parameter row compact, but let all explanatory content span
+        # the full form width. This avoids the old narrow label column and text
+        # clipping in the stage popup.
+        layout.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        layout.setFormAlignment(Qt.AlignmentFlag.AlignTop)
+        layout.setRowWrapPolicy(QFormLayout.RowWrapPolicy.DontWrapRows)
+
         theta_gate = self._float_spin(0.001, 1_000_000.0, 60.0, 2)
         theta_gate.setSuffix(" ″")
         theta_gate.setSingleStep(1.0)
         theta_gate.setToolTip(
             "Максимальное |Δθ| для сопоставления пиков в 4-связных соседних пикселях. "
-            "Единицы совпадают с единицами оси θ; в текущем наборе исходных данных это угловые секунды."
+            "Единицы совпадают с единицами оси θ; для текущих исходных данных это угловые секунды."
         )
         layout.addRow("θ-gate:", theta_gate)
 
+        preview = BranchDetectionPreview()
+        preview.set_theta_gate(float(theta_gate.value()))
+        theta_gate.valueChanged.connect(preview.set_theta_gate)
+        layout.addRow(preview)
+
         diagnostics = QLabel(
-            "Оценки выбранного скана. Q90 — 90-й процентиль Δθ среди принятых "
-            "соседних one-to-one связей при опорном gate 60″; min internal — "
-            "минимум пиксельных медиан расстояния между пиками внутри одного пикселя."
+            "Как читать параметр: для каждой пары соседних пикселей алгоритм строит "
+            "взаимно-однозначное сопоставление пиков с минимальным |Δθ|. Связь входит "
+            "в граф ветвей, только если |Δθ| не превышает θ-gate. Увеличение gate "
+            "добавляет допустимые рёбра; уменьшение оставляет только более близкие пики."
         )
         diagnostics.setWordWrap(True)
+        diagnostics.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        diagnostics.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         diagnostics.setToolTip(
-            "Q90 повторяет edge_deltas из метода в старом ноутбуке при опорном theta_gate=60″. "
-            "Рекомендация — эвристический старт между этим Q90 и минимальным типичным "
-            "внутренним расстоянием. Она не заменяет "
-            "sensitivity analysis и не является физической константой."
+            "Миниатюра выше показывает синтетическую пару соседних пикселей и работает "
+            "через тот же match_neighbor_peaks(), что и алгоритм. Она объясняет правило, "
+            "но не заменяет просмотр результата на данных скана."
         )
-        layout.addRow("Диагностика:", diagnostics)
+        layout.addRow(diagnostics)
 
         stats_label = QLabel("Статистика выбранного скана загружается при открытии формы…")
         stats_label.setWordWrap(True)
         stats_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        layout.addRow("Оценка θ-gate:", stats_label)
+        stats_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        layout.addRow(stats_label)
 
         table = QTableWidget(0, 6)
         table.setHorizontalHeaderLabels(["N", "Пикс.", "Мед.", "Q25", "Q75", "Мин."])
@@ -1140,7 +1156,8 @@ class ProcessingWorkbenchWidget(QWidget):
         table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         table.setAlternatingRowColors(True)
         table.setMaximumHeight(142)
-        table.setMinimumHeight(96)
+        table.setMinimumHeight(92)
+        table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         table.setToolTip(
             "Для каждого N: распределение медианного внутреннего промежутка между "
             "соседними пиками внутри одного пикселя. Единицы — угловые секунды."
@@ -1154,21 +1171,27 @@ class ProcessingWorkbenchWidget(QWidget):
             "Мин.: минимальная пиксельная медиана внутреннего промежутка среди пикселей с N пиками."
         )
         for column, tooltip in enumerate(header_tooltips):
-            item = table.horizontalHeaderItem(column)
-            item.setToolTip(tooltip)
+            table.horizontalHeaderItem(column).setToolTip(tooltip)
         header = table.horizontalHeader()
-        header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        header.setStretchLastSection(True)
-        table.setStyleSheet("QTableWidget { font-size: 9px; } QHeaderView::section { padding: 2px 3px; font-size: 9px; }")
-        layout.addRow("Внутренние интервалы:", table)
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        table.setStyleSheet(
+            "QTableWidget { font-size: 9px; } "
+            "QHeaderView::section { padding: 3px 4px; font-size: 9px; }"
+        )
+        layout.addRow(table)
+
         hint = QLabel(
-            "Алгоритм: 4-связность по X/Y; one-to-one assignment по минимуму |Δθ|. "
-            "Каждый peak-event остаётся отдельным узлом графа; несвязанные события образуют одиночные ветви."
+            "4-связность по X/Y · one-to-one assignment по минимуму |Δθ| · "
+            "каждый пик остаётся отдельным узлом графа · несвязанные события образуют "
+            "одиночные ветви. Диагностические Q90 и внутренние интервалы — ориентиры "
+            "для sensitivity analysis, а не физические константы."
         )
         hint.setWordWrap(True)
-        layout.addRow("Метод:", hint)
+        hint.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        layout.addRow(hint)
         self._forms["peaks.branches"].update(
-            theta_gate=theta_gate, stats_label=stats_label, stats_table=table,
+            theta_gate=theta_gate, preview=preview,
+            stats_label=stats_label, stats_table=table,
         )
 
     def _request_branch_stats(self, parent_id: str) -> None:

@@ -279,6 +279,7 @@ class VTKToolsWidget(QWidget):
     projection_toggled = pyqtSignal(bool)
     cursor_line_color_changed = pyqtSignal(str)
     roi_preview_color_changed = pyqtSignal(str)
+    peak_marker_color_changed = pyqtSignal(str)
     axis_scales_apply_requested = pyqtSignal(float, float, float)
     # Index bounds are inclusive and refer to the currently loaded physical theta axis.
     theta_display_range_changed = pyqtSignal(int, int)
@@ -290,6 +291,7 @@ class VTKToolsWidget(QWidget):
 
     DEFAULT_CURSOR_LINE_COLOR = "#FFBD55"
     DEFAULT_ROI_PREVIEW_COLOR = "#FFB547"
+    DEFAULT_PEAK_MARKER_COLOR = "#FFC857"
     # 0 = restore the exact legacy icons from the supplied project archive.
     # 1..3 = the first monochrome proposal set; 4..7 = the new concepts A..D.
     SCENE_OBJECTS_ICON_VARIANT = 0
@@ -316,6 +318,7 @@ class VTKToolsWidget(QWidget):
         self._volume_source_available = False
         self._cursor_line_color = self.DEFAULT_CURSOR_LINE_COLOR
         self._roi_preview_color = self.DEFAULT_ROI_PREVIEW_COLOR
+        self._peak_marker_color = self.DEFAULT_PEAK_MARKER_COLOR
         self._color_picker: CompactColorPicker | None = None
         self._active_color_picker_key: str | None = None
         self._overlay_settings: dict[str, QWidget] = {}
@@ -1435,6 +1438,23 @@ class VTKToolsWidget(QWidget):
             monochrome=True,
             icon_size=18,
         )
+        self.branch_edges_button = self.register_overlay_tool(
+            "branches",
+            "vtk_theta_link_1.svg",
+            "Связи между пиками одной дифракционной ветви · ЛКМ — показать/скрыть",
+            settings_title="СВЯЗИ ВЕТВЕЙ",
+            monochrome=True,
+            icon_size=18,
+        )
+        self.volume_visibility_button = self.register_overlay_tool(
+            "volume",
+            "vtk_volume_source_1.svg",
+            "Объём интенсивности · ЛКМ — показать/скрыть. Можно оставить только точки и связи",
+            settings_title="ОБЪЁМ",
+            monochrome=True,
+            icon_size=18,
+        )
+        self.set_overlay_tool_checked("volume", True)
         action = QWidgetAction(self.overlays_menu)
         action.setDefaultWidget(self._overlays_panel)
         self.overlays_menu.addAction(action)
@@ -1520,20 +1540,25 @@ class VTKToolsWidget(QWidget):
         title.setStyleSheet("font-size: 9px; font-weight: 650; letter-spacing: 0.35px; color: palette(mid);")
         header.addWidget(title)
 
-        if key in ("cursor", "roi_preview"):
+        if key in ("cursor", "roi_preview", "peaks"):
             header.addWidget(QLabel("Цвет", panel))
             color_button = QToolButton(panel)
             color_button.setObjectName(
-                "VTKCursorColorButton" if key == "cursor" else "VTKROIPreviewColorButton"
+                "VTKCursorColorButton" if key == "cursor"
+                else "VTKROIPreviewColorButton" if key == "roi_preview"
+                else "VTKPeakMarkerColorButton"
             )
             color_button.setAutoRaise(True)
             color_button.setFixedSize(25, 19)
             color_button.setAccessibleName(
-                "Цвет линии курсора" if key == "cursor" else "Цвет подсветки облака внутри ROI"
+                "Цвет линии курсора" if key == "cursor"
+                else "Цвет подсветки облака внутри ROI" if key == "roi_preview"
+                else "Единый цвет центров пиков, когда отключена окраска по branch_id"
             )
             color_button.clicked.connect(
                 self._open_cursor_line_picker if key == "cursor"
-                else self._open_roi_preview_color_picker
+                else self._open_roi_preview_color_picker if key == "roi_preview"
+                else self._open_peak_marker_color_picker
             )
             header.addWidget(color_button)
             if key == "cursor":
@@ -1541,10 +1566,17 @@ class VTKToolsWidget(QWidget):
                 self.cursor_color_btn = color_button
                 self.cursor_line_color_action = color_button
                 self.set_cursor_line_color(self._cursor_line_color)
-            else:
+            elif key == "roi_preview":
                 color_button.setToolTip("Цвет выделяемой части облака")
                 self.roi_preview_color_btn = color_button
                 self.set_roi_preview_color(self._roi_preview_color)
+            else:
+                color_button.setToolTip(
+                    "Единый цвет центров пиков, когда отключена окраска по branch_id. "
+                    "При включённой группировке цвет задаётся отдельно для каждой ветви."
+                )
+                self.peak_marker_color_btn = color_button
+                self.set_peak_marker_color(self._peak_marker_color)
         root.addLayout(header)
 
         widget.setParent(panel)
@@ -1621,6 +1653,7 @@ class VTKToolsWidget(QWidget):
         projection: QWidget | None = None,
         roi_preview: QWidget | None = None,
         peaks: QWidget | None = None,
+        branches: QWidget | None = None,
     ) -> None:
         if cursor_line is not None:
             self.set_overlay_settings_widget(
@@ -1641,6 +1674,10 @@ class VTKToolsWidget(QWidget):
         if peaks is not None:
             self.set_overlay_settings_widget(
                 "peaks", peaks, settings_title="ЦЕНТРЫ ПИКОВ"
+            )
+        if branches is not None:
+            self.set_overlay_settings_widget(
+                "branches", branches, settings_title="СВЯЗИ ВЕТВЕЙ"
             )
 
     def _popup_position_below(self, anchor: QWidget, popup_size: QSize) -> QPoint:
@@ -1719,7 +1756,7 @@ class VTKToolsWidget(QWidget):
         # A manually dismissed settings popup must not leave its nested color
         # picker visible as an orphan. Applying/closing the picker itself does
         # not hide this parent menu, so the normal Apply path is unaffected.
-        if key in ("cursor", "roi_preview") and self._active_color_picker_key == key and self._color_picker is not None:
+        if key in ("cursor", "roi_preview", "peaks") and self._active_color_picker_key == key and self._color_picker is not None:
             try:
                 if self._color_picker.isVisible():
                     self._color_picker.close()
@@ -1825,6 +1862,9 @@ class VTKToolsWidget(QWidget):
     def _open_roi_preview_color_picker(self) -> None:
         self._open_overlay_color_picker("roi_preview")
 
+    def _open_peak_marker_color_picker(self) -> None:
+        self._open_overlay_color_picker("peaks")
+
     def _open_overlay_color_picker(self, key: str) -> None:
         try:
             if self._color_picker is not None:
@@ -1839,6 +1879,10 @@ class VTKToolsWidget(QWidget):
             color = self._roi_preview_color
             button = self.roi_preview_color_btn
             handler = self._on_roi_preview_color_selected
+        elif key == "peaks":
+            color = self._peak_marker_color
+            button = self.peak_marker_color_btn
+            handler = self._on_peak_marker_color_selected
         else:
             raise KeyError(f"Неизвестный ключ color picker: {key!r}")
         parent_menu = self._overlay_settings_menus.get(key, self.overlays_menu)
@@ -1870,6 +1914,29 @@ class VTKToolsWidget(QWidget):
     def _on_roi_preview_color_selected(self, color: str) -> None:
         self.set_roi_preview_color(color)
         self.roi_preview_color_changed.emit(self._roi_preview_color)
+
+    @property
+    def peak_marker_color(self) -> str:
+        return str(self._peak_marker_color)
+
+    def set_peak_marker_color(self, color: str) -> None:
+        candidate = QColor(str(color))
+        if not candidate.isValid():
+            raise ValueError(f"Некорректный цвет центров пиков: {color!r}")
+        self._peak_marker_color = candidate.name(QColor.NameFormat.HexRgb).upper()
+        button = getattr(self, "peak_marker_color_btn", None)
+        if button is not None:
+            button.setIcon(self._color_swatch_icon(self._peak_marker_color))
+            button.setToolTip(
+                f"Единый цвет центров пиков · {self._peak_marker_color}. "
+                "Используется при отключённой окраске по branch_id; "
+                "при включённой окраске это запасной цвет для событий без branch_id. "
+                "Нажмите, чтобы выбрать."
+            )
+
+    def _on_peak_marker_color_selected(self, color: str) -> None:
+        self.set_peak_marker_color(color)
+        self.peak_marker_color_changed.emit(self._peak_marker_color)
 
     def _toggle_theme(self) -> None:
         self.theme_changed.emit("dark" if self._theme == "light" else "light")
@@ -1969,6 +2036,7 @@ class VTKToolsWidget(QWidget):
 
         self.set_cursor_line_color(self._cursor_line_color)
         self.set_roi_preview_color(self._roi_preview_color)
+        self.set_peak_marker_color(self._peak_marker_color)
         self.set_volume_source_mode(self._volume_source_mode)
         self.set_volume_source_available(self._volume_source_available)
         self._set_icon_sizes()
@@ -2067,15 +2135,19 @@ class VTKToolsWidget(QWidget):
     def set_overlay_controls_enabled(
         self, *, cursor: bool, theta: bool, projection: bool = True,
         roi_preview: bool = True, peaks: bool = False,
+        branches: bool = False, volume: bool = True,
     ) -> None:
         self.set_overlay_tool_enabled("cursor", cursor)
         self.set_overlay_tool_enabled("theta", theta)
         self.set_overlay_tool_enabled("projection", projection)
         self.set_overlay_tool_enabled("roi_preview", roi_preview)
         self.set_overlay_tool_enabled("peaks", peaks)
+        self.set_overlay_tool_enabled("branches", branches)
+        self.set_overlay_tool_enabled("volume", volume)
         for key, available in (
             ("cursor", cursor), ("theta", theta), ("projection", projection),
             ("roi_preview", roi_preview), ("peaks", peaks),
+            ("branches", branches), ("volume", volume),
         ):
             widget = self._overlay_settings.get(key)
             if widget is not None:
@@ -2086,3 +2158,6 @@ class VTKToolsWidget(QWidget):
         roi_color_button = getattr(self, "roi_preview_color_btn", None)
         if roi_color_button is not None:
             roi_color_button.setEnabled(bool(roi_preview))
+        peak_color_button = getattr(self, "peak_marker_color_btn", None)
+        if peak_color_button is not None:
+            peak_color_button.setEnabled(bool(peaks))

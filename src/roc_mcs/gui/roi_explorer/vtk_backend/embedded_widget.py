@@ -125,6 +125,11 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
         self._payload = None
         self._peak_catalog = None
         self._peak_position_kind = "detected"
+        self._branch_edges = None
+        # None means "auto-show when data first become available".  Once the
+        # user explicitly toggles a layer, preserve that choice on payload refresh.
+        self._peak_overlay_preference: bool | None = None
+        self._branch_overlay_preference: bool | None = None
         self._dataset_request: dict | None = None
         self._active_worker = None
         self._pending_request: tuple[int, dict] | None = None
@@ -383,9 +388,15 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
             ("Непрозрачность", self.peak_marker_opacity),
         )
         peaks.layout().addRow(self.peak_color_by_branch)
+        self.branch_line_width = self._spin(0.5, 8.0, 2.0, 1, " px", step=0.5)
+        self.branch_line_opacity = self._spin(0.05, 1.0, 0.92, 2, step=0.05)
+        branches = self._settings_panel(
+            ("Толщина", self.branch_line_width),
+            ("Непрозрачность", self.branch_line_opacity),
+        )
         self.tools.set_overlay_settings_widgets(
             cursor_line=cursor, theta_slice=theta, projection=projection,
-            roi_preview=roi, peaks=peaks,
+            roi_preview=roi, peaks=peaks, branches=branches,
         )
 
         self.cursor_width.valueChanged.connect(self._update_cursor)
@@ -404,6 +415,8 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
         self.peak_marker_size.valueChanged.connect(self._apply_peak_marker_settings)
         self.peak_marker_opacity.valueChanged.connect(self._apply_peak_marker_settings)
         self.peak_color_by_branch.toggled.connect(self._apply_peak_marker_coloring)
+        self.branch_line_width.valueChanged.connect(self._apply_branch_edge_settings)
+        self.branch_line_opacity.valueChanged.connect(self._apply_branch_edge_settings)
 
         self.display_panel = QtWidgets.QWidget()
         form = QtWidgets.QFormLayout(self.display_panel)
@@ -525,6 +538,7 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
         t.overlay_toggled.connect(self._toggle_overlay)
         t.cursor_line_color_changed.connect(self._set_cursor_color)
         t.roi_preview_color_changed.connect(self._set_roi_color)
+        t.peak_marker_color_changed.connect(self._set_peak_marker_color)
 
     def _scene_call(self, method, *args):
         scene = self._scene
@@ -536,7 +550,7 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
         self, raw, th, axis, x_coords, y_coords, saved_rois, *,
         scan_label="", view_label="", valid_mask=None, source_path=None,
         operation_id="source.raw", metadata=None, peak_catalog=None,
-        peak_position_kind="detected",
+        peak_position_kind="detected", branch_edges=None,
     ):
         """Передать выбранную версию ROI Explorer; отдельный HDF5 не открывается."""
         scan_key = str(scan_label)
@@ -563,6 +577,7 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
         # the data-adapter contract and avoid copying the DataFrame.
         self._peak_catalog = peak_catalog
         self._peak_position_kind = str(peak_position_kind or "detected")
+        self._branch_edges = branch_edges
         self._dataset_request = {
             "raw": raw, "theta": th, "axis": axis, "x_coords": x_coords, "y_coords": y_coords,
             "valid_mask": valid_mask, "roi": self._selected_roi(), "scan_key": scan_key,
@@ -720,38 +735,66 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
         info = self._scene.set_payload(payload, settings, axis_scales=self.tools.axis_scales)
         request = self._dataset_request or {}
         marker_error = None
+        branch_error = None
+        marker_count = 0
+        branch_edge_count = 0
+        request_x = request.get("x_coords", payload.x)
+        request_y = request.get("y_coords", payload.y)
         try:
             marker_count = self._scene.set_peak_markers(
-                self._peak_catalog,
-                request.get("x_coords", payload.x),
-                request.get("y_coords", payload.y),
-                visible=self.tools.is_overlay_tool_checked("peaks"),
+                self._peak_catalog, request_x, request_y,
+                visible=False,
                 point_size=float(self.peak_marker_size.value()),
                 opacity=float(self.peak_marker_opacity.value()),
                 color_by_branch=bool(self.peak_color_by_branch.isChecked()),
+                uniform_color=self.tools.peak_marker_color,
                 render=False,
             )
         except Exception as exc:
-            # Point overlays are optional presentation. A malformed/legacy
-            # peak table must never make a valid scientific volume disappear.
+            # Overlay construction is optional presentation. A malformed or
+            # legacy table must never make a valid scientific volume disappear.
             marker_error = exc
             logger.exception("Не удалось построить дополнительный слой центров пиков")
             self._scene.set_peak_markers(None, payload.x, payload.y, visible=False, render=False)
-            marker_count = 0
+        try:
+            branch_edge_count = self._scene.set_branch_edges(
+                self._peak_catalog, self._branch_edges, request_x, request_y,
+                visible=False,
+                color_by_branch=True,
+                line_width=float(self.branch_line_width.value()),
+                opacity=float(self.branch_line_opacity.value()),
+                render=False,
+            )
+        except Exception as exc:
+            branch_error = exc
+            logger.exception("Не удалось построить слой связей дифракционных ветвей")
+            self._scene.set_branch_edges(
+                None, None, payload.x, payload.y, visible=False, render=False
+            )
+
         self.tools.set_scene_available(True)
         self.tools.set_theta_axis_values(payload.theta)
         self.tools.set_axis_scales(*self._scene.axis_scales)
-        has_peak_catalog = bool(
-            self._peak_catalog is not None
-            and not getattr(self._peak_catalog, "empty", False)
-            and marker_count > 0
-        )
+        has_peak_catalog = marker_count > 0
+        has_branch_edges = branch_edge_count > 0
+        peak_visible = (
+            bool(self._peak_overlay_preference)
+            if self._peak_overlay_preference is not None else has_peak_catalog
+        ) and has_peak_catalog
+        branches_visible = (
+            bool(self._branch_overlay_preference)
+            if self._branch_overlay_preference is not None else has_branch_edges
+        ) and has_branch_edges
         self.tools.set_overlay_controls_enabled(
             cursor=True, theta=len(payload.theta) > 2, projection=True,
             roi_preview=True, peaks=has_peak_catalog,
+            branches=has_branch_edges, volume=True,
         )
-        if not has_peak_catalog:
-            self.tools.set_overlay_tool_checked("peaks", False)
+        self.tools.set_overlay_tool_checked("peaks", peak_visible)
+        self.tools.set_overlay_tool_checked("branches", branches_visible)
+        self._scene.set_peak_markers_visible(peak_visible, render=False)
+        self._scene.set_branch_edges_visible(branches_visible, render=False)
+        self._scene.set_volume_visible(self.tools.is_overlay_tool_checked("volume"), render=False)
         self.tools.set_projection_enabled(settings.show_projection)
         self._scene.set_theta_slice_palette(str(self.theta_palette.currentData() or "viridis"), render=False)
         self._scene.set_theta_slice_strength(float(self.theta_strength.value()), render=False)
@@ -782,13 +825,16 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
             self._update_roi_preview()
         self._render()
         marker_status = f" · центров пиков {marker_count:,} ({self._peak_position_kind})" if marker_count else ""
+        edge_status = f" · связей ветвей {branch_edge_count:,}" if branch_edge_count else ""
         status_text = (
             f"{payload.scan_key} · {payload.view_mode} · {payload.shape} · "
             f"{payload.scalar_dtype} · invalid {payload.invalid_count:,} · "
-            f"{info.get('point_count', 0):,} узлов{marker_status}"
+            f"{info.get('point_count', 0):,} узлов{marker_status}{edge_status}"
         )
         if marker_error is not None:
             status_text += f" · центры пиков недоступны: {type(marker_error).__name__}"
+        if branch_error is not None:
+            status_text += f" · связи недоступны: {type(branch_error).__name__}"
         self.status.setText(status_text)
 
     def _load_vtk_modules(self):
@@ -1432,13 +1478,22 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
         self._queue_transfer_settings()
 
     def _toggle_overlay(self, key, enabled):
-        if self._scene is None:
-            return
-        if key == "roi_preview":
+        if key == "peaks":
+            self._peak_overlay_preference = bool(enabled)
+            if self._scene is not None:
+                self._scene.set_peak_markers_visible(bool(enabled), render=False)
+                self._render()
+        elif key == "branches":
+            self._branch_overlay_preference = bool(enabled)
+            if self._scene is not None:
+                self._scene.set_branch_edges_visible(bool(enabled), render=False)
+                self._render()
+        elif key == "volume":
+            if self._scene is not None:
+                self._scene.set_volume_visible(bool(enabled), render=False)
+                self._render()
+        elif self._scene is not None and key == "roi_preview":
             self._scene.set_roi_preview_visible(bool(enabled), render=False)
-            self._render()
-        elif key == "peaks":
-            self._scene.set_peak_markers_visible(bool(enabled), render=False)
             self._render()
 
     def _apply_peak_marker_settings(self, *_args):
@@ -1462,6 +1517,33 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
             point_size=float(self.peak_marker_size.value()),
             opacity=float(self.peak_marker_opacity.value()),
             color_by_branch=bool(self.peak_color_by_branch.isChecked()),
+            uniform_color=self.tools.peak_marker_color,
+            render=False,
+        )
+        self._render()
+
+    def _apply_branch_edge_settings(self, *_args):
+        if self._scene is not None:
+            self._scene.set_branch_edge_settings(
+                line_width=float(self.branch_line_width.value()),
+                opacity=float(self.branch_line_opacity.value()),
+                render=False,
+            )
+            self._render()
+
+    def _set_peak_marker_color(self, color):
+        if self._scene is None or self._payload is None or self._dataset_request is None:
+            return
+        request = self._dataset_request
+        self._scene.set_peak_markers(
+            self._peak_catalog,
+            request.get("x_coords", self._payload.x),
+            request.get("y_coords", self._payload.y),
+            visible=self.tools.is_overlay_tool_checked("peaks"),
+            point_size=float(self.peak_marker_size.value()),
+            opacity=float(self.peak_marker_opacity.value()),
+            color_by_branch=bool(self.peak_color_by_branch.isChecked()),
+            uniform_color=str(color),
             render=False,
         )
         self._render()

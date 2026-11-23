@@ -10,7 +10,7 @@ from mpl_toolkits.axes_grid1 import make_axes_locatable, axes_size
 from matplotlib.lines import Line2D
 from matplotlib.font_manager import FontProperties
 from mpl_toolkits.axes_grid1.anchored_artists import AnchoredSizeBar
-from matplotlib.colors import to_rgba
+from matplotlib.colors import Normalize, to_rgba
 import numpy as np
 
 from roc_mcs.roi.spatial_pooling import PoolSpec
@@ -268,6 +268,7 @@ class MapPlotWidget(QWidget):
         self._divider = None
         self._cbar_multiplier = None
         self._peak_map_active = False
+        self._colorbar_mode = "continuous"
         self.peak_count_legend = FloatingLegendPanel(
             self.canvas, "2D-ЛЕГЕНДА", default_size=QSize(258, 214), margin=10
         )
@@ -631,18 +632,69 @@ class MapPlotWidget(QWidget):
         return f"×10{superscript}"
 
     def _configure_colorbar(self) -> None:
-        if self.cbar is None or self.map_image is None: return
-        low, high = map(float, self.map_image.get_clim()); peak=max(abs(low),abs(high)); exponent=int(np.floor(np.log10(peak))) if np.isfinite(peak) and peak>0 else 0; scale=10.0**exponent if -300<exponent<300 else 1.0
-        # Верхние 25% шкалы резервируются под множитель; метки туда не попадают.
-        span=max(abs(high-low),1e-300); ticks=MaxNLocator(nbins=5).tick_values(low,high); ticks=ticks[(ticks>=low+span*0.04)&(ticks<=high-span*0.25)]
-        if len(ticks)>4: ticks=ticks[np.linspace(0,len(ticks)-1,4,dtype=int)]
-        if len(ticks)<2: ticks=np.linspace(low+span*0.28,high-span*0.28,3)
-        self.cbar.set_ticks(ticks); self.cbar.ax.yaxis.set_major_formatter(FuncFormatter(lambda value,_pos,denom=scale:f"{value/denom:.2f}")); self.cbar.ax.yaxis.set_ticks_position("right"); self.cbar.ax.tick_params(axis="y",which="both",labelright=True,labelleft=False,pad=1.5); self.cbar.ax.yaxis.get_offset_text().set_visible(False)
-        font=str(self._display_settings.get("font_family","Segoe UI")); size=int(self._display_settings.get("tick_size",8))
-        # Множитель занимает отдельную верхнюю строку. Метки выровнены по его левой границе.
-        if self._cbar_multiplier is None: self._cbar_multiplier=self.cbar.ax.text(1.04,0.985,"",transform=self.cbar.ax.transAxes,ha="left",va="top",clip_on=False,bbox=dict(facecolor="none",edgecolor="none",pad=0))
-        self._cbar_multiplier.set_position((1.03,0.985)); self._cbar_multiplier.set_clip_on(False); self._cbar_multiplier.set_text(self._power_label(exponent)); self._cbar_multiplier.set_fontsize(size); self._cbar_multiplier.set_fontfamily(font)
-        for tick in self.cbar.ax.yaxis.get_major_ticks(): tick.label2.set_ha("left"); tick.label2.set_x(1.03); tick.label2.set_clip_on(False); tick.label2.set_fontsize(size); tick.label2.set_fontfamily(font)
+        if self.cbar is None or self.map_image is None:
+            return
+        low, high = map(float, self.map_image.get_clim())
+        span = max(abs(high - low), 1e-300)
+        font = str(self._display_settings.get("font_family", "Segoe UI"))
+        size = int(self._display_settings.get("tick_size", 8))
+        axis = self.cbar.ax.yaxis
+        axis.set_ticks_position("right")
+        self.cbar.ax.tick_params(
+            axis="y", which="both", labelright=True, labelleft=False, pad=1.5
+        )
+        axis.get_offset_text().set_visible(False)
+
+        if self._colorbar_mode == "quantitative":
+            # Numerical workflow outputs use an ordinary linear scale. Include
+            # both exact bounds (especially zero) and do not reserve space for
+            # a scientific-notation multiplier that would hide the baseline.
+            ticks = np.linspace(low, high, 5) if high > low else np.asarray([low])
+            self.cbar.set_ticks(ticks)
+
+            def _linear_label(value, _position):
+                if abs(value) < 5e-13:
+                    value = 0.0
+                nearest = round(value)
+                return str(int(nearest)) if abs(value - nearest) <= max(1e-9, abs(value) * 1e-9) else f"{value:.3g}"
+
+            axis.set_major_formatter(FuncFormatter(_linear_label))
+            if self._cbar_multiplier is not None:
+                self._cbar_multiplier.set_visible(False)
+        else:
+            peak = max(abs(low), abs(high))
+            exponent = int(np.floor(np.log10(peak))) if np.isfinite(peak) and peak > 0 else 0
+            scale = 10.0 ** exponent if -300 < exponent < 300 else 1.0
+            # Keep legacy intensity-map formatting unchanged.
+            ticks = MaxNLocator(nbins=5).tick_values(low, high)
+            ticks = ticks[(ticks >= low + span * 0.04) & (ticks <= high - span * 0.25)]
+            if len(ticks) > 4:
+                ticks = ticks[np.linspace(0, len(ticks) - 1, 4, dtype=int)]
+            if len(ticks) < 2:
+                ticks = np.linspace(low + span * 0.28, high - span * 0.28, 3)
+            self.cbar.set_ticks(ticks)
+            axis.set_major_formatter(
+                FuncFormatter(lambda value, _pos, denom=scale: f"{value / denom:.2f}")
+            )
+            if self._cbar_multiplier is None:
+                self._cbar_multiplier = self.cbar.ax.text(
+                    1.04, 0.985, "", transform=self.cbar.ax.transAxes,
+                    ha="left", va="top", clip_on=False,
+                    bbox=dict(facecolor="none", edgecolor="none", pad=0),
+                )
+            self._cbar_multiplier.set_visible(True)
+            self._cbar_multiplier.set_position((1.03, 0.985))
+            self._cbar_multiplier.set_clip_on(False)
+            self._cbar_multiplier.set_text(self._power_label(exponent))
+            self._cbar_multiplier.set_fontsize(size)
+            self._cbar_multiplier.set_fontfamily(font)
+
+        for tick in self.cbar.ax.yaxis.get_major_ticks():
+            tick.label2.set_ha("left")
+            tick.label2.set_x(1.03)
+            tick.label2.set_clip_on(False)
+            tick.label2.set_fontsize(size)
+            tick.label2.set_fontfamily(font)
 
     def _position_contrast_controls(self, _event=None) -> None:
         """Привязывает ползунок к зазору, а кнопку — к ширине цветовой шкалы."""
@@ -888,9 +940,17 @@ class MapPlotWidget(QWidget):
         self.peak_count_legend.show_on_canvas()
         self.canvas.draw_idle()
 
-    def draw_map(self, img, title: str, cmap: str, vmin: float, vmax: float, *, x_coords=None, y_coords=None) -> None:
-        """Обновляет карту в координатах исходной detector-grid, сохраняя ROI и селектор."""
+    def draw_map(
+        self, img, title: str, cmap: str, vmin: float, vmax: float, *,
+        x_coords=None, y_coords=None, colorbar_mode: str = "continuous",
+    ) -> None:
+        """Обновляет карту detector-grid без наследования старой нормировки."""
         self._peak_map_active = False
+        mode = str(colorbar_mode).lower()
+        if mode not in {"continuous", "quantitative"}:
+            raise ValueError(f"Неизвестный режим цветовой шкалы: {colorbar_mode!r}")
+        self._colorbar_mode = mode
+        norm = Normalize(vmin=vmin, vmax=vmax, clip=False)
         self.peak_count_legend.hide_on_canvas()
         img = np.asarray(img)
         if img.ndim != 2:
@@ -910,8 +970,10 @@ class MapPlotWidget(QWidget):
             self.ax.grid(False)
             self.ax.xaxis.set_major_locator(MaxNLocator(nbins=5, integer=True)); self.ax.yaxis.set_major_locator(MaxNLocator(nbins=5, integer=True))
             self.ax.set_aspect("equal", adjustable="box"); self.ax.set_anchor("N")
-            self.map_image = self.ax.imshow(img, origin="lower", cmap=mpl_colormap(cmap), interpolation="nearest",
-                                            extent=extent, vmin=vmin, vmax=vmax)
+            self.map_image = self.ax.imshow(
+                img, origin="lower", cmap=mpl_colormap(cmap), interpolation="nearest",
+                extent=extent, norm=norm,
+            )
             self.ax.set_xlim(x_edges)
             self.ax.set_ylim(y_edges)
         else:
@@ -920,9 +982,8 @@ class MapPlotWidget(QWidget):
             self.map_image.set_data(img)
             self.map_image.set_extent(extent)
             self.map_image.set_cmap(mpl_colormap(cmap))
-            if vmin is not None and vmax is not None:
-                self.map_image.set_clim(vmin, vmax)
-            else:
+            self.map_image.set_norm(norm)
+            if vmin is None or vmax is None:
                 self.map_image.autoscale()
             self.ax.set_xlabel("Detector X (source pixels)")
             self.ax.set_ylabel("Detector Y (source pixels)")

@@ -688,6 +688,31 @@ class VTKVolumeScene:
         self._peak_marker_opacity = 0.95
         self._peak_marker_visible = False
 
+        # Branch links are an independent, lightweight line layer.  They are
+        # built from the immutable peak catalogue + branch_edges table and do
+        # not modify the scientific volume or the catalogue itself.
+        self._branch_edge_polydata = vtk.vtkPolyData()
+        self._branch_edge_mapper = vtk.vtkPolyDataMapper()
+        self._branch_edge_mapper.SetInputData(self._branch_edge_polydata)
+        self._branch_edge_mapper.SetScalarModeToUseCellData()
+        self._branch_edge_mapper.SetColorModeToDirectScalars()
+        self._branch_edge_mapper.ScalarVisibilityOn()
+        self._branch_edge_actor = vtk.vtkActor()
+        self._branch_edge_actor.SetMapper(self._branch_edge_mapper)
+        self._branch_edge_actor.SetUserMatrix(self._scene_user_matrix)
+        self._branch_edge_actor.PickableOff()
+        branch_property = self._branch_edge_actor.GetProperty()
+        branch_property.SetLighting(False)
+        branch_property.SetLineWidth(2.0)
+        self._branch_edge_actor.SetVisibility(0)
+        self.renderer.AddActor(self._branch_edge_actor)
+        self._branch_edge_positions_physical = np.empty((0, 2, 3), dtype=np.float64)
+        self._branch_edge_colors = np.empty((0, 4), dtype=np.uint8)
+        self._branch_edge_visible = False
+        self._branch_edge_width = 2.0
+        self._branch_edge_opacity = 0.92
+        self._volume_visible = True
+
         # The map cursor is an independent, narrow optical marker inside the
         # volume ray. Unlike the previous RGB tint, it contributes its own
         # alpha even when the scalar transfer function is fully transparent.
@@ -2494,6 +2519,11 @@ class VTKVolumeScene:
         self._peak_marker_positions_physical = np.empty((0, 3), dtype=np.float64)
         self._peak_marker_colors = np.empty((0, 4), dtype=np.uint8)
         self._peak_marker_visible = False
+        self._branch_edge_actor.SetVisibility(0)
+        self._branch_edge_polydata.Initialize()
+        self._branch_edge_positions_physical = np.empty((0, 2, 3), dtype=np.float64)
+        self._branch_edge_colors = np.empty((0, 4), dtype=np.uint8)
+        self._branch_edge_visible = False
         self.payload = payload
         self.grid, self.grid_info = new_grid, new_grid_info
         self.projection_grid, self.projection_info = new_projection_grid, new_projection_info
@@ -2552,6 +2582,7 @@ class VTKVolumeScene:
         self._scene_user_matrix.DeepCopy(transform)
         self.volume.SetUserMatrix(self._scene_user_matrix)
         self.renderer.AddVolume(self.volume)
+        self.volume.SetVisibility(1 if self._volume_visible else 0)
         self._install_theta_slice_shader()
 
         projection_min = float(self.projection_info.get("display_scalar_min", self.projection_info["scalar_min"]))
@@ -2927,8 +2958,9 @@ class VTKVolumeScene:
         """Stable categorical RGBA colours keyed by integer branch_id."""
         import colorsys
 
-        palette = np.empty((branch_ids.size, 4), dtype=np.uint8)
-        for row, value in enumerate(branch_ids):
+        ids = np.asarray(branch_ids, dtype=np.int64).reshape(-1)
+        palette = np.empty((ids.size, 4), dtype=np.uint8)
+        for row, value in enumerate(ids):
             hue = (int(value) * 0.618033988749895) % 1.0
             red, green, blue = colorsys.hsv_to_rgb(hue, 0.72, 1.0)
             palette[row] = (
@@ -2936,6 +2968,105 @@ class VTKVolumeScene:
                 int(round(blue * 255)), 255,
             )
         return palette
+
+    @staticmethod
+    def _numeric_column(values: Any) -> np.ndarray:
+        """Convert a nullable table column to float, mapping missing values to NaN.
+
+        Pandas nullable dtypes (for example ``Int64`` with ``pd.NA``) cannot
+        always be passed directly to ``np.asarray(..., dtype=float)``.  Keep
+        this conversion local to the presentation adapter and never mutate the
+        source catalogue.
+        """
+        if hasattr(values, "to_numpy"):
+            try:
+                return np.asarray(values.to_numpy(dtype=np.float64, na_value=np.nan), dtype=np.float64)
+            except (TypeError, ValueError):
+                pass
+        raw = np.asarray(values, dtype=object).reshape(-1)
+        result = np.empty(raw.size, dtype=np.float64)
+        for index, value in enumerate(raw):
+            try:
+                result[index] = float(value)
+            except (TypeError, ValueError, OverflowError):
+                result[index] = np.nan
+        return result
+
+    @staticmethod
+    def _hex_rgba(color: str) -> np.ndarray:
+        """Validate a user-selected #RRGGBB colour and return opaque RGBA."""
+        raw_hex = str(color).strip().lstrip("#")
+        if len(raw_hex) != 6:
+            raise ValueError(f"Некорректный цвет маркеров: {color!r}")
+        try:
+            rgb = tuple(int(raw_hex[index:index + 2], 16) for index in (0, 2, 4))
+        except ValueError as exc:
+            raise ValueError(f"Некорректный цвет маркеров: {color!r}") from exc
+        return np.asarray([*rgb, 255], dtype=np.uint8)
+
+    def _peak_catalog_geometry(
+        self, peak_catalog: Any | None, x_coords: Any, y_coords: Any,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return ROI-clipped physical peak XYZ positions and source row indices."""
+        if peak_catalog is None or getattr(peak_catalog, "empty", False):
+            return np.empty((0, 3), dtype=np.float64), np.empty(0, dtype=np.int64)
+        columns = set(getattr(peak_catalog, "columns", ()))
+        missing = {"x", "y", "theta"}.difference(columns)
+        if missing:
+            raise ValueError(f"Каталог центров пиков не содержит столбцы {sorted(missing)}")
+        source_x = np.asarray(x_coords, dtype=np.float64)
+        source_y = np.asarray(y_coords, dtype=np.float64)
+        if source_x.ndim != 1 or source_y.ndim != 1:
+            raise ValueError("Координаты исходной детекторной сетки должны быть одномерными")
+        x_index = self._numeric_column(peak_catalog["x"])
+        y_index = self._numeric_column(peak_catalog["y"])
+        theta = self._numeric_column(peak_catalog["theta"])
+        finite = np.isfinite(x_index) & np.isfinite(y_index) & np.isfinite(theta)
+        integer = (x_index == np.rint(x_index)) & (y_index == np.rint(y_index))
+        in_range = (
+            (x_index >= 0) & (x_index < source_x.size)
+            & (y_index >= 0) & (y_index < source_y.size)
+        )
+        valid_rows = np.flatnonzero(finite & integer & in_range)
+        if valid_rows.size == 0:
+            return np.empty((0, 3), dtype=np.float64), valid_rows
+        xi = np.rint(x_index[valid_rows]).astype(np.int64)
+        yi = np.rint(y_index[valid_rows]).astype(np.int64)
+        physical = np.column_stack((source_x[xi], source_y[yi], theta[valid_rows]))
+        # An ROI-specific volume may expose a strict sub-grid. Apply the same
+        # physical bounds to points and links, including the theta dimension.
+        if self._physical_x is not None and self._physical_y is not None:
+            in_roi = (
+                (physical[:, 0] >= self._physical_x[0])
+                & (physical[:, 0] <= self._physical_x[-1])
+                & (physical[:, 1] >= self._physical_y[0])
+                & (physical[:, 1] <= self._physical_y[-1])
+            )
+            if self._physical_theta is not None:
+                in_roi &= (
+                    (physical[:, 2] >= self._physical_theta[0])
+                    & (physical[:, 2] <= self._physical_theta[-1])
+                )
+            physical = physical[in_roi]
+            valid_rows = valid_rows[in_roi]
+        return np.ascontiguousarray(physical, dtype=np.float64), valid_rows
+
+    @staticmethod
+    def _stable_id_key(value: Any) -> Any:
+        """Normalize scalar catalogue IDs without conflating distinct strings."""
+        if isinstance(value, np.generic):
+            value = value.item()
+        if value is None or type(value).__name__ in {"NAType", "NaTType"}:
+            return None
+        if isinstance(value, (int, np.integer)):
+            return int(value)
+        if isinstance(value, (float, np.floating)):
+            if not np.isfinite(value):
+                return None
+            if float(value).is_integer():
+                return int(value)
+            return float(value)
+        return value if value is not None else None
 
     def set_peak_markers(
         self,
@@ -2950,12 +3081,11 @@ class VTKVolumeScene:
         uniform_color: str = "#FFC857",
         render: bool = True,
     ) -> int:
-        """Set physical peak centres as a display-only VTK point layer.
+        """Set detected/fitted peak centres as a separate display-only layer.
 
-        Catalog x/y are integer indices into the source detector axes. They are
-        converted once to physical coordinates; display-only axis scaling is
-        reapplied from those immutable physical positions by
-        :meth:`_update_peak_marker_geometry`.
+        Missing ``branch_id`` values deliberately keep the uniform fallback
+        colour.  They are not filtered out: colouring is a presentation choice,
+        never a data-validity condition.
         """
         try:
             point_size = float(point_size)
@@ -2971,73 +3101,17 @@ class VTKVolumeScene:
         self._peak_marker_opacity = opacity
         self._peak_marker_actor.GetProperty().SetPointSize(point_size)
         self._peak_marker_actor.GetProperty().SetOpacity(opacity)
-
-        if peak_catalog is None or getattr(peak_catalog, "empty", False):
-            physical = np.empty((0, 3), dtype=np.float64)
-            colors = np.empty((0, 4), dtype=np.uint8)
-        else:
-            columns = set(getattr(peak_catalog, "columns", ()))
-            required = {"x", "y", "theta"}
-            missing = required.difference(columns)
-            if missing:
-                raise ValueError(
-                    f"Каталог центров пиков не содержит столбцы {sorted(missing)}"
+        physical, valid_rows = self._peak_catalog_geometry(peak_catalog, x_coords, y_coords)
+        fallback = self._hex_rgba(uniform_color)
+        colors = np.repeat(fallback[None, :], physical.shape[0], axis=0)
+        columns = set(getattr(peak_catalog, "columns", ())) if peak_catalog is not None else set()
+        if color_by_branch and "branch_id" in columns and physical.shape[0]:
+            branch_values = self._numeric_column(peak_catalog["branch_id"])[valid_rows]
+            branch_valid = np.isfinite(branch_values)
+            if np.any(branch_valid):
+                colors[branch_valid] = self._branch_rgba(
+                    np.rint(branch_values[branch_valid]).astype(np.int64)
                 )
-            source_x = np.asarray(x_coords, dtype=np.float64)
-            source_y = np.asarray(y_coords, dtype=np.float64)
-            if source_x.ndim != 1 or source_y.ndim != 1:
-                raise ValueError("Координаты исходной детекторной сетки должны быть одномерными")
-            x_index = np.asarray(peak_catalog["x"], dtype=np.float64)
-            y_index = np.asarray(peak_catalog["y"], dtype=np.float64)
-            theta = np.asarray(peak_catalog["theta"], dtype=np.float64)
-            finite = np.isfinite(x_index) & np.isfinite(y_index) & np.isfinite(theta)
-            integer = (x_index == np.rint(x_index)) & (y_index == np.rint(y_index))
-            in_range = (
-                (x_index >= 0) & (x_index < source_x.size)
-                & (y_index >= 0) & (y_index < source_y.size)
-            )
-            valid = finite & integer & in_range
-            if not np.any(valid):
-                physical = np.empty((0, 3), dtype=np.float64)
-                colors = np.empty((0, 4), dtype=np.uint8)
-            else:
-                xi = np.rint(x_index[valid]).astype(np.int64)
-                yi = np.rint(y_index[valid]).astype(np.int64)
-                physical = np.column_stack((source_x[xi], source_y[yi], theta[valid]))
-                # An ROI-specific volume may expose a strict sub-grid. Do not
-                # place peaks outside the currently displayed spatial extent.
-                if self._physical_x is not None and self._physical_y is not None:
-                    spatial = (
-                        (physical[:, 0] >= self._physical_x[0])
-                        & (physical[:, 0] <= self._physical_x[-1])
-                        & (physical[:, 1] >= self._physical_y[0])
-                        & (physical[:, 1] <= self._physical_y[-1])
-                    )
-                    if self._physical_theta is not None:
-                        spatial &= (
-                            (physical[:, 2] >= self._physical_theta[0])
-                            & (physical[:, 2] <= self._physical_theta[-1])
-                        )
-                    physical = physical[spatial]
-                    valid_rows = np.flatnonzero(valid)[spatial]
-                else:
-                    valid_rows = np.flatnonzero(valid)
-                if color_by_branch and "branch_id" in columns and physical.size:
-                    branch_values = np.asarray(peak_catalog["branch_id"], dtype=np.float64)[valid_rows]
-                    branch_valid = np.isfinite(branch_values)
-                    physical = physical[branch_valid]
-                    branch_values = np.rint(branch_values[branch_valid]).astype(np.int64)
-                    colors = self._branch_rgba(branch_values)
-                else:
-                    raw_hex = str(uniform_color).strip().lstrip("#")
-                    if len(raw_hex) != 6:
-                        raise ValueError(f"Некорректный цвет маркеров: {uniform_color!r}")
-                    try:
-                        rgb = tuple(int(raw_hex[index:index + 2], 16) for index in (0, 2, 4))
-                    except ValueError as exc:
-                        raise ValueError(f"Некорректный цвет маркеров: {uniform_color!r}") from exc
-                    rgba = np.asarray([*rgb, 255], dtype=np.uint8)
-                    colors = np.repeat(rgba[None, :], physical.shape[0], axis=0)
 
         if physical.shape[0] > 150_000:
             # Deterministic display-only thinning. Scientific catalogues remain
@@ -3054,6 +3128,170 @@ class VTKVolumeScene:
         if render:
             self._request_render()
         return int(physical.shape[0])
+
+    def set_branch_edges(
+        self,
+        peak_catalog: Any | None,
+        branch_edges: Any | None,
+        x_coords: Any,
+        y_coords: Any,
+        *,
+        visible: bool = False,
+        color_by_branch: bool = True,
+        uniform_color: str = "#53C6D8",
+        line_width: float = 2.0,
+        opacity: float = 0.92,
+        render: bool = True,
+    ) -> int:
+        """Build one VTK line per valid ``branch_edges`` peak-id pair."""
+        try:
+            line_width = float(line_width)
+            opacity = float(opacity)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("Толщина и непрозрачность связей должны быть числами") from exc
+        if not np.isfinite(line_width) or not (0.5 <= line_width <= 8.0):
+            raise ValueError("Толщина связей должна находиться в диапазоне 0.5–8 px")
+        if not np.isfinite(opacity) or not (0.05 <= opacity <= 1.0):
+            raise ValueError("Непрозрачность связей должна находиться в диапазоне 0.05–1.0")
+        self._branch_edge_width = line_width
+        self._branch_edge_opacity = opacity
+        prop = self._branch_edge_actor.GetProperty()
+        prop.SetLineWidth(line_width)
+        prop.SetOpacity(opacity)
+
+        edge_columns = set(getattr(branch_edges, "columns", ())) if branch_edges is not None else set()
+        catalog_columns = set(getattr(peak_catalog, "columns", ())) if peak_catalog is not None else set()
+        if (
+            branch_edges is None or getattr(branch_edges, "empty", False)
+            or not {"peak_id_a", "peak_id_b"}.issubset(edge_columns)
+            or "peak_id" not in catalog_columns
+        ):
+            positions = np.empty((0, 2, 3), dtype=np.float64)
+            colors = np.empty((0, 4), dtype=np.uint8)
+        else:
+            peak_positions, valid_rows = self._peak_catalog_geometry(
+                peak_catalog, x_coords, y_coords
+            )
+            ids = np.asarray(peak_catalog["peak_id"], dtype=object)[valid_rows]
+            position_by_id = {}
+            for peak_id, position in zip(ids, peak_positions):
+                key = self._stable_id_key(peak_id)
+                if key is not None:
+                    position_by_id[key] = position
+            branch_by_id = {}
+            if "branch_id" in catalog_columns:
+                raw_branch_ids = self._numeric_column(peak_catalog["branch_id"])[valid_rows]
+                for peak_id, branch_id in zip(ids, raw_branch_ids):
+                    key = self._stable_id_key(peak_id)
+                    if key is not None and np.isfinite(branch_id):
+                        branch_by_id[key] = int(round(float(branch_id)))
+            edge_a = np.asarray(branch_edges["peak_id_a"], dtype=object)
+            edge_b = np.asarray(branch_edges["peak_id_b"], dtype=object)
+            valid_pairs = []
+            branch_values = []
+            for left, right in zip(edge_a, edge_b):
+                key_a, key_b = self._stable_id_key(left), self._stable_id_key(right)
+                if key_a not in position_by_id or key_b not in position_by_id:
+                    continue
+                valid_pairs.append((position_by_id[key_a], position_by_id[key_b]))
+                branch_values.append(branch_by_id.get(key_a))
+                if len(valid_pairs) >= 200_000:
+                    break
+            positions = (
+                np.asarray(valid_pairs, dtype=np.float64).reshape(-1, 2, 3)
+                if valid_pairs else np.empty((0, 2, 3), dtype=np.float64)
+            )
+            fallback = self._hex_rgba(uniform_color)
+            colors = np.repeat(fallback[None, :], len(valid_pairs), axis=0)
+            if color_by_branch and colors.size:
+                branch_numeric = np.asarray([
+                    np.nan if value is None else float(value) for value in branch_values
+                ], dtype=np.float64)
+                branch_valid = np.isfinite(branch_numeric)
+                if np.any(branch_valid):
+                    colors[branch_valid] = self._branch_rgba(
+                        np.rint(branch_numeric[branch_valid]).astype(np.int64)
+                    )
+        # Actor property opacity is applied globally; preserve per-cell alpha
+        # in the direct RGBA array as fully opaque to avoid accidental squaring.
+        if colors.size:
+            colors[:, 3] = 255
+        self._branch_edge_positions_physical = np.ascontiguousarray(positions, dtype=np.float64)
+        self._branch_edge_colors = np.ascontiguousarray(colors, dtype=np.uint8)
+        self._update_branch_edge_polydata()
+        self._branch_edge_visible = bool(visible and positions.shape[0] > 0)
+        self._branch_edge_actor.SetVisibility(self._branch_edge_visible)
+        if render:
+            self._request_render()
+        return int(positions.shape[0])
+
+    def _update_branch_edge_polydata(self) -> None:
+        """Rebuild VTK line cells using physical endpoints + display scaling."""
+        vtk, numpy_to_vtk = _vtk()
+        edges = self._branch_edge_positions_physical
+        count = int(edges.shape[0])
+        if count == 0:
+            self._branch_edge_polydata.Initialize()
+            self._branch_edge_polydata.Modified()
+            return
+        display = edges.copy()
+        for column, axis, factor in zip(
+            range(3), (self._physical_x, self._physical_y, self._physical_theta),
+            self._axis_scales,
+        ):
+            center = 0.5 * (float(axis[0]) + float(axis[-1]))
+            display[:, :, column] = center + (display[:, :, column] - center) * float(factor)
+        vtk_points = vtk.vtkPoints()
+        vtk_points.SetData(numpy_to_vtk(np.ascontiguousarray(display.reshape(-1, 3)), deep=True))
+        self._branch_edge_polydata.SetPoints(vtk_points)
+        cells = vtk.vtkCellArray()
+        from vtk.util.numpy_support import numpy_to_vtkIdTypeArray
+        offsets = numpy_to_vtkIdTypeArray(np.arange(count + 1, dtype=np.int64) * 2, deep=True)
+        connectivity = numpy_to_vtkIdTypeArray(np.arange(count * 2, dtype=np.int64), deep=True)
+        cells.SetData(offsets, connectivity)
+        self._branch_edge_polydata.SetLines(cells)
+        rgba = numpy_to_vtk(np.ascontiguousarray(self._branch_edge_colors), deep=True)
+        rgba.SetNumberOfComponents(4)
+        rgba.SetName("BranchEdgeRGBA")
+        self._branch_edge_polydata.GetCellData().SetScalars(rgba)
+        self._branch_edge_polydata.Modified()
+
+    def set_branch_edges_visible(self, visible: bool, *, render: bool = True) -> None:
+        self._branch_edge_visible = bool(visible and self._branch_edge_positions_physical.size)
+        self._branch_edge_actor.SetVisibility(self._branch_edge_visible)
+        if render:
+            self._request_render()
+
+    def set_branch_edge_settings(
+        self, *, line_width: float | None = None, opacity: float | None = None,
+        render: bool = True,
+    ) -> None:
+        if line_width is not None:
+            value = float(line_width)
+            if not np.isfinite(value) or not (0.5 <= value <= 8.0):
+                raise ValueError("Толщина связей должна находиться в диапазоне 0.5–8 px")
+            self._branch_edge_width = value
+            self._branch_edge_actor.GetProperty().SetLineWidth(value)
+        if opacity is not None:
+            value = float(opacity)
+            if not np.isfinite(value) or not (0.05 <= value <= 1.0):
+                raise ValueError("Непрозрачность связей должна находиться в диапазоне 0.05–1.0")
+            self._branch_edge_opacity = value
+            self._branch_edge_actor.GetProperty().SetOpacity(value)
+        if render:
+            self._request_render()
+
+    def set_volume_visible(self, visible: bool, *, render: bool = True) -> None:
+        """Show/hide the volume without affecting independent point/edge layers."""
+        self._volume_visible = bool(visible)
+        if self.volume is not None:
+            self.volume.SetVisibility(1 if self._volume_visible else 0)
+        if render:
+            self._request_render()
+
+    @property
+    def volume_visible(self) -> bool:
+        return bool(self._volume_visible)
 
     def _update_peak_marker_polydata(self) -> None:
         """Replace VTK point and vertex buffers from retained physical arrays."""
@@ -3269,6 +3507,7 @@ class VTKVolumeScene:
             self._update_theta_slice_shader_uniforms()
             self._update_theta_slice_marker_geometry()
             self._update_peak_marker_polydata()
+            self._update_branch_edge_polydata()
             self._update_cursor_line_shader_uniforms()
             self._apply_theta_display_crop()
             self._update_theta_boundary_planes()
@@ -3906,6 +4145,12 @@ class VTKVolumeScene:
         self._peak_marker_positions_physical = np.empty((0, 3), dtype=np.float64)
         self._peak_marker_colors = np.empty((0, 4), dtype=np.uint8)
         self._peak_marker_visible = False
+        if self._branch_edge_actor is not None:
+            self._branch_edge_actor.SetVisibility(0)
+            self._branch_edge_polydata.Initialize()
+        self._branch_edge_positions_physical = np.empty((0, 2, 3), dtype=np.float64)
+        self._branch_edge_colors = np.empty((0, 4), dtype=np.uint8)
+        self._branch_edge_visible = False
         self._cursor_line_enabled = False
         self._cursor_line_position = None
         self._cursor_line_radii = None
@@ -3951,6 +4196,7 @@ class VTKVolumeScene:
             self._theta_boundary_plane_actor,
             self._theta_slice_marker_actor,
             self._peak_marker_actor,
+            self._branch_edge_actor,
         ):
             if prop is not None:
                 prop.SetVisibility(0)

@@ -51,6 +51,7 @@ class WorkflowPreviewState:
     analysis_valid_mask_yx: np.ndarray | None = None
     peak_points: Any | None = None
     peak_position_kind: str = "detected"
+    branch_edges: Any | None = None
 
     def map_layer(self, key: str | None = None) -> PreviewMapLayer:
         selected = str(key or self.default_map_key)
@@ -507,7 +508,15 @@ def build_workflow_preview_state(
     branch_catalog = _table(branches, "branch_catalog")
     if branch_catalog is not None and not getattr(branch_catalog, "empty", True):
         if {"x", "y", "branch_id"}.issubset(branch_catalog.columns):
-            branch_counts = np.full((ny, nx), np.nan, dtype=np.float64)
+            # A valid detector pixel with no branch is exactly zero branches,
+            # not missing data. NaN is reserved for pixels outside the valid
+            # analysis mask so the quantitative cbar has a truthful zero end.
+            branch_counts = np.zeros((ny, nx), dtype=np.float64)
+            if analysis_valid is not None:
+                branch_counts[~analysis_valid] = np.nan
+            else:
+                valid_pixels = np.any(effective_valid, axis=2)
+                branch_counts[~valid_pixels] = np.nan
             grouped = branch_catalog.groupby(["y", "x"], sort=False)["branch_id"].nunique()
             for (y_value, x_value), count in grouped.items():
                 try:
@@ -524,6 +533,7 @@ def build_workflow_preview_state(
 
     peak_points = None
     peak_position_kind = "detected"
+    branch_edges = _table(branches, "branch_edges") if branches is not None else None
     if branch_catalog is not None and not getattr(branch_catalog, "empty", True):
         peak_points = branch_catalog
         peak_position_kind = str(getattr(branches, "metadata", {}).get("position_kind", "detected"))
@@ -626,4 +636,5 @@ def build_workflow_preview_state(
         analysis_valid_mask_yx=analysis_valid,
         peak_points=peak_points,
         peak_position_kind=peak_position_kind,
+        branch_edges=branch_edges,
     )
