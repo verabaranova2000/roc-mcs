@@ -283,17 +283,31 @@ class _BranchStatsTask(QRunnable):
     def run(self) -> None:
         try:
             from roc_mcs.peaks.branches import summarize_peak_spacing, fitted_peak_positions
+            from .branch_preview_data import select_preview_patch
+
             bundle = ArtifactStore(self.artifact_directory).read(self.artifact_id)
             if self.parent_operation == "fit.scan":
                 catalog = fitted_peak_positions(bundle)
+                position_label = "позиции после Fit"
             else:
                 catalog = bundle.tables.get("peak_catalog")
                 if catalog is None:
                     raise ValueError("В артефакте поиска пиков отсутствует peak_catalog")
                 if getattr(catalog, "empty", False):
                     raise ValueError("Каталог пиков пуст: для диагностики ветвей нет peak-events")
+                position_label = "обнаруженные пики"
             stats = summarize_peak_spacing(catalog, reference_theta_gate=60.0)
-            self.signals.succeeded.emit(self.parent_id, stats)
+            preview_catalog, preview_info = select_preview_patch(catalog)
+            preview_rows = [
+                (int(row.peak_id), int(row.x), int(row.y), float(row.theta))
+                for row in preview_catalog.itertuples(index=False)
+            ]
+            self.signals.succeeded.emit(self.parent_id, {
+                "stats": stats,
+                "preview_rows": preview_rows,
+                "preview_info": preview_info,
+                "position_label": position_label,
+            })
         except Exception:
             self.signals.failed.emit(self.parent_id, traceback.format_exc())
 
@@ -1127,18 +1141,23 @@ class ProcessingWorkbenchWidget(QWidget):
         layout.addRow(preview)
 
         diagnostics = QLabel(
-            "Как читать параметр: для каждой пары соседних пикселей алгоритм строит "
-            "взаимно-однозначное сопоставление пиков с минимальным |Δθ|. Связь входит "
-            "в граф ветвей, только если |Δθ| не превышает θ-gate. Увеличение gate "
-            "добавляет допустимые рёбра; уменьшение оставляет только более близкие пики."
+            "Точки — реальные пики выбранного участка скана; X/Y — соседство пикселей, "
+            "высота — θ. Цветные ленты показывают принятые связи, а оранжевый пунктир — "
+            "минимальные взаимно-однозначные назначения, которые порог отверг. "
+            "При увеличении θ-gate часть пунктирных связей станет сплошной, а отдельные "
+            "компоненты могут объединиться. Цвет показывает локальную компоненту, "
+            "а площадка появляется только для подтверждённой ячейки 2×2. Пересечение "
+            "проекций линий не означает общий пик. Данные не прореживаются."
         )
         diagnostics.setWordWrap(True)
         diagnostics.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         diagnostics.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         diagnostics.setToolTip(
-            "Миниатюра выше показывает синтетическую пару соседних пикселей и работает "
-            "через тот же match_neighbor_peaks(), что и алгоритм. Она объясняет правило, "
-            "но не заменяет просмотр результата на данных скана."
+            "Миниатюра вычисляется на реальных peak-events небольшого непрерывного "
+            "фрагмента выбранного результата. Для каждой пары соседних пикселей "
+            "используется тот же Hungarian one-to-one matcher, что и в production-алгоритме. "
+            "Показанные компоненты локальны для миниатюры и не являются итоговыми "
+            "глобальными branch_id всего скана."
         )
         layout.addRow(diagnostics)
 
@@ -1199,6 +1218,9 @@ class ProcessingWorkbenchWidget(QWidget):
         form = self._forms.get("peaks.branches", {})
         label = form.get("stats_label")
         table = form.get("stats_table")
+        preview = form.get("preview")
+        if preview is not None:
+            preview.clear_catalog("Загрузка реального фрагмента каталога пиков…")
         if table is not None:
             # Never leave another scan's diagnostic rows visible while this
             # parent's statistics are being computed or if loading fails.
@@ -1208,6 +1230,8 @@ class ProcessingWorkbenchWidget(QWidget):
         if not artifact_id:
             if label is not None:
                 label.setText("У выбранного родителя нет сохранённого каталога пиков.")
+            if preview is not None:
+                preview.clear_catalog("У выбранного родителя нет каталога пиков для иллюстрации.")
             return
         task = _BranchStatsTask(
             parent_id, node.operation_id, artifact_id,
@@ -1243,6 +1267,26 @@ class ProcessingWorkbenchWidget(QWidget):
         table = form.get("stats_table")
         if label is None or table is None:
             return
+        result = stats if isinstance(stats, dict) else {}
+        preview = form.get("preview")
+        if "stats" in result:
+            try:
+                import pandas as pd
+                preview_rows = result.get("preview_rows", ())
+                preview_catalog = pd.DataFrame(
+                    preview_rows, columns=("peak_id", "x", "y", "theta")
+                )
+                source_label = str(result.get("position_label", "пики"))
+                preview_info = dict(result.get("preview_info", {}))
+                preview_info["position_label"] = source_label
+                if preview is not None:
+                    preview.set_catalog(preview_catalog, preview_info)
+            except Exception as exc:
+                if preview is not None:
+                    preview.clear_catalog(
+                        f"Не удалось подготовить иллюстрацию: {type(exc).__name__}: {exc}"
+                    )
+            stats = result["stats"]
         q90 = stats.get("q90_neighbor_delta")
         minimum = stats.get("min_internal_gap")
         suggested = float(stats.get("recommended_theta_gate", 60.0))
@@ -1294,8 +1338,11 @@ class ProcessingWorkbenchWidget(QWidget):
         form = self._forms.get("peaks.branches", {})
         label = form.get("stats_label")
         table = form.get("stats_table")
+        preview = form.get("preview")
         if table is not None:
             table.setRowCount(0)
+        if preview is not None:
+            preview.clear_catalog("Не удалось загрузить каталог из выбранной ветви workflow.")
         if label is not None:
             label.setText("Не удалось вычислить статистику θ; доступно исходное значение 60″.")
             label.setToolTip(error)

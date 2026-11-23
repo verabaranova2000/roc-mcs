@@ -375,7 +375,12 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
             self.roi_preview_mode.addItem(label, value)
         roi = self._settings_panel(("Непрозрачность", self.roi_preview_opacity), ("Подсветка", self.roi_preview_strength), ("Режим", self.roi_preview_mode))
 
-        self.peak_marker_size = self._spin(1.0, 20.0, 5.0, 0, " px", step=1.0)
+        self.peak_marker_size = self._spin(1.0, 20.0, 7.0, 0, " px", step=1.0)
+        self.peak_marker_size.setToolTip(
+            "Диаметр сферических центров в экранных пикселях. Размер автоматически "
+            "пересчитывается при приближении, повороте и изменении размера 3D-окна; "
+            "угловой масштаб θ не делает маркеры микроскопическими."
+        )
         self.peak_marker_opacity = self._spin(0.05, 1.0, 0.95, 2, step=0.05)
         self.peak_color_by_branch = QtWidgets.QCheckBox("Цвет по branch_id")
         self.peak_color_by_branch.setChecked(True)
@@ -824,7 +829,14 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
         if self._roi_preview is not None:
             self._update_roi_preview()
         self._render()
-        marker_status = f" · центров пиков {marker_count:,} ({self._peak_position_kind})" if marker_count else ""
+        marker_status = ""
+        if marker_count:
+            marker_state = "показаны" if bool(self._scene._peak_marker_actor.GetVisibility()) else "скрыты"
+            marker_size_px = float(getattr(self._scene, "_peak_marker_size", self.peak_marker_size.value()))
+            marker_status = (
+                f" · центров пиков {marker_count:,} ({self._peak_position_kind}; "
+                f"{marker_state}; Ø={marker_size_px:g} px)"
+            )
         edge_status = f" · связей ветвей {branch_edge_count:,}" if branch_edge_count else ""
         status_text = (
             f"{payload.scan_key} · {payload.view_mode} · {payload.shape} · "
@@ -1482,6 +1494,23 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
             self._peak_overlay_preference = bool(enabled)
             if self._scene is not None:
                 self._scene.set_peak_markers_visible(bool(enabled), render=False)
+                marker_count = int(self._scene._peak_marker_polydata.GetNumberOfPoints())
+                logger.info(
+                    "3D peak-centre overlay toggled: requested=%s visible=%s "
+                    "count=%d mapper=%s diameter_px=%.3g world_radius_range=%s bounds=%s",
+                    bool(enabled), bool(self._scene._peak_marker_actor.GetVisibility()),
+                    marker_count, self._scene._peak_marker_mapper.GetClassName(),
+                    float(self._scene._peak_marker_size),
+                    tuple(float(v) for v in getattr(self._scene, "_peak_marker_world_radius_range", ())),
+                    self._scene._peak_marker_actor.GetBounds(),
+                )
+                status_text = self.status.text()
+                new_state = "показаны" if enabled else "скрыты"
+                for old_state in ("показаны", "скрыты"):
+                    status_text = status_text.replace(
+                        f"; {old_state}; Ø=", f"; {new_state}; Ø=", 1
+                    )
+                self.status.setText(status_text)
                 self._render()
         elif key == "branches":
             self._branch_overlay_preference = bool(enabled)

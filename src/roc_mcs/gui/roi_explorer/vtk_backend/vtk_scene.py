@@ -664,8 +664,27 @@ class VTKVolumeScene:
         self._peak_marker_points = vtk.vtkPoints()
         self._peak_marker_points.SetDataTypeToDouble()
         self._peak_marker_polydata.SetPoints(self._peak_marker_points)
-        self._peak_marker_mapper = vtk.vtkPolyDataMapper()
+        # Use instanced sphere geometry rather than GL point-sprites.  Point
+        # sprites depend on driver-specific point-size limits and can disappear
+        # in embedded Qt/VTK contexts even while line overlays render correctly.
+        # vtkGlyph3DMapper renders each event as a real, depth-tested 3D sphere.
+        self._peak_marker_glyph_source = vtk.vtkSphereSource()
+        self._peak_marker_glyph_source.SetRadius(1.0)
+        self._peak_marker_glyph_source.SetThetaResolution(16)
+        self._peak_marker_glyph_source.SetPhiResolution(12)
+        self._peak_marker_glyph_source.Update()
+        self._peak_marker_mapper = vtk.vtkGlyph3DMapper()
         self._peak_marker_mapper.SetInputData(self._peak_marker_polydata)
+        self._peak_marker_mapper.SetSourceConnection(
+            self._peak_marker_glyph_source.GetOutputPort()
+        )
+        # The per-point scale array is refreshed from the active camera so the
+        # requested marker diameter is measured in actual screen pixels. A
+        # single world-space radius would shrink/grow with zoom and would be
+        # especially misleading across the angular (theta) axis.
+        self._peak_marker_mapper.SetScaleModeToScaleByMagnitude()
+        self._peak_marker_mapper.SetScaleArray("PeakMarkerGlyphScale")
+        self._peak_marker_mapper.SetScaleFactor(0.1)
         self._peak_marker_mapper.SetScalarModeToUsePointData()
         self._peak_marker_mapper.SetColorModeToDirectScalars()
         self._peak_marker_mapper.ScalarVisibilityOn()
@@ -674,19 +693,25 @@ class VTKVolumeScene:
         self._peak_marker_actor.SetUserMatrix(self._scene_user_matrix)
         self._peak_marker_actor.PickableOff()
         peak_property = self._peak_marker_actor.GetProperty()
-        peak_property.SetRepresentationToPoints()
-        peak_property.SetPointSize(5.0)
         peak_property.SetOpacity(0.95)
-        peak_property.SetLighting(False)
-        if hasattr(peak_property, "SetRenderPointsAsSpheres"):
-            peak_property.SetRenderPointsAsSpheres(True)
+        peak_property.SetLighting(True)
+        peak_property.SetAmbient(0.78)
+        peak_property.SetDiffuse(0.22)
+        peak_property.SetSpecular(0.12)
+        peak_property.SetSpecularPower(18.0)
         self._peak_marker_actor.SetVisibility(0)
-        self.renderer.AddActor(self._peak_marker_actor)
         self._peak_marker_positions_physical = np.empty((0, 3), dtype=np.float64)
+        self._peak_marker_display_positions = np.empty((0, 3), dtype=np.float64)
         self._peak_marker_colors = np.empty((0, 4), dtype=np.uint8)
-        self._peak_marker_size = 5.0
+        self._peak_marker_scale_values = np.empty(0, dtype=np.float64)
+        self._peak_marker_size = 7.0
         self._peak_marker_opacity = 0.95
+        self._peak_marker_world_radius = 0.1
+        self._peak_marker_world_radius_range = (0.1, 0.1)
+        self._peak_marker_reference_pitch = 0.0
         self._peak_marker_visible = False
+        self._peak_marker_camera_observer_id = None
+        self._peak_marker_resize_observer_id = None
 
         # Branch links are an independent, lightweight line layer.  They are
         # built from the immutable peak catalogue + branch_edges table and do
@@ -706,6 +731,9 @@ class VTKVolumeScene:
         branch_property.SetLineWidth(2.0)
         self._branch_edge_actor.SetVisibility(0)
         self.renderer.AddActor(self._branch_edge_actor)
+        # Add node glyphs after links: opaque spheres then sit clearly on top of
+        # their incident line endpoints and make graph vertices unambiguous.
+        self.renderer.AddActor(self._peak_marker_actor)
         self._branch_edge_positions_physical = np.empty((0, 2, 3), dtype=np.float64)
         self._branch_edge_colors = np.empty((0, 4), dtype=np.uint8)
         self._branch_edge_visible = False
@@ -914,6 +942,23 @@ class VTKVolumeScene:
             )
         except Exception:
             self._camera_observer_id = None
+
+        # Keep the screen-pixel diameter invariant while the camera zooms,
+        # rotates, switches projection, or the embedded viewport is resized.
+        # Observers are owned and explicitly removed by close().
+        try:
+            active_camera = self.renderer.GetActiveCamera()
+            self._peak_marker_camera_observer_id = active_camera.AddObserver(
+                "ModifiedEvent", self._on_peak_marker_view_changed
+            )
+        except Exception:
+            self._peak_marker_camera_observer_id = None
+        try:
+            self._peak_marker_resize_observer_id = self.render_window.AddObserver(
+                "WindowResizeEvent", self._on_peak_marker_view_changed
+            )
+        except Exception:
+            self._peak_marker_resize_observer_id = None
 
     @staticmethod
     def _rgb(hex_color: str) -> tuple[float, float, float]:
@@ -3075,7 +3120,7 @@ class VTKVolumeScene:
         y_coords: Any,
         *,
         visible: bool = False,
-        point_size: float = 5.0,
+        point_size: float = 7.0,
         opacity: float = 0.95,
         color_by_branch: bool = True,
         uniform_color: str = "#FFC857",
@@ -3093,13 +3138,12 @@ class VTKVolumeScene:
         except (TypeError, ValueError, OverflowError) as exc:
             raise ValueError("Размер и непрозрачность маркеров должны быть числами") from exc
         if not np.isfinite(point_size) or not (1.0 <= point_size <= 20.0):
-            raise ValueError("Размер маркеров должен находиться в диапазоне 1–20 px")
+            raise ValueError("Диаметр маркеров должен находиться в диапазоне 1–20 px")
         if not np.isfinite(opacity) or not (0.05 <= opacity <= 1.0):
             raise ValueError("Непрозрачность маркеров должна находиться в диапазоне 0.05–1.0")
 
         self._peak_marker_size = point_size
         self._peak_marker_opacity = opacity
-        self._peak_marker_actor.GetProperty().SetPointSize(point_size)
         self._peak_marker_actor.GetProperty().SetOpacity(opacity)
         physical, valid_rows = self._peak_catalog_geometry(peak_catalog, x_coords, y_coords)
         fallback = self._hex_rgba(uniform_color)
@@ -3293,15 +3337,179 @@ class VTKVolumeScene:
     def volume_visible(self) -> bool:
         return bool(self._volume_visible)
 
+    def _on_peak_marker_view_changed(self, _caller=None, _event=None) -> None:
+        """Refresh per-point world scales after camera or viewport changes."""
+        if getattr(self, "_closed", False):
+            return
+        if getattr(self, "_peak_marker_display_positions", np.empty((0, 3))).size:
+            self._update_peak_marker_glyph_scale()
+
+    def _update_peak_marker_glyph_scale(self) -> float:
+        """Convert the requested screen diameter to per-point world radii.
+
+        A shared world-space sphere size is not a screen-space ``px`` size: it
+        becomes sub-pixel when a large detector is fitted into a small window,
+        and changes apparent size on zoom. For parallel projection the
+        conversion is constant. For perspective projection it is calculated
+        independently at each event depth, so points at different theta/depth
+        remain equally legible. The X/Y pitch is retained as a safe fallback
+        for headless tests or a not-yet-sized render window.
+        """
+        spatial_steps: list[float] = []
+        for axis, factor in zip(
+            (self._physical_x, self._physical_y), self._axis_scales[:2],
+        ):
+            if axis is None:
+                continue
+            values = np.asarray(axis, dtype=np.float64).reshape(-1)
+            if values.size < 2:
+                continue
+            steps = np.abs(np.diff(values)) * abs(float(factor))
+            steps = steps[np.isfinite(steps) & (steps > 0.0)]
+            if steps.size:
+                spatial_steps.append(float(np.median(steps)))
+
+        if spatial_steps:
+            reference_pitch = min(spatial_steps)
+        else:
+            spatial_extents = [
+                float(np.ptp(np.asarray(axis, dtype=np.float64))) * abs(float(factor))
+                for axis, factor in zip(
+                    (self._physical_x, self._physical_y), self._axis_scales[:2],
+                )
+                if axis is not None and np.asarray(axis).size > 1
+            ]
+            if spatial_extents:
+                reference_pitch = max(max(spatial_extents) / 50.0, 1e-6)
+            else:
+                theta = self._physical_theta
+                theta_values = np.asarray(theta, dtype=np.float64).reshape(-1) if theta is not None else np.empty(0)
+                if theta_values.size > 1:
+                    theta_steps = np.abs(np.diff(theta_values)) * abs(float(self._axis_scales[2]))
+                    theta_steps = theta_steps[np.isfinite(theta_steps) & (theta_steps > 0.0)]
+                    reference_pitch = float(np.median(theta_steps)) if theta_steps.size else 1.0
+                else:
+                    reference_pitch = 1.0
+        self._peak_marker_reference_pitch = float(reference_pitch)
+
+        display_positions = np.asarray(
+            getattr(self, "_peak_marker_display_positions", np.empty((0, 3))),
+            dtype=np.float64,
+        ).reshape(-1, 3)
+        if display_positions.shape[0] == 0:
+            self._peak_marker_scale_values = np.empty(0, dtype=np.float64)
+            self._peak_marker_world_radius = max(reference_pitch * 0.07, 1e-9)
+            self._peak_marker_world_radius_range = (
+                self._peak_marker_world_radius, self._peak_marker_world_radius,
+            )
+            self._peak_marker_mapper.SetScaleFactor(float(self._peak_marker_world_radius))
+            return float(self._peak_marker_world_radius)
+
+        # Fallback is used only before a valid viewport/camera exists. In a
+        # live QVTK view, radius_px is converted from the actual render size.
+        fallback_radius = max(
+            reference_pitch * min(max(0.07 * float(self._peak_marker_size), 0.07), 0.45),
+            1e-9,
+        )
+        world_radii = np.full(display_positions.shape[0], fallback_radius, dtype=np.float64)
+        try:
+            window_width, window_height = (
+                int(value) for value in self.render_window.GetSize()
+            )
+            viewport = tuple(float(value) for value in self.renderer.GetViewport())
+            viewport_width = window_width * max(viewport[2] - viewport[0], 0.0)
+            viewport_height = window_height * max(viewport[3] - viewport[1], 0.0)
+            camera = self.renderer.GetActiveCamera()
+            if (
+                window_width > 1 and window_height > 1
+                and viewport_width > 1.0 and viewport_height > 1.0
+                and camera is not None
+            ):
+                # Apply the actor's shared display transform before measuring
+                # depth; camera distance is defined in rendered world space.
+                actor_matrix = self._peak_marker_actor.GetMatrix()
+                matrix = np.asarray([
+                    [actor_matrix.GetElement(row, col) for col in range(4)]
+                    for row in range(4)
+                ], dtype=np.float64)
+                homogeneous = np.column_stack((display_positions, np.ones(display_positions.shape[0])))
+                world_h = homogeneous @ matrix.T
+                denominator = world_h[:, 3]
+                valid_w = np.isfinite(denominator) & (np.abs(denominator) > 1e-12)
+                world_positions = np.full((display_positions.shape[0], 3), np.nan, dtype=np.float64)
+                world_positions[valid_w] = world_h[valid_w, :3] / denominator[valid_w, None]
+
+                diameter_radius_px = max(float(self._peak_marker_size) * 0.5, 0.5)
+                if bool(camera.GetParallelProjection()):
+                    parallel_scale = max(float(camera.GetParallelScale()), 1e-12)
+                    radius = diameter_radius_px * (2.0 * parallel_scale) / viewport_height
+                    world_radii.fill(max(radius, 1e-12))
+                else:
+                    view_angle = float(camera.GetViewAngle())
+                    tangent_half = float(np.tan(np.deg2rad(view_angle) * 0.5))
+                    if bool(camera.GetUseHorizontalViewAngle()):
+                        tangent_half *= viewport_height / viewport_width
+                    camera_position = np.asarray(camera.GetPosition(), dtype=np.float64)
+                    direction = np.asarray(camera.GetDirectionOfProjection(), dtype=np.float64)
+                    direction_norm = float(np.linalg.norm(direction))
+                    if direction_norm > 1e-12 and np.isfinite(tangent_half) and tangent_half > 0.0:
+                        direction /= direction_norm
+                        depth = (world_positions - camera_position[None, :]) @ direction
+                        valid_depth = np.isfinite(depth) & (depth > 1e-9)
+                        positive_depth = depth[valid_depth]
+                        fallback_depth = (
+                            float(np.median(positive_depth))
+                            if positive_depth.size else max(float(camera.GetDistance()), 1.0)
+                        )
+                        safe_depth = np.where(valid_depth, depth, fallback_depth)
+                        world_radii = (
+                            diameter_radius_px * (2.0 * safe_depth * tangent_half)
+                            / viewport_height
+                        )
+                world_radii = np.where(
+                    np.isfinite(world_radii) & (world_radii > 1e-12),
+                    world_radii, fallback_radius,
+                )
+        except (AttributeError, TypeError, ValueError, OverflowError, RuntimeError):
+            # A render-window may not have a realised size during construction;
+            # the next camera/resize event will recalculate the exact pixel scale.
+            pass
+
+        median_radius = max(float(np.median(world_radii)), 1e-12)
+        relative_scales = np.asarray(world_radii / median_radius, dtype=np.float64)
+        relative_scales[~np.isfinite(relative_scales) | (relative_scales <= 0.0)] = 1.0
+        self._peak_marker_scale_values = relative_scales
+        self._peak_marker_world_radius = median_radius
+        self._peak_marker_world_radius_range = (
+            float(np.min(world_radii)), float(np.max(world_radii)),
+        )
+
+        vtk, numpy_to_vtk = _vtk()
+        scale_array = numpy_to_vtk(np.ascontiguousarray(relative_scales), deep=True)
+        scale_array.SetName("PeakMarkerGlyphScale")
+        point_data = self._peak_marker_polydata.GetPointData()
+        point_data.RemoveArray("PeakMarkerGlyphScale")
+        point_data.AddArray(scale_array)
+        point_data.Modified()
+        self._peak_marker_mapper.SetScaleModeToScaleByMagnitude()
+        self._peak_marker_mapper.SetScaleArray("PeakMarkerGlyphScale")
+        self._peak_marker_mapper.SetScaleFactor(float(median_radius))
+        self._peak_marker_mapper.Modified()
+        self._peak_marker_polydata.Modified()
+        return float(median_radius)
+
     def _update_peak_marker_polydata(self) -> None:
-        """Replace VTK point and vertex buffers from retained physical arrays."""
+        """Replace event points and their camera-calibrated sphere glyph scales."""
         vtk, numpy_to_vtk = _vtk()
         physical = self._peak_marker_positions_physical
         count = int(physical.shape[0])
         if count == 0:
+            self._peak_marker_display_positions = np.empty((0, 3), dtype=np.float64)
             self._peak_marker_polydata.Initialize()
             self._peak_marker_polydata.Modified()
+            self._update_peak_marker_glyph_scale()
             return
+
         display = physical.copy()
         for column, axis, factor in zip(
             range(3), (self._physical_x, self._physical_y, self._physical_theta),
@@ -3309,14 +3517,14 @@ class VTKVolumeScene:
         ):
             center = 0.5 * (float(axis[0]) + float(axis[-1]))
             display[:, column] = center + (display[:, column] - center) * float(factor)
+        self._peak_marker_display_positions = np.ascontiguousarray(display, dtype=np.float64)
+
         vtk_points = vtk.vtkPoints()
-        vtk_points.SetData(numpy_to_vtk(np.ascontiguousarray(display), deep=True))
+        vtk_points.SetData(numpy_to_vtk(self._peak_marker_display_positions, deep=True))
         self._peak_marker_polydata.SetPoints(vtk_points)
         cells = vtk.vtkCellArray()
         from vtk.util.numpy_support import numpy_to_vtkIdTypeArray
         if hasattr(cells, "SetData"):
-            # VTK 9.x offset/connectivity representation avoids the deprecated
-            # legacy packed-cell SetCells API.
             offsets = numpy_to_vtkIdTypeArray(
                 np.arange(count + 1, dtype=np.int64), deep=True
             )
@@ -3335,6 +3543,7 @@ class VTKVolumeScene:
         rgba.SetName("PeakMarkerRGBA")
         self._peak_marker_polydata.GetPointData().SetScalars(rgba)
         self._peak_marker_polydata.Modified()
+        self._update_peak_marker_glyph_scale()
 
     def set_peak_markers_visible(self, visible: bool, *, render: bool = True) -> None:
         self._peak_marker_visible = bool(visible and self._peak_marker_positions_physical.size)
@@ -3349,9 +3558,9 @@ class VTKVolumeScene:
         if point_size is not None:
             value = float(point_size)
             if not np.isfinite(value) or not (1.0 <= value <= 20.0):
-                raise ValueError("Размер маркеров должен находиться в диапазоне 1–20 px")
+                raise ValueError("Диаметр маркеров должен находиться в диапазоне 1–20 px")
             self._peak_marker_size = value
-            self._peak_marker_actor.GetProperty().SetPointSize(value)
+            self._update_peak_marker_glyph_scale()
         if opacity is not None:
             value = float(opacity)
             if not np.isfinite(value) or not (0.05 <= value <= 1.0):
@@ -3829,6 +4038,18 @@ class VTKVolumeScene:
             "projection_dimensions": tuple(int(v) for v in self.projection_grid.GetDimensions()) if self.projection_grid is not None else None,
             "projection_visible": bool(self.projection_actor.GetVisibility()) if self.projection_actor is not None else False,
             "projection_requested_visible": bool(self.settings.show_projection),
+            "peak_marker_count": int(self._peak_marker_polydata.GetNumberOfPoints()) if self._peak_marker_polydata is not None else 0,
+            "peak_marker_requested_visible": bool(self._peak_marker_visible),
+            "peak_marker_actor_visible": bool(self._peak_marker_actor.GetVisibility()) if self._peak_marker_actor is not None else False,
+            "peak_marker_mapper": self._peak_marker_mapper.GetClassName() if self._peak_marker_mapper is not None else None,
+            "peak_marker_world_radius": float(self._peak_marker_world_radius),
+            "peak_marker_world_radius_range": tuple(float(v) for v in getattr(self, "_peak_marker_world_radius_range", (self._peak_marker_world_radius, self._peak_marker_world_radius))),
+            "peak_marker_diameter_px": float(self._peak_marker_size),
+            "peak_marker_scale_count": int(getattr(self, "_peak_marker_scale_values", np.empty(0)).size),
+            "peak_marker_reference_xy_pitch": float(getattr(self, "_peak_marker_reference_pitch", 0.0)),
+            "peak_marker_bounds": _safe_bounds(self._peak_marker_actor),
+            "branch_edge_count": int(self._branch_edge_polydata.GetNumberOfLines()) if self._branch_edge_polydata is not None else 0,
+            "branch_edge_actor_visible": bool(self._branch_edge_actor.GetVisibility()) if self._branch_edge_actor is not None else False,
             "theta_slice_enabled": bool(self._theta_slice_enabled),
             "theta_slice_shader_installed": bool(self._theta_slice_shader_installed),
             "theta_slice_index": self._theta_slice_index,
@@ -4239,6 +4460,20 @@ class VTKVolumeScene:
             except Exception:
                 logger.debug("Could not remove the scene camera observer during close", exc_info=True)
         self._camera_observer_id = None
+
+        try:
+            camera = self.renderer.GetActiveCamera() if self.renderer is not None else None
+            if self._peak_marker_camera_observer_id is not None and camera is not None:
+                camera.RemoveObserver(self._peak_marker_camera_observer_id)
+        except Exception:
+            logger.debug("Could not remove the peak-marker camera observer during close", exc_info=True)
+        self._peak_marker_camera_observer_id = None
+        try:
+            if self._peak_marker_resize_observer_id is not None and self.render_window is not None:
+                self.render_window.RemoveObserver(self._peak_marker_resize_observer_id)
+        except Exception:
+            logger.debug("Could not remove the peak-marker resize observer during close", exc_info=True)
+        self._peak_marker_resize_observer_id = None
 
         style = getattr(self, "interactor_style", None)
         if style is not None:
