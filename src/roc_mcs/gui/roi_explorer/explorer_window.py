@@ -1948,6 +1948,9 @@ class RockingCurveExplorerWindow(QMainWindow):
                     peak_catalog=state.peak_points,
                     peak_position_kind=state.peak_position_kind,
                     branch_edges=getattr(state, "branch_edges", None),
+                    branch_correlation_preview=getattr(
+                        state, "branch_correlation_preview", None
+                    ),
                 )
             except Exception as exc:
                 self.volume_widget.clear_dataset(f"3D: {type(exc).__name__}: {exc}")

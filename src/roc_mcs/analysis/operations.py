@@ -1135,8 +1135,51 @@ def _validate_branch_correlation(parameters: Mapping[str, Any]) -> dict[str, Any
         "xy_tolerance_px": xy_tol,
         "theta_tolerance_arcsec": theta_tol,
         "assignment_margin": margin,
-        "algorithm": "binary_3d_cross_correlation+directed_support+core_refinement_v1",
+        "algorithm": "binary_3d_cross_correlation_float64_fft+directed_support+core_refinement_v2",
     }
+
+
+def _branch_correlation_geometry_summary(catalog: Any, branch_ids: list[int]) -> list[dict[str, Any]]:
+    """Small, auditable geometry summary used in success metadata and failures."""
+    import pandas as pd
+
+    required = {"branch_id", "peak_id", "theta_index", "x", "y"}
+    if not hasattr(catalog, "columns") or not required.issubset(catalog.columns):
+        return []
+    summaries: list[dict[str, Any]] = []
+    branch_values = catalog["branch_id"].to_numpy(dtype=np.int64, copy=False)
+    for branch_id in branch_ids:
+        subset = catalog.loc[branch_values == int(branch_id), ["theta_index", "y", "x"]]
+        if subset.empty:
+            summaries.append({"branch_id": int(branch_id), "event_count": 0})
+            continue
+        try:
+            numeric = subset.apply(lambda column: pd.to_numeric(column, errors="coerce"))
+            coords_float = numeric.to_numpy(dtype=np.float64, na_value=np.nan)
+            if (
+                not np.isfinite(coords_float).all()
+                or not np.equal(coords_float, np.rint(coords_float)).all()
+            ):
+                raise ValueError("non-finite or non-integer coordinates")
+            coords = np.rint(coords_float).astype(np.int64)
+        except (TypeError, ValueError, OverflowError):
+            summaries.append({
+                "branch_id": int(branch_id),
+                "event_count": int(len(subset)),
+                "geometry_status": "unavailable_invalid_coordinates",
+            })
+            continue
+        low = coords.min(axis=0)
+        high = coords.max(axis=0)
+        shape = high - low + 1
+        summaries.append({
+            "branch_id": int(branch_id),
+            "event_count": int(len(coords)),
+            "occupied_voxel_count": int(np.unique(coords, axis=0).shape[0]),
+            "bbox_theta_y_x": [int(v) for v in shape],
+            "bbox_voxel_count": int(np.prod(shape.astype(object))),
+        })
+    return summaries
 
 
 def _run_branch_correlation(
@@ -1200,17 +1243,34 @@ def _run_branch_correlation(
         ) from exc
     if not np.isfinite(theta_step) or theta_step == 0.0:
         raise ValueError("В артефакте ветвей сохранён некорректный шаг θ на theta_index")
-    result = correlate_branch_catalog(
-        catalog,
-        source_branch_id=parameters["source_branch_id"],
-        partner_branch_ids=parameters["partner_branch_ids"],
-        config=BranchCorrelationConfig(
-            theta_step_arcsec=theta_step,
-            xy_tolerance_px=parameters["xy_tolerance_px"],
-            theta_tolerance_arcsec=parameters["theta_tolerance_arcsec"],
-            assignment_margin=parameters["assignment_margin"],
-        ),
-    )
+    selected_ids = [
+        int(parameters["source_branch_id"]),
+        *(int(value) for value in parameters["partner_branch_ids"]),
+    ]
+    geometry_summary = _branch_correlation_geometry_summary(catalog, selected_ids)
+    try:
+        result = correlate_branch_catalog(
+            catalog,
+            source_branch_id=parameters["source_branch_id"],
+            partner_branch_ids=parameters["partner_branch_ids"],
+            config=BranchCorrelationConfig(
+                theta_step_arcsec=theta_step,
+                xy_tolerance_px=parameters["xy_tolerance_px"],
+                theta_tolerance_arcsec=parameters["theta_tolerance_arcsec"],
+                assignment_margin=parameters["assignment_margin"],
+            ),
+        )
+    except Exception as exc:
+        # Preserve the original exception as the cause, but add the selected IDs
+        # and branch geometry. This makes memory/shape/data failures actionable
+        # from the workflow record without changing the numerical algorithm.
+        detail = (
+            f"Не удалось выполнить 3D-кросс-корреляцию: source_branch_id="
+            f"{selected_ids[0]}, partner_branch_ids={selected_ids[1:]}. "
+            f"Геометрия выбранных ветвей (theta_index, y, x): {geometry_summary}. "
+            f"Причина: {type(exc).__name__}: {exc}"
+        )
+        raise RuntimeError(detail) from exc
     metadata = dict(parent.metadata)
     metadata.update({
         "operation": "3D diffraction-branch cross-correlation",
@@ -1221,6 +1281,7 @@ def _run_branch_correlation(
         "theta_index_step_arcsec": theta_step,
         "theta_index_step_uniform": True,
         "theta_step_source": "parent_scan_axis_metadata",
+        "branch_correlation_input_geometry": geometry_summary,
     })
     assigned = int(result.metadata["assigned_event_count"])
     ambiguous = int(result.metadata["ambiguous_event_count"])

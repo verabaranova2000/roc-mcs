@@ -1449,6 +1449,16 @@ class VTKToolsWidget(QWidget):
             monochrome=True,
             icon_size=18,
         )
+        self.branch_correspondences_button = self.register_overlay_tool(
+            "correspondences",
+            "vtk_branch_correlation.svg",
+            "Результат 3D-кросс-корреляции: сплошные линии — принятые соответствия peak_id, "
+            "пунктир — альтернативные поддержанные кандидаты; остаток ветвей приглушается. "
+            "ЛКМ — показать/скрыть, ПКМ — параметры и выбор пары",
+            settings_title="3D-КРОСС-КОРРЕЛЯЦИЯ",
+            monochrome=True,
+            icon_size=18,
+        )
         self.volume_visibility_button = self.register_overlay_tool(
             "volume",
             "vtk_volume_source_1.svg",
@@ -1657,6 +1667,7 @@ class VTKToolsWidget(QWidget):
         roi_preview: QWidget | None = None,
         peaks: QWidget | None = None,
         branches: QWidget | None = None,
+        correspondences: QWidget | None = None,
     ) -> None:
         if cursor_line is not None:
             self.set_overlay_settings_widget(
@@ -1681,6 +1692,11 @@ class VTKToolsWidget(QWidget):
         if branches is not None:
             self.set_overlay_settings_widget(
                 "branches", branches, settings_title="СВЯЗИ ВЕТВЕЙ"
+            )
+        if correspondences is not None:
+            self.set_overlay_settings_widget(
+                "correspondences", correspondences,
+                settings_title="3D-КРОСС-КОРРЕЛЯЦИЯ",
             )
 
     def _popup_position_below(self, anchor: QWidget, popup_size: QSize) -> QPoint:
@@ -2138,7 +2154,8 @@ class VTKToolsWidget(QWidget):
     def set_overlay_controls_enabled(
         self, *, cursor: bool, theta: bool, projection: bool = True,
         roi_preview: bool = True, peaks: bool = False,
-        branches: bool = False, volume: bool = True,
+        branches: bool = False, correspondences: bool = False,
+        volume: bool = True,
     ) -> None:
         self.set_overlay_tool_enabled("cursor", cursor)
         self.set_overlay_tool_enabled("theta", theta)
@@ -2146,11 +2163,13 @@ class VTKToolsWidget(QWidget):
         self.set_overlay_tool_enabled("roi_preview", roi_preview)
         self.set_overlay_tool_enabled("peaks", peaks)
         self.set_overlay_tool_enabled("branches", branches)
+        self.set_overlay_tool_enabled("correspondences", correspondences)
         self.set_overlay_tool_enabled("volume", volume)
         for key, available in (
             ("cursor", cursor), ("theta", theta), ("projection", projection),
             ("roi_preview", roi_preview), ("peaks", peaks),
-            ("branches", branches), ("volume", volume),
+            ("branches", branches), ("correspondences", correspondences),
+            ("volume", volume),
         ):
             widget = self._overlay_settings.get(key)
             if widget is not None:

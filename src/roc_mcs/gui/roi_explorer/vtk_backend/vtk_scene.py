@@ -742,14 +742,70 @@ class VTKVolumeScene:
         branch_property.SetLineWidth(2.0)
         self._branch_edge_actor.SetVisibility(0)
         self.renderer.AddActor(self._branch_edge_actor)
-        # Add node glyphs after links: opaque spheres then sit clearly on top of
-        # their incident line endpoints and make graph vertices unambiguous.
-        self.renderer.AddActor(self._peak_marker_actor)
+
+        # Correlation correspondences are a separate display-only layer. Solid
+        # links mean accepted source↔partner assignments; optional dashed amber
+        # links mean supported alternatives which were not selected. Neither
+        # layer changes branch_edges or any scientific artifact.
+        self._branch_correlation_matched_polydata = vtk.vtkPolyData()
+        self._branch_correlation_matched_mapper = vtk.vtkPolyDataMapper()
+        self._branch_correlation_matched_mapper.SetInputData(
+            self._branch_correlation_matched_polydata
+        )
+        self._branch_correlation_matched_mapper.SetScalarModeToUseCellData()
+        self._branch_correlation_matched_mapper.SetColorModeToDirectScalars()
+        self._branch_correlation_matched_mapper.ScalarVisibilityOn()
+        self._branch_correlation_matched_actor = vtk.vtkActor()
+        self._branch_correlation_matched_actor.SetMapper(
+            self._branch_correlation_matched_mapper
+        )
+        self._branch_correlation_matched_actor.SetUserMatrix(self._scene_user_matrix)
+        self._branch_correlation_matched_actor.PickableOff()
+        matched_property = self._branch_correlation_matched_actor.GetProperty()
+        matched_property.SetLighting(False)
+        matched_property.SetLineWidth(2.0)
+        matched_property.SetOpacity(0.82)
+        self._branch_correlation_matched_actor.SetVisibility(0)
+        self.renderer.AddActor(self._branch_correlation_matched_actor)
+
+        self._branch_correlation_candidate_polydata = vtk.vtkPolyData()
+        self._branch_correlation_candidate_mapper = vtk.vtkPolyDataMapper()
+        self._branch_correlation_candidate_mapper.SetInputData(
+            self._branch_correlation_candidate_polydata
+        )
+        self._branch_correlation_candidate_mapper.ScalarVisibilityOff()
+        self._branch_correlation_candidate_actor = vtk.vtkActor()
+        self._branch_correlation_candidate_actor.SetMapper(
+            self._branch_correlation_candidate_mapper
+        )
+        self._branch_correlation_candidate_actor.SetUserMatrix(self._scene_user_matrix)
+        self._branch_correlation_candidate_actor.PickableOff()
+        candidate_property = self._branch_correlation_candidate_actor.GetProperty()
+        candidate_property.SetLighting(False)
+        candidate_property.SetColor(0.96, 0.61, 0.22)
+        candidate_property.SetLineWidth(1.4)
+        candidate_property.SetOpacity(0.82)
+        self._branch_correlation_candidate_actor.SetVisibility(0)
+        self.renderer.AddActor(self._branch_correlation_candidate_actor)
+
         self._branch_edge_positions_physical = np.empty((0, 2, 3), dtype=np.float64)
         self._branch_edge_colors = np.empty((0, 4), dtype=np.uint8)
         self._branch_edge_visible = False
         self._branch_edge_width = 2.0
         self._branch_edge_opacity = 0.92
+        self._branch_correlation_matched_segments_physical = np.empty((0, 2, 3), dtype=np.float64)
+        self._branch_correlation_matched_colors = np.empty((0, 4), dtype=np.uint8)
+        self._branch_correlation_candidate_segments_physical = np.empty((0, 2, 3), dtype=np.float64)
+        self._branch_correlation_matched_peak_ids = np.empty(0, dtype=np.int64)
+        self._branch_correlation_focus_branch_ids = np.empty(0, dtype=np.int64)
+        self._branch_correlation_visible = False
+        self._branch_correlation_show_candidates = False
+        self._branch_correlation_emphasize_core = True
+        self._branch_correlation_residual_opacity = 0.28
+        self._branch_correlation_line_width = 2.0
+        self._branch_correlation_opacity = 0.82
+        self._branch_correlation_candidate_opacity = 0.82
+        self._peak_marker_base_colors = np.empty((0, 4), dtype=np.uint8)
         self._volume_visible = True
 
         # The map cursor is an independent, narrow optical marker inside the
@@ -2574,6 +2630,7 @@ class VTKVolumeScene:
         self._peak_marker_polydata.Initialize()
         self._peak_marker_positions_physical = np.empty((0, 3), dtype=np.float64)
         self._peak_marker_colors = np.empty((0, 4), dtype=np.uint8)
+        self._peak_marker_base_colors = np.empty((0, 4), dtype=np.uint8)
         self._peak_marker_peak_ids = np.empty(0, dtype=np.int64)
         self._peak_marker_branch_ids = np.empty(0, dtype=np.int64)
         self._peak_branch_event_counts = {}
@@ -2583,6 +2640,17 @@ class VTKVolumeScene:
         self._branch_edge_positions_physical = np.empty((0, 2, 3), dtype=np.float64)
         self._branch_edge_colors = np.empty((0, 4), dtype=np.uint8)
         self._branch_edge_visible = False
+        self._branch_correlation_matched_actor.SetVisibility(0)
+        self._branch_correlation_candidate_actor.SetVisibility(0)
+        self._branch_correlation_matched_polydata.Initialize()
+        self._branch_correlation_candidate_polydata.Initialize()
+        self._branch_correlation_matched_segments_physical = np.empty((0, 2, 3), dtype=np.float64)
+        self._branch_correlation_matched_colors = np.empty((0, 4), dtype=np.uint8)
+        self._branch_correlation_candidate_segments_physical = np.empty((0, 2, 3), dtype=np.float64)
+        self._branch_correlation_matched_peak_ids = np.empty(0, dtype=np.int64)
+        self._branch_correlation_focus_branch_ids = np.empty(0, dtype=np.int64)
+        self._branch_correlation_visible = False
+        self._branch_correlation_show_candidates = False
         self.payload = payload
         self.grid, self.grid_info = new_grid, new_grid_info
         self.projection_grid, self.projection_info = new_projection_grid, new_projection_info
@@ -3204,9 +3272,10 @@ class VTKVolumeScene:
             branch_ids = branch_ids[indices]
 
         self._peak_marker_positions_physical = np.ascontiguousarray(physical, dtype=np.float64)
-        self._peak_marker_colors = np.ascontiguousarray(colors, dtype=np.uint8)
+        self._peak_marker_base_colors = np.ascontiguousarray(colors, dtype=np.uint8)
         self._peak_marker_peak_ids = np.ascontiguousarray(peak_ids, dtype=np.int64)
         self._peak_marker_branch_ids = np.ascontiguousarray(branch_ids, dtype=np.int64)
+        self._apply_branch_correlation_peak_emphasis(update_polydata=False)
         self._update_peak_marker_polydata()
         self._peak_marker_visible = bool(visible and physical.shape[0] > 0)
         self._peak_marker_actor.SetVisibility(self._peak_marker_visible)
@@ -3402,6 +3471,11 @@ class VTKVolumeScene:
         if count == 0:
             self._branch_edge_polydata.Initialize()
             self._branch_edge_polydata.Modified()
+            # Correlation links are an independent layer and must still be
+            # remapped after display-axis changes when no ordinary branch-edge
+            # geometry exists in this payload.
+            if hasattr(self, "_branch_correlation_matched_polydata"):
+                self._update_branch_correspondence_polydata()
             return
         display = edges.copy()
         for column, axis, factor in zip(
@@ -3424,6 +3498,8 @@ class VTKVolumeScene:
         rgba.SetName("BranchEdgeRGBA")
         self._branch_edge_polydata.GetCellData().SetScalars(rgba)
         self._branch_edge_polydata.Modified()
+        if hasattr(self, "_branch_correlation_matched_polydata"):
+            self._update_branch_correspondence_polydata()
 
     def set_branch_edges_visible(self, visible: bool, *, render: bool = True) -> None:
         self._branch_edge_visible = bool(visible and self._branch_edge_positions_physical.size)
@@ -3447,6 +3523,287 @@ class VTKVolumeScene:
                 raise ValueError("Непрозрачность связей должна находиться в диапазоне 0.05–1.0")
             self._branch_edge_opacity = value
             self._branch_edge_actor.GetProperty().SetOpacity(value)
+        if render:
+            self._request_render()
+
+    @staticmethod
+    def _normalise_line_segments(value: Any, *, name: str) -> np.ndarray:
+        """Validate physical line geometry as finite N×2×3 coordinates."""
+        array = np.asarray(value, dtype=np.float64)
+        if array.size == 0:
+            return np.empty((0, 2, 3), dtype=np.float64)
+        if array.ndim != 3 or array.shape[1:] != (2, 3):
+            raise ValueError(f"{name} должны иметь форму N×2×3, получено {array.shape}")
+        if not np.isfinite(array).all():
+            raise ValueError(f"{name} содержат не конечные координаты")
+        return np.ascontiguousarray(array, dtype=np.float64)
+
+    def _correspondence_roi_mask(self, segments: np.ndarray) -> np.ndarray:
+        """Return one inclusive physical-bounds mask per line segment."""
+        if segments.size == 0:
+            return np.zeros(0, dtype=bool)
+        keep = np.ones(segments.shape[0], dtype=bool)
+        for column, axis in enumerate((self._physical_x, self._physical_y, self._physical_theta)):
+            if axis is None:
+                continue
+            low, high = sorted((float(axis[0]), float(axis[-1])))
+            values = segments[:, :, column]
+            keep &= np.all((values >= low) & (values <= high), axis=1)
+        return keep
+
+    def _correspondence_roi_filter(self, segments: np.ndarray) -> np.ndarray:
+        """Clip link list to the physical bounds of the currently loaded ROI."""
+        if segments.size == 0:
+            return segments
+        return np.ascontiguousarray(segments[self._correspondence_roi_mask(segments)], dtype=np.float64)
+
+    def _line_polydata_from_segments(
+        self, polydata: Any, segments: np.ndarray, colors: np.ndarray | None = None,
+        *, dashed: bool = False,
+    ) -> None:
+        """Replace one line actor's geometry; all input coordinates are physical."""
+        vtk, numpy_to_vtk = _vtk()
+        if segments.size == 0:
+            polydata.Initialize()
+            polydata.Modified()
+            return
+        keep = self._correspondence_roi_mask(segments)
+        source = np.ascontiguousarray(segments[keep], dtype=np.float64)
+        if colors is not None:
+            colors = np.ascontiguousarray(np.asarray(colors, dtype=np.uint8)[keep])
+        if source.size == 0:
+            polydata.Initialize()
+            polydata.Modified()
+            return
+        if dashed:
+            fractions = ((0.00, 0.22), (0.37, 0.59), (0.74, 0.96))
+            delta = source[:, 1, :] - source[:, 0, :]
+            starts = np.concatenate([source[:, 0, :] + delta * start for start, _end in fractions])
+            ends = np.concatenate([source[:, 0, :] + delta * end for _start, end in fractions])
+            source = np.stack((starts, ends), axis=1)
+        display = source.copy()
+        for column, axis, factor in zip(
+            range(3), (self._physical_x, self._physical_y, self._physical_theta),
+            self._axis_scales,
+        ):
+            if axis is None:
+                continue
+            center = 0.5 * (float(axis[0]) + float(axis[-1]))
+            display[:, :, column] = center + (display[:, :, column] - center) * float(factor)
+        vtk_points = vtk.vtkPoints()
+        vtk_points.SetData(numpy_to_vtk(np.ascontiguousarray(display.reshape(-1, 3)), deep=True))
+        polydata.SetPoints(vtk_points)
+        cells = vtk.vtkCellArray()
+        from vtk.util.numpy_support import numpy_to_vtkIdTypeArray
+        count = int(source.shape[0])
+        offsets = numpy_to_vtkIdTypeArray(np.arange(count + 1, dtype=np.int64) * 2, deep=True)
+        connectivity = numpy_to_vtkIdTypeArray(np.arange(count * 2, dtype=np.int64), deep=True)
+        cells.SetData(offsets, connectivity)
+        polydata.SetLines(cells)
+        if colors is not None and not dashed:
+            if colors.shape != (count, 4):
+                raise ValueError(
+                    f"RGBA-цвета связей должны иметь форму {(count, 4)}, "
+                    f"получено {colors.shape}"
+                )
+            rgba = numpy_to_vtk(colors, deep=True)
+            rgba.SetNumberOfComponents(4)
+            rgba.SetName("BranchCorrelationRGBA")
+            polydata.GetCellData().SetScalars(rgba)
+        else:
+            polydata.GetCellData().SetScalars(None)
+        polydata.Modified()
+
+    def _apply_branch_correlation_peak_emphasis(self, *, update_polydata: bool = True) -> None:
+        """Fade non-core peaks only in the selected source/partner branches."""
+        base = np.asarray(
+            getattr(self, "_peak_marker_base_colors", np.empty((0, 4))), dtype=np.uint8
+        )
+        if base.ndim != 2 or base.shape[1:] != (4,):
+            base = np.empty((0, 4), dtype=np.uint8)
+        colors = base.copy()
+        enabled = bool(
+            getattr(self, "_branch_correlation_visible", False)
+            and getattr(self, "_branch_correlation_emphasize_core", True)
+        )
+        branch_ids = np.asarray(getattr(self, "_peak_marker_branch_ids", np.empty(0)), dtype=np.int64)
+        peak_ids = np.asarray(getattr(self, "_peak_marker_peak_ids", np.empty(0)), dtype=np.int64)
+        focus = np.asarray(getattr(self, "_branch_correlation_focus_branch_ids", np.empty(0)), dtype=np.int64)
+        matched = np.asarray(getattr(self, "_branch_correlation_matched_peak_ids", np.empty(0)), dtype=np.int64)
+        if enabled and colors.shape[0] and branch_ids.size == colors.shape[0] and peak_ids.size == colors.shape[0] and focus.size:
+            in_focus = np.isin(branch_ids, focus, assume_unique=False)
+            is_core = np.isin(peak_ids, matched, assume_unique=False) if matched.size else np.zeros(peak_ids.size, dtype=bool)
+            residual = in_focus & ~is_core
+            if np.any(residual):
+                factor = float(np.clip(getattr(self, "_branch_correlation_residual_opacity", 0.28), 0.05, 1.0))
+                colors[residual, 3] = np.rint(colors[residual, 3].astype(np.float64) * factor).astype(np.uint8)
+        self._peak_marker_colors = np.ascontiguousarray(colors, dtype=np.uint8)
+        if update_polydata and getattr(self, "_peak_marker_positions_physical", np.empty((0, 3))).size:
+            self._update_peak_marker_polydata()
+
+    def set_branch_correspondences(
+        self,
+        matched_segments: Any,
+        partner_branch_ids: Any,
+        candidate_segments: Any | None = None,
+        matched_peak_ids: Any | None = None,
+        focus_branch_ids: Any | None = None,
+        *,
+        visible: bool = True,
+        show_candidates: bool = False,
+        emphasize_core: bool = True,
+        residual_opacity: float = 0.28,
+        line_width: float = 2.0,
+        opacity: float = 0.82,
+        candidate_opacity: float = 0.82,
+        render: bool = True,
+    ) -> dict[str, int]:
+        """Install accepted/alternative 3D links from a stored correlation result.
+
+        Solid links are accepted directed peak-ID assignments. Dashed links are
+        only supported alternatives and are optional. All positions are in the
+        original, unregistered physical scene: the pair summary records the
+        translation applied to the partner to align it to the source.
+        """
+        matched = self._normalise_line_segments(matched_segments, name="matched_segments")
+        candidate = self._normalise_line_segments(
+            candidate_segments if candidate_segments is not None else np.empty((0, 2, 3)),
+            name="candidate_segments",
+        )
+        partner_ids = np.asarray(partner_branch_ids, dtype=np.int64).reshape(-1)
+        if partner_ids.size != matched.shape[0]:
+            raise ValueError("partner_branch_ids должен содержать один ID на каждую принятую связь")
+        if np.any(partner_ids < 0):
+            raise ValueError("partner_branch_ids не должны содержать отрицательные ID")
+        try:
+            width = float(line_width)
+            layer_opacity = float(opacity)
+            alt_opacity = float(candidate_opacity)
+            residual_alpha = float(residual_opacity)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("Параметры корреляционных связей должны быть числами") from exc
+        if not np.isfinite(width) or not 0.5 <= width <= 8.0:
+            raise ValueError("Толщина корреляционных связей должна быть 0.5–8 px")
+        if not np.isfinite(layer_opacity) or not 0.05 <= layer_opacity <= 1.0:
+            raise ValueError("Непрозрачность корреляционных связей должна быть 0.05–1.0")
+        if not np.isfinite(alt_opacity) or not 0.05 <= alt_opacity <= 1.0:
+            raise ValueError("Непрозрачность альтернативных связей должна быть 0.05–1.0")
+        if not np.isfinite(residual_alpha) or not 0.05 <= residual_alpha <= 1.0:
+            raise ValueError("Непрозрачность остатка должна быть 0.05–1.0")
+
+        # The upstream preview builder imposes deterministic geometry caps;
+        # keep a final guard here because this scene API is also reusable by
+        # direct callers and must never accept unbounded GPU geometry.
+        if matched.shape[0] > 100_000:
+            select = np.linspace(0, matched.shape[0] - 1, 100_000, dtype=np.int64)
+            matched = matched[select]
+            partner_ids = partner_ids[select]
+        if candidate.shape[0] > 20_000:
+            select = np.linspace(0, candidate.shape[0] - 1, 20_000, dtype=np.int64)
+            candidate = candidate[select]
+        matched_keep = self._correspondence_roi_mask(matched)
+        matched = np.ascontiguousarray(matched[matched_keep], dtype=np.float64)
+        partner_ids = partner_ids[matched_keep]
+        candidate_keep = self._correspondence_roi_mask(candidate)
+        candidate = np.ascontiguousarray(candidate[candidate_keep], dtype=np.float64)
+
+        ids = np.asarray(matched_peak_ids if matched_peak_ids is not None else (), dtype=np.int64).reshape(-1)
+        focus = np.asarray(focus_branch_ids if focus_branch_ids is not None else (), dtype=np.int64).reshape(-1)
+        self._branch_correlation_matched_segments_physical = np.ascontiguousarray(matched, dtype=np.float64)
+        self._branch_correlation_matched_colors = (
+            self._branch_rgba(partner_ids) if partner_ids.size else np.empty((0, 4), dtype=np.uint8)
+        )
+        self._branch_correlation_candidate_segments_physical = np.ascontiguousarray(candidate, dtype=np.float64)
+        self._branch_correlation_matched_peak_ids = np.unique(ids[ids >= 0])
+        self._branch_correlation_focus_branch_ids = np.unique(focus[focus >= 0])
+        self._branch_correlation_show_candidates = bool(show_candidates)
+        self._branch_correlation_emphasize_core = bool(emphasize_core)
+        self._branch_correlation_residual_opacity = residual_alpha
+        self._branch_correlation_line_width = width
+        self._branch_correlation_opacity = layer_opacity
+        self._branch_correlation_candidate_opacity = alt_opacity
+        self._branch_correlation_matched_actor.GetProperty().SetLineWidth(width)
+        self._branch_correlation_matched_actor.GetProperty().SetOpacity(layer_opacity)
+        self._branch_correlation_candidate_actor.GetProperty().SetLineWidth(max(0.5, width * 0.75))
+        self._branch_correlation_candidate_actor.GetProperty().SetOpacity(alt_opacity)
+        self._update_branch_correspondence_polydata()
+        self.set_branch_correspondences_visible(visible, render=False)
+        if render:
+            self._request_render()
+        return {
+            "matched_links": int(self._branch_correlation_matched_segments_physical.shape[0]),
+            "candidate_links": int(self._branch_correlation_candidate_segments_physical.shape[0]),
+            "matched_peaks": int(self._branch_correlation_matched_peak_ids.size),
+            "focus_branches": int(self._branch_correlation_focus_branch_ids.size),
+        }
+
+    def _update_branch_correspondence_polydata(self) -> None:
+        """Regenerate physical-to-display line geometry after ROI/axis changes."""
+        self._line_polydata_from_segments(
+            self._branch_correlation_matched_polydata,
+            self._branch_correlation_matched_segments_physical,
+            self._branch_correlation_matched_colors,
+        )
+        self._line_polydata_from_segments(
+            self._branch_correlation_candidate_polydata,
+            self._branch_correlation_candidate_segments_physical,
+            dashed=True,
+        )
+
+    def set_branch_correspondences_visible(
+        self, visible: bool, *, show_candidates: bool | None = None,
+        render: bool = True,
+    ) -> None:
+        self._branch_correlation_visible = bool(visible)
+        if show_candidates is not None:
+            self._branch_correlation_show_candidates = bool(show_candidates)
+        has_matched = bool(self._branch_correlation_matched_segments_physical.size)
+        has_candidates = bool(self._branch_correlation_candidate_segments_physical.size)
+        self._branch_correlation_matched_actor.SetVisibility(
+            bool(self._branch_correlation_visible and has_matched)
+        )
+        self._branch_correlation_candidate_actor.SetVisibility(
+            bool(self._branch_correlation_visible and self._branch_correlation_show_candidates and has_candidates)
+        )
+        self._apply_branch_correlation_peak_emphasis(update_polydata=True)
+        if render:
+            self._request_render()
+
+    def set_branch_correspondence_settings(
+        self, *, show_candidates: bool | None = None,
+        emphasize_core: bool | None = None,
+        residual_opacity: float | None = None,
+        line_width: float | None = None,
+        opacity: float | None = None,
+        render: bool = True,
+    ) -> None:
+        if show_candidates is not None:
+            self._branch_correlation_show_candidates = bool(show_candidates)
+        if emphasize_core is not None:
+            self._branch_correlation_emphasize_core = bool(emphasize_core)
+        if residual_opacity is not None:
+            value = float(residual_opacity)
+            if not np.isfinite(value) or not 0.05 <= value <= 1.0:
+                raise ValueError("Непрозрачность остатка должна быть 0.05–1.0")
+            self._branch_correlation_residual_opacity = value
+        if line_width is not None:
+            value = float(line_width)
+            if not np.isfinite(value) or not 0.5 <= value <= 8.0:
+                raise ValueError("Толщина корреляционных связей должна быть 0.5–8 px")
+            self._branch_correlation_line_width = value
+            self._branch_correlation_matched_actor.GetProperty().SetLineWidth(value)
+            self._branch_correlation_candidate_actor.GetProperty().SetLineWidth(max(0.5, value * 0.75))
+        if opacity is not None:
+            value = float(opacity)
+            if not np.isfinite(value) or not 0.05 <= value <= 1.0:
+                raise ValueError("Непрозрачность корреляционных связей должна быть 0.05–1.0")
+            self._branch_correlation_opacity = value
+            self._branch_correlation_matched_actor.GetProperty().SetOpacity(value)
+        self.set_branch_correspondences_visible(
+            self._branch_correlation_visible,
+            show_candidates=self._branch_correlation_show_candidates,
+            render=False,
+        )
         if render:
             self._request_render()
 
@@ -4179,6 +4536,12 @@ class VTKVolumeScene:
             "peak_marker_bounds": _safe_bounds(self._peak_marker_actor),
             "branch_edge_count": int(self._branch_edge_polydata.GetNumberOfLines()) if self._branch_edge_polydata is not None else 0,
             "branch_edge_actor_visible": bool(self._branch_edge_actor.GetVisibility()) if self._branch_edge_actor is not None else False,
+            "branch_correlation_matched_link_count": int(self._branch_correlation_matched_polydata.GetNumberOfLines()) if self._branch_correlation_matched_polydata is not None else 0,
+            "branch_correlation_candidate_dash_count": int(self._branch_correlation_candidate_polydata.GetNumberOfLines()) if self._branch_correlation_candidate_polydata is not None else 0,
+            "branch_correlation_matched_actor_visible": bool(self._branch_correlation_matched_actor.GetVisibility()) if self._branch_correlation_matched_actor is not None else False,
+            "branch_correlation_candidates_visible": bool(self._branch_correlation_candidate_actor.GetVisibility()) if self._branch_correlation_candidate_actor is not None else False,
+            "branch_correlation_matched_peak_count": int(self._branch_correlation_matched_peak_ids.size),
+            "branch_correlation_focus_branch_count": int(self._branch_correlation_focus_branch_ids.size),
             "theta_slice_enabled": bool(self._theta_slice_enabled),
             "theta_slice_shader_installed": bool(self._theta_slice_shader_installed),
             "theta_slice_index": self._theta_slice_index,
@@ -4494,6 +4857,7 @@ class VTKVolumeScene:
             self._peak_marker_polydata.Initialize()
         self._peak_marker_positions_physical = np.empty((0, 3), dtype=np.float64)
         self._peak_marker_colors = np.empty((0, 4), dtype=np.uint8)
+        self._peak_marker_base_colors = np.empty((0, 4), dtype=np.uint8)
         self._peak_marker_peak_ids = np.empty(0, dtype=np.int64)
         self._peak_marker_branch_ids = np.empty(0, dtype=np.int64)
         self._peak_branch_event_counts = {}
@@ -4504,6 +4868,18 @@ class VTKVolumeScene:
         self._branch_edge_positions_physical = np.empty((0, 2, 3), dtype=np.float64)
         self._branch_edge_colors = np.empty((0, 4), dtype=np.uint8)
         self._branch_edge_visible = False
+        self._branch_correlation_matched_actor.SetVisibility(0)
+        self._branch_correlation_candidate_actor.SetVisibility(0)
+        self._branch_correlation_matched_polydata.Initialize()
+        self._branch_correlation_candidate_polydata.Initialize()
+        self._branch_correlation_matched_segments_physical = np.empty((0, 2, 3), dtype=np.float64)
+        self._branch_correlation_matched_colors = np.empty((0, 4), dtype=np.uint8)
+        self._branch_correlation_candidate_segments_physical = np.empty((0, 2, 3), dtype=np.float64)
+        self._branch_correlation_matched_peak_ids = np.empty(0, dtype=np.int64)
+        self._branch_correlation_focus_branch_ids = np.empty(0, dtype=np.int64)
+        self._branch_correlation_visible = False
+        self._branch_correlation_show_candidates = False
+        self._apply_branch_correlation_peak_emphasis(update_polydata=False)
         self._cursor_line_enabled = False
         self._cursor_line_position = None
         self._cursor_line_radii = None
@@ -4550,6 +4926,8 @@ class VTKVolumeScene:
             self._theta_slice_marker_actor,
             self._peak_marker_actor,
             self._branch_edge_actor,
+            self._branch_correlation_matched_actor,
+            self._branch_correlation_candidate_actor,
         ):
             if prop is not None:
                 prop.SetVisibility(0)

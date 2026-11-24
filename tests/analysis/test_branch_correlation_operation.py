@@ -59,6 +59,7 @@ def test_branch_correlation_validator_accepts_manual_ids_without_guessing_theta_
     })
     assert result["source_branch_id"] == 34
     assert result["partner_branch_ids"] == [72, 32]
+    assert result["algorithm"].endswith("core_refinement_v2")
     assert "theta_step_arcsec" not in result
 
 
@@ -94,6 +95,8 @@ def test_branch_correlation_operation_uses_measured_theta_step_and_roundtrips_ta
     )
     assert result.output_ports == ("branch_correlation",)
     assert result.bundle.metadata["theta_step_source"] == "parent_scan_axis_metadata"
+    assert result.bundle.metadata["branch_correlation"]["algorithm_version"] == 2
+    assert result.bundle.metadata["branch_correlation"]["fft_precision"] == "float64"
     assert result.bundle.metadata["theta_index_step_arcsec"] == pytest.approx(15.0)
     assert len(result.bundle.tables["branch_correlation_pairs"]) == 1
     assert len(result.bundle.tables["branch_correlation_assignments"]) == 4
@@ -108,6 +111,10 @@ def test_branch_correlation_operation_uses_measured_theta_step_and_roundtrips_ta
         "branch_correlation_candidates",
     }
     assert loaded.tables["branch_correlation_assignments"]["assigned_partner_branch_id"].dtype.name == "Int64"
+    diagnostics = loaded.metadata["branch_correlation"]["registration_diagnostics"][0]
+    assert diagnostics["coarse_method"] == "fft_float64"
+    assert diagnostics["fft_shape_theta_y_x"]
+    assert loaded.tables["branch_correlation_pairs"].iloc[0]["coarse_registration_method"] == "fft_float64"
     pd.testing.assert_frame_equal(
         loaded.tables["branch_correlation_assignments"],
         result.bundle.tables["branch_correlation_assignments"],
@@ -197,3 +204,58 @@ def test_artifact_store_reads_metadata_without_reading_payload(tmp_path, monkeyp
 
     monkeypatch.setattr(store, "read", fail_read)
     assert store.read_metadata(artifact_id) == {"grid_id": "test-grid", "n_branches": 3}
+
+
+def test_branch_correlation_accepts_zero_based_ids_zero_and_one():
+    catalog = _catalog().copy()
+    catalog["branch_id"] = catalog["branch_id"].map({10: 0, 20: 1}).astype(np.int64)
+    parent = ArtifactBundle(
+        tables={"branch_catalog": catalog},
+        metadata={
+            "grid_id": "zero-based-grid",
+            "n_branches": 2,
+            "theta_index_step_arcsec": 15.0,
+            "theta_index_step_uniform": True,
+        },
+    )
+    result = default_registry().execute(
+        "peaks.branch_correlation",
+        {"branches": parent},
+        {
+            "source_branch_id": "0",
+            "partner_branch_ids": "1",
+            "xy_tolerance_px": 1.5,
+            "theta_tolerance_arcsec": 20.0,
+            "assignment_margin": 0.2,
+        },
+    )
+    assert result.bundle.tables["branch_correlation_pairs"].iloc[0]["source_branch_id"] == 0
+    assert result.bundle.tables["branch_correlation_pairs"].iloc[0]["partner_branch_id"] == 1
+    assert result.bundle.metadata["branch_correlation"]["assigned_event_count"] == 4
+    assert result.bundle.metadata["branch_correlation_input_geometry"][0]["branch_id"] == 0
+
+
+def test_algorithm_failure_is_wrapped_with_selected_ids_and_geometry(monkeypatch):
+    import roc_mcs.processing.branch_correlation as correlation_module
+
+    parent = ArtifactBundle(
+        tables={"branch_catalog": _catalog()},
+        metadata={"theta_index_step_arcsec": 15.0, "theta_index_step_uniform": True},
+    )
+
+    def fail(*_args, **_kwargs):
+        raise MemoryError("synthetic FFT allocation guard")
+
+    monkeypatch.setattr(correlation_module, "correlate_branch_catalog", fail)
+    with pytest.raises(RuntimeError, match=r"source_branch_id=10.*partner_branch_ids=\[20\].*synthetic FFT allocation guard"):
+        default_registry().execute(
+            "peaks.branch_correlation",
+            {"branches": parent},
+            {
+                "source_branch_id": 10,
+                "partner_branch_ids": [20],
+                "xy_tolerance_px": 1.5,
+                "theta_tolerance_arcsec": 20.0,
+                "assignment_margin": 0.2,
+            },
+        )

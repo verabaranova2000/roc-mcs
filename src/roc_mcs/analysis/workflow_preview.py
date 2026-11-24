@@ -52,6 +52,7 @@ class WorkflowPreviewState:
     peak_points: Any | None = None
     peak_position_kind: str = "detected"
     branch_edges: Any | None = None
+    branch_correlation_preview: Any | None = None
 
     def map_layer(self, key: str | None = None) -> PreviewMapLayer:
         selected = str(key or self.default_map_key)
@@ -599,10 +600,30 @@ def build_workflow_preview_state(
     if fit is not None:
         metadata.update({f"fit_{k}": v for k, v in (getattr(fit, "metadata", {}) or {}).items()})
     branch_correlation = context.get("branch_correlation")
+    branch_correlation_preview = None
     if branch_correlation is not None:
         metadata["branch_correlation"] = dict(
             (getattr(branch_correlation, "metadata", {}) or {}).get("branch_correlation", {})
         )
+        try:
+            from roc_mcs.analysis.branch_correlation_preview import build_branch_correlation_preview
+
+            branch_correlation_preview = build_branch_correlation_preview(
+                branch_catalog, branch_correlation, x_coords, y_coords,
+            )
+            metadata["branch_correlation_preview"] = {
+                "pair_count": len(branch_correlation_preview.pairs),
+                "matched_link_count": branch_correlation_preview.total_matched,
+                "candidate_link_count": branch_correlation_preview.total_candidates,
+                "assignment_counts": dict(branch_correlation_preview.assignment_counts),
+            }
+        except Exception as exc:
+            # The stored scientific result and the ordinary scan/branch preview
+            # remain available even if a legacy or malformed correlation table
+            # cannot be adapted into display geometry. Report the precise cause.
+            metadata["branch_correlation_preview_warning"] = (
+                f"3D-визуализация кросс-корреляции недоступна: {type(exc).__name__}: {exc}"
+            )
     metadata.update(dict(source_metadata or {}))
     metadata["workflow_node_id"] = str(node.id)
     metadata["workflow_operation_id"] = str(node.operation_id)
@@ -644,4 +665,5 @@ def build_workflow_preview_state(
         peak_points=peak_points,
         peak_position_kind=peak_position_kind,
         branch_edges=branch_edges,
+        branch_correlation_preview=branch_correlation_preview,
     )

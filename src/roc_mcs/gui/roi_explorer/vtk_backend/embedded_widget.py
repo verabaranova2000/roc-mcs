@@ -131,10 +131,15 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
         self._peak_catalog = None
         self._peak_position_kind = "detected"
         self._branch_edges = None
+        # Immutable, renderer-neutral view model built from the stored
+        # correlation artifact. It is deliberately excluded from the volume
+        # worker request and never triggers a second scientific calculation.
+        self._branch_correlation_preview = None
         # None means "auto-show when data first become available".  Once the
         # user explicitly toggles a layer, preserve that choice on payload refresh.
         self._peak_overlay_preference: bool | None = None
         self._branch_overlay_preference: bool | None = None
+        self._branch_correspondence_overlay_preference: bool | None = None
         self._dataset_request: dict | None = None
         self._active_worker = None
         self._pending_request: tuple[int, dict] | None = None
@@ -244,6 +249,13 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
             margin=8,
         )
         self.branch_legend.hide_on_canvas()
+        self.branch_correlation_legend = FloatingLegendPanel(
+            self.viewport,
+            title="3D-КОРРЕЛЯЦИЯ · СООТВЕТСТВИЯ",
+            default_size=QtCore.QSize(292, 208),
+            margin=8,
+        )
+        self.branch_correlation_legend.hide_on_canvas()
         root.addWidget(self.viewport, 1)
 
         self.status = QtWidgets.QLabel("3D не инициализировано", self)
@@ -411,9 +423,51 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
             ("Толщина", self.branch_line_width),
             ("Непрозрачность", self.branch_line_opacity),
         )
+        self.correlation_pair_combo = QtWidgets.QComboBox()
+        self.correlation_pair_combo.setObjectName("vtkBranchCorrelationPairSelector")
+        self.correlation_pair_combo.addItem("Все пары", None)
+        self.correlation_pair_combo.setMinimumContentsLength(15)
+        self.correlation_pair_combo.setToolTip(
+            "Показать все пары регистрации или только одну пару source ↔ partner."
+        )
+        self.correlation_show_candidates = QtWidgets.QCheckBox(
+            "Альтернативные поддержанные связи"
+        )
+        self.correlation_show_candidates.setObjectName("vtkBranchCorrelationCandidates")
+        self.correlation_show_candidates.setToolTip(
+            "Пунктиром показать поддержанные one-to-one кандидаты, которые не были "
+            "выбраны итоговым назначением. Они не являются принятыми соответствиями."
+        )
+        self.correlation_emphasize_core = QtWidgets.QCheckBox(
+            "Подсветить совпавшее ядро"
+        )
+        self.correlation_emphasize_core.setObjectName("vtkBranchCorrelationCoreEmphasis")
+        self.correlation_emphasize_core.setChecked(True)
+        self.correlation_emphasize_core.setToolTip(
+            "Пики, участвующие в принятых соответствиях, остаются яркими; остальные "
+            "пики выбранных ветвей приглушаются. Координаты и цвета ветвей не меняются."
+        )
+        self.correlation_residual_opacity = self._spin(
+            0.05, 1.0, 0.28, 2, step=0.05
+        )
+        self.correlation_line_width = self._spin(
+            0.5, 8.0, 2.0, 1, " px", step=0.5
+        )
+        self.correlation_line_opacity = self._spin(
+            0.05, 1.0, 0.82, 2, step=0.05
+        )
+        correspondences = self._settings_panel(
+            ("Пара", self.correlation_pair_combo),
+            ("Непрозрачность связей", self.correlation_line_opacity),
+            ("Толщина линий", self.correlation_line_width),
+            ("Непрозрачность остатка", self.correlation_residual_opacity),
+        )
+        correspondences.layout().addRow(self.correlation_show_candidates)
+        correspondences.layout().addRow(self.correlation_emphasize_core)
         self.tools.set_overlay_settings_widgets(
             cursor_line=cursor, theta_slice=theta, projection=projection,
             roi_preview=roi, peaks=peaks, branches=branches,
+            correspondences=correspondences,
         )
 
         self.cursor_width.valueChanged.connect(self._update_cursor)
@@ -434,6 +488,24 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
         self.peak_color_by_branch.toggled.connect(self._apply_peak_marker_coloring)
         self.branch_line_width.valueChanged.connect(self._apply_branch_edge_settings)
         self.branch_line_opacity.valueChanged.connect(self._apply_branch_edge_settings)
+        self.correlation_pair_combo.currentIndexChanged.connect(
+            self._apply_branch_correlation_selection
+        )
+        self.correlation_show_candidates.toggled.connect(
+            self._apply_branch_correlation_settings
+        )
+        self.correlation_emphasize_core.toggled.connect(
+            self._apply_branch_correlation_settings
+        )
+        self.correlation_residual_opacity.valueChanged.connect(
+            self._apply_branch_correlation_settings
+        )
+        self.correlation_line_width.valueChanged.connect(
+            self._apply_branch_correlation_settings
+        )
+        self.correlation_line_opacity.valueChanged.connect(
+            self._apply_branch_correlation_settings
+        )
 
         self.display_panel = QtWidgets.QWidget()
         form = QtWidgets.QFormLayout(self.display_panel)
@@ -568,6 +640,7 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
         scan_label="", view_label="", valid_mask=None, source_path=None,
         operation_id="source.raw", metadata=None, peak_catalog=None,
         peak_position_kind="detected", branch_edges=None,
+        branch_correlation_preview=None,
     ):
         """Передать выбранную версию ROI Explorer; отдельный HDF5 не открывается."""
         scan_key = str(scan_label)
@@ -595,6 +668,8 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
         self._peak_catalog = peak_catalog
         self._peak_position_kind = str(peak_position_kind or "detected")
         self._branch_edges = branch_edges
+        self._branch_correlation_preview = branch_correlation_preview
+        self._sync_branch_correlation_pair_combo()
         self._dataset_request = {
             "raw": raw, "theta": th, "axis": axis, "x_coords": x_coords, "y_coords": y_coords,
             "valid_mask": valid_mask, "roi": self._selected_roi(), "scan_key": scan_key,
@@ -754,8 +829,10 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
         request = self._dataset_request or {}
         marker_error = None
         branch_error = None
+        correlation_error = None
         marker_count = 0
         branch_edge_count = 0
+        correlation_info = {"matched_links": 0, "candidate_links": 0}
         request_x = request.get("x_coords", payload.x)
         request_y = request.get("y_coords", payload.y)
         try:
@@ -790,6 +867,45 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
                 None, None, payload.x, payload.y, visible=False, render=False
             )
 
+        correlation_model = self._branch_correlation_preview
+        has_correlation = bool(
+            correlation_model is not None
+            and getattr(correlation_model, "pairs", ())
+        )
+        self._sync_branch_correlation_pair_combo()
+        correlation_visible = (
+            bool(self._branch_correspondence_overlay_preference)
+            if self._branch_correspondence_overlay_preference is not None
+            else has_correlation
+        ) and has_correlation
+        self.tools.set_overlay_tool_checked("correspondences", correlation_visible)
+        if has_correlation:
+            try:
+                correlation_info = self._update_branch_correlation_scene(
+                    visible=correlation_visible, render=False
+                )
+            except Exception as exc:
+                correlation_error = exc
+                logger.exception("Не удалось построить слой 3D-корреляции ветвей")
+                self._scene.set_branch_correspondences(
+                    np.empty((0, 2, 3), dtype=np.float64),
+                    np.empty(0, dtype=np.int64),
+                    visible=False,
+                    render=False,
+                )
+                correlation_visible = False
+                self.tools.set_overlay_tool_checked("correspondences", False)
+        else:
+            # set_payload() clears all previous-scene actors. Reset the logical
+            # overlay as well, so no stale legend or preference can suggest
+            # that a prior correlation is still attached to this scan.
+            self._scene.set_branch_correspondences(
+                np.empty((0, 2, 3), dtype=np.float64),
+                np.empty(0, dtype=np.int64),
+                visible=False,
+                render=False,
+            )
+
         self.tools.set_scene_available(True)
         self.tools.set_theta_axis_values(payload.theta)
         self.tools.set_axis_scales(*self._scene.axis_scales)
@@ -806,14 +922,24 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
         self.tools.set_overlay_controls_enabled(
             cursor=True, theta=len(payload.theta) > 2, projection=True,
             roi_preview=True, peaks=has_peak_catalog,
-            branches=has_branch_edges, volume=True,
+            branches=has_branch_edges, correspondences=has_correlation and correlation_error is None,
+            volume=True,
         )
         self.tools.set_overlay_tool_checked("peaks", peak_visible)
         self.tools.set_overlay_tool_checked("branches", branches_visible)
         self._scene.set_peak_markers_visible(peak_visible, render=False)
         self._scene.set_branch_edges_visible(branches_visible, render=False)
+        # The correlation actor is independent of both volume and the ordinary
+        # adjacent-pixel branch-edge layer. Its visibility was established
+        # above from the stored correlation artifact.
+        self._scene.set_branch_correspondences_visible(
+            correlation_visible,
+            show_candidates=bool(self.correlation_show_candidates.isChecked()),
+            render=False,
+        )
         self._scene.set_volume_visible(self.tools.is_overlay_tool_checked("volume"), render=False)
         self._update_branch_legend()
+        self._update_branch_correlation_legend()
         self.tools.set_projection_enabled(settings.show_projection)
         self._scene.set_theta_slice_palette(str(self.theta_palette.currentData() or "viridis"), render=False)
         self._scene.set_theta_slice_strength(float(self.theta_strength.value()), render=False)
@@ -861,6 +987,47 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
             status_text += f" · центры пиков недоступны: {type(marker_error).__name__}"
         if branch_error is not None:
             status_text += f" · связи недоступны: {type(branch_error).__name__}"
+        if has_correlation and correlation_error is None:
+            model = self._branch_correlation_preview
+            total_matches = int(getattr(model, "total_matched", 0))
+            total_candidates = int(getattr(model, "total_candidates", 0))
+            drawn_matches = int(correlation_info.get("matched_links", 0))
+            pair_count = len(getattr(model, "pairs", ()))
+            pair_word = "пара" if pair_count == 1 else "пары" if 2 <= pair_count <= 4 else "пар"
+            status_text += (
+                f" · 3D-корреляция: {total_matches:,} соответствий / {pair_count} {pair_word}"
+                f" (в текущем ROI показано {drawn_matches:,})"
+            )
+            if total_candidates:
+                status_text += f" · альтернативных кандидатов {total_candidates:,}"
+            assignment_counts = dict(getattr(model, "assignment_counts", {}) or {})
+            if assignment_counts:
+                status_text += (
+                    f" · назначения: принято {int(assignment_counts.get('partner', 0)):,}, "
+                    f"неоднозначно {int(assignment_counts.get('ambiguous', 0)):,}, "
+                    f"остаток {int(assignment_counts.get('residual', 0)):,}"
+                )
+            if any(
+                bool(getattr(pair, "matched_truncated", False))
+                or bool(getattr(pair, "candidate_truncated", False))
+                for pair in getattr(model, "pairs", ())
+            ):
+                status_text += " · геометрия связей прорежена только для отображения"
+            warnings = tuple(getattr(model, "warnings", ()) or ())
+            if warnings:
+                status_text += f" · предупреждение корреляции: {warnings[0]}"
+            preview_warning = (request.get("metadata") or {}).get(
+                "branch_correlation_preview_warning"
+            )
+            if preview_warning:
+                status_text += f" · {preview_warning}"
+        elif correlation_error is not None:
+            status_text += f" · 3D-корреляция недоступна: {type(correlation_error).__name__}: {correlation_error}"
+        preview_warning = (request.get("metadata") or {}).get(
+            "branch_correlation_preview_warning"
+        )
+        if preview_warning and not has_correlation:
+            status_text += f" · {preview_warning}"
         self.status.setText(status_text)
 
     def _load_vtk_modules(self):
@@ -1603,6 +1770,196 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
             )
         )
 
+    def _sync_branch_correlation_pair_combo(self) -> None:
+        """Populate the pair filter without causing intermediate scene updates."""
+        combo = getattr(self, "correlation_pair_combo", None)
+        if combo is None:
+            return
+        model = self._branch_correlation_preview
+        pairs = tuple(getattr(model, "pairs", ()) or ()) if model is not None else ()
+        previous = combo.currentData()
+        combo.blockSignals(True)
+        try:
+            combo.clear()
+            combo.addItem("Все пары", None)
+            for pair in pairs:
+                source_id = int(pair.source_branch_id)
+                partner_id = int(pair.partner_branch_id)
+                combo.addItem(
+                    f"branch {source_id} ↔ {partner_id}",
+                    (source_id, partner_id),
+                )
+            restore = combo.findData(previous) if previous is not None else 0
+            combo.setCurrentIndex(max(0, restore))
+            combo.setEnabled(bool(pairs))
+        finally:
+            combo.blockSignals(False)
+
+    def _selected_branch_correlation_pairs(self) -> tuple[Any, ...]:
+        model = self._branch_correlation_preview
+        pairs = tuple(getattr(model, "pairs", ()) or ()) if model is not None else ()
+        selected = self.correlation_pair_combo.currentData()
+        if selected is None:
+            return pairs
+        try:
+            selected_key = (int(selected[0]), int(selected[1]))
+        except (TypeError, ValueError, IndexError):
+            return pairs
+        return tuple(
+            pair for pair in pairs
+            if (int(pair.source_branch_id), int(pair.partner_branch_id)) == selected_key
+        )
+
+    def _update_branch_correlation_scene(
+        self, *, visible: bool | None = None, render: bool = True
+    ) -> dict[str, int]:
+        """Install the selected, already-computed peak correspondences in VTK."""
+        if self._scene is None:
+            return {"matched_links": 0, "candidate_links": 0, "matched_peaks": 0, "focus_branches": 0}
+        selected_pairs = self._selected_branch_correlation_pairs()
+        matched_parts: list[np.ndarray] = []
+        partner_parts: list[np.ndarray] = []
+        candidate_parts: list[np.ndarray] = []
+        peak_id_parts: list[np.ndarray] = []
+        focus_ids: list[int] = []
+        for pair in selected_pairs:
+            segments = np.asarray(pair.matched_segments, dtype=np.float64)
+            if segments.size:
+                matched_parts.append(segments)
+                partner_parts.append(
+                    np.full(segments.shape[0], int(pair.partner_branch_id), dtype=np.int64)
+                )
+            alternatives = np.asarray(pair.candidate_segments, dtype=np.float64)
+            if alternatives.size:
+                candidate_parts.append(alternatives)
+            ids = np.asarray(pair.matched_peak_ids, dtype=np.int64).reshape(-1)
+            if ids.size:
+                # The scene itself deterministically caps the marker cloud.
+                # Intersect before concatenating so emphasis work/memory is
+                # proportional to rendered glyphs, not the complete catalog.
+                displayed_ids = np.asarray(
+                    getattr(self._scene, "_peak_marker_peak_ids", np.empty(0)),
+                    dtype=np.int64,
+                )
+                visible_ids = np.intersect1d(ids, displayed_ids, assume_unique=False)
+                if visible_ids.size:
+                    peak_id_parts.append(visible_ids)
+            focus_ids.extend((int(pair.source_branch_id), int(pair.partner_branch_id)))
+
+        matched = (
+            np.concatenate(matched_parts, axis=0)
+            if matched_parts else np.empty((0, 2, 3), dtype=np.float64)
+        )
+        partner_ids = (
+            np.concatenate(partner_parts, axis=0)
+            if partner_parts else np.empty(0, dtype=np.int64)
+        )
+        candidates = (
+            np.concatenate(candidate_parts, axis=0)
+            if candidate_parts else np.empty((0, 2, 3), dtype=np.float64)
+        )
+        matched_peak_ids = (
+            np.unique(np.concatenate(peak_id_parts))
+            if peak_id_parts else np.empty(0, dtype=np.int64)
+        )
+        if visible is None:
+            visible = self.tools.is_overlay_tool_checked("correspondences")
+        return self._scene.set_branch_correspondences(
+            matched,
+            partner_ids,
+            candidate_segments=candidates,
+            matched_peak_ids=matched_peak_ids,
+            focus_branch_ids=np.unique(np.asarray(focus_ids, dtype=np.int64)),
+            visible=bool(visible),
+            show_candidates=bool(self.correlation_show_candidates.isChecked()),
+            emphasize_core=bool(self.correlation_emphasize_core.isChecked()),
+            residual_opacity=float(self.correlation_residual_opacity.value()),
+            line_width=float(self.correlation_line_width.value()),
+            opacity=float(self.correlation_line_opacity.value()),
+            candidate_opacity=float(self.correlation_line_opacity.value()),
+            render=render,
+        )
+
+    def _update_branch_correlation_legend(self) -> None:
+        """Show per-pair shifts and exact match counts in the floating key."""
+        panel = getattr(self, "branch_correlation_legend", None)
+        if panel is None:
+            return
+        pairs = self._selected_branch_correlation_pairs()
+        should_show = bool(
+            self._scene is not None
+            and pairs
+            and self.tools.is_overlay_tool_checked("correspondences")
+        )
+        if not should_show:
+            panel.hide_on_canvas()
+            return
+
+        def signed(value, digits=2):
+            try:
+                number = float(value)
+            except (TypeError, ValueError, OverflowError):
+                return "—"
+            if not np.isfinite(number):
+                return "—"
+            return f"{number:+.{digits}f}"
+
+        entries = []
+        for pair in pairs:
+            summary = dict(getattr(pair, "summary", {}) or {})
+            x_shift = summary.get("shift_x_px")
+            y_shift = summary.get("shift_y_px")
+            theta_shift = summary.get("shift_theta_arcsec")
+            mad = summary.get("theta_residual_mad_arcsec")
+            source_count = int(summary.get("source_event_count", 0))
+            matched_count = int(getattr(pair, "matched_total_count", 0))
+            candidate_count = int(getattr(pair, "candidate_total_count", 0))
+            details = (
+                f"{matched_count:,}/{source_count:,} принятых пар · "
+                f"ΔX={signed(x_shift, 0)} px · ΔY={signed(y_shift, 0)} px · "
+                f"Δθ={signed(theta_shift, 2)}″"
+            )
+            details += f" · MADθ={signed(mad, 2)}″" if mad is not None else ""
+            details += " · сдвиг партнёра → source; цвет линии = branch партнёра"
+            invalid_links = int(summary.get("invalid_assignment_count", 0))
+            if invalid_links:
+                details += f" · не восстановлено по peak_id: {invalid_links:,}"
+            if candidate_count:
+                details += f" · альтернативы {candidate_count:,}"
+            if bool(getattr(pair, "matched_truncated", False)):
+                details += " · линии прорежены для экрана"
+            entries.append(LegendEntry(
+                label=f"branch {int(pair.source_branch_id)} ↔ {int(pair.partner_branch_id)}",
+                color=VTKVolumeScene._branch_hex_color(int(pair.partner_branch_id)),
+                detail=details,
+            ))
+        entries.extend((
+            LegendEntry(
+                label="Сплошная линия",
+                color="#4C72B0",
+                detail="Принятое соответствие peak_id ↔ peak_id",
+            ),
+            LegendEntry(
+                label="Пунктир",
+                color="#EFA542",
+                detail="Поддержанный альтернативный кандидат (не назначен)",
+            ),
+            LegendEntry(
+                label="Приглушённый остаток",
+                color="#858585",
+                detail="Остальные пики выбранных ветвей; исходный цвет branch_id сохранён",
+            ),
+        ))
+        pair_word = "ПАРА" if len(pairs) == 1 else "ПАРЫ"
+        panel.set_title(f"3D-КОРРЕЛЯЦИЯ · {len(pairs)} {pair_word}")
+        panel.set_entries(entries)
+        panel.show_on_canvas(
+            position=QtCore.QPoint(
+                max(8, self.viewport.width() - panel.width() - 8),
+                8,
+            )
+        )
+
     def _toggle_projection(self, enabled):
         self._transfer = replace(self._transfer, show_projection=bool(enabled))
         self._queue_transfer_settings()
@@ -1636,6 +1993,16 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
             self._branch_overlay_preference = bool(enabled)
             if self._scene is not None:
                 self._scene.set_branch_edges_visible(bool(enabled), render=False)
+                self._render()
+        elif key == "correspondences":
+            self._branch_correspondence_overlay_preference = bool(enabled)
+            if self._scene is not None:
+                self._scene.set_branch_correspondences_visible(
+                    bool(enabled),
+                    show_candidates=bool(self.correlation_show_candidates.isChecked()),
+                    render=False,
+                )
+                self._update_branch_correlation_legend()
                 self._render()
         elif key == "volume":
             if self._scene is not None:
@@ -1680,6 +2047,29 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
                 render=False,
             )
             self._render()
+
+    def _apply_branch_correlation_selection(self, *_args):
+        if self._scene is None or self._branch_correlation_preview is None:
+            self._update_branch_correlation_legend()
+            return
+        visible = self.tools.is_overlay_tool_checked("correspondences")
+        self._update_branch_correlation_scene(visible=visible, render=False)
+        self._update_branch_correlation_legend()
+        self._render()
+
+    def _apply_branch_correlation_settings(self, *_args):
+        if self._scene is None:
+            return
+        self._scene.set_branch_correspondence_settings(
+            show_candidates=bool(self.correlation_show_candidates.isChecked()),
+            emphasize_core=bool(self.correlation_emphasize_core.isChecked()),
+            residual_opacity=float(self.correlation_residual_opacity.value()),
+            line_width=float(self.correlation_line_width.value()),
+            opacity=float(self.correlation_line_opacity.value()),
+            render=False,
+        )
+        self._update_branch_correlation_legend()
+        self._render()
 
     def _set_peak_marker_color(self, color):
         if self._scene is None or self._payload is None or self._dataset_request is None:
@@ -1795,7 +2185,16 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
         self._payload = None
         self._peak_catalog = None
         self._peak_position_kind = "detected"
+        self._branch_edges = None
+        self._branch_correlation_preview = None
         self.tools.set_overlay_tool_checked("peaks", False)
+        self.tools.set_overlay_tool_checked("correspondences", False)
+        self._branch_correspondence_overlay_preference = None
+        self._sync_branch_correlation_pair_combo()
+        if self.branch_legend is not None:
+            self.branch_legend.hide_on_canvas()
+        if self.branch_correlation_legend is not None:
+            self.branch_correlation_legend.hide_on_canvas()
         self._rois.clear()
         self._source_scan_key = None
         self.source_combo.blockSignals(True)
@@ -1874,6 +2273,8 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
             self._hide_peak_tooltip()
             if self.branch_legend is not None:
                 self.branch_legend.hide_on_canvas()
+            if self.branch_correlation_legend is not None:
+                self.branch_correlation_legend.hide_on_canvas()
             if self._interactor is not None and self._peak_hover_observer_id is not None:
                 try:
                     self._interactor.RemoveObserver(self._peak_hover_observer_id)

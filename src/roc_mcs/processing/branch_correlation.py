@@ -1,31 +1,36 @@
 """3D cross-correlation and directed branch decomposition.
 
-The implementation extracts the reproducible pipeline from
-``Из блокнота кросс-корреляция.ipynb`` (cells 6, 56, 57 and 59):
+The production coarse-registration path computes the full linear cross-correlation
+of binary occupancy volumes.  It uses a real-valued float64 FFT with an explicit
+memory estimate; it does not reject a volume because an arbitrary voxel-count
+threshold was crossed.  A bounded exact sparse vote is retained only for tiny
+point sets when the FFT estimate does not fit the available memory.
 
-1. binary 3D cross-correlation on (theta_index, y, x) for coarse registration;
-2. directed nearest-neighbour support in continuous (theta, y, x);
-3. assignment of a source branch to one or several candidate partner branches;
-4. one core-based coarse refinement per partner;
-5. a robust continuous theta refinement and final assignment.
-
-No input catalogue is modified. The directed nearest-neighbour rule is kept as
-in the notebook: different source events may select the same partner event.
+The event-level pipeline (directed nearest-neighbour support, multi-partner
+assignment, exclusive-core refinement and robust sub-bin theta correction) is
+kept separate from registration and preserves the notebook's matching semantics.
 """
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
-from math import prod
+from math import ceil, prod, sqrt
+import os
+import sys
 from typing import Any, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
-from scipy.signal import fftconvolve
+from scipy.fft import irfftn, next_fast_len, rfftn
 from scipy.spatial import cKDTree
-from scipy.fft import next_fast_len
 
-
-_MAX_FFT_VOXELS = 8_000_000
+# Sparse translation voting has O(Na*Nb) work.  It is intentionally a small-data
+# fallback, never the path for normal 35k x 35k diffraction branches.
+_MAX_SPARSE_CORRELATION_PAIRS = 2_000_000
+_SPARSE_CHUNK_PAIRS = 100_000
+_DEFAULT_UNKNOWN_MEMORY_BUDGET = 1024**3
+_MEMORY_SAFETY_FACTOR = 1.25
+_MEMORY_FIXED_OVERHEAD = 32 * 1024**2
 _MAX_PARTNERS = 8
 _REQUIRED_COLUMNS = {
     "peak_id", "branch_id", "theta_index", "theta", "x", "y",
@@ -94,69 +99,311 @@ def _integer_points(points: Any, *, name: str) -> np.ndarray:
     return np.asarray(np.rint(numeric), dtype=np.int64)
 
 
+def _available_memory_bytes() -> int | None:
+    """Return currently available physical RAM without making psutil mandatory."""
+    try:
+        import psutil  # type: ignore[import-not-found]
+        available = int(psutil.virtual_memory().available)
+        if available > 0:
+            return available
+    except Exception:
+        pass
+
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class _MemoryStatusEx(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", wintypes.DWORD),
+                    ("dwMemoryLoad", wintypes.DWORD),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            status = _MemoryStatusEx()
+            status.dwLength = ctypes.sizeof(_MemoryStatusEx)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+                value = int(status.ullAvailPhys)
+                if value > 0:
+                    return value
+        except Exception:
+            pass
+
+    # Linux exposes MemAvailable, which includes reclaimable cache and is a better
+    # measure than SC_AVPHYS_PAGES for deciding whether a transform can be run.
+    try:
+        with open("/proc/meminfo", "r", encoding="ascii") as stream:
+            for line in stream:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+
+    try:
+        pages = int(os.sysconf("SC_AVPHYS_PAGES"))
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+        value = pages * page_size
+        return value if value > 0 else None
+    except (AttributeError, OSError, ValueError):
+        return None
+
+
+def _fft_memory_estimate_bytes(
+    shape_a: Sequence[int], shape_b: Sequence[int], fft_shape: Sequence[int]
+) -> int:
+    """Conservative peak working-set estimate for the float64 real FFT path.
+
+    Counts both dense input volumes, two complex half-spectra, the inverse real
+    array, an additional full real-size scratch allowance, fixed FFT/allocator
+    overhead, and a 25% safety factor.  This deliberately overestimates the
+    measured working set rather than using an arbitrary voxel-count cutoff.
+    """
+    volume_cells = int(prod(int(v) for v in shape_a)) + int(prod(int(v) for v in shape_b))
+    real_cells = int(prod(int(v) for v in fft_shape))
+    spectrum_cells = int(prod(int(v) for v in fft_shape[:-1])) * (int(fft_shape[-1]) // 2 + 1)
+    volume_bytes = volume_cells * np.dtype(np.float64).itemsize
+    real_bytes = real_cells * np.dtype(np.float64).itemsize
+    spectrum_bytes = spectrum_cells * np.dtype(np.complex128).itemsize
+    live_bytes = volume_bytes + (2 * spectrum_bytes) + (2 * real_bytes)
+    return int(ceil(live_bytes * _MEMORY_SAFETY_FACTOR + _MEMORY_FIXED_OVERHEAD))
+
+
+def _automatic_fft_memory_budget_bytes(available_bytes: int | None = None) -> int:
+    available = _available_memory_bytes() if available_bytes is None else int(available_bytes)
+    if available is None or available <= 0:
+        return _DEFAULT_UNKNOWN_MEMORY_BUDGET
+    # Leave 30% of currently available RAM for the OS, GUI, scan arrays and
+    # concurrent application tasks.  There is no fixed 8-million-voxel ceiling.
+    return max(0, int(available * 0.70))
+
+
 def points_to_volume(
     points: Any,
     *,
-    max_voxels: int = _MAX_FFT_VOXELS,
+    max_voxels: int | None = None,
     name: str = "points",
 ) -> tuple[np.ndarray, np.ndarray]:
     """Rasterize integer (theta_index, y, x) points into a local binary volume.
 
     Duplicate events at the same grid position share one occupied voxel, exactly
-    as in the notebook's assignment ``volume[tuple(local.T)] = 1``.
+    as in the research notebook.  ``max_voxels`` is an optional caller-supplied
+    guard for standalone use; production registration uses its memory estimator.
     """
     grid = _integer_points(points, name=name)
     origin = grid.min(axis=0)
     local = grid - origin
     shape = local.max(axis=0) + 1
     cells = int(prod(int(value) for value in shape))
-    if cells > int(max_voxels):
+    if max_voxels is not None and cells > int(max_voxels):
         raise MemoryError(
             f"{name}: ограничивающий 3D-блок содержит {cells:,} ячеек; "
-            f"лимит одного бинарного объёма — {int(max_voxels):,}. "
-            "Выберите более компактные ветви/ROI или уменьшите диапазон данных."
+            f"запрошенный лимит — {int(max_voxels):,}."
         )
-    volume = np.zeros(tuple(int(value) for value in shape), dtype=np.float32)
+    volume = np.zeros(tuple(int(value) for value in shape), dtype=np.float64)
     volume[tuple(local.T)] = 1.0
     return volume, origin
+
+
+def _sparse_translation_vote(
+    local_a: np.ndarray,
+    local_b: np.ndarray,
+    *,
+    shape_b: np.ndarray,
+    output_shape: tuple[int, int, int],
+    max_pairs: int = _MAX_SPARSE_CORRELATION_PAIRS,
+    chunk_pairs: int = _SPARSE_CHUNK_PAIRS,
+) -> tuple[np.ndarray, float]:
+    """Exact sparse equivalent of binary-volume cross-correlation for tiny clouds."""
+    a = np.unique(np.asarray(local_a, dtype=np.int64), axis=0)
+    b = np.unique(np.asarray(local_b, dtype=np.int64), axis=0)
+    if len(a) == 0 or len(b) == 0:
+        raise ValueError("Нельзя регистрировать пустую ветвь")
+    pair_count = int(len(a)) * int(len(b))
+    output_cells = int(prod(int(v) for v in output_shape))
+    if output_cells > np.iinfo(np.int64).max:
+        raise MemoryError(
+            "Размер корреляционного результата превышает диапазон безопасной "
+            "индексации int64 для sparse fallback."
+        )
+    if pair_count > int(max_pairs):
+        raise MemoryError(
+            f"Плотная FFT не помещается в доступный бюджет, а точный sparse-подсчёт "
+            f"потребовал бы {pair_count:,} пар при лимите {int(max_pairs):,}. "
+            "Увеличьте доступную память/освободите память и повторите расчёт; "
+            "пики не прореживались и результат не приближался."
+        )
+
+    chunk_pairs = max(1, int(chunk_pairs))
+    block_a = max(1, min(len(a), int(sqrt(chunk_pairs * len(a) / max(1, len(b))))))
+    block_b = max(1, min(len(b), chunk_pairs // block_a))
+    votes: Counter[int] = Counter()
+    offset = np.asarray(shape_b, dtype=np.int64) - 1
+    out_y, out_x = int(output_shape[1]), int(output_shape[2])
+    for a_start in range(0, len(a), block_a):
+        a_block = a[a_start:a_start + block_a]
+        for b_start in range(0, len(b), block_b):
+            b_block = b[b_start:b_start + block_b]
+            differences = a_block[:, None, :] - b_block[None, :, :]
+            correlation_indices = differences.reshape(-1, 3) + offset[None, :]
+            flat = (
+                (correlation_indices[:, 0] * out_y + correlation_indices[:, 1])
+                * out_x + correlation_indices[:, 2]
+            )
+            unique, counts = np.unique(flat, return_counts=True)
+            votes.update({int(key): int(count) for key, count in zip(unique, counts)})
+    maximum = max(votes.values())
+    best_flat = min(key for key, count in votes.items() if count == maximum)
+    peak_index = np.asarray(np.unravel_index(best_flat, output_shape), dtype=np.int64)
+    return peak_index - offset, float(maximum)
+
+
+def _register_branches_3d_coarse(
+    points_a: Any,
+    points_b: Any,
+    *,
+    max_fft_memory_bytes: int | None = None,
+    max_sparse_pairs: int = _MAX_SPARSE_CORRELATION_PAIRS,
+) -> tuple[np.ndarray, float, dict[str, Any]]:
+    """Detailed internal registration; the public wrapper preserves the old API."""
+    grid_a = _integer_points(points_a, name="source branch")
+    grid_b = _integer_points(points_b, name="partner branch")
+    origin_a = grid_a.min(axis=0)
+    origin_b = grid_b.min(axis=0)
+    local_a = np.unique(grid_a - origin_a, axis=0)
+    local_b = np.unique(grid_b - origin_b, axis=0)
+    shape_a = local_a.max(axis=0) + 1
+    shape_b = local_b.max(axis=0) + 1
+    output_shape = tuple(int(a + b - 1) for a, b in zip(shape_a, shape_b))
+    # Match scipy.signal.fftconvolve's real-transform padding convention.
+    fft_shape = tuple(next_fast_len(size, real=True) for size in output_shape)
+    estimated_bytes = _fft_memory_estimate_bytes(shape_a, shape_b, fft_shape)
+    available_bytes = _available_memory_bytes()
+    if max_fft_memory_bytes is None:
+        memory_budget = _automatic_fft_memory_budget_bytes(available_bytes)
+        if memory_budget <= 0:
+            raise MemoryError(
+                "Операционная система не сообщает доступную физическую память; "
+                "невозможно безопасно выделить рабочие массивы полной 3D FFT."
+            )
+    else:
+        if isinstance(max_fft_memory_bytes, (bool, np.bool_)):
+            raise ValueError("max_fft_memory_bytes должен быть положительным целым числом байтов")
+        try:
+            memory_budget = int(max_fft_memory_bytes)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("max_fft_memory_bytes должен быть положительным целым числом байтов") from exc
+        if memory_budget <= 0 or memory_budget != max_fft_memory_bytes:
+            raise ValueError("max_fft_memory_bytes должен быть положительным целым числом байтов")
+    if int(max_sparse_pairs) < 0:
+        raise ValueError("max_sparse_pairs не может быть отрицательным")
+
+    diagnostics: dict[str, Any] = {
+        "method": "fft_float64",
+        "source_unique_voxels": int(len(local_a)),
+        "partner_unique_voxels": int(len(local_b)),
+        "source_bbox_theta_y_x": [int(v) for v in shape_a],
+        "partner_bbox_theta_y_x": [int(v) for v in shape_b],
+        "correlation_shape_theta_y_x": [int(v) for v in output_shape],
+        "fft_shape_theta_y_x": [int(v) for v in fft_shape],
+        "estimated_peak_memory_bytes": int(estimated_bytes),
+        "available_memory_bytes": None if available_bytes is None else int(available_bytes),
+        "memory_budget_bytes": int(memory_budget),
+        "sparse_pair_count": int(len(local_a)) * int(len(local_b)),
+    }
+
+    if estimated_bytes <= memory_budget:
+        volume_a = np.zeros(tuple(int(v) for v in shape_a), dtype=np.float64)
+        volume_b = np.zeros(tuple(int(v) for v in shape_b), dtype=np.float64)
+        volume_a[tuple(local_a.T)] = 1.0
+        volume_b[tuple(local_b.T)] = 1.0
+
+        # Explicit real FFT: one complex half-spectrum per input.  Multiply the
+        # first spectrum in-place and release the second before the inverse FFT.
+        # This bounds transient allocations and keeps the calculation float64.
+        try:
+            spectrum_a = rfftn(volume_a, s=fft_shape, workers=1)
+            spectrum_b = rfftn(volume_b[::-1, ::-1, ::-1], s=fft_shape, workers=1)
+            spectrum_a *= spectrum_b
+            del spectrum_b, volume_a, volume_b
+            correlation = irfftn(
+                spectrum_a, s=fft_shape, workers=1, overwrite_x=True
+            )
+            del spectrum_a
+        except MemoryError as exc:
+            raise MemoryError(
+                "Фактическое выделение памяти для полной float64 FFT не удалось, "
+                f"хотя предварительная оценка составляла {estimated_bytes / (1024**3):.2f} GiB "
+                f"при бюджете {memory_budget / (1024**3):.2f} GiB. "
+                "Возможно, свободная память уменьшилась после проверки. "
+                "Закройте другие тяжёлые приложения и повторите расчёт."
+            ) from exc
+
+        valid = correlation[tuple(slice(0, size) for size in output_shape)]
+        # For binary occupancy, every exact correlation coefficient is an
+        # integer. Round only floating FFT noise before deterministic argmax.
+        np.rint(valid, out=valid)
+        peak_flat = int(np.argmax(valid))
+        peak_index = np.asarray(np.unravel_index(peak_flat, output_shape), dtype=np.int64)
+        shift_local = peak_index - (shape_b.astype(np.int64) - 1)
+        peak_value = float(valid[tuple(peak_index)])
+    else:
+        pair_count = int(len(local_a)) * int(len(local_b))
+        if pair_count > int(max_sparse_pairs):
+            available_text = (
+                f"{available_bytes / (1024**3):.2f} GiB"
+                if available_bytes is not None else "не удалось определить"
+            )
+            raise MemoryError(
+                "Полная 3D-кросс-корреляция не запускалась: расчётная пиковая "
+                f"память float64 FFT ≈ {estimated_bytes / (1024**3):.2f} GiB, "
+                f"доступная физическая память — {available_text}, "
+                f"рабочий бюджет — {memory_budget / (1024**3):.2f} GiB. "
+                f"Точный sparse-вариант потребовал бы {pair_count:,} пар "
+                f"(лимит {int(max_sparse_pairs):,}). Данные не изменены. "
+                "Закройте другие тяжёлые приложения/освободите RAM и повторите расчёт."
+            )
+        shift_local, peak_value = _sparse_translation_vote(
+            local_a,
+            local_b,
+            shape_b=shape_b,
+            output_shape=output_shape,
+            max_pairs=max_sparse_pairs,
+        )
+        diagnostics["method"] = "sparse_exact_vote"
+
+    shift_global = origin_a - origin_b + shift_local
+    return shift_global.astype(np.int64), float(peak_value), diagnostics
 
 
 def register_branches_3d_coarse(
     points_a: Any,
     points_b: Any,
     *,
-    max_fft_voxels: int = _MAX_FFT_VOXELS,
+    max_fft_memory_bytes: int | None = None,
+    max_sparse_pairs: int = _MAX_SPARSE_CORRELATION_PAIRS,
 ) -> tuple[np.ndarray, float]:
-    """Return integer translation for which ``B + shift`` aligns to ``A``.
+    """Return the integer translation to apply to B to align it with A.
 
-    The maximum of the full binary 3D cross-correlation is used, preserving the
-    notebook's registration definition. A conservative FFT-size guard avoids
-    accidental multi-gigabyte temporary allocations for very extended branches.
+    Uses the full binary 3D cross-correlation.  By default the dense float64 FFT
+    is selected from a conservative peak-memory estimate and current available
+    RAM.  An exact sparse vote is used only when the point-pair count is small.
+    ``max_fft_memory_bytes`` is an optional explicit budget for tests and advanced
+    callers; no fixed voxel-count ceiling is imposed.
     """
-    volume_a, origin_a = points_to_volume(points_a, name="source branch")
-    volume_b, origin_b = points_to_volume(points_b, name="partner branch")
-    output_shape = tuple(
-        int(a + b - 1) for a, b in zip(volume_a.shape, volume_b.shape)
+    shift, peak, _ = _register_branches_3d_coarse(
+        points_a,
+        points_b,
+        max_fft_memory_bytes=max_fft_memory_bytes,
+        max_sparse_pairs=max_sparse_pairs,
     )
-    fft_shape = tuple(next_fast_len(size) for size in output_shape)
-    fft_cells = int(prod(fft_shape))
-    if fft_cells > int(max_fft_voxels):
-        raise MemoryError(
-            "3D cross-correlation потребовала бы FFT-сетку "
-            f"{fft_shape} ({fft_cells:,} ячеек); безопасный лимит — "
-            f"{int(max_fft_voxels):,}. Разбейте анализ на компактные ROI/ветви."
-        )
-    correlation = fftconvolve(
-        volume_a, volume_b[::-1, ::-1, ::-1], mode="full"
-    )
-    peak_index = np.asarray(
-        np.unravel_index(int(np.argmax(correlation)), correlation.shape),
-        dtype=np.int64,
-    )
-    shift_local = peak_index - (np.asarray(volume_b.shape, dtype=np.int64) - 1)
-    shift_global = origin_a - origin_b + shift_local
-    peak_value = float(correlation[tuple(peak_index)])
-    return shift_global.astype(np.int64), peak_value
+    return shift, peak
 
 
 def apply_translation(
@@ -360,12 +607,14 @@ def correlate_branch_catalog(
     # 1. Independent coarse 3D registration, following notebook cells 57/59.
     coarse_shifts: list[np.ndarray] = []
     coarse_peaks: list[float] = []
+    coarse_diagnostics: list[dict[str, Any]] = []
     aligned_coarse: list[np.ndarray] = []
     supports_initial: list[dict[str, np.ndarray]] = []
     for grid, positions in zip(partner_grids, partner_xyz):
-        shift, corr_peak = register_branches_3d_coarse(source_grid, grid)
+        shift, corr_peak, registration_info = _register_branches_3d_coarse(source_grid, grid)
         coarse_shifts.append(shift)
         coarse_peaks.append(corr_peak)
+        coarse_diagnostics.append(registration_info)
         aligned = apply_translation(
             positions,
             shift_theta_arcsec=float(shift[0]) * cfg.theta_step_arcsec,
@@ -383,6 +632,7 @@ def correlate_branch_catalog(
     refined_shifts: list[np.ndarray] = []
     refined_peaks: list[float] = []
     refinement_status: list[str] = []
+    refined_diagnostics: list[dict[str, Any] | None] = []
     supports_refined: list[dict[str, np.ndarray]] = []
     aligned_refined: list[np.ndarray] = []
     for partner_index, (grid, positions, initial_support, shift_initial) in enumerate(
@@ -393,20 +643,23 @@ def correlate_branch_catalog(
             shift_refined = shift_initial.copy()
             corr_refined = coarse_peaks[partner_index]
             status = "coarse_only_no_exclusive_core"
+            refinement_info = None
         else:
             target_core_idx = np.unique(initial_support["matched_idx"][source_core_idx])
             if target_core_idx.size == 0:
                 shift_refined = shift_initial.copy()
                 corr_refined = coarse_peaks[partner_index]
                 status = "coarse_only_no_target_core"
+                refinement_info = None
             else:
-                shift_refined, corr_refined = register_branches_3d_coarse(
+                shift_refined, corr_refined, refinement_info = _register_branches_3d_coarse(
                     source_grid[source_core_idx], grid[target_core_idx]
                 )
                 status = "refined_on_exclusive_core"
         refined_shifts.append(np.asarray(shift_refined, dtype=np.int64))
         refined_peaks.append(float(corr_refined))
         refinement_status.append(status)
+        refined_diagnostics.append(refinement_info)
         aligned = apply_translation(
             positions,
             shift_theta_arcsec=float(shift_refined[0]) * cfg.theta_step_arcsec,
@@ -546,6 +799,26 @@ def correlate_branch_catalog(
             "final_supported_count": int(np.count_nonzero(support["supported"])),
             "assigned_source_count": int(np.count_nonzero(selected_for_partner)),
             "refinement_status": refinement_status[partner_index],
+            "coarse_registration_method": coarse_diagnostics[partner_index]["method"],
+            "coarse_correlation_shape_theta_y_x": "×".join(
+                str(v) for v in coarse_diagnostics[partner_index]["correlation_shape_theta_y_x"]
+            ),
+            "coarse_fft_shape_theta_y_x": "×".join(
+                str(v) for v in coarse_diagnostics[partner_index]["fft_shape_theta_y_x"]
+            ),
+            "coarse_fft_estimated_peak_memory_mb": (
+                coarse_diagnostics[partner_index]["estimated_peak_memory_bytes"] / (1024.0 ** 2)
+            ),
+            "coarse_fft_available_memory_mb": (
+                float("nan") if coarse_diagnostics[partner_index]["available_memory_bytes"] is None
+                else coarse_diagnostics[partner_index]["available_memory_bytes"] / (1024.0 ** 2)
+            ),
+            "coarse_unique_source_voxels": coarse_diagnostics[partner_index]["source_unique_voxels"],
+            "coarse_unique_partner_voxels": coarse_diagnostics[partner_index]["partner_unique_voxels"],
+            "refined_registration_method": (
+                None if refined_diagnostics[partner_index] is None
+                else refined_diagnostics[partner_index]["method"]
+            ),
         })
 
     candidates = pd.concat(candidate_frames, ignore_index=True) if candidate_frames else pd.DataFrame()
@@ -565,7 +838,26 @@ def correlate_branch_catalog(
         "matching_rule": "directed_nearest_neighbor_many_to_one",
         "assignment_rule": "unique_support_or_relative_best_score_margin",
         "theta_correction_sign": "negative_median(target_aligned_minus_source)",
-        "algorithm_version": 1,
+        "algorithm_version": 2,
+        "coarse_registration_backend": "adaptive_float64_real_fft_with_exact_sparse_fallback",
+        "fft_precision": "float64",
+        "registration_uses_all_unique_occupied_voxels": True,
+        "registration_diagnostics": [
+            {
+                "partner_branch_id": int(partner_id),
+                "coarse_method": coarse_diagnostics[index]["method"],
+                "correlation_shape_theta_y_x": coarse_diagnostics[index]["correlation_shape_theta_y_x"],
+                "fft_shape_theta_y_x": coarse_diagnostics[index]["fft_shape_theta_y_x"],
+                "estimated_peak_memory_bytes": coarse_diagnostics[index]["estimated_peak_memory_bytes"],
+                "available_memory_bytes": coarse_diagnostics[index]["available_memory_bytes"],
+                "source_unique_voxels": coarse_diagnostics[index]["source_unique_voxels"],
+                "partner_unique_voxels": coarse_diagnostics[index]["partner_unique_voxels"],
+                "refinement_method": (
+                    None if refined_diagnostics[index] is None else refined_diagnostics[index]["method"]
+                ),
+            }
+            for index, partner_id in enumerate(partners)
+        ],
     }
     return BranchCorrelationResult(
         pairs=pairs,

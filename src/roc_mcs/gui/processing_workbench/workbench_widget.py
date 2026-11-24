@@ -2168,12 +2168,37 @@ class ProcessingWorkbenchWidget(QWidget):
             self._active_task = None
             self.progress.setRange(0, 1)
             self.progress.setValue(0)
-            self.status_label.setText("Этап завершился с ошибкой")
+            self.status_label.setText("Этап завершился с ошибкой — подробности сохранены")
             self._log(error)
             self._rebuild_graph(select_id=node_id)
             self._update_controls()
         if persistence_error is not None:
             QMessageBox.critical(self, "Ошибка сохранения истории", persistence_error)
+            return
+
+        # A failed workflow node must expose its real exception immediately.
+        # The full traceback remains in node.error and in the execution log;
+        # QMessageBox's details section makes it accessible without opening JSON.
+        node = self.project.history.get(node_id)
+        lines = [line.strip() for line in str(error).splitlines() if line.strip()]
+        cause = lines[-1] if lines else "Причина не была записана; откройте журнал выполнения."
+        details = QMessageBox(self)
+        details.setIcon(QMessageBox.Icon.Critical)
+        details.setWindowTitle("Ошибка выполнения этапа")
+        details.setText(f"Этап «{node.label}» не выполнен.")
+        details.setInformativeText(
+            f"{cause}\n\nПараметры запуска: {node.parameters}\n\n"
+            "Ни исходный скан, ни принятый результат родительского этапа не изменены. "
+            "Полный traceback находится в разделе «Подробности» и сохранён в истории workflow."
+        )
+        details.setDetailedText(str(error))
+        copy_button = details.addButton(
+            "Копировать traceback", QMessageBox.ButtonRole.ActionRole
+        )
+        details.addButton(QMessageBox.StandardButton.Ok)
+        details.exec()
+        if details.clickedButton() is copy_button:
+            QApplication.clipboard().setText(str(error))
 
     def _rebuild_graph(self, *_args, select_id: str | None = None) -> None:
         if not hasattr(self, "graph"):
