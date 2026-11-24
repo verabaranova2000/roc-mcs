@@ -45,7 +45,7 @@ class _WorkflowNodeItem(QGraphicsObject):
             f"Execution: {node.status}\nReview: {node.review_status}\n"
             f"Summary: {node.summary or '—'}\n"
             f"Parameters: {node.parameters}\nID: {node.id}\n"
-            "Глаз — открыть результат; + — создать следующую ветвь."
+            "Глаз — открыть результат; + — добавить следующий допустимый этап обработки."
         )
         if input_descriptions:
             tooltip += "\n\nСохранённые входы операции:\n" + "\n".join(
@@ -264,6 +264,7 @@ class ProcessingGraphView(QGraphicsView):
         *,
         selected_id: str | None = None,
         show_rejected: bool = False,
+        addable_node_ids: set[str] | None = None,
     ) -> None:
         self._history = history
         self._show_rejected = bool(show_rejected)
@@ -364,9 +365,13 @@ class ProcessingGraphView(QGraphicsView):
                 input_descriptions=input_descriptions_by_node[node.id],
                 can_preview=node.status == NodeStatus.SUCCEEDED,
                 can_add=(
-                    node.status == NodeStatus.SUCCEEDED
-                    and node.review_status == ReviewStatus.ACCEPTED
-                    and node.operation_id != "peaks.branches"
+                    (
+                        node.status == NodeStatus.SUCCEEDED
+                        and node.review_status == ReviewStatus.ACCEPTED
+                        and node.operation_id not in {"peaks.branch_correlation"}
+                    )
+                    if addable_node_ids is None
+                    else node.id in addable_node_ids
                 ),
                 is_selected=node.id == selected,
             )

@@ -125,8 +125,8 @@ def test_zero_internal_gap_is_not_discarded_from_diagnostics():
 def test_fitted_positions_keep_peak_identity_after_shuffled_fit_rows():
     detected = pd.DataFrame(
         [
-            {"peak_id": 11, "x": 0, "y": 0, "theta": 100.0, "component_id": 0},
-            {"peak_id": 12, "x": 0, "y": 0, "theta": 400.0, "component_id": 1},
+            {"peak_id": 11, "x": 0, "y": 0, "theta_index": 3, "theta": 100.0, "component_id": 0},
+            {"peak_id": 12, "x": 0, "y": 0, "theta_index": 14, "theta": 400.0, "component_id": 1},
         ]
     )
     fitted = pd.DataFrame(
@@ -142,6 +142,8 @@ def test_fitted_positions_keep_peak_identity_after_shuffled_fit_rows():
     assert by_id.loc[11, "theta"] == pytest.approx(98.5)
     assert by_id.loc[12, "theta"] == pytest.approx(402.5)
     assert by_id.loc[11, "theta_detected"] == pytest.approx(100.0)
+    assert by_id.loc[11, "theta_index"] == 3
+    assert by_id.loc[12, "theta_index"] == 14
 
 
 def test_fitted_catalog_existing_peak_ids_are_validated_and_preserved():

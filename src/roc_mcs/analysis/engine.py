@@ -393,6 +393,13 @@ def build_input_refs(
                 "Определение ветвей можно создать от принятого результата «Поиск пиков» "
                 "или «Fit». Выберите один из этих узлов."
             )
+    elif operation_id == "peaks.branch_correlation":
+        if selected.operation_id != "peaks.branches" or "branches" not in selected.output_refs:
+            raise ValueError(
+                "3D-кросс-корреляцию можно создать только от принятого результата "
+                "«Определение дифракционных ветвей»."
+            )
+        refs["branches"] = {"node_id": selected.id, "output": "branches"}
     else:
         raise KeyError(f"Для операции {operation_id!r} не определены входы")
     return refs
@@ -415,4 +422,7 @@ def make_operation_label(operation_id: str, parameters: Mapping[str, Any]) -> st
         return f"Fit · {parameters['model']} · {parameters['backend']}"
     if operation_id == "peaks.branches":
         return f"Ветви · θ-gate {parameters['theta_gate']:g}″"
+    if operation_id == "peaks.branch_correlation":
+        partners = ",".join(str(value) for value in parameters["partner_branch_ids"])
+        return f"3D-корреляция · {parameters['source_branch_id']} ↔ {partners}"
     return operation_id

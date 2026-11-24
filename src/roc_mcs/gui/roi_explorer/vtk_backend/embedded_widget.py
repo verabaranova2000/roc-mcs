@@ -5,11 +5,13 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 import logging
+import time
 
 import numpy as np
 from PyQt6 import QtCore, QtGui, QtWidgets
 
 from roc_mcs.gui.roi_explorer.theme import resolve_theme, theme_colors
+from roc_mcs.gui.components.floating_legend import FloatingLegendPanel, LegendEntry
 from roc_mcs.gui.roi_explorer.map_tools_widget import SmartDropdownButton
 from roc_mcs.gui.roi_explorer.plot_toolbar_style import (
     SMART_DROPDOWN_INDICATOR_RGBA,
@@ -122,6 +124,9 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
         self._interactor = None
         self._scene = None
         self._display = None
+        self._peak_hover_observer_id = None
+        self._last_hover_peak_key = None
+        self._last_hover_pick_time = 0.0
         self._payload = None
         self._peak_catalog = None
         self._peak_position_kind = "detected"
@@ -232,6 +237,13 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
         self.placeholder.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         self.placeholder.setWordWrap(True)
         self.viewport_layout.addWidget(self.placeholder, 0, 0)
+        self.branch_legend = FloatingLegendPanel(
+            self.viewport,
+            title="BRANCH ID · ЦВЕТА",
+            default_size=QtCore.QSize(224, 248),
+            margin=8,
+        )
+        self.branch_legend.hide_on_canvas()
         root.addWidget(self.viewport, 1)
 
         self.status = QtWidgets.QLabel("3D не инициализировано", self)
@@ -736,6 +748,7 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
         if self._scene is None:
             self._payload = payload
             return
+        self._hide_peak_tooltip()
         settings = self._transfer_settings()
         info = self._scene.set_payload(payload, settings, axis_scales=self.tools.axis_scales)
         request = self._dataset_request or {}
@@ -800,6 +813,7 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
         self._scene.set_peak_markers_visible(peak_visible, render=False)
         self._scene.set_branch_edges_visible(branches_visible, render=False)
         self._scene.set_volume_visible(self.tools.is_overlay_tool_checked("volume"), render=False)
+        self._update_branch_legend()
         self.tools.set_projection_enabled(settings.show_projection)
         self._scene.set_theta_slice_palette(str(self.theta_palette.currentData() or "viridis"), render=False)
         self._scene.set_theta_slice_strength(float(self.theta_strength.value()), render=False)
@@ -1027,6 +1041,10 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
             # render synchronously, allowing nested paints during Qt events.
             self._scene = VTKVolumeScene(render_window, interactor, render_callback=widget.update)
             self._scene.set_theme(self._theme)
+            if self._peak_hover_observer_id is None:
+                self._peak_hover_observer_id = interactor.AddObserver(
+                    "MouseMoveEvent", self._on_peak_hover, 0.10
+                )
             self.tools.apply_theme(self._theme)
             self.tools.set_scene_available(False)
             if self.display is None:
@@ -1485,6 +1503,106 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
             self._scene.set_theta_slice_strength(float(value), render=False)
             self._render()
 
+    def _hide_peak_tooltip(self) -> None:
+        self._last_hover_peak_key = None
+        QtWidgets.QToolTip.hideText()
+
+    def _on_peak_hover(self, _caller=None, _event=None) -> None:
+        """Low-cost hover inspection for the currently rendered peak glyphs."""
+        scene = self._scene
+        interactor = self._interactor
+        marker_actor = getattr(scene, "_peak_marker_actor", None) if scene is not None else None
+        if scene is None or interactor is None or marker_actor is None or not marker_actor.GetVisibility():
+            self._hide_peak_tooltip()
+            return
+        now = time.monotonic()
+        # vtkPointPicker is invoked at most 24 times/s. The camera interactor
+        # still receives every event; this observer never aborts interaction.
+        if now - self._last_hover_pick_time < (1.0 / 24.0):
+            return
+        self._last_hover_pick_time = now
+        try:
+            position = interactor.GetEventPosition()
+            window_size = self._render_window.GetSize() if self._render_window is not None else (800, 600)
+            min_dimension = max(1, min(int(window_size[0]), int(window_size[1])))
+            tolerance = max(
+                0.006,
+                min(0.030, 1.8 * float(self.peak_marker_size.value()) / min_dimension),
+            )
+            info = scene.pick_peak_at_display(
+                float(position[0]), float(position[1]), tolerance=tolerance
+            )
+        except Exception:
+            logger.debug("Не удалось определить пик под курсором в 3D", exc_info=True)
+            info = None
+        if info is None:
+            self._hide_peak_tooltip()
+            return
+
+        key = (info.get("peak_id"), info.get("branch_id"))
+        if key == self._last_hover_peak_key:
+            return
+        self._last_hover_peak_key = key
+        color = str(info.get("color", "#FFC857"))
+        branch_id = info.get("branch_id")
+        if branch_id is None:
+            branch_label = "branch_id не назначен"
+            count_label = "число точек ветви: —"
+        else:
+            branch_label = f"branch_id {int(branch_id)}"
+            count_label = f"точек в ветви: {int(info.get('branch_event_count', 0)):,}"
+        peak_id = info.get("peak_id")
+        peak_label = f"peak_id {int(peak_id)}" if peak_id is not None else "peak_id —"
+        html = (
+            '<div style="white-space:nowrap; padding:2px 3px;">'
+            f'<span style="color:{color}; font-size:15px;">●</span> '
+            f'<b style="color:{color};">{branch_label}</b><br>'
+            f'<span>{count_label}</span><br>'
+            f'<span>{peak_label}</span><br>'
+            f'<span style="color:#888;">X={float(info["x"]):.4g}; '
+            f'Y={float(info["y"]):.4g}; θ={float(info["theta"]):.5g}</span>'
+            '</div>'
+        )
+        if self._qvtk is not None:
+            QtWidgets.QToolTip.showText(QtGui.QCursor.pos(), html, self._qvtk)
+
+    def _update_branch_legend(self) -> None:
+        """Synchronize floating branch colour key with the visible peak layer."""
+        panel = getattr(self, "branch_legend", None)
+        scene = self._scene
+        if panel is None:
+            return
+        should_show = (
+            scene is not None
+            and self.tools.is_overlay_tool_checked("peaks")
+            and bool(self.peak_color_by_branch.isChecked())
+        )
+        if not should_show:
+            panel.hide_on_canvas()
+            return
+        data = scene.branch_legend_data(limit=48)
+        entries = data.get("entries", ())
+        if not entries:
+            panel.hide_on_canvas()
+            return
+        legend_entries = [
+            LegendEntry(
+                label=f"branch_id {int(item['branch_id'])}",
+                color=str(item["color"]),
+                detail=f"{int(item['event_count']):,} пиков",
+            )
+            for item in entries
+        ]
+        suffix = f" · TOP {len(entries)} / {data['total_branches']}" if data.get("truncated") else ""
+        panel.set_title(f"ВЕТВИ · {data['total_branches']} BRANCH_ID{suffix}")
+        panel.set_entries(legend_entries)
+        panel.show_on_canvas(
+            position=QtCore.QPoint(
+                8,
+                max(8, self.viewport.height() - panel.height() - 8),
+            )
+        )
+
     def _toggle_projection(self, enabled):
         self._transfer = replace(self._transfer, show_projection=bool(enabled))
         self._queue_transfer_settings()
@@ -1511,6 +1629,8 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
                         f"; {old_state}; Ø=", f"; {new_state}; Ø=", 1
                     )
                 self.status.setText(status_text)
+                self._update_branch_legend()
+                self._hide_peak_tooltip()
                 self._render()
         elif key == "branches":
             self._branch_overlay_preference = bool(enabled)
@@ -1549,6 +1669,7 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
             uniform_color=self.tools.peak_marker_color,
             render=False,
         )
+        self._update_branch_legend()
         self._render()
 
     def _apply_branch_edge_settings(self, *_args):
@@ -1750,6 +1871,15 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
                 pass
             self._active_worker = None
 
+            self._hide_peak_tooltip()
+            if self.branch_legend is not None:
+                self.branch_legend.hide_on_canvas()
+            if self._interactor is not None and self._peak_hover_observer_id is not None:
+                try:
+                    self._interactor.RemoveObserver(self._peak_hover_observer_id)
+                except Exception:
+                    logger.debug("Не удалось снять peak-hover observer", exc_info=True)
+            self._peak_hover_observer_id = None
             scene, self._scene = self._scene, None
             widget, self._qvtk = self._qvtk, None
             self._render_window = None

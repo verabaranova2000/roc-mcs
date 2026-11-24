@@ -407,9 +407,18 @@ class FloatingLegendPanel(QFrame):
             self.collapse_button.setToolTip("Развернуть легенду")
         self._clamp_to_parent()
 
-    def show_on_canvas(self) -> None:
+    def show_on_canvas(self, *, position: QPoint | None = None) -> None:
+        """Show above the canvas, optionally at a view-selected anchor point.
+
+        A supplied position is treated as the panel's initial user placement,
+        so a later parent resize clamps it without resetting it over another HUD.
+        """
         if self.parentWidget() is not None and not self._user_moved:
-            self._place_initially()
+            if position is None:
+                self._place_initially()
+            else:
+                self.move(position)
+                self._user_moved = True
         self.show()
         self.raise_()
 

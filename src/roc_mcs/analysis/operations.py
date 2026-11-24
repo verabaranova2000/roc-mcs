@@ -623,6 +623,38 @@ def _validate_peaks(parameters: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _theta_axis_sampling_metadata(theta_values: Any) -> dict[str, Any]:
+    """Record the signed physical step corresponding to one theta_index.
+
+    The 3D branch registration performs an integer shift in theta_index and
+    converts that shift to physical theta. A single constant conversion is
+    valid only for a uniformly sampled axis, so uniformity is recorded rather
+    than silently approximated for irregular scans.
+    """
+    theta = np.asarray(theta_values, dtype=np.float64)
+    if theta.ndim != 1 or theta.size < 2 or not np.isfinite(theta).all():
+        return {
+            "theta_index_step_arcsec": None,
+            "theta_index_step_uniform": False,
+            "theta_index_step_max_deviation_arcsec": None,
+        }
+    steps = np.diff(theta)
+    signed_step = float(np.median(steps))
+    if signed_step == 0.0 or not np.isfinite(signed_step):
+        uniform = False
+        deviation = None
+    else:
+        deviations = np.abs(steps - signed_step)
+        tolerance = max(abs(signed_step) * 1e-6, 1e-12)
+        uniform = bool(np.all(deviations <= tolerance))
+        deviation = float(np.max(deviations))
+    return {
+        "theta_index_step_arcsec": signed_step,
+        "theta_index_step_uniform": uniform,
+        "theta_index_step_max_deviation_arcsec": deviation,
+    }
+
+
 def _run_peaks(inputs: Mapping[str, ArtifactBundle], parameters: Mapping[str, Any]) -> OperationResult:
     import pandas as pd
     from roc_mcs.peaks.catalog import build_peak_catalog
@@ -736,6 +768,8 @@ def _run_peaks(inputs: Mapping[str, ArtifactBundle], parameters: Mapping[str, An
                 peak_count[int(y), int(x)] = int(count)
     metadata = {
         "grid_id": scan.metadata["grid_id"],
+        **_theta_axis_sampling_metadata(theta),
+        "theta_unit": "arcsec",
         "used_interpolated_data": used_interpolated_data,
         "peak_input_source": (
             "spike_interpolated" if used_interpolated_data else "scan_counts"
@@ -928,6 +962,8 @@ def _run_fit(inputs: Mapping[str, ArtifactBundle], parameters: Mapping[str, Any]
     }
     metadata = {
         "grid_id": scan.metadata["grid_id"],
+        **_theta_axis_sampling_metadata(np.asarray(scan.arrays["theta"], dtype=np.float64)),
+        "theta_unit": "arcsec",
         "model_id": result.model_id,
         "model_version": result.model_version,
         "backend": result.backend,
@@ -1038,6 +1074,175 @@ def _run_branches(inputs: Mapping[str, ArtifactBundle], parameters: Mapping[str,
         ),
     )
 
+
+def _normalise_branch_ids(value: Any, *, name: str) -> list[int]:
+    """Accept a sequence or a comma/semicolon-separated list of branch IDs."""
+    if isinstance(value, str):
+        value = [part.strip() for part in value.replace(";", ",").split(",") if part.strip()]
+    if isinstance(value, (int, float, np.integer, np.floating)) and not isinstance(value, (bool, np.bool_)):
+        value = [value]
+    elif value is None:
+        value = []
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(f"{name} должен быть branch_id или списком branch_id через запятую")
+    result: list[int] = []
+    for raw in value:
+        if isinstance(raw, (bool, np.bool_)):
+            raise ValueError(f"{name}: bool не является branch_id")
+        try:
+            number = float(raw)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"{name}: некорректный branch_id {raw!r}") from exc
+        if not np.isfinite(number) or not number.is_integer() or number < 0:
+            raise ValueError(f"{name}: branch_id должны быть неотрицательными целыми числами")
+        result.append(int(number))
+    if len(result) != len(set(result)):
+        raise ValueError(f"{name}: повторяющиеся branch_id")
+    return result
+
+
+def _validate_branch_correlation(parameters: Mapping[str, Any]) -> dict[str, Any]:
+    source_ids = _normalise_branch_ids(parameters.get("source_branch_id", ""), name="source_branch_id")
+    if len(source_ids) != 1:
+        raise ValueError("Укажите ровно один исходный source_branch_id")
+    partner_ids = _normalise_branch_ids(parameters.get("partner_branch_ids", ()), name="partner_branch_ids")
+    if not partner_ids:
+        raise ValueError("Укажите хотя бы один partner_branch_id")
+    if len(partner_ids) > 8:
+        raise ValueError("За один расчёт можно указать не более 8 ветвей-партнёров")
+    if source_ids[0] in partner_ids:
+        raise ValueError("Исходная ветвь не может быть указана среди партнёров")
+
+    def finite_float(name: str, default: float) -> float:
+        try:
+            value = float(parameters.get(name, default))
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"{name} должен быть конечным числом") from exc
+        if not np.isfinite(value):
+            raise ValueError(f"{name} должен быть конечным числом")
+        return value
+
+    xy_tol = finite_float("xy_tolerance_px", 1.5)
+    theta_tol = finite_float("theta_tolerance_arcsec", 45.0)
+    margin = finite_float("assignment_margin", 0.20)
+    if xy_tol <= 0.0 or theta_tol <= 0.0:
+        raise ValueError("Допуски по X/Y и θ должны быть положительными")
+    if not 0.0 <= margin < 1.0:
+        raise ValueError("assignment_margin должен находиться в диапазоне [0, 1)")
+    return {
+        "source_branch_id": source_ids[0],
+        "partner_branch_ids": partner_ids,
+        "xy_tolerance_px": xy_tol,
+        "theta_tolerance_arcsec": theta_tol,
+        "assignment_margin": margin,
+        "algorithm": "binary_3d_cross_correlation+directed_support+core_refinement_v1",
+    }
+
+
+def _run_branch_correlation(
+    inputs: Mapping[str, ArtifactBundle],
+    parameters: Mapping[str, Any],
+) -> OperationResult:
+    import pandas as pd
+    from roc_mcs.processing.branch_correlation import (
+        BranchCorrelationConfig, correlate_branch_catalog,
+    )
+
+    parent = inputs["branches"]
+    catalog = parent.tables.get("branch_catalog")
+    if catalog is None:
+        raise ValueError("В артефакте ветвей отсутствует branch_catalog")
+    if "branch_id" not in catalog.columns:
+        raise ValueError("В branch_catalog отсутствует столбец branch_id")
+    branch_values = pd.to_numeric(catalog["branch_id"], errors="coerce").to_numpy(dtype=float)
+    if (
+        branch_values.size == 0
+        or not np.all(np.isfinite(branch_values))
+        or not np.all(branch_values == np.floor(branch_values))
+        or np.any(branch_values < 0)
+    ):
+        raise ValueError("branch_catalog содержит пустые или некорректные branch_id")
+    available_branch_ids = set(branch_values.astype(np.int64).tolist())
+    if len(available_branch_ids) < 2:
+        raise ValueError(
+            "3D-кросс-корреляция требует как минимум две различные дифракционные ветви. "
+            "В текущем branch_catalog обнаружена только одна ветвь или каталог пуст."
+        )
+    requested_branch_ids = {
+        int(parameters["source_branch_id"]),
+        *(int(value) for value in parameters["partner_branch_ids"]),
+    }
+    missing_branch_ids = sorted(requested_branch_ids - available_branch_ids)
+    if missing_branch_ids:
+        raise ValueError(
+            f"В выбранном branch_catalog отсутствуют branch_id: {missing_branch_ids}. "
+            "Проверьте ID по подсказкам 3D-облака и убедитесь, что выбран тот же результат ветвей."
+        )
+    theta_step = parent.metadata.get("theta_index_step_arcsec")
+    uniform_step = parent.metadata.get("theta_index_step_uniform")
+    if uniform_step is False:
+        raise ValueError(
+            "3D-кросс-корреляция требует равномерную ось θ: постоянный сдвиг "
+            "theta_index нельзя точно перевести в физический θ для неравномерной сетки. "
+            "Проверьте метаданные исходного скана; алгоритм не будет подменять шаг усреднённым."
+        )
+    if uniform_step is not True:
+        raise ValueError(
+            "В артефакте ветвей отсутствуют метаданные равномерности оси θ. "
+            "Повторно выполните поиск пиков/Fit и определение ветвей в текущей версии."
+        )
+    try:
+        theta_step = float(theta_step)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            "В артефакте ветвей нет корректного шага θ на один theta_index. "
+            "Повторно выполните поиск пиков/Fit и определение ветвей в текущей версии."
+        ) from exc
+    if not np.isfinite(theta_step) or theta_step == 0.0:
+        raise ValueError("В артефакте ветвей сохранён некорректный шаг θ на theta_index")
+    result = correlate_branch_catalog(
+        catalog,
+        source_branch_id=parameters["source_branch_id"],
+        partner_branch_ids=parameters["partner_branch_ids"],
+        config=BranchCorrelationConfig(
+            theta_step_arcsec=theta_step,
+            xy_tolerance_px=parameters["xy_tolerance_px"],
+            theta_tolerance_arcsec=parameters["theta_tolerance_arcsec"],
+            assignment_margin=parameters["assignment_margin"],
+        ),
+    )
+    metadata = dict(parent.metadata)
+    metadata.update({
+        "operation": "3D diffraction-branch cross-correlation",
+        "branch_correlation": dict(result.metadata),
+        "parent_branch_algorithm": parent.metadata.get("branch_algorithm"),
+        "parent_branch_count": parent.metadata.get("n_branches"),
+        "parent_grid_id": parent.metadata.get("grid_id"),
+        "theta_index_step_arcsec": theta_step,
+        "theta_index_step_uniform": True,
+        "theta_step_source": "parent_scan_axis_metadata",
+    })
+    assigned = int(result.metadata["assigned_event_count"])
+    ambiguous = int(result.metadata["ambiguous_event_count"])
+    residual = int(result.metadata["residual_event_count"])
+    return OperationResult(
+        bundle=ArtifactBundle(
+            tables={
+                "branch_correlation_pairs": result.pairs,
+                "branch_correlation_assignments": result.assignments,
+                "branch_correlation_candidates": result.candidates,
+            },
+            metadata=metadata,
+        ),
+        output_ports=("branch_correlation",),
+        summary=(
+            f"3D-корреляция branch_id={parameters['source_branch_id']} с "
+            f"{len(parameters['partner_branch_ids'])} партнёрами (шаг θ={theta_step:g}″/index): "
+            f"назначено={assigned:,}; неоднозначно={ambiguous:,}; остаток={residual:,}."
+        ),
+    )
+
+
 def _grid_signature(parent_grid: str, operation_signature: str) -> str:
     import hashlib
 
@@ -1103,5 +1308,18 @@ def default_registry() -> OperationRegistry:
         output_ports=("branches",),
         execute=_run_branches,
         validate=_validate_branches,
+    ))
+    registry.register(OperationSpec(
+        operation_id="peaks.branch_correlation",
+        label="3D-кросс-корреляция дифракционных ветвей",
+        description=(
+            "Регистрирует вручную выбранную исходную ветвь с одной или несколькими "
+            "ветвями-партнёрами в (θ, Y, X), уточняет сдвиг и разделяет события "
+            "на назначенные, неоднозначные и остаточные. Вход — принятый результат "
+            "«Определение дифракционных ветвей»; исходные каталоги не изменяются."
+        ),
+        output_ports=("branch_correlation",),
+        execute=_run_branch_correlation,
+        validate=_validate_branch_correlation,
     ))
     return registry

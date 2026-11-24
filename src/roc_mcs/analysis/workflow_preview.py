@@ -598,6 +598,11 @@ def build_workflow_preview_state(
         metadata.update({f"peaks_{k}": v for k, v in (getattr(peaks, "metadata", {}) or {}).items()})
     if fit is not None:
         metadata.update({f"fit_{k}": v for k, v in (getattr(fit, "metadata", {}) or {}).items()})
+    branch_correlation = context.get("branch_correlation")
+    if branch_correlation is not None:
+        metadata["branch_correlation"] = dict(
+            (getattr(branch_correlation, "metadata", {}) or {}).get("branch_correlation", {})
+        )
     metadata.update(dict(source_metadata or {}))
     metadata["workflow_node_id"] = str(node.id)
     metadata["workflow_operation_id"] = str(node.operation_id)
@@ -614,7 +619,9 @@ def build_workflow_preview_state(
         default_map = "peaks.count"
     elif node.operation_id == "fit.scan":
         default_map = next((key for key in ("fit.rmse", "fit.redchi", "fit.n_fitted", "fit.n_fitted_map") if any(layer.key == key for layer in layers)), default_map)
-    elif node.operation_id == "peaks.branches" and any(layer.key == "branches.count" for layer in layers):
+    elif node.operation_id in {"peaks.branches", "peaks.branch_correlation"} and any(
+        layer.key == "branches.count" for layer in layers
+    ):
         default_map = "branches.count"
     default_curve = "scan.measured"
     if node.operation_id == "preprocess.spikes" and any(source.key == "spikes.interpolated" for source in curve_sources):

@@ -275,6 +275,12 @@ def fitted_peak_positions(fit_bundle):
             "Сопоставление detected/fitted пиков неоднозначно: повторяются (x, y, component_id)"
         )
     mapping_columns = [*keys, "peak_id"]
+    # Preserve the original discrete scan coordinate alongside the fitted
+    # continuous centre. The branch-correlation coarse registration operates
+    # on theta_index, while support/refinement operate on fitted theta. This is
+    # identity/provenance metadata only; it does not alter fit values or IDs.
+    if "theta_index" in detected_frame.columns and "theta_index" not in fitted_frame.columns:
+        mapping_columns.append("theta_index")
     if "theta" in detected_frame.columns and "theta_detected" not in fitted_frame.columns:
         mapping_columns.append("theta")
     mapping = detected_frame[mapping_columns].copy()

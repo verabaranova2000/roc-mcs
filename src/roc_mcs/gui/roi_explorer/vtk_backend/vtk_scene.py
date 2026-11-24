@@ -691,7 +691,10 @@ class VTKVolumeScene:
         self._peak_marker_actor = vtk.vtkActor()
         self._peak_marker_actor.SetMapper(self._peak_marker_mapper)
         self._peak_marker_actor.SetUserMatrix(self._scene_user_matrix)
-        self._peak_marker_actor.PickableOff()
+        # Hover inspection uses a dedicated vtkPointPicker restricted to this
+        # actor; the marker layer remains read-only and does not intercept the
+        # trackball camera's mouse interaction.
+        self._peak_marker_actor.PickableOn()
         peak_property = self._peak_marker_actor.GetProperty()
         peak_property.SetOpacity(0.95)
         peak_property.SetLighting(True)
@@ -703,6 +706,14 @@ class VTKVolumeScene:
         self._peak_marker_positions_physical = np.empty((0, 3), dtype=np.float64)
         self._peak_marker_display_positions = np.empty((0, 3), dtype=np.float64)
         self._peak_marker_colors = np.empty((0, 4), dtype=np.uint8)
+        self._peak_marker_peak_ids = np.empty(0, dtype=np.int64)
+        self._peak_marker_branch_ids = np.empty(0, dtype=np.int64)
+        self._peak_branch_event_counts: dict[int, int] = {}
+        self._peak_point_picker = vtk.vtkPointPicker()
+        self._peak_point_picker.SetTolerance(0.012)
+        self._peak_point_picker.PickFromListOn()
+        self._peak_point_picker.InitializePickList()
+        self._peak_point_picker.AddPickList(self._peak_marker_actor)
         self._peak_marker_scale_values = np.empty(0, dtype=np.float64)
         self._peak_marker_size = 7.0
         self._peak_marker_opacity = 0.95
@@ -2563,6 +2574,9 @@ class VTKVolumeScene:
         self._peak_marker_polydata.Initialize()
         self._peak_marker_positions_physical = np.empty((0, 3), dtype=np.float64)
         self._peak_marker_colors = np.empty((0, 4), dtype=np.uint8)
+        self._peak_marker_peak_ids = np.empty(0, dtype=np.int64)
+        self._peak_marker_branch_ids = np.empty(0, dtype=np.int64)
+        self._peak_branch_event_counts = {}
         self._peak_marker_visible = False
         self._branch_edge_actor.SetVisibility(0)
         self._branch_edge_polydata.Initialize()
@@ -3149,13 +3163,36 @@ class VTKVolumeScene:
         fallback = self._hex_rgba(uniform_color)
         colors = np.repeat(fallback[None, :], physical.shape[0], axis=0)
         columns = set(getattr(peak_catalog, "columns", ())) if peak_catalog is not None else set()
-        if color_by_branch and "branch_id" in columns and physical.shape[0]:
+
+        # Keep picking metadata aligned one-to-one with the input points passed
+        # to vtkGlyph3DMapper. Full branch counts are computed before the
+        # display-only glyph cap, so tooltip/legend counts remain scientifically
+        # exact even when a very large cloud is thinned for rendering.
+        peak_ids = np.full(physical.shape[0], -1, dtype=np.int64)
+        if "peak_id" in columns and physical.shape[0]:
+            peak_id_values = self._numeric_column(peak_catalog["peak_id"])[valid_rows]
+            peak_id_valid = np.isfinite(peak_id_values) & (peak_id_values >= 0)
+            peak_ids[peak_id_valid] = np.rint(peak_id_values[peak_id_valid]).astype(np.int64)
+
+        branch_ids = np.full(physical.shape[0], -1, dtype=np.int64)
+        self._peak_branch_event_counts = {}
+        if "branch_id" in columns and physical.shape[0]:
             branch_values = self._numeric_column(peak_catalog["branch_id"])[valid_rows]
-            branch_valid = np.isfinite(branch_values)
+            branch_valid = (
+                np.isfinite(branch_values) & (branch_values >= 0)
+                & (branch_values == np.rint(branch_values))
+            )
+            branch_ids[branch_valid] = np.rint(branch_values[branch_valid]).astype(np.int64)
             if np.any(branch_valid):
-                colors[branch_valid] = self._branch_rgba(
-                    np.rint(branch_values[branch_valid]).astype(np.int64)
+                branch_values_int, branch_counts = np.unique(
+                    branch_ids[branch_valid], return_counts=True
                 )
+                self._peak_branch_event_counts = {
+                    int(branch_id): int(count)
+                    for branch_id, count in zip(branch_values_int, branch_counts)
+                }
+            if color_by_branch and np.any(branch_valid):
+                colors[branch_valid] = self._branch_rgba(branch_ids[branch_valid])
 
         if physical.shape[0] > 150_000:
             # Deterministic display-only thinning. Scientific catalogues remain
@@ -3163,15 +3200,103 @@ class VTKVolumeScene:
             indices = np.linspace(0, physical.shape[0] - 1, 150_000, dtype=np.int64)
             physical = physical[indices]
             colors = colors[indices]
+            peak_ids = peak_ids[indices]
+            branch_ids = branch_ids[indices]
 
         self._peak_marker_positions_physical = np.ascontiguousarray(physical, dtype=np.float64)
         self._peak_marker_colors = np.ascontiguousarray(colors, dtype=np.uint8)
+        self._peak_marker_peak_ids = np.ascontiguousarray(peak_ids, dtype=np.int64)
+        self._peak_marker_branch_ids = np.ascontiguousarray(branch_ids, dtype=np.int64)
         self._update_peak_marker_polydata()
         self._peak_marker_visible = bool(visible and physical.shape[0] > 0)
         self._peak_marker_actor.SetVisibility(self._peak_marker_visible)
         if render:
             self._request_render()
         return int(physical.shape[0])
+
+    @staticmethod
+    def _branch_hex_color(branch_id: int) -> str:
+        rgba = VTKVolumeScene._branch_rgba(np.asarray([int(branch_id)], dtype=np.int64))[0]
+        return "#{:02X}{:02X}{:02X}".format(int(rgba[0]), int(rgba[1]), int(rgba[2]))
+
+    def branch_legend_data(self, *, limit: int = 40) -> dict[str, Any]:
+        """Return exact in-ROI branch event counts and stable marker colours."""
+        limit = max(1, min(200, int(limit)))
+        ordered = sorted(
+            self._peak_branch_event_counts.items(),
+            key=lambda item: (-int(item[1]), int(item[0])),
+        )
+        return {
+            "total_branches": int(len(ordered)),
+            "total_events": int(sum(count for _, count in ordered)),
+            "entries": [
+                {
+                    "branch_id": int(branch_id),
+                    "event_count": int(count),
+                    "color": self._branch_hex_color(branch_id),
+                }
+                for branch_id, count in ordered[:limit]
+            ],
+            "truncated": bool(len(ordered) > limit),
+        }
+
+    def pick_peak_at_display(
+        self, x: float, y: float, *, tolerance: float = 0.012
+    ) -> dict[str, Any] | None:
+        """Pick one rendered peak glyph and return compact branch metadata.
+
+        Coordinates are VTK display coordinates (origin at the lower-left).
+        The picker is restricted to the peak actor and never changes the active
+        interactor style or consumes the mouse event.
+        """
+        if (
+            self._peak_marker_actor is None
+            or not self._peak_marker_actor.GetVisibility()
+            or self._peak_marker_polydata.GetNumberOfPoints() == 0
+        ):
+            return None
+        try:
+            tolerance = float(tolerance)
+            if not np.isfinite(tolerance):
+                return None
+            self._peak_point_picker.SetTolerance(max(0.002, min(0.05, tolerance)))
+            hit = self._peak_point_picker.Pick(float(x), float(y), 0.0, self.renderer)
+            if not hit:
+                return None
+            picked_actor = self._peak_point_picker.GetActor()
+            if picked_actor is None or picked_actor != self._peak_marker_actor:
+                return None
+            point_id = int(self._peak_point_picker.GetPointId())
+            if point_id < 0 or point_id >= self._peak_marker_positions_physical.shape[0]:
+                return None
+            position = self._peak_marker_positions_physical[point_id]
+            peak_id = int(self._peak_marker_peak_ids[point_id])
+            branch_id = int(self._peak_marker_branch_ids[point_id])
+            if branch_id >= 0:
+                event_count = int(self._peak_branch_event_counts.get(branch_id, 0))
+            else:
+                event_count = 0
+            # Reflect the actual color uploaded to this glyph. When colouring
+            # by branch is disabled this is the user's uniform color, not the
+            # branch palette; missing branch IDs use the marker fallback.
+            rgba = self._peak_marker_colors[point_id]
+            color = "#{:02X}{:02X}{:02X}".format(
+                int(rgba[0]), int(rgba[1]), int(rgba[2])
+            )
+            return {
+                "point_index": point_id,
+                "peak_id": peak_id if peak_id >= 0 else None,
+                "branch_id": branch_id if branch_id >= 0 else None,
+                "branch_event_count": event_count,
+                "x": float(position[0]),
+                "y": float(position[1]),
+                "theta": float(position[2]),
+                "color": color,
+            }
+        except Exception:
+            # Hover is an optional inspection affordance. A picking failure
+            # must never interrupt rendering or camera interaction.
+            return None
 
     def set_branch_edges(
         self,
@@ -4042,6 +4167,10 @@ class VTKVolumeScene:
             "peak_marker_requested_visible": bool(self._peak_marker_visible),
             "peak_marker_actor_visible": bool(self._peak_marker_actor.GetVisibility()) if self._peak_marker_actor is not None else False,
             "peak_marker_mapper": self._peak_marker_mapper.GetClassName() if self._peak_marker_mapper is not None else None,
+            "peak_marker_pickable": bool(self._peak_marker_actor.GetPickable()) if self._peak_marker_actor is not None else False,
+            "peak_marker_peak_id_count": int(self._peak_marker_peak_ids.size),
+            "peak_marker_branch_id_count": int(np.count_nonzero(self._peak_marker_branch_ids >= 0)),
+            "peak_marker_branch_count": int(len(self._peak_branch_event_counts)),
             "peak_marker_world_radius": float(self._peak_marker_world_radius),
             "peak_marker_world_radius_range": tuple(float(v) for v in getattr(self, "_peak_marker_world_radius_range", (self._peak_marker_world_radius, self._peak_marker_world_radius))),
             "peak_marker_diameter_px": float(self._peak_marker_size),
@@ -4365,6 +4494,9 @@ class VTKVolumeScene:
             self._peak_marker_polydata.Initialize()
         self._peak_marker_positions_physical = np.empty((0, 3), dtype=np.float64)
         self._peak_marker_colors = np.empty((0, 4), dtype=np.uint8)
+        self._peak_marker_peak_ids = np.empty(0, dtype=np.int64)
+        self._peak_marker_branch_ids = np.empty(0, dtype=np.int64)
+        self._peak_branch_event_counts = {}
         self._peak_marker_visible = False
         if self._branch_edge_actor is not None:
             self._branch_edge_actor.SetVisibility(0)

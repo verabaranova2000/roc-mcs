@@ -319,6 +319,23 @@ class ArtifactStore:
         frame.columns = columns
         return frame
 
+    def read_metadata(self, artifact_id: str) -> dict[str, Any]:
+        """Read only immutable artifact metadata without materializing arrays/tables."""
+        path = self._path(artifact_id)
+        if not path.is_file():
+            raise FileNotFoundError(f"Артефакт не найден: {artifact_id}")
+        with h5py.File(path, "r") as handle:
+            version = int(handle.attrs.get("format_version", -1))
+            if version not in self.READABLE_FORMAT_VERSIONS:
+                raise ValueError(f"Неподдерживаемый формат артефакта: {version}")
+            raw = handle.attrs.get("metadata_json", "{}")
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8")
+        metadata = json.loads(str(raw))
+        if not isinstance(metadata, dict):
+            raise ValueError("Метаданные артефакта должны быть JSON-объектом")
+        return metadata
+
     def contains(self, artifact_id: str) -> bool:
         try:
             return self._path(artifact_id).is_file()

@@ -29,6 +29,7 @@ from roc_mcs.analysis.project import WorkflowProject
 from roc_mcs.analysis.workflow_history import NodeStatus, ReviewStatus, WorkflowHistory
 from .presenter import ArtifactPreviewRequest
 from roc_mcs.analysis.workflow_preview import build_workflow_preview_state
+from roc_mcs.analysis.preview_context import load_node_preview_context
 from .graph_canvas import ProcessingGraphView
 from .peak_detection_preview import PeakDetectionPreview
 from .branch_detection_preview import BranchDetectionPreview
@@ -151,73 +152,7 @@ class _PreviewNodeTask(QRunnable):
                 default_registry(),
             )
             node = self.history_snapshot.get(self.node_id)
-            if node.operation_id == "source.scan":
-                context = {
-                    "node": node,
-                    "scan": executor.load_output(node, "scan"),
-                    "spikes": None,
-                    "peaks": None,
-                    "fit": None,
-                }
-            elif node.operation_id in {"preprocess.pool", "preprocess.detector_bad_pixels"}:
-                # These operations return a complete ScanArtifact. Preview their
-                # exact output, not the unmodified upstream input scan.
-                context = {
-                    "node": node,
-                    "scan": executor.load_output(node, "scan"),
-                    "spikes": None,
-                    "peaks": None,
-                    "fit": None,
-                }
-            elif node.operation_id == "peaks.branches":
-                inputs = executor.resolve_node_inputs(node)
-                position_bundle = inputs["positions"]
-                parent_ref = node.input_refs["positions"]
-                position_node = self.history_snapshot.get(parent_ref["node_id"])
-                scan_node = self.history_snapshot.find_ancestor_output(node.id, "scan")
-                if scan_node is None or scan_node.status != NodeStatus.SUCCEEDED:
-                    raise RuntimeError("Для предпросмотра ветвей не найден исходный Scan-вход")
-                scan_bundle = executor.load_output(scan_node, "scan")
-                spike_node = self.history_snapshot.find_ancestor_output(node.id, "spikes")
-                spike_bundle = (
-                    executor.load_output(spike_node, "spikes")
-                    if spike_node is not None and spike_node.status == NodeStatus.SUCCEEDED
-                    else None
-                )
-                context = {
-                    "node": node,
-                    "scan": scan_bundle,
-                    "spikes": spike_bundle,
-                    "peaks": position_bundle if position_node.operation_id == "peaks.detect" else None,
-                    "fit": position_bundle if position_node.operation_id == "fit.scan" else None,
-                    "branches": executor.load_output(node, "branches"),
-                }
-            else:
-                inputs = executor.resolve_node_inputs(node)
-                stage_output = executor.load_output(node, next(iter(node.output_refs)))
-                spike_context = (
-                    stage_output if node.operation_id == "preprocess.spikes"
-                    else inputs.get("spikes")
-                )
-                spike_diagnostic_warning = None
-                if spike_context is None and node.operation_id in {"peaks.detect", "fit.scan"}:
-                    # QC overlay is not an algorithm input. Resolve it from branch
-                    # ancestry only for display when the operation does not consume
-                    # the spike artifact (raw peak search / fit without spike mask).
-                    spike_node = self.history_snapshot.find_ancestor_output(self.node_id, "spikes")
-                    if spike_node is not None and spike_node.status == NodeStatus.SUCCEEDED:
-                        try:
-                            spike_context = executor.load_output(spike_node, "spikes")
-                        except Exception as exc:
-                            spike_diagnostic_warning = str(exc)
-                context = {
-                    "node": node,
-                    "scan": inputs.get("scan"),
-                    "spikes": spike_context,
-                    "spike_diagnostic_warning": spike_diagnostic_warning,
-                    "peaks": stage_output if node.operation_id == "peaks.detect" else inputs.get("peaks"),
-                    "fit": stage_output if node.operation_id == "fit.scan" else None,
-                }
+            context = load_node_preview_context(node, self.history_snapshot, executor)
             if context["scan"] is None:
                 raise RuntimeError("Для предпросмотра не удалось разрешить ScanArtifact")
             # Build the typed host view in the worker: ROI Explorer receives only
@@ -338,6 +273,9 @@ class ProcessingWorkbenchWidget(QWidget):
         self._active_peak_input_task: _PeakPixelInputTask | None = None
         self._active_branch_stats_task: _BranchStatsTask | None = None
         self._branch_gate_values: dict[str, float] = {}
+        # Branch outputs are immutable artifacts. Cache only their small metadata
+        # (not the peak catalog) so graph rebuilds never reload large tables.
+        self._branch_count_cache: dict[str, tuple[int | None, str | None]] = {}
         self._active_branch_stats_parent_id: str | None = None
         self._pending_peak_pixel_coordinates: tuple[float, float] | None = None
         self._discard_active_peak_input = False
@@ -457,7 +395,8 @@ class ProcessingWorkbenchWidget(QWidget):
         self.operation_combo = QComboBox()
         self._operation_ids = [
             "preprocess.detector_bad_pixels",
-            "preprocess.pool", "preprocess.spikes", "peaks.detect", "fit.scan", "peaks.branches"
+            "preprocess.pool", "preprocess.spikes", "peaks.detect", "fit.scan",
+            "peaks.branches", "peaks.branch_correlation",
         ]
         for operation_id in self._operation_ids:
             self.operation_combo.addItem(self.registry.get(operation_id).label, operation_id)
@@ -479,6 +418,7 @@ class ProcessingWorkbenchWidget(QWidget):
         self._build_peak_form()
         self._build_fit_form()
         self._build_branch_form()
+        self._build_branch_correlation_form()
         operation_layout.addWidget(self.form_stack)
 
         actions = QHBoxLayout()
@@ -1213,6 +1153,77 @@ class ProcessingWorkbenchWidget(QWidget):
             stats_label=stats_label, stats_table=table,
         )
 
+    def _build_branch_correlation_form(self) -> None:
+        layout = self._add_form_page(
+            "peaks.branch_correlation", "3D-кросс-корреляция дифракционных ветвей"
+        )
+        layout.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        layout.setFormAlignment(Qt.AlignmentFlag.AlignTop)
+        layout.setRowWrapPolicy(QFormLayout.RowWrapPolicy.DontWrapRows)
+
+        source = QLineEdit()
+        source.setPlaceholderText("например, 34")
+        source.setToolTip(
+            "Одна опорная ветвь branch_id из принятого результата «Определение ветвей». "
+            "Наведите курсор на точку в 3D-облаке: подсказка покажет branch_id."
+        )
+        partners = QLineEdit()
+        partners.setPlaceholderText("например, 72, 32")
+        partners.setToolTip(
+            "Одна или несколько ветвей, которые будут независимо зарегистрированы "
+            "относительно опорной. Разделители — запятая или точка с запятой; максимум 8. "
+            "Так можно разложить смешанную ветвь на несколько структурных партнёров."
+        )
+        layout.addRow("Опорная branch_id:", source)
+        layout.addRow("Ветви-партнёры:", partners)
+
+        theta_step_info = QLabel(
+            "Шаг θ на theta_index берётся автоматически из фактической оси исходного "
+            "скана и проверяется на равномерность. Вводить условные 15″/index вручную "
+            "не требуется."
+        )
+        theta_step_info.setWordWrap(True)
+        theta_step_info.setToolTip(
+            "Integer registration is converted with the signed step stored by peak detection/Fit. "
+            "Irregular theta sampling is rejected rather than approximated."
+        )
+        theta_step_info.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        layout.addRow("Шаг θ:", theta_step_info)
+        xy_tolerance = self._float_spin(0.05, 100.0, 1.5, 3)
+        xy_tolerance.setSuffix(" px")
+        theta_tolerance = self._float_spin(0.05, 100_000.0, 45.0, 3)
+        theta_tolerance.setSuffix(" ″")
+        margin = self._float_spin(0.0, 0.95, 0.20, 3)
+        margin.setSingleStep(0.05)
+        margin.setToolTip(
+            "Относительное преимущество лучшего нормированного расстояния перед вторым. "
+            "Если преимущество меньше порога, точка остаётся ambiguous, а не назначается силой."
+        )
+        layout.addRow("Допуск X/Y:", xy_tolerance)
+        layout.addRow("Допуск θ:", theta_tolerance)
+        layout.addRow("Порог однозначности:", margin)
+
+        explanation = QLabel(
+            "Сначала для каждой пары выполняется независимая бинарная 3D-кросс-корреляция "
+            "в координатах (theta_index, y, x), затем — направленный поиск ближайших "
+            "пиков и уточнение по однозначно назначенному ядру. Одна исходная ветвь может "
+            "разделиться между несколькими партнёрами. Результат содержит отдельные классы "
+            "partner / ambiguous / residual и таблицу всех кандидатов. Исходный каталог "
+            "пиков и результат определения ветвей не изменяются."
+        )
+        explanation.setWordWrap(True)
+        explanation.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        explanation.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        layout.addRow(explanation)
+
+        self._forms["peaks.branch_correlation"].update(
+            source_branch_id=source,
+            partner_branch_ids=partners,
+            xy_tolerance_px=xy_tolerance,
+            theta_tolerance_arcsec=theta_tolerance,
+            assignment_margin=margin,
+        )
+
     def _request_branch_stats(self, parent_id: str) -> None:
         node = self.project.history.get(parent_id)
         form = self._forms.get("peaks.branches", {})
@@ -1478,10 +1489,45 @@ class ProcessingWorkbenchWidget(QWidget):
             }
         if operation_id == "peaks.branches":
             return {"theta_gate": form["theta_gate"].value()}
+        if operation_id == "peaks.branch_correlation":
+            return {
+                "source_branch_id": form["source_branch_id"].text().strip(),
+                "partner_branch_ids": form["partner_branch_ids"].text().strip(),
+                "xy_tolerance_px": form["xy_tolerance_px"].value(),
+                "theta_tolerance_arcsec": form["theta_tolerance_arcsec"].value(),
+                "assignment_margin": form["assignment_margin"].value(),
+            }
         raise KeyError(operation_id)
 
     def _selected_node_id(self) -> str | None:
         return self.graph.selected_node_id
+
+    def _branch_count_for_node(self, node) -> tuple[int | None, str | None]:
+        """Read the branch count from immutable artifact metadata without loading peak rows."""
+        artifact_id = node.output_refs.get("branches")
+        if not artifact_id:
+            return None, "У результата определения ветвей отсутствует выходной артефакт branches."
+        cached = self._branch_count_cache.get(str(artifact_id))
+        if cached is not None:
+            return cached
+        try:
+            metadata = self.project.artifact_store.read_metadata(str(artifact_id))
+            raw_count = metadata.get("n_branches")
+            if isinstance(raw_count, bool):
+                raise ValueError("n_branches содержит bool вместо целого числа")
+            count_float = float(raw_count)
+            if not np.isfinite(count_float) or not count_float.is_integer() or count_float < 0:
+                raise ValueError(f"Некорректное значение n_branches: {raw_count!r}")
+            result = (int(count_float), None)
+        except Exception as exc:
+            result = (
+                None,
+                "Не удалось проверить число ветвей в артефакте. "
+                "Повторно выполните этап определения ветвей в актуальной версии. "
+                f"Причина: {type(exc).__name__}: {exc}",
+            )
+        self._branch_count_cache[str(artifact_id)] = result
+        return result
 
     def _available_operations_for_parent(self, parent_id: str) -> list[str]:
         """Return operation ids that can consume outputs of the selected node."""
@@ -1501,6 +1547,9 @@ class ProcessingWorkbenchWidget(QWidget):
             return ["fit.scan", "peaks.branches"]
         if node.operation_id == "fit.scan":
             return ["peaks.branches"]
+        if node.operation_id == "peaks.branches":
+            branch_count, _reason = self._branch_count_for_node(node)
+            return ["peaks.branch_correlation"] if branch_count is not None and branch_count >= 2 else []
         return []
 
     def _on_graph_add_stage_requested(self, parent_id: str) -> None:
@@ -1514,11 +1563,25 @@ class ProcessingWorkbenchWidget(QWidget):
                 if operation_id not in self._unavailable_operations
             ]
             if not operation_ids:
-                QMessageBox.information(
-                    self, "Новая ветвь",
-                    "Для выбранного узла нет доступных следующих операций. "
-                    "Проверьте статус результата и его выходные данные.",
-                )
+                if parent.operation_id == "peaks.branches":
+                    branch_count, reason = self._branch_count_for_node(parent)
+                    if branch_count is not None and branch_count < 2:
+                        message = (
+                            f"В результате обнаружена только {branch_count} дифракционная ветвь. "
+                            "3D-кросс-корреляция требует как минимум двух различных branch_id: "
+                            "одну опорную ветвь и хотя бы одну ветвь-партнёр."
+                        )
+                    else:
+                        message = reason or (
+                            "3D-кросс-корреляция недоступна для этого результата. "
+                            "Проверьте число ветвей и метаданные артефакта."
+                        )
+                else:
+                    message = (
+                        "Для выбранного узла нет доступных следующих операций. "
+                        "Проверьте статус результата и его выходные данные."
+                    )
+                QMessageBox.information(self, "Новая ветвь", message)
                 return
             menu = QMenu(self)
             menu.setTitle("Добавить этап от выбранного результата")
@@ -2116,10 +2179,19 @@ class ProcessingWorkbenchWidget(QWidget):
         if not hasattr(self, "graph"):
             return
         previous = select_id or self._selected_node_id()
+        addable_node_ids: set[str] = set()
+        for candidate in self.project.history.nodes:
+            if (
+                candidate.status == NodeStatus.SUCCEEDED
+                and candidate.review_status == ReviewStatus.ACCEPTED
+                and self._available_operations_for_parent(candidate.id)
+            ):
+                addable_node_ids.add(candidate.id)
         self.graph.set_history(
             self.project.history,
             selected_id=previous,
             show_rejected=self.show_rejected_check.isChecked(),
+            addable_node_ids=addable_node_ids,
         )
         selected_id = self.graph.selected_node_id
         if selected_id:
@@ -2173,6 +2245,38 @@ class ProcessingWorkbenchWidget(QWidget):
         self.node_details.setPlainText(
             json.dumps(detail, ensure_ascii=False, indent=2, default=str)
         )
+        if node.operation_id == "peaks.branches" and node.status == NodeStatus.SUCCEEDED:
+            branch_count, reason = self._branch_count_for_node(node)
+            if branch_count is not None and branch_count >= 2:
+                if node.review_status == ReviewStatus.ACCEPTED:
+                    self.branch_hint.setText(
+                        f"Число дифракционных ветвей: {branch_count}. Нажмите «+» в правом нижнем "
+                        "углу этой карточки, чтобы добавить 3D-кросс-корреляцию; выберите одну "
+                        "опорную ветвь и одну или несколько ветвей-партнёров."
+                    )
+                else:
+                    self.branch_hint.setText(
+                        f"Число дифракционных ветвей: {branch_count}. Сначала проверьте результат "
+                        "и нажмите «Принять результат». После принятия на карточке появится «+» "
+                        "для добавления 3D-кросс-корреляции."
+                    )
+            elif branch_count == 1:
+                self.branch_hint.setText(
+                    "Обнаружена одна дифракционная ветвь. 3D-кросс-корреляция доступна только "
+                    "при наличии не менее двух различных branch_id."
+                )
+            elif branch_count == 0:
+                self.branch_hint.setText(
+                    "Каталог ветвей пуст. 3D-кросс-корреляция недоступна."
+                )
+            elif reason:
+                self.branch_hint.setText(reason)
+        else:
+            self.branch_hint.setText(
+                "Щелчок — инспектор · глаз — результат · + — новая ветвь. "
+                "Сплошная стрелка — вычислительный вход; пунктир — только происхождение ветви. "
+                "Перетаскивание — панорама; Ctrl+колесо — масштаб."
+            )
         self._update_controls()
 
     def _accept_selected(self) -> None:
@@ -2382,7 +2486,19 @@ class ProcessingWorkbenchWidget(QWidget):
             view_state = context.get("view_state")
             if view_state is not None:
                 self.preview_state_ready.emit(view_state)
-            if node.operation_id == "peaks.detect" and context.get("peaks") is not None:
+            if node.operation_id == "peaks.branch_correlation" and context.get("branch_correlation") is not None:
+                correlation_bundle = context["branch_correlation"]
+                correlation_meta = (correlation_bundle.metadata or {}).get("branch_correlation", {})
+                self.preview_summary.setText(
+                    f"3D-кросс-корреляция: source branch_id={correlation_meta.get('source_branch_id', '—')}; "
+                    f"партнёры={correlation_meta.get('partner_branch_ids', [])}. "
+                    f"Назначено пиков: {int(correlation_meta.get('assigned_event_count', 0)):,}; "
+                    f"неоднозначно: {int(correlation_meta.get('ambiguous_event_count', 0)):,}; "
+                    f"без соответствия: {int(correlation_meta.get('residual_event_count', 0)):,}. "
+                    "В 3D сохранены исходные координаты и branch_id; таблицы подробных назначений "
+                    "и сдвигов доступны в диагностике результата."
+                )
+            elif node.operation_id == "peaks.detect" and context.get("peaks") is not None:
                 peak_meta = context["peaks"].metadata
                 peak_cfg = peak_meta.get("peak_config", {})
                 signal_name = (
@@ -2466,6 +2582,8 @@ class ProcessingWorkbenchWidget(QWidget):
             "preprocess.spikes": "spike_count_map",
             "peaks.detect": "peak_count_map",
             "fit.scan": "fit_quality_map",
+            "peaks.branches": "branch_count_map",
+            "peaks.branch_correlation": "branch_count_map",
         }.get(operation_id, "intensity_map")
 
     @staticmethod
@@ -2515,6 +2633,19 @@ class ProcessingWorkbenchWidget(QWidget):
         elif node.operation_id == "fit.scan" and fit is not None and "n_fitted_map" in fit.arrays:
             map_data = np.asarray(fit.arrays["n_fitted_map"])
             map_title = "Число fitted-компонент"
+        elif node.operation_id in {"peaks.branches", "peaks.branch_correlation"}:
+            view_state = ctx.get("view_state")
+            branch_state = next(
+                (layer for layer in getattr(view_state, "map_layers", ())
+                 if layer.key == "branches.count"),
+                None,
+            )
+            if branch_state is not None:
+                map_data = np.asarray(branch_state.data_yx, dtype=float)
+                map_title = "Число ветвей в пикселе"
+            else:
+                map_data = np.nansum(data, axis=-1)
+                map_title = "Суммарная интенсивность"
         else:
             map_data = np.nansum(data, axis=-1)
             # A detector exclusion is missing data, never a physical zero.
@@ -2610,6 +2741,53 @@ class ProcessingWorkbenchWidget(QWidget):
                 ax.set_xlabel("Статус")
                 ax.set_ylabel("Число пикселей")
                 ax.tick_params(axis="x", labelrotation=20)
+        elif node.operation_id == "peaks.branch_correlation":
+            result = ctx.get("branch_correlation")
+            tables = getattr(result, "tables", {}) if result is not None else {}
+            assignments = tables.get("branch_correlation_assignments") if isinstance(tables, dict) else None
+            pairs = tables.get("branch_correlation_pairs") if isinstance(tables, dict) else None
+            metadata = (getattr(result, "metadata", {}) or {}).get("branch_correlation", {}) if result is not None else {}
+            if result is None or assignments is None or assignments.empty:
+                ax.text(0.5, 0.5, "Таблица назначений кросс-корреляции отсутствует или пуста", ha="center", va="center")
+                ax.set_axis_off()
+            else:
+                classes = assignments["assignment_class"].astype(str).value_counts() if "assignment_class" in assignments else {}
+                order = ["partner", "ambiguous", "residual"]
+                labels = ["Назначено партнёру", "Неоднозначно", "Без соответствия"]
+                values = [int(classes.get(key, 0)) for key in order]
+                bars = ax.bar(labels, values)
+                ax.set_title(
+                    f"Результат 3D-кросс-корреляции · source branch_id={metadata.get('source_branch_id', '—')}"
+                )
+                ax.set_ylabel("Число пиков исходной ветви")
+                ax.tick_params(axis="x", labelrotation=12)
+                for bar, value in zip(bars, values):
+                    ax.annotate(
+                        f"{value:,}",
+                        (bar.get_x() + bar.get_width() / 2.0, bar.get_height()),
+                        ha="center", va="bottom", fontsize=8,
+                    )
+                details = []
+                if pairs is not None and not pairs.empty:
+                    for row in pairs.itertuples(index=False):
+                        details.append(
+                            f"branch {int(row.partner_branch_id)}: "
+                            f"Δθ={float(row.theta_shift_final_arcsec):+.3g}″, "
+                            f"ΔY={int(row.refined_shift_y_px):+d}, "
+                            f"ΔX={int(row.refined_shift_x_px):+d}; {row.refinement_status}"
+                        )
+                if details:
+                    ax.text(
+                        0.01, 0.98, "\n".join(details),
+                        transform=ax.transAxes, ha="left", va="top", fontsize=7.2,
+                        bbox={
+                            "boxstyle": "round,pad=0.35",
+                            "facecolor": ax.get_facecolor(),
+                            "alpha": 0.92,
+                            "edgecolor": "0.55",
+                        },
+                    )
+                ax.grid(axis="y", alpha=0.2)
         elif node.operation_id == "preprocess.detector_bad_pixels":
             scan = ctx.get("scan")
             bad = np.asarray(
