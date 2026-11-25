@@ -2,7 +2,7 @@
 from PyQt6.QtWidgets import (QApplication, QWidget, QHBoxLayout, QVBoxLayout, QGridLayout, QComboBox,
     QDoubleSpinBox, QPushButton, QLabel, QToolButton, QMenu, QWidgetAction, QSpinBox, QDialog, QSizePolicy)
 from PyQt6.QtGui import QIcon, QPixmap, QPainter, QLinearGradient, QColor, QActionGroup, QPen, QPolygon, QPalette
-from PyQt6.QtCore import QSize, Qt, QRectF, QLineF, pyqtSignal, QPointF, QPoint
+from PyQt6.QtCore import QEvent, QSize, Qt, QRectF, QLineF, pyqtSignal, QPointF, QPoint
 from bisect import bisect_left, bisect_right
 import math
 
@@ -64,6 +64,8 @@ class MapToolsWidget(QWidget):
     pool_apply_requested = pyqtSignal()
     settings_requested = pyqtSignal()
     theta_display_range_changed = pyqtSignal(int, int)
+    theta_display_range_interaction_started = pyqtSignal()
+    theta_display_range_interaction_finished = pyqtSignal()
     theta_range_link_toggled = pyqtSignal(bool)
 
     def __init__(self, roi_tools_config: dict, current_roi_type: str, smart_dropdown_cls, range_slider_cls, parent=None):
@@ -414,6 +416,12 @@ class MapToolsWidget(QWidget):
             "Границы привязываются к существующим θ-отсчётам"
         )
         new_slider.valueChanged.connect(self._on_theta_range_slider_changed)
+        new_slider.interactionStarted.connect(
+            self.theta_display_range_interaction_started.emit
+        )
+        new_slider.interactionFinished.connect(
+            self.theta_display_range_interaction_finished.emit
+        )
         self.theta_range_panel.layout().replaceWidget(old_slider, new_slider)
         old_slider.hide()
         old_slider.deleteLater()
@@ -509,6 +517,7 @@ class MapToolsWidget(QWidget):
         self.set_theta_display_range_indices(
             0, len(self._theta_axis_values) - 1, emit=True
         )
+        self.theta_display_range_interaction_finished.emit()
 
     def swap_theta_display_range(self) -> None:
         indices = self._theta_range_indices
@@ -517,6 +526,7 @@ class MapToolsWidget(QWidget):
         target = complementary_theta_range(*indices, len(self._theta_axis_values))
         if target is not None:
             self.set_theta_display_range_indices(*target, emit=True)
+            self.theta_display_range_interaction_finished.emit()
 
     def _select_cmap(self, name: str) -> None:
         self.set_current_cmap(name); self.cmap_selected.emit(name)
@@ -692,6 +702,8 @@ class MapToolsWidget(QWidget):
 class QRangeSlider(QWidget):
     """Компактный двухсторонний ползунок диапазона для горизонтальной или вертикальной установки."""
     valueChanged = pyqtSignal(float, float)
+    interactionStarted = pyqtSignal()
+    interactionFinished = pyqtSignal()
     def __init__(self, low=1.0, high=99.0, min_val=0.0, max_val=100.0, parent=None, orientation=Qt.Orientation.Horizontal, minimum_gap=0.5):
         super().__init__(parent); self._min=float(min_val); self._max=float(max_val); self._minimum_gap=min(max(0.0,float(minimum_gap)),max(0.0,self._max-self._min)); self._low=float(low); self._high=float(high); self._active_handle=None; self._orientation=orientation
         self._low=max(self._min,min(self._low,self._max-self._minimum_gap)); self._high=max(self._low+self._minimum_gap,min(self._high,self._max))
@@ -731,13 +743,32 @@ class QRangeSlider(QWidget):
     def mousePressEvent(self,event):
         if event.button()!=Qt.MouseButton.LeftButton:return
         pos=self._coordinate(event);a=self._val_to_pos(self._low);b=self._val_to_pos(self._high)
-        self._active_handle='low' if abs(pos-a)<=abs(pos-b) else 'high';self._set_position(pos);self.setFocus();event.accept()
+        was_active = self._active_handle is not None
+        self._active_handle='low' if abs(pos-a)<=abs(pos-b) else 'high'
+        if not was_active:
+            self.interactionStarted.emit()
+        self._set_position(pos);self.setFocus();event.accept()
     def mouseMoveEvent(self,event):
         if self._active_handle:self._set_position(self._coordinate(event));event.accept()
     def _set_position(self,pos):
         value=self._pos_to_val(pos);self.setLow(value) if self._active_handle=='low' else self.setHigh(value);self.valueChanged.emit(self._low,self._high)
-    def mouseReleaseEvent(self,event):self._active_handle=None;event.accept()
+    def mouseReleaseEvent(self,event):
+        was_active = self._active_handle is not None
+        self._active_handle=None
+        event.accept()
+        if was_active:
+            self.interactionFinished.emit()
 
+    def event(self, event):
+        # Mouse ungrab/focus loss can terminate a drag without a normal release
+        # event on some window managers. Always close the interaction so the
+        # linked VTK mapper cannot remain in temporary preview quality.
+        if event.type() in (QEvent.Type.UngrabMouse, QEvent.Type.FocusOut):
+            was_active = self._active_handle is not None
+            self._active_handle = None
+            if was_active:
+                self.interactionFinished.emit()
+        return super().event(event)
 
 
 class ColorbarOptionsButton(QToolButton):

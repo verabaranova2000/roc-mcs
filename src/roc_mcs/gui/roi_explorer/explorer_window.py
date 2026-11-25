@@ -84,7 +84,8 @@ from roc_mcs.visualization.peak_count_map import integrated_intensity_map
 from roc_mcs.gui.roi_explorer.theta_range_preview import (
     infer_theta_projection_kind,
     normalize_theta_axis,
-    reduce_theta_stack,
+    ThetaProjectionAccumulator,
+    THETA_RANGE_PREVIEW_INTERVAL_MS,
 )
 
 
@@ -119,9 +120,16 @@ class RockingCurveExplorerWindow(QMainWindow):
         self.reduction_mode = "mean"
         self.current_file: Optional[Path] = None
         self._theta_slice_mode = False; self._theta_index = 0; self._theta_scan_cache_key = None; self._theta_scan_cache = None; self._theta_levels_cache = {}; self._show_theta_guide = False
-        self._theta_projection_cache: dict[tuple, np.ndarray] = {}
+        self._theta_projection_accumulator = ThetaProjectionAccumulator()
+        self._theta_projection_full_image: np.ndarray | None = None
+        self._theta_projection_full_title = ""
+        self._theta_range_finalize_pending = False
         self._theta_range_linked = False
         self._theta_range_link_available = False
+        # Last discrete sample interval accepted from either linked slider.
+        # Range sliders emit many sub-sample mouse events; ignore repeats so
+        # they cannot keep postponing the coalesced 2D refresh.
+        self._theta_range_last_requested_indices: tuple[int, int] | None = None
         self._analysis_view = None
         self._volume_refresh_pending = True
         self._analysis_previous_pool = None
@@ -134,6 +142,10 @@ class RockingCurveExplorerWindow(QMainWindow):
         self._analysis_contrast_snapshot: tuple[float, float] | None = None
 
         self._theta_render_timer = QTimer(self); self._theta_render_timer.setSingleShot(True); self._theta_render_timer.setInterval(35); self._theta_render_timer.timeout.connect(self.refresh_map)
+        self._theta_range_preview_timer = QTimer(self)
+        self._theta_range_preview_timer.setSingleShot(True)
+        self._theta_range_preview_timer.setInterval(THETA_RANGE_PREVIEW_INTERVAL_MS)
+        self._theta_range_preview_timer.timeout.connect(self._refresh_theta_range_preview)
         self._preview_timer = QTimer(self)
         self._preview_timer.setSingleShot(True)
         self._preview_timer.timeout.connect(self._update_preview_curve)
@@ -398,6 +410,18 @@ class RockingCurveExplorerWindow(QMainWindow):
         volume_tools.theta_range_link_toggled.connect(
             lambda checked: self._on_theta_range_link_toggled(checked, "volume")
         )
+        map_tools.theta_display_range_interaction_started.connect(
+            self._on_theta_range_interaction_started
+        )
+        volume_tools.theta_display_range_interaction_started.connect(
+            self._on_theta_range_interaction_started
+        )
+        map_tools.theta_display_range_interaction_finished.connect(
+            self._on_theta_range_interaction_finished
+        )
+        volume_tools.theta_display_range_interaction_finished.connect(
+            self._on_theta_range_interaction_finished
+        )
         self.volume_widget.theta_range_axis_changed.connect(
             lambda _axis: self._sync_theta_range_context()
         )
@@ -463,7 +487,7 @@ class RockingCurveExplorerWindow(QMainWindow):
         self._analysis_view = None
         self._analysis_previous_pool = None
         self._analysis_curve_cache.clear()
-        self._theta_projection_cache.clear()
+        self._theta_projection_accumulator.clear()
         self._set_theta_range_linked(False)
         self._analysis_map_key = None; self._analysis_curve_key = None; self._analysis_display_identity = None
         self._sync_analysis_result_menus(None)
@@ -801,7 +825,7 @@ class RockingCurveExplorerWindow(QMainWindow):
             self.restore_analysis_preview()
         self.selected_scan = self.map_widget.scan_combo.currentText()
         self._theta_scan_cache_key = None; self._theta_scan_cache = None; self._theta_levels_cache.clear()
-        self._theta_projection_cache.clear()
+        self._theta_projection_accumulator.clear()
         source = self.repo.load_source(self.selected_scan)
         pool = self.repo.pool
         pool_warning = None
@@ -942,6 +966,12 @@ class RockingCurveExplorerWindow(QMainWindow):
         kind = self._current_theta_projection_kind()
 
         if kind is None:
+            self._theta_range_preview_timer.stop()
+            self._theta_range_finalize_pending = False
+            self._theta_range_last_requested_indices = None
+            self._theta_projection_accumulator.clear()
+            self._theta_projection_full_image = None
+            self._theta_projection_full_title = ""
             map_tools.set_theta_range_available(False)
             map_tools.set_theta_range_link_available(False)
             volume_tools.set_theta_range_link_available(False)
@@ -957,6 +987,12 @@ class RockingCurveExplorerWindow(QMainWindow):
             raw_axis = self._current_map_theta_axis()
             map_axis, _order = normalize_theta_axis(raw_axis)
         except (TypeError, ValueError, AttributeError):
+            self._theta_range_preview_timer.stop()
+            self._theta_range_finalize_pending = False
+            self._theta_range_last_requested_indices = None
+            self._theta_projection_accumulator.clear()
+            self._theta_projection_full_image = None
+            self._theta_projection_full_title = ""
             map_tools.set_theta_range_available(False)
             map_tools.set_theta_range_link_available(False)
             volume_tools.set_theta_range_link_available(False)
@@ -971,6 +1007,11 @@ class RockingCurveExplorerWindow(QMainWindow):
         else:
             map_tools.set_theta_axis_values(map_axis)
             map_tools.set_theta_range_available(True)
+
+        current_indices = map_tools.theta_range_indices
+        self._theta_range_last_requested_indices = (
+            tuple(map(int, current_indices)) if current_indices is not None else None
+        )
 
         volume_axis = np.asarray(volume_tools.theta_axis_values, dtype=np.float64)
         compatible = bool(
@@ -994,6 +1035,8 @@ class RockingCurveExplorerWindow(QMainWindow):
     def _set_theta_range_linked(self, linked: bool) -> None:
         active = bool(linked and self._theta_range_link_available)
         self._theta_range_linked = active
+        if not active:
+            self.volume_widget.finish_theta_range_interaction()
         self.map_widget.tools.set_theta_range_link_checked(active)
         self.volume_widget.tools.set_theta_range_link_checked(active)
 
@@ -1012,27 +1055,62 @@ class RockingCurveExplorerWindow(QMainWindow):
         indices = source_tools.theta_range_indices
         if indices is None:
             indices = (0, len(map_tools.theta_axis_values) - 1)
+        indices = (int(indices[0]), int(indices[1]))
         self._set_theta_range_linked(True)
+        self._theta_range_last_requested_indices = indices
         if source == "map":
             self.volume_widget.set_theta_display_range_indices(*indices)
         else:
             map_tools.set_theta_display_range_indices(*indices)
-            self._theta_render_timer.start(0)
+            self._schedule_theta_range_preview(immediate=True)
+
+    def _schedule_theta_range_preview(self, *, immediate: bool = False) -> None:
+        """Throttle range redraws without starving them during a continuous drag."""
+        if immediate:
+            self._theta_range_preview_timer.start(0)
+        elif not self._theta_range_preview_timer.isActive():
+            # Start once and keep the deadline stable while new slider values
+            # arrive; the timeout always reads the newest stored interval.
+            self._theta_range_preview_timer.start()
+
+    def _accept_theta_range_indices(self, low: int, high: int) -> bool:
+        """Return True only when a new discrete interval was selected."""
+        indices = (int(low), int(high))
+        if indices == self._theta_range_last_requested_indices:
+            return False
+        self._theta_range_last_requested_indices = indices
+        return True
 
     def _on_map_theta_display_range_changed(self, low: int, high: int) -> None:
+        if not self._accept_theta_range_indices(low, high):
+            return
         if self._theta_range_linked and self._theta_range_link_available:
             self.volume_widget.set_theta_display_range_indices(int(low), int(high))
-        self._theta_render_timer.start()
+        self._schedule_theta_range_preview()
 
     def _on_volume_theta_display_range_changed(self, low: int, high: int) -> None:
+        if not self._theta_range_linked or not self._theta_range_link_available:
+            return
+        if not self._accept_theta_range_indices(low, high):
+            return
+        self.map_widget.tools.set_theta_display_range_indices(
+            int(low), int(high)
+        )
+        self._schedule_theta_range_preview()
+
+    def _on_theta_range_interaction_started(self) -> None:
+        """Use a lighter 3D screen sampling rate only while linked handles move."""
         if self._theta_range_linked and self._theta_range_link_available:
-            self.map_widget.tools.set_theta_display_range_indices(
-                int(low), int(high)
-            )
-            self._theta_render_timer.start()
+            self.volume_widget.set_theta_range_interaction_active(True)
+
+    def _on_theta_range_interaction_finished(self) -> None:
+        """Restore full 3D quality and finalize 2D contrast after a gesture."""
+        self.volume_widget.finish_theta_range_interaction()
+        self._theta_range_finalize_pending = True
+        self._schedule_theta_range_preview()
 
     def _theta_projection_image(self, kind: str, low: int, high: int) -> np.ndarray:
-        """Calculate one projection from the selected θ samples, with a small LRU."""
+        """Calculate the selected projection, reusing incremental 2D state."""
         state = self._analysis_view
         valid_mask = None
         if state is not None:
@@ -1100,38 +1178,22 @@ class RockingCurveExplorerWindow(QMainWindow):
             )
         if high >= ascending_theta.size:
             raise ValueError("Диапазон θ не согласован с текущим объёмом.")
-        cache_key = (source_key, kind, int(low), int(high))
-        cached = self._theta_projection_cache.pop(cache_key, None)
-        if cached is not None:
-            self._theta_projection_cache[cache_key] = cached
-            return cached
-
-        selected = order[int(low):int(high) + 1]
-        if axis == 0:
-            stack = np.take(data, selected, axis=0)
-            mask_stack = (
-                np.take(np.asarray(valid_mask), selected, axis=0)
-                if valid_mask is not None else None
-            )
-        elif axis == 2:
-            stack = np.take(data, selected, axis=2).transpose(2, 0, 1)
-            mask_stack = (
-                np.take(np.asarray(valid_mask), selected, axis=2).transpose(2, 0, 1)
-                if valid_mask is not None else None
-            )
-        else:
+        if axis not in (0, 2):
             raise ValueError(
                 f"Неподдерживаемое расположение θ-оси: axis={axis}."
             )
-
-        image = reduce_theta_stack(stack, kind, valid_mask=mask_stack)
-        self._theta_projection_cache[cache_key] = image
-        # At most two 2D arrays are retained: this keeps the current crop and
-        # its just-used predecessor available without multiplying memory use
-        # for detector maps that can be very large.
-        while len(self._theta_projection_cache) > 2:
-            self._theta_projection_cache.pop(next(iter(self._theta_projection_cache)))
-        return image
+        # The source stack remains in its native memory layout. For mean/sum,
+        # small endpoint moves update only the entering/leaving detector plane.
+        return self._theta_projection_accumulator.project(
+            data,
+            order,
+            axis,
+            kind,
+            int(low),
+            int(high),
+            valid_mask=valid_mask,
+            source_token=source_key,
+        )
 
     def _apply_theta_projection_range(
         self, image: np.ndarray, title: str
@@ -1139,7 +1201,13 @@ class RockingCurveExplorerWindow(QMainWindow):
         """Apply the current θ interval only to an eligible mean/max/sum map."""
         kind = self._current_theta_projection_kind()
         indices = self.map_widget.tools.theta_range_indices
-        if kind is None or indices is None:
+        if kind is None:
+            self._theta_projection_full_image = None
+            self._theta_projection_full_title = ""
+            return image, title
+        self._theta_projection_full_image = np.asarray(image)
+        self._theta_projection_full_title = str(title)
+        if indices is None:
             return image, title
         try:
             axis, _order = normalize_theta_axis(self._current_map_theta_axis())
@@ -1160,6 +1228,63 @@ class RockingCurveExplorerWindow(QMainWindow):
             cropped,
             f"{title} · θ ∈ [{axis[low]:.7g}°, {axis[high]:.7g}°]",
         )
+
+    def _refresh_theta_range_preview(self) -> None:
+        """Fast hot path for 2D range interaction; leave all static artists alone."""
+        if self._theta_slice_mode:
+            self._theta_range_finalize_pending = False
+            return
+        kind = self._current_theta_projection_kind()
+        indices = self.map_widget.tools.theta_range_indices
+        base_image = self._theta_projection_full_image
+        if kind is None or indices is None or base_image is None:
+            self._theta_range_finalize_pending = False
+            return
+
+        try:
+            axis, _order = normalize_theta_axis(self._current_map_theta_axis())
+            low, high = (int(indices[0]), int(indices[1]))
+            if not (0 <= low < high < axis.size):
+                return
+            if (low, high) == (0, axis.size - 1):
+                image = base_image
+                title = self._theta_projection_full_title
+            else:
+                image = self._theta_projection_image(kind, low, high)
+                if image.shape != base_image.shape:
+                    raise ValueError(
+                        "Форма пересчитанной θ-проекции не совпала с исходной картой: "
+                        f"{image.shape} != {base_image.shape}."
+                    )
+                title = (
+                    f"{self._theta_projection_full_title} · θ ∈ "
+                    f"[{axis[low]:.7g}°, {axis[high]:.7g}°]"
+                )
+
+            clim = None
+            if self._theta_range_finalize_pending:
+                # Auto-contrast is refreshed once on release, not at every
+                # mouse-move event. During the gesture the existing limits are
+                # held fixed, which also makes adjacent θ intervals comparable.
+                values = np.asarray(image, dtype=np.float64)
+                finite = values[np.isfinite(values)]
+                if finite.size:
+                    p_lo = float(self.map_widget.low_pct.value())
+                    p_hi = float(self.map_widget.high_pct.value())
+                    if p_hi <= p_lo:
+                        p_hi = min(100.0, p_lo + 1.0)
+                    vmin, vmax = np.percentile(finite, [p_lo, p_hi])
+                    if vmin >= vmax:
+                        vmax = vmin + max(abs(float(vmin)) * 1e-9, 1e-12)
+                    clim = (float(vmin), float(vmax))
+
+            self.map_widget.update_theta_preview_image(image, title, clim=clim)
+        except (ValueError, TypeError, IndexError, RuntimeError) as exc:
+            self.status.showMessage(
+                f"Предпросмотр диапазона θ не обновлён: {exc}", 8000
+            )
+        finally:
+            self._theta_range_finalize_pending = False
 
     def _sync_volume_theta_context(self) -> None:
         """Tell the 3D panel whether its theta slider can link to the 2D map."""
@@ -1281,7 +1406,7 @@ class RockingCurveExplorerWindow(QMainWindow):
             return
 
         self.map_widget.set_pool_spec(pool, source_shape_yx=source.source_shape_yx)
-        self._theta_projection_cache.clear()
+        self._theta_projection_accumulator.clear()
         self._invalidate_curve_cache()
         self.selected_pixel = None  # Индексы пикселей принадлежат конкретной grid.
         self._preview_timer.stop()
@@ -1530,7 +1655,7 @@ class RockingCurveExplorerWindow(QMainWindow):
         self._analysis_curve_cache.clear()
         self.selected_pixel = None
         self._theta_scan_cache_key = None; self._theta_scan_cache = None
-        self._theta_projection_cache.clear()
+        self._theta_projection_accumulator.clear()
         self._set_theta_axis_for_current_scan()
         self._sync_theta_range_context()
         self.refresh_map()
@@ -1563,7 +1688,7 @@ class RockingCurveExplorerWindow(QMainWindow):
             self.map_widget.set_pool_spec(previous, source_shape_yx=source.source_shape_yx if source else None)
         self.map_widget.set_pool_enabled(self.repo is not None)
         self._theta_scan_cache_key = None; self._theta_scan_cache = None
-        self._theta_projection_cache.clear()
+        self._theta_projection_accumulator.clear()
         self._set_theta_axis_for_current_scan()
         self._sync_theta_range_context()
         self.refresh_all()
@@ -1986,6 +2111,8 @@ class RockingCurveExplorerWindow(QMainWindow):
 
     def refresh_map(self, *args) -> None:
         """Отрисовывает карту выбранной версии данных либо исходного HDF5."""
+        self._theta_range_preview_timer.stop()
+        self._theta_range_finalize_pending = False
         if self._analysis_view is not None:
             state = self._analysis_view
             if self._theta_slice_mode:
@@ -2437,7 +2564,7 @@ class RockingCurveExplorerWindow(QMainWindow):
         """Stop pending UI refreshes, finalize VTK once, and release HDF5."""
         # Prevent queued GUI slots from requesting map/volume updates while
         # the embedded native QVTK surface is being finalized.
-        for timer_name in ("_theta_render_timer", "_preview_timer", "_volume_refresh_timer"):
+        for timer_name in ("_theta_render_timer", "_theta_range_preview_timer", "_preview_timer", "_volume_refresh_timer"):
             timer = getattr(self, timer_name, None)
             if timer is not None:
                 try:

@@ -1012,6 +1012,44 @@ class MapPlotWidget(QWidget):
         if first_draw and self.roi_btn.isChecked(): self._apply_current_roi_tool(active=True)
         self.canvas.draw_idle()
 
+    def update_theta_preview_image(
+        self, img, title: str, *, clim: tuple[float, float] | None = None
+    ) -> None:
+        """Update only the scalar image for an interactive θ-range preview.
+
+        Unlike :meth:`draw_map`, this hot path does not rebuild axes, recalculate
+        coordinate extents, restyle the colorbar, touch ROI artists, or schedule
+        multiple redraws. Existing color limits are intentionally retained while
+        the user drags a range handle; ``clim`` may be supplied once on release.
+        """
+        image = np.asarray(img)
+        if image.ndim != 2:
+            raise ValueError(
+                f"Ожидалась 2D-карта для предпросмотра θ, получена форма {image.shape}"
+            )
+        if self.map_image is None:
+            self.draw_map(
+                image, title, self.current_cmap, None, None,
+                x_coords=self._x_coords, y_coords=self._y_coords,
+            )
+            return
+
+        self._cursor_intensity_map = image
+        self.map_image.set_data(image)
+        if clim is not None:
+            low, high = (float(clim[0]), float(clim[1]))
+            if np.isfinite(low) and np.isfinite(high) and low < high:
+                self.map_image.set_clim(low, high)
+                if self.cbar is not None:
+                    self.cbar.update_normal(self.map_image)
+                    # Contrast is finalized only once per drag gesture, so it
+                    # is safe to refresh the colorbar's numeric tick policy here.
+                    self._configure_colorbar()
+        label = str(title)
+        if self.map_title_label.text() != label:
+            self.map_title_label.setText(label)
+        self.canvas.draw_idle()
+
     @staticmethod
     def _hollow_picker(artist, event) -> tuple[bool, dict]:
         """

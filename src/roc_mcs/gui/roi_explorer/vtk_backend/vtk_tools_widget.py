@@ -284,6 +284,8 @@ class VTKToolsWidget(QWidget):
     axis_scales_apply_requested = pyqtSignal(float, float, float)
     # Index bounds are inclusive and refer to the currently loaded physical theta axis.
     theta_display_range_changed = pyqtSignal(int, int)
+    theta_display_range_interaction_started = pyqtSignal()
+    theta_display_range_interaction_finished = pyqtSignal()
     theta_range_link_toggled = pyqtSignal(bool)
     theta_boundary_planes_toggled = pyqtSignal(bool)
     theta_boundary_plane_opacity_changed = pyqtSignal(float)
@@ -860,6 +862,12 @@ class VTKToolsWidget(QWidget):
         )
         self.theta_range_slider.setEnabled(False)
         self.theta_range_slider.valueChanged.connect(self._on_theta_range_slider_changed)
+        self.theta_range_slider.interactionStarted.connect(
+            self.theta_display_range_interaction_started.emit
+        )
+        self.theta_range_slider.interactionFinished.connect(
+            self.theta_display_range_interaction_finished.emit
+        )
         layout.addWidget(self.theta_range_slider, 0, Qt.AlignmentFlag.AlignHCenter)
 
         endpoints = QHBoxLayout()
@@ -992,6 +1000,12 @@ class VTKToolsWidget(QWidget):
             "Ограничить видимую часть объёма по θ. Значения привязываются к реальным отсчётам."
         )
         new_slider.valueChanged.connect(self._on_theta_range_slider_changed)
+        new_slider.interactionStarted.connect(
+            self.theta_display_range_interaction_started.emit
+        )
+        new_slider.interactionFinished.connect(
+            self.theta_display_range_interaction_finished.emit
+        )
         self.theta_range_panel.layout().replaceWidget(old_slider, new_slider)
         old_slider.hide()
         old_slider.deleteLater()
@@ -1101,6 +1115,7 @@ class VTKToolsWidget(QWidget):
         self._update_theta_range_labels(0, len(values) - 1)
         self._update_theta_range_aux_controls()
         self.theta_display_range_changed.emit(0, len(values) - 1)
+        self.theta_display_range_interaction_finished.emit()
 
     def swap_theta_display_range(self) -> None:
         indices = self._theta_range_indices
@@ -1110,6 +1125,7 @@ class VTKToolsWidget(QWidget):
         if target is not None:
             self.set_theta_display_range_indices(*target)
             self.theta_display_range_changed.emit(*target)
+            self.theta_display_range_interaction_finished.emit()
 
     def set_theta_display_range_indices(self, low_index: int, high_index: int) -> None:
         values = self._theta_axis_values

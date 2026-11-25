@@ -13,6 +13,7 @@ from PyQt6 import QtCore, QtGui, QtWidgets
 from roc_mcs.gui.roi_explorer.theme import resolve_theme, theme_colors
 from roc_mcs.gui.components.floating_legend import FloatingLegendPanel, LegendEntry
 from roc_mcs.gui.roi_explorer.map_tools_widget import SmartDropdownButton
+from roc_mcs.gui.roi_explorer.theta_range_preview import THETA_RANGE_PREVIEW_INTERVAL_MS
 from roc_mcs.gui.roi_explorer.plot_toolbar_style import (
     SMART_DROPDOWN_INDICATOR_RGBA,
     SMART_DROPDOWN_INDICATOR_SIZE,
@@ -182,6 +183,14 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
         self._roi_preview_timer.setSingleShot(True)
         self._roi_preview_timer.setInterval(16)
         self._roi_preview_timer.timeout.connect(self._flush_roi_preview)
+        # Coalesce the high-frequency θ-slider events. The 3D mapper only
+        # needs the newest discrete interval; applying every intermediate
+        # mouse event needlessly rebuilds tiny VTK props and queues renders.
+        self._theta_range_timer = QtCore.QTimer(self)
+        self._theta_range_timer.setSingleShot(True)
+        self._theta_range_timer.setInterval(THETA_RANGE_PREVIEW_INTERVAL_MS)
+        self._theta_range_timer.timeout.connect(self._apply_pending_theta_range)
+        self._pending_theta_range: tuple[int, int] | None = None
         self._thread_pool = QtCore.QThreadPool(self)
         self._thread_pool.setMaxThreadCount(1)
 
@@ -646,6 +655,8 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
         branch_correlation_preview=None,
     ):
         """Передать выбранную версию ROI Explorer; отдельный HDF5 не открывается."""
+        self._theta_range_timer.stop()
+        self._pending_theta_range = None
         scan_key = str(scan_label)
         source_identity = f"{Path(source_path).expanduser().resolve() if source_path else ''}|{scan_key}"
         if self._source_scan_key != source_identity:
@@ -2168,14 +2179,85 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
             self._render()
 
     def _set_theta_range(self, low, high):
-        if self._scene is not None:
-            self._scene.set_theta_display_range_indices(int(low), int(high), render=False)
-            self._render()
+        """Queue the newest range for a bounded-rate VTK scene update."""
+        scene = self._scene
+        if scene is None or self._closed:
+            return
+        try:
+            low_index, high_index = int(low), int(high)
+        except (TypeError, ValueError, OverflowError):
+            return
+        axis_count = len(self.tools.theta_axis_values)
+        if not (0 <= low_index < high_index < axis_count):
+            return
+        requested = (low_index, high_index)
+        if self._pending_theta_range == requested:
+            return
+        full_range = (0, axis_count - 1)
+        normalized = None if requested == full_range else requested
+        if self._pending_theta_range is None and scene.theta_display_range_indices == normalized:
+            return
+        self._pending_theta_range = requested
+        # Do not restart an active timer: a continuous drag must not postpone
+        # rendering forever. The timeout applies the latest interval received.
+        if not self._theta_range_timer.isActive():
+            self._theta_range_timer.start()
+
+    def _apply_pending_theta_range(self, *, render: bool = True) -> None:
+        pending, self._pending_theta_range = self._pending_theta_range, None
+        scene = self._scene
+        if pending is None or scene is None or self._closed:
+            return
+        try:
+            low, high = pending
+            axis_count = len(self.tools.theta_axis_values)
+            requested = None if (low == 0 and high == axis_count - 1) else (low, high)
+            if scene.theta_display_range_indices != requested:
+                scene.set_theta_display_range_indices(low, high, render=False)
+                if render:
+                    self._render()
+        except (ValueError, RuntimeError, TypeError) as exc:
+            logger.debug("Не удалось применить отложенный диапазон θ: %s", exc)
 
     def set_theta_display_range_indices(self, low: int, high: int) -> None:
         """Apply a linked inclusive theta range without emitting a UI change."""
         self.tools.set_theta_display_range_indices(int(low), int(high))
         self._set_theta_range(int(low), int(high))
+
+    def set_theta_range_interaction_active(self, active: bool) -> None:
+        """Temporarily lower only the 3D screen sampling during linked drags."""
+        scene = self._scene
+        if scene is None or self._closed:
+            return
+        try:
+            changed = scene.set_theta_range_interaction_active(
+                bool(active), render=False
+            )
+        except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+            logger.debug("Не удалось изменить интерактивное качество VTK: %s", exc)
+            return
+        if changed:
+            self._render()
+
+    def finish_theta_range_interaction(self) -> None:
+        """Apply the last queued crop and restore full quality in one repaint."""
+        self._theta_range_timer.stop()
+        has_pending_range = self._pending_theta_range is not None
+        if has_pending_range:
+            self._apply_pending_theta_range(render=False)
+
+        scene = self._scene
+        if scene is None or self._closed:
+            return
+        try:
+            quality_changed = scene.set_theta_range_interaction_active(
+                False, render=False
+            )
+        except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+            logger.debug("Не удалось восстановить качество VTK: %s", exc)
+            quality_changed = False
+        if has_pending_range or quality_changed:
+            self._render()
 
     def _set_theta_boundary_planes(self, enabled):
         if self._scene is not None:
@@ -2252,6 +2334,8 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
             self._roi_preview_timer.stop()
             self._settings_timer.stop()
             self._volume_contrast_timer.stop()
+            self._theta_range_timer.stop()
+            self._pending_theta_range = None
             self._init_pending = False
             self._init_generation += 1
             self._generation += 1
@@ -2274,6 +2358,8 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
             self._roi_preview_timer.stop()
             self._settings_timer.stop()
             self._volume_contrast_timer.stop()
+            self._theta_range_timer.stop()
+            self._pending_theta_range = None
             self._init_pending = False
             self._init_generation += 1
             self._generation += 1

@@ -544,6 +544,9 @@ class VTKVolumeScene:
         self.interactor.SetInteractorStyle(self.interactor_style)
         self.grid = None
         self.mapper = None
+        # Original screen-space sampling and automatic-quality mode are saved
+        # while a linked theta-range slider is actively dragged.
+        self._theta_range_interaction_render_state: tuple[float, bool] | None = None
         self.volume = None
         self.volume_property = None
         self.color_function = vtk.vtkColorTransferFunction()
@@ -1234,8 +1237,13 @@ class VTKVolumeScene:
     def set_roi_preview_visible(self, visible: bool, *, render: bool = True) -> None:
         """Toggle the geometric preview and the matching in-volume highlight."""
         self._roi_preview_enabled = bool(visible)
-        self._apply_roi_preview_visibility()
-        self._update_roi_preview_shader_uniforms()
+        if self._roi_preview_enabled:
+            # Geometry may have been intentionally left untouched while the
+            # preview was hidden and θ-range changes were being applied.
+            self._update_roi_preview_geometry()
+        else:
+            self._apply_roi_preview_visibility()
+            self._update_roi_preview_shader_uniforms()
         if render:
             self._request_render()
 
@@ -1374,7 +1382,8 @@ class VTKVolumeScene:
     def _update_roi_preview_geometry(self) -> None:
         """Rebuild a handful of ROI preview primitives in the current display frame."""
         if (
-            self.payload is None or self._roi_preview_roi is None
+            self.payload is None or not self._roi_preview_enabled
+            or self._roi_preview_roi is None
             or self._roi_preview_surface_polydata is None
         ):
             self._apply_roi_preview_visibility()
@@ -2605,6 +2614,11 @@ class VTKVolumeScene:
             new_positive_reference_999 = float(np.max(new_finite_sample))
             new_positive_max = None
 
+        # A payload replacement ends any transient low-resolution drag mode;
+        # the newly created mapper always starts with the normal full-quality
+        # settings configured below.
+        self.set_theta_range_interaction_active(False, render=False)
+
         # vtkRenderer.RemoveVolume/RemoveActor already call MakeCurrent() and
         # ReleaseGraphicsResources() on the removed prop. Do not manually
         # release the same mapper a second time: that is redundant and makes
@@ -2980,7 +2994,10 @@ class VTKVolumeScene:
         """Show or hide the two non-interactive visual caps of the θ preview."""
         requested = bool(visible)
         self._theta_boundary_planes_visible = requested
-        self._update_theta_boundary_planes()
+        if requested:
+            self._update_theta_boundary_planes()
+        elif self._theta_boundary_plane_actor is not None:
+            self._theta_boundary_plane_actor.SetVisibility(0)
         if render:
             self._request_render()
         return bool(
@@ -3054,14 +3071,20 @@ class VTKVolumeScene:
         # uncropped path (not a full-bounds clipping pass).
         requested = None if (low == 0 and high == count - 1) else (low, high)
         previous_indices = self._theta_display_range_indices
+        # Ignore duplicate snapped mouse events before making any native VTK
+        # queries. The continuous toolbar slider can emit repeatedly while
+        # both handles remain on the same discrete θ samples.
+        if requested == previous_indices:
+            return (low, high)
+
         previous_enabled = bool(self.mapper.GetCropping())
         previous_planes = tuple(float(v) for v in self.mapper.GetCroppingRegionPlanes())
         previous_flags = int(self.mapper.GetCroppingRegionFlags())
-
         self._theta_display_range_indices = requested
         try:
             self._apply_theta_display_crop()
-            self._update_theta_boundary_planes()
+            if self._theta_boundary_planes_visible:
+                self._update_theta_boundary_planes()
         except Exception:
             self._theta_display_range_indices = previous_indices
             try:
@@ -3074,10 +3097,80 @@ class VTKVolumeScene:
                 pass
             raise
 
-        self._update_roi_preview_geometry()
+        if self._roi_preview_enabled:
+            self._update_roi_preview_geometry()
         if render:
             self._request_render()
         return (low, high)
+
+    def set_theta_range_interaction_active(
+        self, active: bool, *, render: bool = True
+    ) -> bool:
+        """Temporarily trade 3D screen sampling for responsive linked dragging.
+
+        This changes only vtkGPUVolumeRayCastMapper's screen-space image sample
+        distance. The volume data, voxel sampling distance, transfer functions,
+        crop coordinates, camera, and all scientific results remain untouched.
+        Original mapper settings are restored exactly when the gesture ends.
+        """
+        mapper = self.mapper
+        if mapper is None:
+            self._theta_range_interaction_render_state = None
+            return False
+        if not hasattr(mapper, "SetImageSampleDistance"):
+            return False
+
+        if bool(active):
+            if self._theta_range_interaction_render_state is not None:
+                return False
+            try:
+                original_distance = float(mapper.GetImageSampleDistance())
+                original_auto_adjust = bool(mapper.GetAutoAdjustSampleDistances())
+            except (AttributeError, TypeError, ValueError, RuntimeError):
+                return False
+            if not np.isfinite(original_distance) or original_distance <= 0:
+                return False
+
+            self._theta_range_interaction_render_state = (
+                original_distance, original_auto_adjust
+            )
+            try:
+                # Lock auto-adjust for the duration of the gesture. A modest
+                # 1.5x screen-space step renders ~44% as many rays as 1.0 while
+                # keeping the live volume preview legible. This is display-only.
+                if hasattr(mapper, "SetAutoAdjustSampleDistances"):
+                    mapper.SetAutoAdjustSampleDistances(False)
+                mapper.SetImageSampleDistance(max(original_distance, 1.5))
+                mapper.Modified()
+            except Exception:
+                self._theta_range_interaction_render_state = None
+                try:
+                    mapper.SetImageSampleDistance(original_distance)
+                    if hasattr(mapper, "SetAutoAdjustSampleDistances"):
+                        mapper.SetAutoAdjustSampleDistances(original_auto_adjust)
+                    mapper.Modified()
+                except Exception:
+                    pass
+                raise
+        else:
+            previous = self._theta_range_interaction_render_state
+            if previous is None:
+                return False
+            original_distance, original_auto_adjust = previous
+            try:
+                mapper.SetImageSampleDistance(float(original_distance))
+                if hasattr(mapper, "SetAutoAdjustSampleDistances"):
+                    mapper.SetAutoAdjustSampleDistances(bool(original_auto_adjust))
+                mapper.Modified()
+            except Exception:
+                # Keep the restore token so a later release/cleanup can retry.
+                self._theta_range_interaction_render_state = previous
+                raise
+            self._theta_range_interaction_render_state = None
+
+        if render:
+            self._request_render()
+        return True
 
     @property
     def theta_display_range_indices(self) -> tuple[int, int] | None:
@@ -4894,6 +4987,7 @@ class VTKVolumeScene:
         self._cursor_line_enabled = False
         self._cursor_line_position = None
         self._cursor_line_radii = None
+        self.set_theta_range_interaction_active(False, render=False)
         self.payload = None
         self._apply_roi_preview_visibility()
         self.grid = None
