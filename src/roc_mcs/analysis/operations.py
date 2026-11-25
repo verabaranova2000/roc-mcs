@@ -1304,6 +1304,111 @@ def _run_branch_correlation(
     )
 
 
+
+def _validate_kalpha_hkl(parameters: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate a reproducible crystal/Mo Kα doublet identification run."""
+    model_id = str(parameters.get("crystal_model_id", "caf2_fluorite")).strip()
+    from roc_mcs.theory.crystals import get_crystal_model
+    crystal_model = get_crystal_model(model_id)
+
+    def positive_float(name: str, default: float) -> float:
+        try:
+            value = float(parameters.get(name, default))
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"{name} должен быть конечным положительным числом") from exc
+        if not np.isfinite(value) or value <= 0.0:
+            raise ValueError(f"{name} должен быть конечным положительным числом")
+        return value
+
+    lattice_a = positive_float("lattice_a_A", 5.4635)
+    lambda_1 = positive_float("lambda_ka1_A", 0.7093000)
+    lambda_2 = positive_float("lambda_ka2_A", 0.7135900)
+    if lambda_2 <= lambda_1:
+        raise ValueError("Для пары Mo Kα требуется λ(Kα2) > λ(Kα1)")
+    max_index = _integer_parameter(parameters, "max_miller_index", 10)
+    if not 1 <= max_index <= 30:
+        raise ValueError("max_miller_index должен находиться в диапазоне 1–30")
+    bin_width = positive_float("histogram_bin_width_arcsec", 7.0)
+    crystal_thickness = positive_float("crystal_thickness_m", 1e-5)
+    include_crystalpy = parameters.get("include_crystalpy", False)
+    if not isinstance(include_crystalpy, (bool, np.bool_)):
+        raise ValueError("include_crystalpy должен быть логическим значением")
+    return {
+        "crystal_model_id": model_id, "crystal_model_label": str(crystal_model.display_name),
+        "lattice_a_A": lattice_a,
+        "lambda_ka1_A": lambda_1, "lambda_ka2_A": lambda_2,
+        "max_miller_index": max_index,
+        "histogram_bin_width_arcsec": bin_width,
+        "include_crystalpy": bool(include_crystalpy),
+        "crystal_thickness_m": crystal_thickness,
+        "algorithm": "kalpha_doublet_raw_peak_id_pairing+database_crystal_hkl_bragg_ranking_v2",
+    }
+
+
+def _run_kalpha_hkl(
+    inputs: Mapping[str, ArtifactBundle],
+    parameters: Mapping[str, Any],
+) -> OperationResult:
+    from roc_mcs.processing.kalpha_identification import (
+        KAlphaIdentificationConfig, identify_kalpha_hkl,
+    )
+
+    branches = inputs["branches"]
+    correlation = inputs["branch_correlation"]
+    catalog = branches.tables.get("branch_catalog")
+    if catalog is None:
+        raise ValueError("В артефакте ветвей отсутствует branch_catalog")
+    reflections, rejected, measurements, pair_stats, ranking, theory_meta = identify_kalpha_hkl(
+        catalog, correlation.tables, branch_metadata=branches.metadata,
+        config=KAlphaIdentificationConfig(
+            crystal_model_id=parameters["crystal_model_id"],
+            lattice_a_A=parameters["lattice_a_A"],
+            lambda_ka1_A=parameters["lambda_ka1_A"],
+            lambda_ka2_A=parameters["lambda_ka2_A"],
+            max_miller_index=parameters["max_miller_index"],
+            histogram_bin_width_arcsec=parameters["histogram_bin_width_arcsec"],
+            include_crystalpy=parameters["include_crystalpy"],
+            crystal_thickness_m=parameters["crystal_thickness_m"],
+        ),
+    )
+    metadata = {
+        "operation": "Kα doublet / theoretical HKL identification",
+        "algorithm": parameters["algorithm"],
+        "theory": theory_meta,
+        "branch_correlation_artifact_metadata": dict(correlation.metadata.get("branch_correlation", {})),
+        "branch_artifact_metadata": {
+            "grid_id": branches.metadata.get("grid_id"),
+            "position_kind": branches.metadata.get("position_kind"),
+            "theta_unit": branches.metadata.get("theta_unit"),
+            "n_branches": branches.metadata.get("n_branches"),
+        },
+    }
+    ready = int((pair_stats.get("identification_status", []) == "ready").sum()) if not pair_stats.empty else 0
+    best_labels = [
+        f"{row.pair_id}: {row.best_hkl} (ошибка {row.best_abs_difference_arcsec:.2f}″)"
+        for row in pair_stats.itertuples(index=False)
+        if getattr(row, "best_hkl", None) is not None and str(getattr(row, "best_hkl", "")) not in {"", "nan", "None"}
+    ]
+    summary = (
+        f"HKL-идентификация Mo Kα для {parameters['crystal_model_label']}: пар={len(pair_stats)}, "
+        f"с достаточными назначениями={ready}, теоретических рефлексов={len(reflections)}. "
+        + ("Ближайшие: " + "; ".join(best_labels[:4]) if best_labels else "Нет пар с достаточным числом принятых соответствий.")
+    )
+    return OperationResult(
+        bundle=ArtifactBundle(
+            tables={
+                "hkl_theoretical_reflections": reflections,
+                "hkl_bragg_rejected": rejected,
+                "hkl_pair_measurements": measurements,
+                "hkl_pair_statistics": pair_stats,
+                "hkl_pair_ranking": ranking,
+            },
+            metadata=metadata,
+        ),
+        output_ports=("hkl_analysis",),
+        summary=summary,
+    )
+
 def _grid_signature(parent_grid: str, operation_signature: str) -> str:
     import hashlib
 
@@ -1382,5 +1487,18 @@ def default_registry() -> OperationRegistry:
         output_ports=("branch_correlation",),
         execute=_run_branch_correlation,
         validate=_validate_branch_correlation,
+    ))
+    registry.register(OperationSpec(
+        operation_id="theory.identify_hkl",
+        label="Теоретическая идентификация HKL по Kα-дублету",
+        description=(
+            "Сопоставляет исходные угловые разности Δθ принятых peak_id-пар "
+            "с расчётными разделениями Mo Kα1/Kα2 для выбранной кристаллической "
+            "модели или материала из базы XrayLib. Результат — ранжирование по "
+            "близости медианы, а не формальная вероятность; исходные артефакты неизменны."
+        ),
+        output_ports=("hkl_analysis",),
+        execute=_run_kalpha_hkl,
+        validate=_validate_kalpha_hkl,
     ))
     return registry

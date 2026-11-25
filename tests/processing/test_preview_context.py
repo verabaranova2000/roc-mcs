@@ -168,3 +168,96 @@ def test_branch_correlation_preview_rejects_broken_lineage_with_specific_error(t
         assert "предшествующий выход 'scan'" in str(exc)
     else:  # pragma: no cover - assertion clarity
         raise AssertionError("Ожидалась диагностируемая ошибка lineage")
+
+
+def test_hkl_preview_resolves_original_branch_catalog_and_correlation_lineage(tmp_path):
+    from roc_mcs.analysis.engine import build_input_refs
+    from roc_mcs.analysis.hkl_preview import build_hkl_identification_preview
+    from roc_mcs.analysis.workflow_history import ReviewStatus
+
+    history, store, executor, branches_node, correlation_node, _catalog = (
+        _make_branch_correlation_workflow(tmp_path)
+    )
+    history.set_review_status(correlation_node.id, ReviewStatus.ACCEPTED)
+    refs = build_input_refs(history, correlation_node.id, "theory.identify_hkl", {})
+    assert refs == {
+        "branch_correlation": {"node_id": correlation_node.id, "output": "branch_correlation"},
+        "branches": {"node_id": branches_node.id, "output": "branches"},
+    }
+
+    hkl_bundle = ArtifactBundle(
+        tables={
+            "hkl_theoretical_reflections": pd.DataFrame([{
+                "hkl": "(111)", "d_A": 3.154, "theta_ka1_deg": 6.45,
+                "delta_theta_arcsec": 141.0,
+            }]),
+            "hkl_bragg_rejected": pd.DataFrame(columns=["hkl", "d_A", "reason"]),
+            "hkl_pair_measurements": pd.DataFrame([{
+                "pair_id": "3↔7", "delta_theta_abs_arcsec": 140.0,
+                "source_peak_id": 10, "matched_partner_peak_id": 11,
+            }]),
+            "hkl_pair_statistics": pd.DataFrame([{
+                "pair_id": "3↔7", "matched_assignment_count": 1,
+                "delta_theta_abs_median_arcsec": 140.0,
+                "identification_status": "insufficient_matches",
+            }]),
+            "hkl_pair_ranking": pd.DataFrame(columns=[
+                "pair_id", "rank", "hkl", "delta_theta_arcsec",
+                "difference_from_exp_median_arcsec",
+            ]),
+        },
+        metadata={"theory": {
+            "crystal_name": "CaF₂ · флюорит", "lattice_a_A": 5.4635,
+            "lambda_ka1_A": 0.7093000, "lambda_ka2_A": 0.7135900,
+            "histogram_bin_width_arcsec": 7.0,
+        }},
+    )
+    hkl_artifact = store.write(hkl_bundle)
+    hkl_node = history.add_node(
+        "theory.identify_hkl", "HKL · CaF₂", parent_ids=[correlation_node.id],
+        input_refs=refs, output_refs={"hkl_analysis": hkl_artifact},
+        status=NodeStatus.SUCCEEDED, review_status=ReviewStatus.ACCEPTED,
+    )
+
+    context = load_node_preview_context(hkl_node, history, executor)
+    assert context["scan"].arrays["data_yxt"].shape == (1, 2, 3)
+    assert context["branches"].tables["branch_catalog"].shape[0] == 2
+    assert context["branch_correlation"].tables["branch_correlation_pairs"].shape[0] == 1
+    assert context["hkl_analysis"].tables["hkl_pair_statistics"].shape[0] == 1
+
+    state = build_workflow_preview_state(hkl_node, context)
+    assert state.hkl_identification_preview is not None
+    assert state.hkl_identification_preview.pair_statistics.iloc[0]["pair_id"] == "3↔7"
+    assert state.branch_correlation_preview is not None
+    assert state.branch_correlation_preview.pairs
+    assert state.default_map_key == "branches.count"
+    assert set(state.peak_points["branch_id"].tolist()) == {3, 7}
+
+
+def test_hkl_preview_model_detaches_tables_from_artifact_bundle():
+    from roc_mcs.analysis.hkl_preview import build_hkl_identification_preview
+
+    bundle = ArtifactBundle(
+        tables={
+            "hkl_theoretical_reflections": pd.DataFrame([{
+                "hkl": "(111)", "d_A": 3.0, "theta_ka1_deg": 6.0,
+                "delta_theta_arcsec": 140.0,
+            }]),
+            "hkl_bragg_rejected": pd.DataFrame(columns=["hkl", "d_A", "reason"]),
+            "hkl_pair_measurements": pd.DataFrame(columns=[
+                "pair_id", "delta_theta_abs_arcsec", "source_peak_id", "matched_partner_peak_id",
+            ]),
+            "hkl_pair_statistics": pd.DataFrame(columns=[
+                "pair_id", "matched_assignment_count", "delta_theta_abs_median_arcsec",
+                "identification_status",
+            ]),
+            "hkl_pair_ranking": pd.DataFrame(columns=[
+                "pair_id", "rank", "hkl", "delta_theta_arcsec",
+                "difference_from_exp_median_arcsec",
+            ]),
+        },
+        metadata={"theory": {"crystal_name": "CaF₂"}},
+    )
+    view = build_hkl_identification_preview(bundle)
+    view.theoretical_reflections.loc[0, "hkl"] = "MUTATED"
+    assert bundle.tables["hkl_theoretical_reflections"].loc[0, "hkl"] == "(111)"

@@ -703,6 +703,10 @@ class VTKVolumeScene:
         peak_property.SetSpecular(0.12)
         peak_property.SetSpecularPower(18.0)
         self._peak_marker_actor.SetVisibility(0)
+        # Register the persistent marker actor exactly once. The picker can
+        # reference an unregistered actor, so hover diagnostics alone do not
+        # reveal a missing renderer prop; without AddActor(), markers never draw.
+        self.renderer.AddActor(self._peak_marker_actor)
         self._peak_marker_positions_physical = np.empty((0, 3), dtype=np.float64)
         self._peak_marker_display_positions = np.empty((0, 3), dtype=np.float64)
         self._peak_marker_colors = np.empty((0, 4), dtype=np.uint8)
@@ -3163,17 +3167,24 @@ class VTKVolumeScene:
         # An ROI-specific volume may expose a strict sub-grid. Apply the same
         # physical bounds to points and links, including the theta dimension.
         if self._physical_x is not None and self._physical_y is not None:
+            # Axes may be strictly ascending OR descending (ROI and scan views
+            # preserve the source orientation).  Compare against physical bounds,
+            # not first/last samples; the latter silently removed every marker
+            # for a descending detector axis while correspondence lines used
+            # the correct orientation-independent mask.
+            x_low, x_high = sorted((float(self._physical_x[0]), float(self._physical_x[-1])))
+            y_low, y_high = sorted((float(self._physical_y[0]), float(self._physical_y[-1])))
             in_roi = (
-                (physical[:, 0] >= self._physical_x[0])
-                & (physical[:, 0] <= self._physical_x[-1])
-                & (physical[:, 1] >= self._physical_y[0])
-                & (physical[:, 1] <= self._physical_y[-1])
+                (physical[:, 0] >= x_low)
+                & (physical[:, 0] <= x_high)
+                & (physical[:, 1] >= y_low)
+                & (physical[:, 1] <= y_high)
             )
-            if self._physical_theta is not None:
-                in_roi &= (
-                    (physical[:, 2] >= self._physical_theta[0])
-                    & (physical[:, 2] <= self._physical_theta[-1])
-                )
+            if self._physical_theta is not None and len(self._physical_theta):
+                theta_low, theta_high = sorted((
+                    float(self._physical_theta[0]), float(self._physical_theta[-1])
+                ))
+                in_roi &= (physical[:, 2] >= theta_low) & (physical[:, 2] <= theta_high)
             physical = physical[in_roi]
             valid_rows = valid_rows[in_roi]
         return np.ascontiguousarray(physical, dtype=np.float64), valid_rows

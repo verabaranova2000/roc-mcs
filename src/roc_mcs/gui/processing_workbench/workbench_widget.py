@@ -396,7 +396,7 @@ class ProcessingWorkbenchWidget(QWidget):
         self._operation_ids = [
             "preprocess.detector_bad_pixels",
             "preprocess.pool", "preprocess.spikes", "peaks.detect", "fit.scan",
-            "peaks.branches", "peaks.branch_correlation",
+            "peaks.branches", "peaks.branch_correlation", "theory.identify_hkl",
         ]
         for operation_id in self._operation_ids:
             self.operation_combo.addItem(self.registry.get(operation_id).label, operation_id)
@@ -419,6 +419,7 @@ class ProcessingWorkbenchWidget(QWidget):
         self._build_fit_form()
         self._build_branch_form()
         self._build_branch_correlation_form()
+        self._build_hkl_identification_form()
         operation_layout.addWidget(self.form_stack)
 
         actions = QHBoxLayout()
@@ -1224,6 +1225,138 @@ class ProcessingWorkbenchWidget(QWidget):
             assignment_margin=margin,
         )
 
+    def _build_hkl_identification_form(self) -> None:
+        layout = self._add_form_page(
+            "theory.identify_hkl", "Теоретическая идентификация HKL по Kα-дублету"
+        )
+        layout.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        layout.setFormAlignment(Qt.AlignmentFlag.AlignTop)
+        layout.setRowWrapPolicy(QFormLayout.RowWrapPolicy.DontWrapRows)
+
+        from roc_mcs.theory.crystals import available_crystal_models, xraylib_available
+        crystal_selector = QComboBox()
+        try:
+            crystal_models = available_crystal_models()
+            xraylib_ready = bool(xraylib_available())
+        except Exception:
+            # A broken optional XrayLib installation must not remove the
+            # established CaF2 analysis path from the workbench.
+            crystal_models = (("caf2_fluorite", "CaF₂ · флюорит"),)
+            xraylib_ready = False
+        for model_id, display_name in crystal_models:
+            crystal_selector.addItem(display_name, model_id)
+        default_index = crystal_selector.findData("caf2_fluorite")
+        crystal_selector.setCurrentIndex(max(0, default_index))
+        crystal_selector.setToolTip(
+            "CaF₂ использует встроенную проверенную модель Fm-3m. Остальные материалы "
+            "берутся из встроенного каталога кристаллов XrayLib, если пакет установлен."
+        )
+        layout.addRow("Кристаллическая модель:", crystal_selector)
+
+        lattice = self._float_spin(0.1, 100.0, 5.4635, 6)
+        lattice.setSuffix(" Å")
+        lattice.setToolTip(
+            "Параметр a для встроенной кубической модели CaF₂. Для материалов XrayLib "
+            "все параметры ячейки a,b,c,α,β,γ берутся из базы и это поле игнорируется."
+        )
+        layout.addRow("Параметр a (CaF₂):", lattice)
+
+        def update_crystal_controls(_index: int = -1) -> None:
+            is_builtin_caf2 = crystal_selector.currentData() == "caf2_fluorite"
+            lattice.setEnabled(is_builtin_caf2)
+            if is_builtin_caf2:
+                lattice.setToolTip(
+                    "Параметр кубической решётки CaF₂; значение по умолчанию 5.4635 Å."
+                )
+            else:
+                lattice.setToolTip(
+                    "Отключено: параметры некубической ячейки берутся из выбранной записи XrayLib."
+                )
+        crystal_selector.currentIndexChanged.connect(update_crystal_controls)
+        update_crystal_controls()
+
+        lambda_1 = self._float_spin(0.1, 10.0, 0.7093000, 7)
+        lambda_1.setSuffix(" Å")
+        lambda_2 = self._float_spin(0.1, 10.0, 0.7135900, 7)
+        lambda_2.setSuffix(" Å")
+        layout.addRow("λ(Kα₁):", lambda_1)
+        layout.addRow("λ(Kα₂):", lambda_2)
+
+        max_index = self._int_spin(1, 30, 10)
+        max_index.setToolTip(
+            "Максимум |h|, |k|, |l|. Для базы XrayLib перебирается полный знаковый "
+            "куб индексов; эквивалентные направления не скрываются, погасания проверяются F_H."
+        )
+        layout.addRow("Максимальный индекс:", max_index)
+
+        bin_width = self._float_spin(0.5, 100.0, 7.0, 1)
+        bin_width.setSuffix(" ″")
+        layout.addRow("Ширина бина гистограммы:", bin_width)
+
+        include_crystalpy = QCheckBox(
+            "Дополнительно рассчитать |Fₕₖₗ|² и Darwin widths"
+        )
+        try:
+            from roc_mcs.theory.crystalpy_caf2 import crystalpy_available
+            crystalpy_ready = bool(crystalpy_available())
+        except Exception:
+            crystalpy_ready = False
+        include_crystalpy.setChecked(crystalpy_ready)
+        include_crystalpy.setEnabled(crystalpy_ready)
+        thickness = self._float_spin(1e-8, 1e-2, 1e-5, 8)
+        thickness.setSuffix(" m")
+        thickness.setEnabled(crystalpy_ready)
+        thickness.setToolTip(
+            "Толщина кристалла для динамических параметров CrystalPy; для CaF₂ сохранена "
+            "исходная настройка из notebook."
+        )
+        layout.addRow("Толщина CrystalPy:", thickness)
+        include_crystalpy.setToolTip(
+            "Дополнительный расчёт F0/FH/FH̄, ψH/ψH̄ и Darwin widths через CrystalPy/XrayLib. "
+            "Для CaF₂ применяется явная basis из notebook, для остальных материалов — "
+            "атомная ячейка выбранной записи XrayLib."
+        )
+        layout.addRow(include_crystalpy)
+        if crystalpy_ready:
+            dependency_message = (
+                "XrayLib и CrystalPy доступны: каталог материалов, структурные факторы "
+                "и дополнительные σ/π Darwin widths можно рассчитывать для выбранного кристалла."
+            )
+        elif xraylib_ready:
+            dependency_message = (
+                "XrayLib доступен: каталог материалов и F_H участвуют в теоретическом отборе. "
+                "CrystalPy не обнаружен — дополнительные σ/π Darwin widths отключены."
+            )
+        else:
+            dependency_message = (
+                "XrayLib не обнаружен: доступна встроенная геометрическая модель CaF₂. "
+                "Для каталога других кристаллов и структурных факторов установите xraylib; "
+                "для Darwin widths дополнительно нужен crystalpy."
+            )
+        dependency_hint = QLabel(dependency_message)
+        dependency_hint.setWordWrap(True)
+        dependency_hint.setStyleSheet("color: palette(placeholderText); font-size: 9px;")
+        layout.addRow(dependency_hint)
+
+        explanation = QLabel(
+            "Экспериментальная |Δθ| восстанавливается по исходным θ двух пиков "
+            "из принятых assignments (точный join по peak_id). Остаток после 3D-совмещения "
+            "не используется. Рефлексы ранжируются по |Δθтеория − median(|Δθэксп|)|. "
+            "Для XrayLib учитываются полная метрика ячейки и систематические погасания "
+            "по F_H; это ранжирование геометрического совпадения, не формальная вероятность "
+            "и не оценка измеренной интенсивности."
+        )
+        explanation.setWordWrap(True)
+        explanation.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        explanation.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        layout.addRow(explanation)
+        self._forms["theory.identify_hkl"].update(
+            crystal_model_id=crystal_selector, lattice_a_A=lattice,
+            lambda_ka1_A=lambda_1, lambda_ka2_A=lambda_2,
+            max_miller_index=max_index, histogram_bin_width_arcsec=bin_width,
+            include_crystalpy=include_crystalpy, crystal_thickness_m=thickness,
+        )
+
     def _request_branch_stats(self, parent_id: str) -> None:
         node = self.project.history.get(parent_id)
         form = self._forms.get("peaks.branches", {})
@@ -1497,6 +1630,17 @@ class ProcessingWorkbenchWidget(QWidget):
                 "theta_tolerance_arcsec": form["theta_tolerance_arcsec"].value(),
                 "assignment_margin": form["assignment_margin"].value(),
             }
+        if operation_id == "theory.identify_hkl":
+            return {
+                "crystal_model_id": str(form["crystal_model_id"].currentData()),
+                "lattice_a_A": form["lattice_a_A"].value(),
+                "lambda_ka1_A": form["lambda_ka1_A"].value(),
+                "lambda_ka2_A": form["lambda_ka2_A"].value(),
+                "max_miller_index": form["max_miller_index"].value(),
+                "histogram_bin_width_arcsec": form["histogram_bin_width_arcsec"].value(),
+                "include_crystalpy": form["include_crystalpy"].isChecked(),
+                "crystal_thickness_m": form["crystal_thickness_m"].value(),
+            }
         raise KeyError(operation_id)
 
     def _selected_node_id(self) -> str | None:
@@ -1550,6 +1694,8 @@ class ProcessingWorkbenchWidget(QWidget):
         if node.operation_id == "peaks.branches":
             branch_count, _reason = self._branch_count_for_node(node)
             return ["peaks.branch_correlation"] if branch_count is not None and branch_count >= 2 else []
+        if node.operation_id == "peaks.branch_correlation":
+            return ["theory.identify_hkl"] if "branch_correlation" in node.output_refs else []
         return []
 
     def _on_graph_add_stage_requested(self, parent_id: str) -> None:
@@ -2511,7 +2657,27 @@ class ProcessingWorkbenchWidget(QWidget):
             view_state = context.get("view_state")
             if view_state is not None:
                 self.preview_state_ready.emit(view_state)
-            if node.operation_id == "peaks.branch_correlation" and context.get("branch_correlation") is not None:
+            if node.operation_id == "theory.identify_hkl" and context.get("hkl_analysis") is not None:
+                hkl_bundle = context["hkl_analysis"]
+                theory_meta = (hkl_bundle.metadata or {}).get("theory", {})
+                pair_stats = hkl_bundle.tables.get("hkl_pair_statistics")
+                ready_rows = [] if pair_stats is None else pair_stats.loc[
+                    pair_stats["identification_status"].astype(str) == "ready"
+                ]
+                best = [
+                    f"{row.pair_id}: {row.best_hkl} (Δ={row.best_abs_difference_arcsec:.2f}″)"
+                    for row in ready_rows.itertuples(index=False)
+                    if getattr(row, "best_hkl", None) is not None
+                ]
+                self.preview_summary.setText(
+                    f"Теоретическая идентификация {theory_meta.get('crystal_name', 'HKL')}: "
+                    f"рассчитано рефлексов={theory_meta.get('reflection_count', 0)}; "
+                    f"пар с данными={theory_meta.get('pair_count', 0)}. "
+                    + ("Ближайшие геометрические совпадения: " + "; ".join(best[:4])
+                       if best else "Недостаточно принятых соответствий для ранжирования.")
+                    + " Вероятности не вычислялись; откройте секцию «Теоретическая идентификация HKL» в ROI Explorer."
+                )
+            elif node.operation_id == "peaks.branch_correlation" and context.get("branch_correlation") is not None:
                 correlation_bundle = context["branch_correlation"]
                 correlation_meta = (correlation_bundle.metadata or {}).get("branch_correlation", {})
                 self.preview_summary.setText(

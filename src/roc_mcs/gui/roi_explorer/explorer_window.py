@@ -75,6 +75,7 @@ from roc_mcs.gui.components.icon_provider import resource_svg_icon, set_icon_the
 from roc_mcs.gui.app_settings import load_settings, save_settings, resolve_initial_database, remember_hdf5_database, settings_path
 from roc_mcs.gui.roi_explorer.theme import apply_theme as apply_roi_theme, apply_popup_theme, resolve_theme, theme_colors
 from roc_mcs.gui.roi_explorer.plot_workspace_widget import PlotWorkspaceWidget
+from roc_mcs.gui.roi_explorer.hkl_results_panel import HklResultsPanel
 from roc_mcs.gui.roi_explorer.plot_display_settings import PlotDisplaySettingsDialog, load_plot_display_settings, save_plot_display_settings
 from roc_mcs.roi.roi_types import ROI, SavedROI
 from roc_mcs.roi.extraction import extract_from_roi
@@ -205,6 +206,15 @@ class RockingCurveExplorerWindow(QMainWindow):
         self.processing_section.content_layout.addWidget(self.processing_panel)
         left_layout.addWidget(self.processing_section)
 
+        # Theoretical analyses have their own result surface: HKL histograms and
+        # reflection tables do not belong in the spatial map / ROC / VTK views.
+        self.hkl_section = CollapsibleSection("Теоретическая идентификация HKL", expanded=True)
+        self.hkl_results_panel = HklResultsPanel(self.hkl_section.body)
+        self.hkl_results_panel.apply_theme(self._preferred_theme)
+        self.hkl_section.content_layout.addWidget(self.hkl_results_panel)
+        self.hkl_section.setVisible(False)
+        left_layout.addWidget(self.hkl_section)
+
         # Inspector закреплён сверху; свободное место остаётся после секций,
         # как в боковой панели Live Scans.
         self.inspector_section = CollapsibleSection("Inspector", expanded=True)
@@ -260,6 +270,8 @@ class RockingCurveExplorerWindow(QMainWindow):
             self.map_widget.apply_theme(active_theme); self.curve_widget.apply_theme(active_theme); self.volume_widget.apply_theme(active_theme); self.roi_manager.apply_theme(active_theme)
             if hasattr(self, "processing_panel"):
                 self.processing_panel.apply_theme(active_theme)
+            if hasattr(self, "hkl_results_panel"):
+                self.hkl_results_panel.apply_theme(active_theme)
             display_settings = load_plot_display_settings(); self.map_widget.apply_display_settings(display_settings["map"]); self.curve_widget.apply_display_settings(display_settings["curve"]); self.volume_widget.apply_display_settings(display_settings["volume"])
             self.plot_workspace.apply_theme(active_theme)
             for popup in self.findChildren(QWidget):
@@ -1195,6 +1207,12 @@ class RockingCurveExplorerWindow(QMainWindow):
         if source_file and Path(str(source_file)).expanduser().resolve() != Path(self.current_file).resolve():
             self.status.showMessage("Предпросмотр относится к другому HDF5-файлу", 8000)
             return
+        hkl_preview = getattr(state, "hkl_identification_preview", None)
+        self.hkl_results_panel.set_result(hkl_preview)
+        self.hkl_section.setVisible(hkl_preview is not None)
+        if hkl_preview is not None:
+            self.hkl_section.setExpanded(True)
+
         self._remember_analysis_display_preferences()
         identity = self._analysis_display_key(state)
         if self._analysis_previous_pool is None:
@@ -1221,11 +1239,17 @@ class RockingCurveExplorerWindow(QMainWindow):
         self.refresh_curves()
         self._update_inspector()
         self._request_volume_refresh()
-        self.status.showMessage(f"Workflow preview: {state.label}")
+        hkl_preview_warning = metadata.get("hkl_identification_preview_warning")
+        if hkl_preview_warning:
+            self.status.showMessage(str(hkl_preview_warning), 15000)
+        else:
+            self.status.showMessage(f"Workflow preview: {state.label}")
 
     def restore_analysis_preview(self) -> None:
         """Возвращает исходный HDF5-view и прежний spatial pooling."""
         self._remember_analysis_display_preferences()
+        self.hkl_results_panel.set_result(None)
+        self.hkl_section.setVisible(False)
         self._analysis_view = None
         self._set_analysis_contrast_mode(None)
         self._analysis_map_key = None

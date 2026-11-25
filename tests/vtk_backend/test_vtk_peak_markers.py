@@ -365,3 +365,45 @@ def test_perspective_marker_radii_compensate_for_each_event_depth():
     camera.SetViewAngle(45.0)
     scene._on_peak_marker_view_changed()
     assert scene._peak_marker_world_radius > old_median
+
+
+def test_peak_markers_remain_visible_with_descending_physical_x_axis():
+    scene = _marker_scene()
+    x_axis = np.asarray([30.0, 20.0, 10.0, 0.0])
+    y_axis = np.arange(3.0)
+    scene._physical_x = x_axis.copy()
+    catalog = pd.DataFrame({
+        "peak_id": [1, 2, 3], "x": [0, 2, 3], "y": [1, 1, 2],
+        "theta": [1.0, 2.0, 3.0], "branch_id": [0, 1, 1],
+    })
+    count = scene.set_peak_markers(
+        catalog, x_axis, y_axis, visible=True, render=False,
+    )
+    assert count == 3
+    assert scene._peak_marker_actor.GetVisibility() == 1
+    np.testing.assert_allclose(
+        vtk_to_numpy(scene._peak_marker_polydata.GetPoints().GetData())[:, 0],
+        [30.0, 10.0, 0.0],
+    )
+
+
+def test_peak_markers_remain_visible_with_descending_y_and_theta_axes():
+    scene = _marker_scene()
+    x_axis = np.arange(4.0)
+    y_axis = np.asarray([20.0, 10.0, 0.0])
+    scene._physical_x = x_axis.copy()
+    scene._physical_y = y_axis.copy()
+    scene._physical_theta = np.asarray([5.0, 4.0, 3.0, 2.0, 1.0, 0.0])
+    catalog = pd.DataFrame({
+        "peak_id": [1, 2, 3], "x": [0, 1, 2], "y": [0, 1, 2],
+        "theta": [5.0, 3.0, 1.0],
+    })
+    count = scene.set_peak_markers(
+        catalog, x_axis, y_axis, visible=True, render=False,
+    )
+    assert count == 3
+    assert scene._peak_marker_actor.GetVisibility() == 1
+    np.testing.assert_allclose(
+        vtk_to_numpy(scene._peak_marker_polydata.GetPoints().GetData()),
+        [[0.0, 20.0, 5.0], [1.0, 10.0, 3.0], [2.0, 0.0, 1.0]],
+    )

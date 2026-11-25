@@ -400,6 +400,19 @@ def build_input_refs(
                 "«Определение дифракционных ветвей»."
             )
         refs["branches"] = {"node_id": selected.id, "output": "branches"}
+    elif operation_id == "theory.identify_hkl":
+        if selected.operation_id != "peaks.branch_correlation" or "branch_correlation" not in selected.output_refs:
+            raise ValueError(
+                "HKL-идентификацию можно создать только от принятого результата "
+                "«3D-кросс-корреляция дифракционных ветвей»."
+            )
+        # Correlation is the direct scientific result; the unchanged source
+        # peak catalogue is an explicit second input for raw theta-by-peak_id.
+        branches = required("branches")
+        refs["branch_correlation"] = {
+            "node_id": selected.id, "output": "branch_correlation",
+        }
+        refs["branches"] = {"node_id": branches.id, "output": "branches"}
     else:
         raise KeyError(f"Для операции {operation_id!r} не определены входы")
     return refs
@@ -425,4 +438,7 @@ def make_operation_label(operation_id: str, parameters: Mapping[str, Any]) -> st
     if operation_id == "peaks.branch_correlation":
         partners = ",".join(str(value) for value in parameters["partner_branch_ids"])
         return f"3D-корреляция · {parameters['source_branch_id']} ↔ {partners}"
+    if operation_id == "theory.identify_hkl":
+        model_label = parameters.get("crystal_model_label", parameters.get("crystal_model_id", "crystal"))
+        return f"HKL · {model_label} · max(hkl)={parameters['max_miller_index']}"
     return operation_id

@@ -10,7 +10,7 @@ from typing import Any
 from .workflow_history import NodeStatus
 
 
-_BRANCH_OPERATIONS = {"peaks.branches", "peaks.branch_correlation"}
+_BRANCH_OPERATIONS = {"peaks.branches", "peaks.branch_correlation", "theory.identify_hkl"}
 
 
 def _require_successful_ancestor(history: Any, node_id: str, output_name: str):
@@ -28,22 +28,24 @@ def _require_successful_ancestor(history: Any, node_id: str, output_name: str):
 
 
 def _branch_preview_context(node: Any, history: Any, executor: Any) -> dict[str, Any]:
-    """Resolve scan, peak positions, optional spike QC and branch artifacts.
+    """Resolve scan, original peak positions, branches and downstream analyses.
 
-    A cross-correlation node consumes only the accepted branch catalogue.  The
-    display Scan is intentionally resolved through that exact branch node's
-    ancestry; it is not added as a fictitious scientific input to correlation.
+    The HKL stage consumes the accepted cross-correlation artifact plus the
+    exact unchanged branch catalogue.  Its preview inherits the same scan and
+    peak geometry through the branch stage ancestry; no fictitious Scan input
+    is added to either scientific operation.
     """
     if node.operation_id == "peaks.branches":
         branch_node = node
         branch_inputs = executor.resolve_node_inputs(branch_node)
         branches_bundle = executor.load_output(branch_node, "branches")
         correlation_bundle = None
+        hkl_bundle = None
     else:
         branch_ref = node.input_refs.get("branches")
         if not isinstance(branch_ref, dict) or not branch_ref.get("node_id"):
             raise RuntimeError(
-                "У узла 3D-кросс-корреляции отсутствует явная ссылка на вход branches."
+                f"У узла {node.operation_id!r} отсутствует явная ссылка на вход branches."
             )
         branch_node = history.get(branch_ref["node_id"])
         if branch_node.operation_id != "peaks.branches":
@@ -53,10 +55,18 @@ def _branch_preview_context(node: Any, history: Any, executor: Any) -> dict[str,
             )
         inputs = executor.resolve_node_inputs(node)
         branches_bundle = inputs["branches"]
-        # Re-resolve the branch stage's exact positional input to reconstruct
-        # optional detected/Fit maps in the same way as its own preview.
         branch_inputs = executor.resolve_node_inputs(branch_node)
-        correlation_bundle = executor.load_output(node, "branch_correlation")
+        if node.operation_id == "peaks.branch_correlation":
+            # Correlation is this node's output, not one of its inputs.
+            correlation_bundle = executor.load_output(node, "branch_correlation")
+            hkl_bundle = None
+        elif node.operation_id == "theory.identify_hkl":
+            correlation_bundle = inputs.get("branch_correlation")
+            if correlation_bundle is None:
+                raise RuntimeError("У HKL-этапа отсутствует разрешённый вход branch_correlation.")
+            hkl_bundle = executor.load_output(node, "hkl_analysis")
+        else:
+            raise RuntimeError(f"Неподдерживаемый branch preview для {node.operation_id!r}.")
 
     position_bundle = branch_inputs.get("positions")
     if position_bundle is None:
@@ -88,8 +98,10 @@ def _branch_preview_context(node: Any, history: Any, executor: Any) -> dict[str,
         "fit": position_bundle if position_node.operation_id == "fit.scan" else None,
         "branches": branches_bundle,
     }
-    if node.operation_id == "peaks.branch_correlation":
+    if correlation_bundle is not None:
         context["branch_correlation"] = correlation_bundle
+    if hkl_bundle is not None:
+        context["hkl_analysis"] = hkl_bundle
     return context
 
 

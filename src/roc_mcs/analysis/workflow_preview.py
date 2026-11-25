@@ -53,6 +53,7 @@ class WorkflowPreviewState:
     peak_position_kind: str = "detected"
     branch_edges: Any | None = None
     branch_correlation_preview: Any | None = None
+    hkl_identification_preview: Any | None = None
 
     def map_layer(self, key: str | None = None) -> PreviewMapLayer:
         selected = str(key or self.default_map_key)
@@ -624,6 +625,25 @@ def build_workflow_preview_state(
             metadata["branch_correlation_preview_warning"] = (
                 f"3D-визуализация кросс-корреляции недоступна: {type(exc).__name__}: {exc}"
             )
+    hkl_identification_preview = None
+    hkl_bundle = context.get("hkl_analysis")
+    if hkl_bundle is not None:
+        try:
+            from roc_mcs.analysis.hkl_preview import build_hkl_identification_preview
+
+            hkl_identification_preview = build_hkl_identification_preview(hkl_bundle)
+            metadata["hkl_identification"] = {
+                "pair_count": int(len(hkl_identification_preview.pair_statistics)),
+                "reflection_count": int(len(hkl_identification_preview.theoretical_reflections)),
+                "measurement_count": int(len(hkl_identification_preview.measurements)),
+                "crystal_name": hkl_identification_preview.metadata.get("crystal_name", ""),
+            }
+        except Exception as exc:
+            # The scientific HDF5 artifact remains available for explicit
+            # inspection even if a future schema cannot be rendered.
+            metadata["hkl_identification_preview_warning"] = (
+                f"Панель HKL недоступна: {type(exc).__name__}: {exc}"
+            )
     metadata.update(dict(source_metadata or {}))
     metadata["workflow_node_id"] = str(node.id)
     metadata["workflow_operation_id"] = str(node.operation_id)
@@ -640,7 +660,7 @@ def build_workflow_preview_state(
         default_map = "peaks.count"
     elif node.operation_id == "fit.scan":
         default_map = next((key for key in ("fit.rmse", "fit.redchi", "fit.n_fitted", "fit.n_fitted_map") if any(layer.key == key for layer in layers)), default_map)
-    elif node.operation_id in {"peaks.branches", "peaks.branch_correlation"} and any(
+    elif node.operation_id in {"peaks.branches", "peaks.branch_correlation", "theory.identify_hkl"} and any(
         layer.key == "branches.count" for layer in layers
     ):
         default_map = "branches.count"
@@ -666,4 +686,5 @@ def build_workflow_preview_state(
         peak_position_kind=peak_position_kind,
         branch_edges=branch_edges,
         branch_correlation_preview=branch_correlation_preview,
+        hkl_identification_preview=hkl_identification_preview,
     )
