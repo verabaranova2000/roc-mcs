@@ -31,6 +31,7 @@ from roc_mcs.gui.components.icon_provider import svg_icon
 from roc_mcs.gui.roi_explorer.hex_color_picker import CompactColorPicker
 from roc_mcs.gui.roi_explorer.map_tools_widget import QRangeSlider, SmartDropdownButton
 from roc_mcs.gui.roi_explorer.plot_toolbar_style import ICON_DIR
+from roc_mcs.gui.roi_explorer.theta_range_preview import complementary_theta_range
 from roc_mcs.gui.roi_explorer.theme import (
     apply_popup_theme,
     apply_widget_palette,
@@ -283,6 +284,7 @@ class VTKToolsWidget(QWidget):
     axis_scales_apply_requested = pyqtSignal(float, float, float)
     # Index bounds are inclusive and refer to the currently loaded physical theta axis.
     theta_display_range_changed = pyqtSignal(int, int)
+    theta_range_link_toggled = pyqtSignal(bool)
     theta_boundary_planes_toggled = pyqtSignal(bool)
     theta_boundary_plane_opacity_changed = pyqtSignal(float)
     theme_changed = pyqtSignal(str)
@@ -339,6 +341,7 @@ class VTKToolsWidget(QWidget):
         self._applied_axis_scales = (1.0, 1.0, 1.0)
         self._theta_axis_values: list[float] = []
         self._theta_range_indices: tuple[int, int] | None = None
+        self._theta_range_link_available = False
         self.setFixedHeight(34)
         self.setStyleSheet(
             """
@@ -807,10 +810,39 @@ class VTKToolsWidget(QWidget):
         )
         layout.addWidget(title)
 
+        value_row = QHBoxLayout()
+        value_row.setContentsMargins(0, 0, 0, 0)
+        value_row.setSpacing(5)
         self.theta_range_value_label = QLabel("θ: —", panel)
         self.theta_range_value_label.setObjectName("VTKThetaRangeValue")
-        self.theta_range_value_label.setMinimumWidth(240)
-        layout.addWidget(self.theta_range_value_label)
+        self.theta_range_value_label.setMinimumWidth(0)
+        self.theta_range_value_label.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
+        self.theta_range_swap_button = QToolButton(panel)
+        self.theta_range_swap_button.setObjectName("VTKThetaRangeComplementButton")
+        self.theta_range_swap_button.setAutoRaise(True)
+        self.theta_range_swap_button.setFixedSize(22, 22)
+        self.theta_range_swap_button.setIconSize(QSize(15, 15))
+        self.theta_range_swap_button.setToolTip(
+            "Показать противоположный участок θ, оставив общую граничную точку"
+        )
+        self.theta_range_swap_button.setAccessibleName(
+            "Переключить на дополнительный диапазон θ"
+        )
+        self.theta_range_swap_button.setIcon(svg_icon(
+            ICON_DIR / "theta_range_swap_1.svg",
+            widget=self.theta_range_swap_button, monochrome=True,
+        ))
+        self.theta_range_swap_button.setEnabled(False)
+        self.theta_range_swap_button.clicked.connect(
+            self.swap_theta_display_range
+        )
+        value_row.addWidget(self.theta_range_value_label, 1)
+        value_row.addWidget(
+            self.theta_range_swap_button, 0, Qt.AlignmentFlag.AlignRight
+        )
+        layout.addLayout(value_row)
 
         self.theta_range_slider = QRangeSlider(
             low=0.0,
@@ -841,6 +873,37 @@ class VTKToolsWidget(QWidget):
         endpoints.addStretch(1)
         endpoints.addWidget(self.theta_range_max_label)
         layout.addLayout(endpoints)
+
+        link_row = QHBoxLayout()
+        link_row.setContentsMargins(0, 1, 0, 0)
+        link_row.setSpacing(5)
+        self.theta_range_link_button = QToolButton(panel)
+        self.theta_range_link_button.setObjectName("VTKThetaRangeLinkButton")
+        self.theta_range_link_button.setAutoRaise(True)
+        self.theta_range_link_button.setCheckable(True)
+        self.theta_range_link_button.setFixedSize(20, 20)
+        self.theta_range_link_button.setIconSize(QSize(14, 14))
+        self.theta_range_link_button.setIcon(svg_icon(
+            ICON_DIR / "vtk_theta_link_1.svg",
+            widget=self.theta_range_link_button, monochrome=True,
+        ))
+        self.theta_range_link_button.setAccessibleName(
+            "Связать диапазон θ с 2D-картой"
+        )
+        self.theta_range_link_button.setToolTip(
+            "Синхронизировать границы диапазона с 2D-картой; "
+            "доступно для mean/max/sum projection при совпадающих θ-осях"
+        )
+        self.theta_range_link_button.toggled.connect(
+            self.theta_range_link_toggled.emit
+        )
+        self.theta_range_link_label = QLabel("Связать с 2D", panel)
+        self.theta_range_link_label.setToolTip(
+            self.theta_range_link_button.toolTip()
+        )
+        link_row.addWidget(self.theta_range_link_button)
+        link_row.addWidget(self.theta_range_link_label, 1)
+        layout.addLayout(link_row)
 
         # Optional range markers: a single checkable control and one restrained
         # opacity slider. They affect only two lightweight VTK plane props;
@@ -955,6 +1018,7 @@ class VTKToolsWidget(QWidget):
             self.theta_range_value_label.setText("θ: —")
             self.theta_range_min_label.setText("min: —")
             self.theta_range_max_label.setText("max: —")
+            self._update_theta_range_aux_controls()
             return
 
         theta_values = [float(value) for value in values]
@@ -964,6 +1028,22 @@ class VTKToolsWidget(QWidget):
             raise ValueError("Ось θ содержит нечисловые или бесконечные значения.")
         if any(right <= left for left, right in zip(theta_values, theta_values[1:])):
             raise ValueError("Ось θ должна быть строго возрастающей.")
+
+        same_axis = (
+            len(theta_values) == len(self._theta_axis_values)
+            and all(
+                math.isclose(a, b, rel_tol=1e-10, abs_tol=1e-12)
+                for a, b in zip(theta_values, self._theta_axis_values)
+            )
+        )
+        if same_axis and self._theta_range_indices is not None:
+            low, high = self._theta_range_indices
+            self._update_theta_range_labels(low, high)
+            self.theta_range_slider.setEnabled(len(theta_values) > 2)
+            self.theta_range_reset_button.setEnabled(len(theta_values) > 2)
+            self.theta_boundary_planes_check.setEnabled(len(theta_values) > 2)
+            self._update_theta_range_aux_controls()
+            return
 
         self._theta_axis_values = theta_values
         self._replace_theta_range_slider(theta_values)
@@ -977,6 +1057,7 @@ class VTKToolsWidget(QWidget):
         self.theta_boundary_opacity_slider.setEnabled(show_boundary_options)
         self.theta_boundary_opacity_value.setEnabled(show_boundary_options)
         self._update_theta_range_labels(0, len(theta_values) - 1)
+        self._update_theta_range_aux_controls()
 
     def _update_theta_range_labels(self, low_index: int, high_index: int) -> None:
         values = self._theta_axis_values
@@ -1006,6 +1087,7 @@ class VTKToolsWidget(QWidget):
         self.theta_range_slider.blockSignals(False)
         self._theta_range_indices = (low_index, high_index)
         self._update_theta_range_labels(low_index, high_index)
+        self._update_theta_range_aux_controls()
         self.theta_display_range_changed.emit(low_index, high_index)
 
     def reset_theta_display_range(self) -> None:
@@ -1017,7 +1099,17 @@ class VTKToolsWidget(QWidget):
         self.theta_range_slider.blockSignals(False)
         self._theta_range_indices = (0, len(values) - 1)
         self._update_theta_range_labels(0, len(values) - 1)
+        self._update_theta_range_aux_controls()
         self.theta_display_range_changed.emit(0, len(values) - 1)
+
+    def swap_theta_display_range(self) -> None:
+        indices = self._theta_range_indices
+        if indices is None:
+            return
+        target = complementary_theta_range(*indices, len(self._theta_axis_values))
+        if target is not None:
+            self.set_theta_display_range_indices(*target)
+            self.theta_display_range_changed.emit(*target)
 
     def set_theta_display_range_indices(self, low_index: int, high_index: int) -> None:
         values = self._theta_axis_values
@@ -1032,6 +1124,54 @@ class VTKToolsWidget(QWidget):
         self.theta_range_slider.setValues(values[low], values[high])
         self.theta_range_slider.blockSignals(False)
         self._update_theta_range_labels(low, high)
+        self._update_theta_range_aux_controls()
+
+    @property
+    def theta_axis_values(self) -> tuple[float, ...]:
+        return tuple(self._theta_axis_values)
+
+    @property
+    def theta_range_indices(self) -> tuple[int, int] | None:
+        return self._theta_range_indices
+
+    def set_theta_range_link_available(self, available: bool) -> None:
+        self._theta_range_link_available = bool(available)
+        enabled = bool(
+            self._theta_range_link_available
+            and len(self._theta_axis_values) > 2
+        )
+        self.theta_range_link_button.setEnabled(enabled)
+        tooltip = (
+            "Диапазон синхронизирован с 2D-картой"
+            if enabled else
+            "Связь доступна, когда в 2D открыта mean/max/sum projection "
+            "и физические θ-оси обоих окон совпадают"
+        )
+        self.theta_range_link_button.setToolTip(tooltip)
+        self.theta_range_link_label.setToolTip(tooltip)
+        if not self._theta_range_link_available:
+            self.set_theta_range_link_checked(False)
+
+    def set_theta_range_link_checked(self, checked: bool) -> None:
+        self.theta_range_link_button.blockSignals(True)
+        self.theta_range_link_button.setChecked(bool(checked))
+        self.theta_range_link_button.blockSignals(False)
+
+    def _update_theta_range_aux_controls(self) -> None:
+        indices = self._theta_range_indices
+        complement = (
+            complementary_theta_range(*indices, len(self._theta_axis_values))
+            if indices is not None else None
+        )
+        self.theta_range_swap_button.setEnabled(
+            bool(len(self._theta_axis_values) > 2 and complement is not None)
+        )
+        self.theta_range_link_button.setEnabled(
+            bool(
+                self._theta_range_link_available
+                and len(self._theta_axis_values) > 2
+            )
+        )
 
     # ------------------------------------------------------------------
     # Camera / axes popup
@@ -1981,6 +2121,14 @@ class VTKToolsWidget(QWidget):
             svg_icon(ICON_DIR / theta_range_icon, color=foreground,
                      widget=self.theta_range_btn, monochrome=False)
         )
+        self.theta_range_swap_button.setIcon(svg_icon(
+            ICON_DIR / "theta_range_swap_1.svg", color=foreground,
+            widget=self.theta_range_swap_button, monochrome=True,
+        ))
+        self.theta_range_link_button.setIcon(svg_icon(
+            ICON_DIR / "vtk_theta_link_1.svg", color=foreground,
+            widget=self.theta_range_link_button, monochrome=True,
+        ))
         camera_icon_name = (
             "vtk_axes_triad_1.svg" if int(self.CAMERA_AXES_ICON_VARIANT) == 0
             else f"vtk_camera_axes_settings_{self.CAMERA_AXES_ICON_VARIANT}.svg"
@@ -2073,6 +2221,7 @@ class VTKToolsWidget(QWidget):
         for widget in (self._orientation_panel, self._camera_panel, self._overlays_panel,
                        self.theta_range_panel, self.axis_scale_panel, *self._overlay_settings_panels.values()):
             self._apply_popup_panel_theme(widget, self._theme)
+        apply_widget_palette(self.theta_range_panel, self._theme)
         apply_widget_palette(self.theta_range_slider, self._theme)
         apply_widget_palette(self.theta_boundary_planes_check, self._theme)
         apply_widget_palette(self.theta_boundary_opacity_slider, self._theme)
@@ -2145,6 +2294,7 @@ class VTKToolsWidget(QWidget):
         self.theta_range_slider.setEnabled(enabled and has_theta_range)
         self.theta_range_reset_button.setEnabled(enabled and has_theta_range)
         self.theta_boundary_planes_check.setEnabled(enabled and has_theta_range)
+        self._update_theta_range_aux_controls()
         show_boundary_options = bool(
             enabled and has_theta_range and self.theta_boundary_planes_check.isChecked()
         )

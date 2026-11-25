@@ -81,6 +81,11 @@ from roc_mcs.roi.roi_types import ROI, SavedROI
 from roc_mcs.roi.extraction import extract_from_roi
 from roc_mcs.gui.processing_workbench.roi_workflow_panel import ProcessingStepsPanel
 from roc_mcs.visualization.peak_count_map import integrated_intensity_map
+from roc_mcs.gui.roi_explorer.theta_range_preview import (
+    infer_theta_projection_kind,
+    normalize_theta_axis,
+    reduce_theta_stack,
+)
 
 
 class RockingCurveExplorerWindow(QMainWindow):
@@ -114,6 +119,9 @@ class RockingCurveExplorerWindow(QMainWindow):
         self.reduction_mode = "mean"
         self.current_file: Optional[Path] = None
         self._theta_slice_mode = False; self._theta_index = 0; self._theta_scan_cache_key = None; self._theta_scan_cache = None; self._theta_levels_cache = {}; self._show_theta_guide = False
+        self._theta_projection_cache: dict[tuple, np.ndarray] = {}
+        self._theta_range_linked = False
+        self._theta_range_link_available = False
         self._analysis_view = None
         self._volume_refresh_pending = True
         self._analysis_previous_pool = None
@@ -374,6 +382,25 @@ class RockingCurveExplorerWindow(QMainWindow):
         self.map_widget.preview_roi_finished.connect(self.volume_widget.set_roi_preview_geometry)
         self.volume_widget.data_rebuild_requested.connect(self._request_volume_refresh)
         self.volume_widget.theta_slice_value_changed.connect(self._on_vtk_theta_slice_changed)
+        # Range previews use inclusive sample indices on a normalized ascending
+        # physical θ axis. Programmatic mirroring blocks the source signals.
+        map_tools = self.map_widget.tools
+        volume_tools = self.volume_widget.tools
+        map_tools.theta_display_range_changed.connect(
+            self._on_map_theta_display_range_changed
+        )
+        map_tools.theta_range_link_toggled.connect(
+            lambda checked: self._on_theta_range_link_toggled(checked, "map")
+        )
+        volume_tools.theta_display_range_changed.connect(
+            self._on_volume_theta_display_range_changed
+        )
+        volume_tools.theta_range_link_toggled.connect(
+            lambda checked: self._on_theta_range_link_toggled(checked, "volume")
+        )
+        self.volume_widget.theta_range_axis_changed.connect(
+            lambda _axis: self._sync_theta_range_context()
+        )
         self.plot_workspace.mdi_area.panel_visibility_changed.connect(self._on_plot_panel_visibility_changed)
         self.plot_workspace.mdi_area.panel_restored.connect(self._on_plot_panel_restored)
         self.curve_widget.theta_guide_toggled.connect(self._on_theta_guide_toggled)
@@ -436,6 +463,8 @@ class RockingCurveExplorerWindow(QMainWindow):
         self._analysis_view = None
         self._analysis_previous_pool = None
         self._analysis_curve_cache.clear()
+        self._theta_projection_cache.clear()
+        self._set_theta_range_linked(False)
         self._analysis_map_key = None; self._analysis_curve_key = None; self._analysis_display_identity = None
         self._sync_analysis_result_menus(None)
         old_repo = self.repo; self.repo = repo
@@ -772,6 +801,7 @@ class RockingCurveExplorerWindow(QMainWindow):
             self.restore_analysis_preview()
         self.selected_scan = self.map_widget.scan_combo.currentText()
         self._theta_scan_cache_key = None; self._theta_scan_cache = None; self._theta_levels_cache.clear()
+        self._theta_projection_cache.clear()
         source = self.repo.load_source(self.selected_scan)
         pool = self.repo.pool
         pool_warning = None
@@ -824,6 +854,7 @@ class RockingCurveExplorerWindow(QMainWindow):
         combo.setCurrentIndex(max(0, idx) if idx >= 0 else 0); combo.blockSignals(False)
         self._set_theta_axis_for_current_scan()
         self.map_widget.set_theta_slice_mode(self._theta_slice_mode)
+        self._sync_theta_range_context()
         self.refresh_map(); self.refresh_curves()
 
     @staticmethod
@@ -870,6 +901,265 @@ class RockingCurveExplorerWindow(QMainWindow):
             return axis
         except (AttributeError, TypeError, ValueError, KeyError, IndexError):
             return np.empty(0, dtype=np.float64)
+
+    def _current_theta_projection_kind(self) -> str | None:
+        """Return a reduction only when the selected 2D layer is a projection."""
+        if self._theta_slice_mode:
+            return None
+        identifiers: list[object] = []
+        if self._analysis_view is not None:
+            state = self._analysis_view
+            key = self._analysis_map_key
+            identifiers.append(key)
+            if hasattr(state, "map_layer"):
+                try:
+                    layer = state.map_layer(key)
+                except (AttributeError, KeyError, TypeError, ValueError):
+                    layer = None
+                if layer is not None:
+                    identifiers.extend((
+                        getattr(layer, "key", None),
+                        getattr(layer, "label", None),
+                        getattr(layer, "title", None),
+                    ))
+            else:
+                identifiers.extend((
+                    getattr(state, "map_title", None),
+                    getattr(state, "label", None),
+                ))
+        else:
+            identifiers.extend((
+                self.selected_map,
+                self.map_widget.map_combo.currentData(),
+                self.map_widget.map_combo.currentText(),
+            ))
+        return infer_theta_projection_kind(*identifiers)
+
+    def _sync_theta_range_context(self) -> None:
+        """Refresh 2D/3D range availability and validate their physical axes."""
+        map_tools = self.map_widget.tools
+        volume_tools = self.volume_widget.tools
+        kind = self._current_theta_projection_kind()
+
+        if kind is None:
+            map_tools.set_theta_range_available(False)
+            map_tools.set_theta_range_link_available(False)
+            volume_tools.set_theta_range_link_available(False)
+            self._theta_range_link_available = False
+            if self._theta_range_linked:
+                self._set_theta_range_linked(False)
+            else:
+                map_tools.set_theta_range_link_checked(False)
+                volume_tools.set_theta_range_link_checked(False)
+            return
+
+        try:
+            raw_axis = self._current_map_theta_axis()
+            map_axis, _order = normalize_theta_axis(raw_axis)
+        except (TypeError, ValueError, AttributeError):
+            map_tools.set_theta_range_available(False)
+            map_tools.set_theta_range_link_available(False)
+            volume_tools.set_theta_range_link_available(False)
+            self._theta_range_link_available = False
+            if self._theta_range_linked:
+                self._set_theta_range_linked(False)
+            return
+
+        if map_axis.size < 3:
+            map_tools.set_theta_axis_values(map_axis)
+            map_tools.set_theta_range_available(False)
+        else:
+            map_tools.set_theta_axis_values(map_axis)
+            map_tools.set_theta_range_available(True)
+
+        volume_axis = np.asarray(volume_tools.theta_axis_values, dtype=np.float64)
+        compatible = bool(
+            map_axis.size > 2
+            and volume_axis.ndim == 1
+            and volume_axis.size == map_axis.size
+            and np.all(np.isfinite(volume_axis))
+            and np.allclose(
+                map_axis, volume_axis, rtol=1e-10, atol=1e-12
+            )
+        )
+        self._theta_range_link_available = compatible
+        map_tools.set_theta_range_link_available(compatible)
+        volume_tools.set_theta_range_link_available(compatible)
+        if not compatible and self._theta_range_linked:
+            self._set_theta_range_linked(False)
+        else:
+            map_tools.set_theta_range_link_checked(self._theta_range_linked)
+            volume_tools.set_theta_range_link_checked(self._theta_range_linked)
+
+    def _set_theta_range_linked(self, linked: bool) -> None:
+        active = bool(linked and self._theta_range_link_available)
+        self._theta_range_linked = active
+        self.map_widget.tools.set_theta_range_link_checked(active)
+        self.volume_widget.tools.set_theta_range_link_checked(active)
+
+    def _on_theta_range_link_toggled(self, checked: bool, source: str) -> None:
+        """Enable/disable a two-way link; the initiating window is authoritative."""
+        if not checked:
+            self._set_theta_range_linked(False)
+            return
+        if not self._theta_range_link_available:
+            self._set_theta_range_linked(False)
+            return
+
+        map_tools = self.map_widget.tools
+        volume_tools = self.volume_widget.tools
+        source_tools = map_tools if source == "map" else volume_tools
+        indices = source_tools.theta_range_indices
+        if indices is None:
+            indices = (0, len(map_tools.theta_axis_values) - 1)
+        self._set_theta_range_linked(True)
+        if source == "map":
+            self.volume_widget.set_theta_display_range_indices(*indices)
+        else:
+            map_tools.set_theta_display_range_indices(*indices)
+            self._theta_render_timer.start(0)
+
+    def _on_map_theta_display_range_changed(self, low: int, high: int) -> None:
+        if self._theta_range_linked and self._theta_range_link_available:
+            self.volume_widget.set_theta_display_range_indices(int(low), int(high))
+        self._theta_render_timer.start()
+
+    def _on_volume_theta_display_range_changed(self, low: int, high: int) -> None:
+        if self._theta_range_linked and self._theta_range_link_available:
+            self.map_widget.tools.set_theta_display_range_indices(
+                int(low), int(high)
+            )
+            self._theta_render_timer.start()
+
+    def _theta_projection_image(self, kind: str, low: int, high: int) -> np.ndarray:
+        """Calculate one projection from the selected θ samples, with a small LRU."""
+        state = self._analysis_view
+        valid_mask = None
+        if state is not None:
+            # The user-facing scan.intensity_sum layer can intentionally use
+            # the spike-interpolated signal. Reproduce the same source choice
+            # as the workflow's peak-input selector; never silently integrate
+            # the measured stack when the selected layer is explicitly based
+            # on interpolation.
+            data_source = state
+            source_key_name = "scan.measured_intensity_sum"
+            if (
+                self._analysis_map_key == "scan.intensity_sum"
+                and bool(state.metadata.get("peaks_used_interpolated_data", False))
+            ):
+                interpolated = (
+                    state.curve_source("spikes.interpolated")
+                    if hasattr(state, "curve_source") else None
+                )
+                if interpolated is None:
+                    interpolated = next(
+                        (
+                            source for source in getattr(state, "curve_sources", ())
+                            if getattr(source, "key", None) == "spikes.interpolated"
+                        ),
+                        None,
+                    )
+                if interpolated is None:
+                    raise ValueError(
+                        "Карта scan.intensity_sum использует spike-interpolation, "
+                        "но источник spikes.interpolated недоступен."
+                    )
+                data_source = interpolated
+                source_key_name = "spikes.interpolated"
+
+            data = np.asarray(data_source.data_yxt)
+            theta = np.asarray(data_source.theta, dtype=np.float64).reshape(-1)
+            axis = 2
+            valid_mask = getattr(data_source, "valid_mask_yxt", None)
+            source_key = (
+                "analysis", id(state), str(getattr(state, "node_id", "")),
+                str(self._analysis_map_key), source_key_name, id(data),
+                id(valid_mask),
+            )
+        else:
+            scan = self._get_theta_scan()
+            if scan is None:
+                raise ValueError("Нет загруженного θ-объёма для пересчёта проекции.")
+            data, theta, axis = scan
+            source_key = (
+                "hdf5", self._theta_scan_cache_key, id(data),
+            )
+
+        ascending_theta, order = normalize_theta_axis(theta)
+        control_theta, _control_order = normalize_theta_axis(
+            self._current_map_theta_axis()
+        )
+        if (
+            ascending_theta.size != control_theta.size
+            or not np.allclose(
+                ascending_theta, control_theta, rtol=1e-10, atol=1e-12
+            )
+        ):
+            raise ValueError(
+                "Ось θ источника проекции не совпадает с осью θ текущего 2D/3D view."
+            )
+        if high >= ascending_theta.size:
+            raise ValueError("Диапазон θ не согласован с текущим объёмом.")
+        cache_key = (source_key, kind, int(low), int(high))
+        cached = self._theta_projection_cache.pop(cache_key, None)
+        if cached is not None:
+            self._theta_projection_cache[cache_key] = cached
+            return cached
+
+        selected = order[int(low):int(high) + 1]
+        if axis == 0:
+            stack = np.take(data, selected, axis=0)
+            mask_stack = (
+                np.take(np.asarray(valid_mask), selected, axis=0)
+                if valid_mask is not None else None
+            )
+        elif axis == 2:
+            stack = np.take(data, selected, axis=2).transpose(2, 0, 1)
+            mask_stack = (
+                np.take(np.asarray(valid_mask), selected, axis=2).transpose(2, 0, 1)
+                if valid_mask is not None else None
+            )
+        else:
+            raise ValueError(
+                f"Неподдерживаемое расположение θ-оси: axis={axis}."
+            )
+
+        image = reduce_theta_stack(stack, kind, valid_mask=mask_stack)
+        self._theta_projection_cache[cache_key] = image
+        # At most two 2D arrays are retained: this keeps the current crop and
+        # its just-used predecessor available without multiplying memory use
+        # for detector maps that can be very large.
+        while len(self._theta_projection_cache) > 2:
+            self._theta_projection_cache.pop(next(iter(self._theta_projection_cache)))
+        return image
+
+    def _apply_theta_projection_range(
+        self, image: np.ndarray, title: str
+    ) -> tuple[np.ndarray, str]:
+        """Apply the current θ interval only to an eligible mean/max/sum map."""
+        kind = self._current_theta_projection_kind()
+        indices = self.map_widget.tools.theta_range_indices
+        if kind is None or indices is None:
+            return image, title
+        try:
+            axis, _order = normalize_theta_axis(self._current_map_theta_axis())
+        except (TypeError, ValueError, AttributeError):
+            return image, title
+        low, high = indices
+        if (low, high) == (0, axis.size - 1):
+            return image, title
+        if not (0 <= low < high < axis.size):
+            return image, title
+        cropped = self._theta_projection_image(kind, low, high)
+        if cropped.shape != np.asarray(image).shape:
+            raise ValueError(
+                "Форма пересчитанной θ-проекции не совпала с текущей 2D-картой: "
+                f"{cropped.shape} != {np.asarray(image).shape}."
+            )
+        return (
+            cropped,
+            f"{title} · θ ∈ [{axis[low]:.7g}°, {axis[high]:.7g}°]",
+        )
 
     def _sync_volume_theta_context(self) -> None:
         """Tell the 3D panel whether its theta slider can link to the 2D map."""
@@ -943,7 +1233,9 @@ class RockingCurveExplorerWindow(QMainWindow):
         if combo.currentData() == "__theta_slice__":
             self._theta_slice_mode = True
             self._set_analysis_contrast_mode(None)
-            self._set_theta_axis_for_current_scan(); self.map_widget.set_theta_slice_mode(True); self.refresh_map()
+            self._set_theta_axis_for_current_scan(); self.map_widget.set_theta_slice_mode(True)
+            self._sync_theta_range_context()
+            self.refresh_map()
             if self._show_theta_guide: self.curve_widget.set_theta_guide(self._current_theta_value())
             return
         self._theta_slice_mode = False
@@ -953,7 +1245,9 @@ class RockingCurveExplorerWindow(QMainWindow):
         if self._show_theta_guide: self.curve_widget.set_theta_guide(None)
         value = combo.currentData() or combo.currentText()
         if value:
-            self.selected_map = str(value); self.refresh_map(); self.refresh_curves(update_volume=False)
+            self.selected_map = str(value)
+            self._sync_theta_range_context()
+            self.refresh_map(); self.refresh_curves(update_volume=False)
 
     def _invalidate_curve_cache(self) -> None:
         """Очищает производные профили, зависящие от view или режима редукции."""
@@ -987,6 +1281,7 @@ class RockingCurveExplorerWindow(QMainWindow):
             return
 
         self.map_widget.set_pool_spec(pool, source_shape_yx=source.source_shape_yx)
+        self._theta_projection_cache.clear()
         self._invalidate_curve_cache()
         self.selected_pixel = None  # Индексы пикселей принадлежат конкретной grid.
         self._preview_timer.stop()
@@ -1142,6 +1437,7 @@ class RockingCurveExplorerWindow(QMainWindow):
         self._set_analysis_contrast_mode(self._analysis_map_key)
         self._remember_analysis_display_preferences()
         self._set_result_menu_checked(self.map_widget.tools.results_menu, self._analysis_map_key)
+        self._sync_theta_range_context()
         self.refresh_map()
         self._update_inspector()
 
@@ -1234,7 +1530,9 @@ class RockingCurveExplorerWindow(QMainWindow):
         self._analysis_curve_cache.clear()
         self.selected_pixel = None
         self._theta_scan_cache_key = None; self._theta_scan_cache = None
+        self._theta_projection_cache.clear()
         self._set_theta_axis_for_current_scan()
+        self._sync_theta_range_context()
         self.refresh_map()
         self.refresh_curves()
         self._update_inspector()
@@ -1265,7 +1563,9 @@ class RockingCurveExplorerWindow(QMainWindow):
             self.map_widget.set_pool_spec(previous, source_shape_yx=source.source_shape_yx if source else None)
         self.map_widget.set_pool_enabled(self.repo is not None)
         self._theta_scan_cache_key = None; self._theta_scan_cache = None
+        self._theta_projection_cache.clear()
         self._set_theta_axis_for_current_scan()
+        self._sync_theta_range_context()
         self.refresh_all()
         self.status.showMessage("Исходный HDF5-view восстановлен")
 
@@ -1740,6 +2040,13 @@ class RockingCurveExplorerWindow(QMainWindow):
                 self._draw_pinned_rois(); self.map_widget.canvas.draw_idle()
                 return
 
+            try:
+                img, title = self._apply_theta_projection_range(img, title)
+            except (ValueError, TypeError, IndexError) as exc:
+                self.status.showMessage(
+                    f"Предпросмотр диапазона θ не применён: {exc}", 8000
+                )
+
             quantitative = self._is_quantitative_analysis_map(self._analysis_map_key)
             p_lo = float(self.map_widget.low_pct.value())
             p_hi = float(self.map_widget.high_pct.value())
@@ -1786,6 +2093,12 @@ class RockingCurveExplorerWindow(QMainWindow):
         else:
             img = self.repo.get_map(self.selected_scan, self.selected_map)
             title = f"{self.selected_scan}  |  {self.selected_map}"
+            try:
+                img, title = self._apply_theta_projection_range(img, title)
+            except (ValueError, TypeError, IndexError) as exc:
+                self.status.showMessage(
+                    f"Предпросмотр диапазона θ не применён: {exc}", 8000
+                )
         p_lo = float(self.map_widget.low_pct.value()); p_hi = float(self.map_widget.high_pct.value())
         if p_hi <= p_lo:p_hi=min(100.0,p_lo+1.0)
         try:

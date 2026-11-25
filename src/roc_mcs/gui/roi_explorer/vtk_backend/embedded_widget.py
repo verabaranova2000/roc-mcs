@@ -98,6 +98,9 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
     # The explorer maps this value to its own 2D theta axis; indices are not
     # assumed to match because either source may be stored in descending order.
     theta_slice_value_changed = QtCore.pyqtSignal(float)
+    # Emitted after the VTK toolbar receives a new physical theta axis.
+    # The explorer uses it to re-evaluate 2D/3D range-link compatibility.
+    theta_range_axis_changed = QtCore.pyqtSignal(object)
 
     # Choose one of the four supplied scientific source symbols (1..4).
     # 1 is the default nested-volume/cube glyph.
@@ -908,6 +911,16 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
 
         self.tools.set_scene_available(True)
         self.tools.set_theta_axis_values(payload.theta)
+        # vtk_scene.set_payload() intentionally resets its GPU crop to the full
+        # volume. Reapply the toolbar's retained interval after every payload
+        # rebuild so the slider and actual scene cannot diverge when only the
+        # underlying view/ROI changes but the physical θ-axis stays identical.
+        theta_range = self.tools.theta_range_indices
+        if theta_range is not None:
+            self._scene.set_theta_display_range_indices(
+                int(theta_range[0]), int(theta_range[1]), render=False
+            )
+        self.theta_range_axis_changed.emit(tuple(float(v) for v in payload.theta))
         self.tools.set_axis_scales(*self._scene.axis_scales)
         has_peak_catalog = marker_count > 0
         has_branch_edges = branch_edge_count > 0
@@ -2159,6 +2172,11 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
             self._scene.set_theta_display_range_indices(int(low), int(high), render=False)
             self._render()
 
+    def set_theta_display_range_indices(self, low: int, high: int) -> None:
+        """Apply a linked inclusive theta range without emitting a UI change."""
+        self.tools.set_theta_display_range_indices(int(low), int(high))
+        self._set_theta_range(int(low), int(high))
+
     def _set_theta_boundary_planes(self, enabled):
         if self._scene is not None:
             self._scene.set_theta_boundary_planes_visible(bool(enabled), render=False)
@@ -2183,6 +2201,8 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
         self._pending_request = None
         self._dataset_request = None
         self._payload = None
+        self.tools.set_theta_axis_values(None)
+        self.theta_range_axis_changed.emit(tuple())
         self._peak_catalog = None
         self._peak_position_kind = "detected"
         self._branch_edges = None

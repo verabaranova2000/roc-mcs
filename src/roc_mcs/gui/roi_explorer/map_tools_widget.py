@@ -3,12 +3,15 @@ from PyQt6.QtWidgets import (QApplication, QWidget, QHBoxLayout, QVBoxLayout, QG
     QDoubleSpinBox, QPushButton, QLabel, QToolButton, QMenu, QWidgetAction, QSpinBox, QDialog, QSizePolicy)
 from PyQt6.QtGui import QIcon, QPixmap, QPainter, QLinearGradient, QColor, QActionGroup, QPen, QPolygon, QPalette
 from PyQt6.QtCore import QSize, Qt, QRectF, QLineF, pyqtSignal, QPointF, QPoint
+from bisect import bisect_left, bisect_right
+import math
 
 
 from roc_mcs.gui.roi_explorer.plot_toolbar_style import (ICON_DIR, COMPACT_PLOT_TOOLBAR_STYLE, SMART_DROPDOWN_INDICATOR_RGBA, SMART_DROPDOWN_INDICATOR_SIZE)
 from roc_mcs.gui.components.icon_provider import svg_icon
 from roc_mcs.gui.roi_explorer.theme import apply_widget_palette, apply_popup_theme, theme_colors
 from roc_mcs.gui.roi_explorer.colormap_catalog import NAPARI_STYLE_COLORMAPS, colormap_icon
+from roc_mcs.gui.roi_explorer.theta_range_preview import complementary_theta_range
 
 
 
@@ -60,6 +63,8 @@ class MapToolsWidget(QWidget):
     pool_stride_changed = pyqtSignal(int)
     pool_apply_requested = pyqtSignal()
     settings_requested = pyqtSignal()
+    theta_display_range_changed = pyqtSignal(int, int)
+    theta_range_link_toggled = pyqtSignal(bool)
 
     def __init__(self, roi_tools_config: dict, current_roi_type: str, smart_dropdown_cls, range_slider_cls, parent=None):
         super().__init__(parent)
@@ -86,6 +91,11 @@ class MapToolsWidget(QWidget):
         self.pin_roi_btn.setToolTip("Pin preview ROI")
         self.pin_roi_btn.clicked.connect(self.pin_roi_requested.emit)
         layout.addWidget(self.pin_roi_btn)
+        self._theta_axis_values: list[float] = []
+        self._theta_range_indices: tuple[int, int] | None = None
+        self._theta_range_available = False
+        self._theta_range_link_available = False
+        self._build_theta_range_tools(layout)
         self.results_btn = QToolButton(self)
         self.results_btn.setObjectName("mapAnalysisResultsButton")
         self.results_btn.setAutoRaise(True)
@@ -139,6 +149,21 @@ class MapToolsWidget(QWidget):
         apply_popup_theme(self.results_menu, active)
         self.settings_btn.setIcon(svg_icon(ICON_DIR / "setting_icon.svg", color=icon_color, widget=self.settings_btn))
         self.pool_btn.setIcon(svg_icon(ICON_DIR / "pool_stride_dense.svg", color=icon_color, widget=self.pool_btn))
+        self.theta_range_btn.setIcon(svg_icon(
+            ICON_DIR / "vtk_theta_range_1.svg", color=icon_color,
+            widget=self.theta_range_btn, monochrome=False,
+        ))
+        self.theta_range_swap_btn.setIcon(svg_icon(
+            ICON_DIR / "theta_range_swap_1.svg", color=icon_color,
+            widget=self.theta_range_swap_btn, monochrome=True,
+        ))
+        self.theta_range_link_btn.setIcon(svg_icon(
+            ICON_DIR / "vtk_theta_link_1.svg", color=icon_color,
+            widget=self.theta_range_link_btn, monochrome=True,
+        ))
+        apply_popup_theme(self.theta_range_menu, active)
+        apply_widget_palette(self.theta_range_panel, active)
+        apply_widget_palette(self.theta_range_slider, active)
         for roi_id, button in self.roi_tool_buttons.items():
             icon_path = self.roi_tools_config[roi_id]["icon"]
             button.setIcon(svg_icon(icon_path, color=icon_color, widget=button))
@@ -159,6 +184,339 @@ class MapToolsWidget(QWidget):
             QWidget#PoolingPanel QPushButton, QWidget#PoolingPanel QToolButton {{ background:{pc['button']}; color:{pc['button_text']}; border:1px solid {pc['border']}; }}
             QWidget#PoolingPanel QPushButton:hover, QWidget#PoolingPanel QToolButton:hover {{ background:{pc['hover']}; border-color:{pc['highlight']}; }}
         """)
+
+    def _build_theta_range_tools(self, toolbar_layout) -> None:
+        """Create the 2D projection-only theta-range popup."""
+        self.theta_range_btn = self.smart_dropdown_cls(self)
+        self.theta_range_btn.setObjectName("mapThetaDisplayRangeButton")
+        self.theta_range_btn.setAutoRaise(True)
+        self.theta_range_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.theta_range_btn.setFixedSize(26, 22)
+        self.theta_range_btn.setIconSize(QSize(17, 17))
+        self.theta_range_btn.setIcon(svg_icon(
+            ICON_DIR / "vtk_theta_range_1.svg", widget=self.theta_range_btn,
+            monochrome=False,
+        ))
+        self.theta_range_btn.setToolTip(
+            "Предпросмотр диапазона θ для mean/max/sum projection"
+        )
+        self.theta_range_btn.setAccessibleName(
+            "Предпросмотр диапазона θ на 2D-карте"
+        )
+        self.theta_range_menu = QMenu(self.theta_range_btn)
+        self.theta_range_menu.setObjectName("MapThetaDisplayRangeMenu")
+        self.theta_range_menu.setToolTipsVisible(True)
+
+        panel = QWidget(self.theta_range_menu)
+        panel.setObjectName("MapThetaRangePanel")
+        panel.setMinimumWidth(258)
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(8, 6, 8, 6)
+        layout.setSpacing(4)
+
+        title = QLabel("ОБЛАСТЬ ПРОЕКЦИИ ПО θ", panel)
+        title.setStyleSheet("font-size:8px;font-weight:700;letter-spacing:0.4px;")
+        layout.addWidget(title)
+
+        value_row = QHBoxLayout()
+        value_row.setContentsMargins(0, 0, 0, 0)
+        value_row.setSpacing(5)
+        self.theta_range_value_label = QLabel("θ: —", panel)
+        self.theta_range_value_label.setMinimumWidth(0)
+        self.theta_range_value_label.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
+        self.theta_range_value_label.setStyleSheet("font-size:10px;font-weight:600;")
+        self.theta_range_swap_btn = QToolButton(panel)
+        self.theta_range_swap_btn.setObjectName("mapThetaRangeComplementButton")
+        self.theta_range_swap_btn.setAutoRaise(True)
+        self.theta_range_swap_btn.setFixedSize(22, 22)
+        self.theta_range_swap_btn.setIconSize(QSize(15, 15))
+        self.theta_range_swap_btn.setIcon(svg_icon(
+            ICON_DIR / "theta_range_swap_1.svg", widget=self.theta_range_swap_btn,
+            monochrome=True,
+        ))
+        self.theta_range_swap_btn.setToolTip(
+            "Показать противоположный участок θ, оставив общую граничную точку"
+        )
+        self.theta_range_swap_btn.setAccessibleName(
+            "Переключить на дополнительный диапазон θ"
+        )
+        self.theta_range_swap_btn.setEnabled(False)
+        self.theta_range_swap_btn.clicked.connect(self.swap_theta_display_range)
+        value_row.addWidget(self.theta_range_value_label, 1)
+        value_row.addWidget(self.theta_range_swap_btn, 0, Qt.AlignmentFlag.AlignRight)
+        layout.addLayout(value_row)
+
+        self.theta_range_slider = self.range_slider_cls(
+            low=0.0, high=1.0, min_val=0.0, max_val=1.0,
+            parent=panel, orientation=Qt.Orientation.Horizontal,
+            minimum_gap=0.01,
+        )
+        self.theta_range_slider.setObjectName("mapThetaDisplayRangeSlider")
+        self.theta_range_slider.setFixedWidth(238)
+        self.theta_range_slider.setToolTip(
+            "Ограничить расчёт и отображение mean/max/sum по выбранным отсчётам θ"
+        )
+        self.theta_range_slider.setEnabled(False)
+        self.theta_range_slider.valueChanged.connect(
+            self._on_theta_range_slider_changed
+        )
+        layout.addWidget(
+            self.theta_range_slider, 0, Qt.AlignmentFlag.AlignHCenter
+        )
+
+        endpoints = QHBoxLayout()
+        endpoints.setContentsMargins(0, 0, 0, 0)
+        endpoints.setSpacing(4)
+        self.theta_range_min_label = QLabel("min: —", panel)
+        self.theta_range_max_label = QLabel("max: —", panel)
+        self.theta_range_min_label.setStyleSheet("font-size:8px;color:palette(mid);")
+        self.theta_range_max_label.setStyleSheet("font-size:8px;color:palette(mid);")
+        endpoints.addWidget(self.theta_range_min_label)
+        endpoints.addStretch(1)
+        endpoints.addWidget(self.theta_range_max_label)
+        layout.addLayout(endpoints)
+
+        link_row = QHBoxLayout()
+        link_row.setContentsMargins(0, 1, 0, 0)
+        link_row.setSpacing(5)
+        self.theta_range_link_btn = QToolButton(panel)
+        self.theta_range_link_btn.setObjectName("mapThetaRangeLinkButton")
+        self.theta_range_link_btn.setAutoRaise(True)
+        self.theta_range_link_btn.setCheckable(True)
+        self.theta_range_link_btn.setFixedSize(20, 20)
+        self.theta_range_link_btn.setIconSize(QSize(14, 14))
+        self.theta_range_link_btn.setIcon(svg_icon(
+            ICON_DIR / "vtk_theta_link_1.svg", widget=self.theta_range_link_btn,
+            monochrome=True,
+        ))
+        self.theta_range_link_btn.setToolTip(
+            "Синхронизировать границы диапазона с 3D-окном; физические θ-оси должны совпадать"
+        )
+        self.theta_range_link_btn.setAccessibleName(
+            "Связать диапазон θ с 3D-окном"
+        )
+        self.theta_range_link_btn.toggled.connect(
+            self.theta_range_link_toggled.emit
+        )
+        self.theta_range_link_label = QLabel("Связать с 3D", panel)
+        self.theta_range_link_label.setToolTip(self.theta_range_link_btn.toolTip())
+        link_row.addWidget(self.theta_range_link_btn)
+        link_row.addWidget(self.theta_range_link_label, 1)
+        layout.addLayout(link_row)
+
+        self.theta_range_reset_button = QPushButton("Полный диапазон", panel)
+        self.theta_range_reset_button.setObjectName("MapThetaRangeReset")
+        self.theta_range_reset_button.setToolTip(
+            "Вернуть отображение всей θ-проекции"
+        )
+        self.theta_range_reset_button.clicked.connect(
+            self.reset_theta_display_range
+        )
+        layout.addWidget(
+            self.theta_range_reset_button, 0, Qt.AlignmentFlag.AlignRight
+        )
+
+        action = QWidgetAction(self.theta_range_menu)
+        action.setDefaultWidget(panel)
+        self.theta_range_menu.addAction(action)
+        self.theta_range_panel = panel
+        self.theta_range_btn.setMenu(self.theta_range_menu)
+        self.theta_range_btn.hide()
+        toolbar_layout.addWidget(self.theta_range_btn)
+
+    @property
+    def theta_axis_values(self) -> tuple[float, ...]:
+        return tuple(self._theta_axis_values)
+
+    @property
+    def theta_range_indices(self) -> tuple[int, int] | None:
+        return self._theta_range_indices
+
+    def set_theta_range_available(self, available: bool) -> None:
+        self._theta_range_available = bool(available)
+        self.theta_range_btn.setVisible(self._theta_range_available)
+        has_axis = len(self._theta_axis_values) > 2
+        enabled = self._theta_range_available and has_axis
+        self.theta_range_btn.setEnabled(enabled)
+        self.theta_range_btn.setToolTip(
+            "Предпросмотр диапазона θ для mean/max/sum projection"
+            if enabled else
+            "Предпросмотр диапазона θ доступен для mean/max/sum projection "
+            "при наличии не менее трёх отсчётов θ"
+        )
+        self.theta_range_slider.setEnabled(enabled)
+        self.theta_range_reset_button.setEnabled(enabled)
+        self._update_theta_range_aux_controls()
+
+    def set_theta_axis_values(self, values) -> None:
+        """Set ascending physical θ coordinates, preserving a matching range."""
+        if values is None:
+            self._theta_axis_values = []
+            self._theta_range_indices = None
+            self.theta_range_slider.setEnabled(False)
+            self.theta_range_reset_button.setEnabled(False)
+            self.theta_range_value_label.setText("θ: —")
+            self.theta_range_min_label.setText("min: —")
+            self.theta_range_max_label.setText("max: —")
+            self._update_theta_range_aux_controls()
+            return
+
+        theta_values = [float(value) for value in values]
+        if len(theta_values) < 2:
+            raise ValueError("Для предпросмотра диапазона θ нужны минимум два отсчёта.")
+        if any(not math.isfinite(value) for value in theta_values):
+            raise ValueError("Ось θ содержит нечисловые или бесконечные значения.")
+        if any(right <= left for left, right in zip(theta_values, theta_values[1:])):
+            raise ValueError("Ось θ должна быть строго возрастающей.")
+
+        same_axis = (
+            len(theta_values) == len(self._theta_axis_values)
+            and all(
+                math.isclose(a, b, rel_tol=1e-10, abs_tol=1e-12)
+                for a, b in zip(theta_values, self._theta_axis_values)
+            )
+        )
+        if same_axis and self._theta_range_indices is not None:
+            self._update_theta_range_labels(*self._theta_range_indices)
+            self.theta_range_slider.setEnabled(
+                self._theta_range_available and len(theta_values) > 2
+            )
+            self.theta_range_reset_button.setEnabled(
+                self._theta_range_available and len(theta_values) > 2
+            )
+            self._update_theta_range_aux_controls()
+            return
+
+        self._theta_axis_values = theta_values
+        self._replace_theta_range_slider(theta_values)
+        self._theta_range_indices = (0, len(theta_values) - 1)
+        enabled = self._theta_range_available and len(theta_values) > 2
+        self.theta_range_slider.setEnabled(enabled)
+        self.theta_range_reset_button.setEnabled(enabled)
+        self._update_theta_range_labels(0, len(theta_values) - 1)
+        self._update_theta_range_aux_controls()
+
+    def _replace_theta_range_slider(self, values: list[float]) -> None:
+        old_slider = self.theta_range_slider
+        minimum_gap = min(b - a for a, b in zip(values, values[1:]))
+        new_slider = self.range_slider_cls(
+            low=float(values[0]), high=float(values[-1]),
+            min_val=float(values[0]), max_val=float(values[-1]),
+            parent=self.theta_range_panel,
+            orientation=Qt.Orientation.Horizontal,
+            minimum_gap=float(minimum_gap),
+        )
+        new_slider.setObjectName("mapThetaDisplayRangeSlider")
+        new_slider.setFixedWidth(238)
+        new_slider.setToolTip(
+            "Границы привязываются к существующим θ-отсчётам"
+        )
+        new_slider.valueChanged.connect(self._on_theta_range_slider_changed)
+        self.theta_range_panel.layout().replaceWidget(old_slider, new_slider)
+        old_slider.hide()
+        old_slider.deleteLater()
+        self.theta_range_slider = new_slider
+        apply_widget_palette(self.theta_range_slider, self._theme)
+
+    def _update_theta_range_labels(self, low_index: int, high_index: int) -> None:
+        values = self._theta_axis_values
+        if not values:
+            return
+        self.theta_range_value_label.setText(
+            f"θ: {values[int(low_index)]:.7g}°  —  {values[int(high_index)]:.7g}°"
+        )
+        self.theta_range_min_label.setText(f"min: {values[0]:.7g}°")
+        self.theta_range_max_label.setText(f"max: {values[-1]:.7g}°")
+
+    def _update_theta_range_aux_controls(self) -> None:
+        indices = self._theta_range_indices
+        complement = (
+            complementary_theta_range(*indices, len(self._theta_axis_values))
+            if indices is not None else None
+        )
+        enabled = bool(
+            self._theta_range_available
+            and len(self._theta_axis_values) > 2
+            and complement is not None
+        )
+        self.theta_range_swap_btn.setEnabled(enabled)
+        self.theta_range_link_btn.setEnabled(
+            self._theta_range_available and self._theta_range_link_available
+        )
+
+    def set_theta_range_link_available(self, available: bool) -> None:
+        self._theta_range_link_available = bool(available)
+        can_link = bool(
+            self._theta_range_available and self._theta_range_link_available
+        )
+        self.theta_range_link_btn.setEnabled(can_link)
+        tooltip = (
+            "Диапазон синхронизирован с 3D-объёмом"
+            if can_link else
+            "Связь доступна только для mean/max/sum projection и при совпадающих "
+            "физических θ-осях 2D- и 3D-окон"
+        )
+        self.theta_range_link_btn.setToolTip(tooltip)
+        self.theta_range_link_label.setToolTip(tooltip)
+        if not self._theta_range_link_available:
+            self.set_theta_range_link_checked(False)
+
+    def set_theta_range_link_checked(self, checked: bool) -> None:
+        self.theta_range_link_btn.blockSignals(True)
+        self.theta_range_link_btn.setChecked(bool(checked))
+        self.theta_range_link_btn.blockSignals(False)
+
+    def _on_theta_range_slider_changed(
+        self, low_value: float, high_value: float
+    ) -> None:
+        values = self._theta_axis_values
+        if len(values) < 2:
+            return
+        low_index = max(
+            0, min(len(values) - 2, bisect_left(values, float(low_value)))
+        )
+        high_index = max(
+            low_index + 1,
+            min(len(values) - 1, bisect_right(values, float(high_value)) - 1),
+        )
+        self.set_theta_display_range_indices(low_index, high_index, emit=True)
+
+    def set_theta_display_range_indices(
+        self, low_index: int, high_index: int, *, emit: bool = False
+    ) -> None:
+        values = self._theta_axis_values
+        if len(values) < 2:
+            return
+        low, high = int(low_index), int(high_index)
+        if not (0 <= low < high < len(values)):
+            raise ValueError(
+                "Индексы предпросмотра θ должны удовлетворять 0 ≤ low < high < N."
+            )
+        self._theta_range_indices = (low, high)
+        self.theta_range_slider.blockSignals(True)
+        self.theta_range_slider.setValues(values[low], values[high])
+        self.theta_range_slider.blockSignals(False)
+        self._update_theta_range_labels(low, high)
+        self._update_theta_range_aux_controls()
+        if emit:
+            self.theta_display_range_changed.emit(low, high)
+
+    def reset_theta_display_range(self) -> None:
+        if len(self._theta_axis_values) < 2:
+            return
+        self.set_theta_display_range_indices(
+            0, len(self._theta_axis_values) - 1, emit=True
+        )
+
+    def swap_theta_display_range(self) -> None:
+        indices = self._theta_range_indices
+        if indices is None:
+            return
+        target = complementary_theta_range(*indices, len(self._theta_axis_values))
+        if target is not None:
+            self.set_theta_display_range_indices(*target, emit=True)
 
     def _select_cmap(self, name: str) -> None:
         self.set_current_cmap(name); self.cmap_selected.emit(name)
