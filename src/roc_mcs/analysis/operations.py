@@ -1306,7 +1306,7 @@ def _run_branch_correlation(
 
 
 def _validate_kalpha_hkl(parameters: Mapping[str, Any]) -> dict[str, Any]:
-    """Validate a reproducible crystal/Mo Kα doublet identification run."""
+    """Validate a reproducible crystal Kα-doublet identification run."""
     model_id = str(parameters.get("crystal_model_id", "caf2_fluorite")).strip()
     from roc_mcs.theory.crystals import get_crystal_model
     crystal_model = get_crystal_model(model_id)
@@ -1320,15 +1320,26 @@ def _validate_kalpha_hkl(parameters: Mapping[str, Any]) -> dict[str, Any]:
             raise ValueError(f"{name} должен быть конечным положительным числом")
         return value
 
-    lattice_a = positive_float("lattice_a_A", 5.4635)
+    if model_id == "caf2_fluorite":
+        lattice_a = positive_float("lattice_a_A", 5.4635)
+    else:
+        # Database-backed unit-cell constants are authoritative. Persist the
+        # actual database a value rather than a stale hidden CaF2 form value.
+        try:
+            lattice_a = float(crystal_model.unit_cell_parameters_A["a"])
+        except (AttributeError, KeyError, TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                f"Не удалось получить параметр a ячейки для модели {model_id!r}"
+            ) from exc
+        if not np.isfinite(lattice_a) or lattice_a <= 0.0:
+            raise ValueError(f"Некорректный параметр a ячейки для модели {model_id!r}")
     lambda_1 = positive_float("lambda_ka1_A", 0.7093000)
     lambda_2 = positive_float("lambda_ka2_A", 0.7135900)
     if lambda_2 <= lambda_1:
-        raise ValueError("Для пары Mo Kα требуется λ(Kα2) > λ(Kα1)")
+        raise ValueError("Для Kα-дублета требуется λ(Kα2) > λ(Kα1)")
     max_index = _integer_parameter(parameters, "max_miller_index", 10)
     if not 1 <= max_index <= 30:
         raise ValueError("max_miller_index должен находиться в диапазоне 1–30")
-    bin_width = positive_float("histogram_bin_width_arcsec", 7.0)
     crystal_thickness = positive_float("crystal_thickness_m", 1e-5)
     include_crystalpy = parameters.get("include_crystalpy", False)
     if not isinstance(include_crystalpy, (bool, np.bool_)):
@@ -1338,7 +1349,6 @@ def _validate_kalpha_hkl(parameters: Mapping[str, Any]) -> dict[str, Any]:
         "lattice_a_A": lattice_a,
         "lambda_ka1_A": lambda_1, "lambda_ka2_A": lambda_2,
         "max_miller_index": max_index,
-        "histogram_bin_width_arcsec": bin_width,
         "include_crystalpy": bool(include_crystalpy),
         "crystal_thickness_m": crystal_thickness,
         "algorithm": "kalpha_doublet_raw_peak_id_pairing+database_crystal_hkl_bragg_ranking_v2",
@@ -1366,7 +1376,6 @@ def _run_kalpha_hkl(
             lambda_ka1_A=parameters["lambda_ka1_A"],
             lambda_ka2_A=parameters["lambda_ka2_A"],
             max_miller_index=parameters["max_miller_index"],
-            histogram_bin_width_arcsec=parameters["histogram_bin_width_arcsec"],
             include_crystalpy=parameters["include_crystalpy"],
             crystal_thickness_m=parameters["crystal_thickness_m"],
         ),
@@ -1390,7 +1399,7 @@ def _run_kalpha_hkl(
         if getattr(row, "best_hkl", None) is not None and str(getattr(row, "best_hkl", "")) not in {"", "nan", "None"}
     ]
     summary = (
-        f"HKL-идентификация Mo Kα для {parameters['crystal_model_label']}: пар={len(pair_stats)}, "
+        f"HKL-идентификация Kα-дублета для {parameters['crystal_model_label']}: пар={len(pair_stats)}, "
         f"с достаточными назначениями={ready}, теоретических рефлексов={len(reflections)}. "
         + ("Ближайшие: " + "; ".join(best_labels[:4]) if best_labels else "Нет пар с достаточным числом принятых соответствий.")
     )
@@ -1493,7 +1502,7 @@ def default_registry() -> OperationRegistry:
         label="Теоретическая идентификация HKL по Kα-дублету",
         description=(
             "Сопоставляет исходные угловые разности Δθ принятых peak_id-пар "
-            "с расчётными разделениями Mo Kα1/Kα2 для выбранной кристаллической "
+            "с расчётными разделениями Kα1/Kα2 для заданных длин волн и выбранной кристаллической "
             "модели или материала из базы XrayLib. Результат — ранжирование по "
             "близости медианы, а не формальная вероятность; исходные артефакты неизменны."
         ),

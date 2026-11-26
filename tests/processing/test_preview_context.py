@@ -213,6 +213,13 @@ def test_hkl_preview_resolves_original_branch_catalog_and_correlation_lineage(tm
         }},
     )
     hkl_artifact = store.write(hkl_bundle)
+    # The dedicated result path must be able to open the HKL artifact directly;
+    # it must not need a Scan/branch lineage or generic ROI preview construction.
+    from roc_mcs.analysis.hkl_preview import load_hkl_identification_preview
+    direct_view = load_hkl_identification_preview(store, hkl_artifact)
+    assert direct_view.pair_statistics.shape[0] == 1
+    assert direct_view.pair_statistics.iloc[0]["pair_id"] == "3↔7"
+
     hkl_node = history.add_node(
         "theory.identify_hkl", "HKL · CaF₂", parent_ids=[correlation_node.id],
         input_refs=refs, output_refs={"hkl_analysis": hkl_artifact},

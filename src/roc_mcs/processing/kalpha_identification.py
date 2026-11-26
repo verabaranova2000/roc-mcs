@@ -19,7 +19,6 @@ class KAlphaIdentificationConfig:
     lambda_ka1_A: float = 0.7093000
     lambda_ka2_A: float = 0.7135900
     max_miller_index: int = 10
-    histogram_bin_width_arcsec: float = 7.0
     include_crystalpy: bool = False
     crystal_thickness_m: float = 1e-5
 
@@ -189,8 +188,6 @@ def identify_kalpha_hkl(
     residuals from the matcher are deliberately not used: they should be near
     zero after registration and do not represent the Kα doublet separation.
     """
-    if not np.isfinite(float(config.histogram_bin_width_arcsec)) or config.histogram_bin_width_arcsec <= 0:
-        raise ValueError("Ширина гистограммы должна быть конечной и положительной")
     if not np.isfinite(float(config.crystal_thickness_m)) or config.crystal_thickness_m <= 0:
         raise ValueError("Толщина кристалла должна быть конечной и положительной")
     crystal = get_crystal_model(config.crystal_model_id)
@@ -277,10 +274,9 @@ def identify_kalpha_hkl(
         "unit_cell_angles_deg": cell_angles,
         "unit_cell_description": cell_description,
         "crystal_database": "XrayLib" if hasattr(crystal, "crystal_data") else "встроенная модель CaF2",
-        "radiation": "Mo Kα1/Kα2", "lambda_ka1_A": float(config.lambda_ka1_A),
+        "radiation": "parameterized Kα1/Kα2", "lambda_ka1_A": float(config.lambda_ka1_A),
         "lambda_ka2_A": float(config.lambda_ka2_A),
         "max_miller_index": int(config.max_miller_index),
-        "histogram_bin_width_arcsec": float(config.histogram_bin_width_arcsec),
         "crystalpy_thickness_m": float(config.crystal_thickness_m) if config.include_crystalpy else None,
         "structure_factor_backend": "CrystalPy/XrayLib" if config.include_crystalpy else (
             "XrayLib F_H at Kα1/Kα2" if hasattr(crystal, "crystal_data") else None

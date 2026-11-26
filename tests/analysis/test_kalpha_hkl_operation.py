@@ -71,6 +71,7 @@ def test_hkl_operation_ranks_known_caf2_reflection_from_exact_peak_id_pairs():
     assert stats["best_theory_delta_theta_arcsec"] == pytest.approx(expected_delta)
     assert stats["best_abs_difference_arcsec"] < 0.1
     assert result.bundle.metadata["theory"]["ranking_is_probability"] is False
+    assert result.bundle.metadata["theory"]["radiation"] == "parameterized Kα1/Kα2"
     assert result.bundle.tables["hkl_pair_measurements"]["pair_id"].nunique() == 1
     assert len(ranking) == len(result.bundle.tables["hkl_theoretical_reflections"])
 
@@ -250,3 +251,139 @@ def test_caf2_crystalpy_adapter_fails_explicitly_without_optional_dependencies(m
             pd.DataFrame([{"h": 1, "k": 1, "l": 1}]),
             lattice_a_A=5.4635, lambda_ka1_A=0.7093000, lambda_ka2_A=0.7135900,
         )
+
+
+def test_histogram_bin_width_is_view_only_and_legacy_parameter_is_ignored():
+    validated = _validate_kalpha_hkl({"histogram_bin_width_arcsec": -1000.0})
+    assert "histogram_bin_width_arcsec" not in validated
+    assert validated["lattice_a_A"] == pytest.approx(5.4635)
+
+
+def test_database_crystal_uses_authoritative_unit_cell_a_not_stale_caf2_value(monkeypatch):
+    from types import SimpleNamespace
+
+    from roc_mcs.theory import crystals
+
+    model = SimpleNamespace(
+        display_name="Quartz · XrayLib",
+        unit_cell_parameters_A={"a": 4.913, "b": 4.913, "c": 5.405},
+    )
+    monkeypatch.setattr(crystals, "get_crystal_model", lambda _model_id: model)
+    validated = _validate_kalpha_hkl({
+        "crystal_model_id": "xraylib:quartz",
+        "lattice_a_A": 5.4635,  # stale value from the old disabled CaF2 control
+    })
+    assert validated["lattice_a_A"] == pytest.approx(4.913)
+    assert "histogram_bin_width_arcsec" not in validated
+
+
+def test_bragg_doublet_separation_is_the_difference_of_bragg_theta_angles():
+    from roc_mcs.theory.bragg import RAD_TO_ARCSEC
+
+    reflections, _ = calculate_doublet_reflections(
+        CA_F2_FLUORITE, BraggDoubletConfig(max_miller_index=10)
+    )
+    row = reflections.loc[reflections["hkl"] == "(004)"].iloc[0]
+    d = CA_F2_FLUORITE.d_spacing_A((0, 0, 4), 5.4635)
+    theta_1 = np.arcsin(0.7093000 / (2.0 * d))
+    theta_2 = np.arcsin(0.7135900 / (2.0 * d))
+    expected_arcsec = (theta_2 - theta_1) * RAD_TO_ARCSEC
+    assert row["theta_ka1_deg"] == pytest.approx(np.degrees(theta_1))
+    assert row["theta_ka2_deg"] == pytest.approx(np.degrees(theta_2))
+    assert row["delta_theta_arcsec"] == pytest.approx(expected_arcsec)
+
+
+def test_general_triclinic_xraylib_cell_metric_matches_reciprocal_metric():
+    from roc_mcs.theory.crystals import XraylibCrystalModel
+
+    cell = {
+        "a": 4.2, "b": 5.1, "c": 6.3,
+        "alpha": 76.0, "beta": 83.0, "gamma": 68.0,
+    }
+    model = XraylibCrystalModel(
+        model_id="test:triclinic", crystal_name="triclinic",
+        crystal_data=cell, display_name="test triclinic",
+    )
+    alpha, beta, gamma = np.radians([cell["alpha"], cell["beta"], cell["gamma"]])
+    a, b, c = cell["a"], cell["b"], cell["c"]
+    direct_metric = np.array([
+        [a * a, a * b * np.cos(gamma), a * c * np.cos(beta)],
+        [a * b * np.cos(gamma), b * b, b * c * np.cos(alpha)],
+        [a * c * np.cos(beta), b * c * np.cos(alpha), c * c],
+    ])
+    reciprocal_metric = np.linalg.inv(direct_metric)
+    for hkl in ((1, 0, 0), (0, 1, 1), (2, -1, 3)):
+        indices = np.asarray(hkl, dtype=float)
+        expected = 1.0 / np.sqrt(indices @ reciprocal_metric @ indices)
+        assert model.d_spacing_A(hkl) == pytest.approx(expected, rel=1e-12)
+
+
+def test_artifact_store_reads_only_requested_tables(tmp_path):
+    store = ArtifactStore(tmp_path / "artifacts")
+    bundle = ArtifactBundle(
+        arrays={"large_array": np.arange(1000, dtype=np.float64)},
+        tables={
+            "requested": pd.DataFrame({"value": [1, 2, 3]}),
+            "not_requested": pd.DataFrame({"ignored": [4, 5]}),
+        },
+        metadata={"provenance": "test"},
+    )
+    artifact_id = store.write(bundle)
+
+    selected = store.read_tables(artifact_id, ("requested",))
+
+    assert selected.arrays == {}
+    assert set(selected.tables) == {"requested"}
+    assert selected.tables["requested"].equals(bundle.tables["requested"])
+    assert selected.metadata == {"provenance": "test"}
+    with pytest.raises(KeyError, match="not_in_artifact"):
+        store.read_tables(artifact_id, ("not_in_artifact",))
+    with pytest.raises(ValueError, match="хотя бы одну"):
+        store.read_tables(artifact_id, ())
+
+
+def test_artifact_store_limits_preview_rows_per_group_without_changing_artifact(tmp_path):
+    store = ArtifactStore(tmp_path / "artifacts")
+    ranking = pd.DataFrame({
+        "pair_id": ["A", "A", "A", "B", "B", "B"],
+        "rank": [1, 2, 3, 1, 2, 3],
+        "hkl": ["(100)", "(110)", "(111)", "(200)", "(210)", "(211)"],
+    })
+    artifact_id = store.write(ArtifactBundle(tables={"ranking": ranking}))
+
+    preview = store.read_tables(
+        artifact_id, ("ranking",), group_head_limits={"ranking": ("pair_id", 2)}
+    )
+    full = store.read(artifact_id)
+
+    assert preview.tables["ranking"].to_dict(orient="records") == ranking.iloc[
+        [0, 1, 3, 4]
+    ].to_dict(orient="records")
+    assert len(full.tables["ranking"]) == 6
+    assert full.tables["ranking"].equals(ranking)
+
+
+def test_artifact_store_rejects_boolean_group_head_limit(tmp_path):
+    store = ArtifactStore(tmp_path / "artifacts")
+    artifact_id = store.write(ArtifactBundle(tables={
+        "ranking": pd.DataFrame({"pair_id": ["A"], "rank": [1]}),
+    }))
+
+    with pytest.raises(ValueError, match="целый лимит"):
+        store.read_tables(
+            artifact_id, ("ranking",), group_head_limits={"ranking": ("pair_id", True)}
+        )
+
+
+def test_artifact_store_group_head_limit_handles_empty_table(tmp_path):
+    store = ArtifactStore(tmp_path / "artifacts")
+    artifact_id = store.write(ArtifactBundle(tables={
+        "ranking": pd.DataFrame({"pair_id": pd.Series(dtype=object), "rank": pd.Series(dtype=int)}),
+    }))
+
+    preview = store.read_tables(
+        artifact_id, ("ranking",), group_head_limits={"ranking": ("pair_id", 15)}
+    )
+
+    assert preview.tables["ranking"].empty
+    assert list(preview.tables["ranking"].columns) == ["pair_id", "rank"]

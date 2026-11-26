@@ -7,7 +7,7 @@ import re
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 from uuid import uuid4
 
 import h5py
@@ -227,9 +227,88 @@ class ArtifactStore:
                 tables[table_name] = self._read_table(group)
         return ArtifactBundle(arrays=arrays, tables=tables, metadata=metadata)
 
+    def read_tables(
+        self,
+        artifact_id: str,
+        table_names: Iterable[str],
+        *,
+        group_head_limits: Mapping[str, tuple[str, int]] | None = None,
+    ) -> ArtifactBundle:
+        """Read only the requested HDF5 tables, without materializing arrays or peers.
+
+        This is intended for analysis views that need a small subset of a larger
+        immutable artifact. ``group_head_limits`` optionally limits a table to
+        its first N stored rows per group-key value, without modifying the
+        original artifact. Returned DataFrames are detached HDF5-decoded values.
+        """
+        names = tuple(dict.fromkeys(str(name) for name in table_names))
+        if not names:
+            raise ValueError("Необходимо запросить хотя бы одну таблицу артефакта")
+        for name in names:
+            if not _KEY_RE.fullmatch(name):
+                raise ValueError(f"Некорректное имя таблицы: {name!r}")
+
+        path = self._path(artifact_id)
+        if not path.is_file():
+            raise FileNotFoundError(f"Артефакт не найден: {artifact_id}")
+        tables: dict[str, Any] = {}
+        with h5py.File(path, "r") as handle:
+            version = int(handle.attrs.get("format_version", -1))
+            if version not in self.READABLE_FORMAT_VERSIONS:
+                raise ValueError(f"Неподдерживаемый формат артефакта: {version}")
+            metadata = json.loads(handle.attrs.get("metadata_json", "{}"))
+            source_tables = handle.get("tables")
+            if source_tables is None:
+                raise ValueError("В артефакте отсутствует группа tables")
+            missing = [name for name in names if name not in source_tables]
+            if missing:
+                raise KeyError(f"В артефакте отсутствуют таблицы: {missing}")
+            limits = dict(group_head_limits or {})
+            unexpected_limits = set(limits).difference(names)
+            if unexpected_limits:
+                raise ValueError(
+                    "Лимиты групповых строк заданы для невыбранных таблиц: "
+                    f"{sorted(unexpected_limits)}"
+                )
+            for name in names:
+                group = source_tables[name]
+                row_indices = None
+                if name in limits:
+                    group_column, raw_limit = limits[name]
+                    if not isinstance(group_column, str) or not group_column.strip():
+                        raise ValueError("group_head_limits должен задавать имя столбца-группы")
+                    if isinstance(raw_limit, (bool, np.bool_)):
+                        raise ValueError("group_head_limits должен задавать положительный целый лимит")
+                    try:
+                        per_group_limit = int(raw_limit)
+                    except (TypeError, ValueError, OverflowError) as exc:
+                        raise ValueError(
+                            "group_head_limits должен задавать положительный целый лимит"
+                        ) from exc
+                    if per_group_limit < 1 or per_group_limit != raw_limit:
+                        raise ValueError("group_head_limits должен задавать положительный целый лимит")
+                    columns = json.loads(group.attrs["columns_json"])
+                    if group_column not in columns:
+                        raise KeyError(
+                            f"В таблице {name!r} отсутствует группирующий столбец {group_column!r}"
+                        )
+                    column_index = columns.index(group_column)
+                    group_values = self._read_dataset(group[f"c{column_index:04d}"])
+                    seen_per_group: dict[str, int] = {}
+                    selected_rows: list[int] = []
+                    for row_index, raw_key in enumerate(group_values):
+                        key = str(raw_key)
+                        current = seen_per_group.get(key, 0)
+                        if current < per_group_limit:
+                            selected_rows.append(row_index)
+                            seen_per_group[key] = current + 1
+                    row_indices = np.asarray(selected_rows, dtype=np.int64)
+                tables[name] = self._read_table(group, row_indices=row_indices)
+        return ArtifactBundle(tables=tables, metadata=metadata)
+
     @staticmethod
-    def _read_dataset(dataset: h5py.Dataset) -> np.ndarray:
-        value = dataset[()]
+    def _read_dataset(dataset: h5py.Dataset, selection=None) -> np.ndarray:
+        value = dataset[()] if selection is None else dataset[selection]
         array = np.asarray(value)
         if array.dtype.kind in {"S", "O"}:
             if array.ndim == 0:
@@ -245,19 +324,20 @@ class ArtifactStore:
         return array
 
     @classmethod
-    def _read_table(cls, group: h5py.Group):
+    def _read_table(cls, group: h5py.Group, *, row_indices: np.ndarray | None = None):
         import pandas as pd
 
         columns = json.loads(group.attrs["columns_json"])
         row_count = int(group.attrs.get("row_count", -1))
+        selected_row_count = len(row_indices) if row_indices is not None else row_count
         restored_columns: list[Any] = []
         for index, name in enumerate(columns):
             dataset = group[f"c{index:04d}"]
-            values = cls._read_dataset(dataset)
-            if values.ndim != 1 or (row_count >= 0 and len(values) != row_count):
+            values = cls._read_dataset(dataset, selection=row_indices)
+            if values.ndim != 1 or (selected_row_count >= 0 and len(values) != selected_row_count):
                 raise ValueError(
                     f"Повреждённая таблица {group.name!r}: столбец {name!r} "
-                    f"имеет shape={values.shape}, row_count={row_count}"
+                    f"имеет shape={values.shape}, row_count={selected_row_count}"
                 )
             logical_type = dataset.attrs.get("logical_type", "")
             if isinstance(logical_type, bytes):
@@ -270,7 +350,10 @@ class ArtifactStore:
                         f"Повреждённая таблица {group.name!r}: отсутствует null-mask "
                         f"для столбца {name!r}"
                     )
-                null_mask = np.asarray(group[null_name], dtype=bool)
+                null_mask = np.asarray(
+                    group[null_name][()] if row_indices is None else group[null_name][row_indices],
+                    dtype=bool,
+                )
                 if null_mask.shape != values.shape:
                     raise ValueError(
                         f"Повреждённая таблица {group.name!r}: null-mask столбца "
@@ -290,7 +373,10 @@ class ArtifactStore:
                         f"Повреждённая таблица {group.name!r}: отсутствует null-mask "
                         f"для nullable-столбца {name!r}"
                     )
-                null_mask = np.asarray(group[null_name], dtype=bool)
+                null_mask = np.asarray(
+                    group[null_name][()] if row_indices is None else group[null_name][row_indices],
+                    dtype=bool,
+                )
                 if null_mask.shape != values.shape:
                     raise ValueError(
                         f"Повреждённая таблица {group.name!r}: null-mask столбца "

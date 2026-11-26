@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import traceback
+from html import escape as html_escape
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +30,7 @@ from roc_mcs.analysis.project import WorkflowProject
 from roc_mcs.analysis.workflow_history import NodeStatus, ReviewStatus, WorkflowHistory
 from .presenter import ArtifactPreviewRequest
 from roc_mcs.analysis.workflow_preview import build_workflow_preview_state
+from roc_mcs.analysis.hkl_preview import load_hkl_identification_preview
 from roc_mcs.analysis.preview_context import load_node_preview_context
 from .graph_canvas import ProcessingGraphView
 from .peak_detection_preview import PeakDetectionPreview
@@ -38,6 +40,7 @@ from roc_mcs.gui.components.icon_provider import svg_icon
 from roc_mcs.gui.roi_explorer.plot_toolbar_style import ICON_DIR
 from roc_mcs.gui.roi_explorer.map_tools_widget import pooling_preview_pixmap
 from roc_mcs.gui.roi_explorer.theme import apply_widget_palette, apply_popup_theme, resolve_theme, theme_colors
+from roc_mcs.gui.roi_explorer.hkl_results_panel import HklResultsPanel
 
 
 # Keep the initial values and the in-form reset action in one place. These are
@@ -165,6 +168,38 @@ class _PreviewNodeTask(QRunnable):
             self.signals.failed.emit(self.node_id, traceback.format_exc())
 
 
+class _HklResultPreviewTask(QRunnable):
+    """Load only the immutable HKL result artifact; never load the 3D Scan.
+
+    The HKL stage is analysis-only, so its dedicated result window needs the
+    five tabular outputs but not the generic map/ROC preview lineage.
+    """
+
+    def __init__(self, node_id: str, history: WorkflowHistory, artifact_directory: str):
+        super().__init__()
+        self.node_id = str(node_id)
+        self.history_snapshot = WorkflowHistory(list(history.nodes))
+        self.artifact_directory = str(artifact_directory)
+        self.signals = _WorkerSignals()
+
+    def run(self) -> None:
+        try:
+            node = self.history_snapshot.get(self.node_id)
+            if node.operation_id != "theory.identify_hkl":
+                raise ValueError(f"Узел {node.id!r} не является HKL-этапом")
+            if node.status != NodeStatus.SUCCEEDED:
+                raise RuntimeError("HKL-результат ещё не завершён успешно")
+            artifact_id = node.output_refs.get("hkl_analysis")
+            if not artifact_id:
+                raise RuntimeError("В успешно завершённом HKL-узле отсутствует выход hkl_analysis")
+            preview = load_hkl_identification_preview(
+                ArtifactStore(self.artifact_directory), str(artifact_id)
+            )
+            self.signals.succeeded.emit(self.node_id, preview)
+        except Exception:
+            self.signals.failed.emit(self.node_id, traceback.format_exc())
+
+
 class _PeakPixelInputTask(QRunnable):
     """Loads the exact Scan/Spike inputs for one selected detector pixel."""
 
@@ -270,6 +305,8 @@ class ProcessingWorkbenchWidget(QWidget):
         self.thread_pool = QThreadPool.globalInstance()
         self._active_task: _RunNodeTask | None = None
         self._active_preview_task: _PreviewNodeTask | None = None
+        self._hkl_preview_tasks: dict[str, _HklResultPreviewTask] = {}
+        self._hkl_preview_cache: dict[str, Any] = {}
         self._active_peak_input_task: _PeakPixelInputTask | None = None
         self._active_branch_stats_task: _BranchStatsTask | None = None
         self._branch_gate_values: dict[str, float] = {}
@@ -625,6 +662,12 @@ class ProcessingWorkbenchWidget(QWidget):
             self.graph.setBackgroundBrush(self.graph.palette().color(QPalette.ColorRole.Base))
             self._style_matplotlib_figure(self.figure)
             self._style_matplotlib_figure(self.diagnostic_figure)
+            stage_popup = self._active_stage_popup
+            if stage_popup is not None:
+                apply_widget_palette(stage_popup, self._theme)
+                stage_panel = getattr(stage_popup, "_stage_hkl_panel", None)
+                if stage_panel is not None:
+                    stage_panel.apply_theme(self._theme)
             pool_form = self._forms.get("preprocess.pool", {})
             preview = pool_form.get("preview")
             if preview is not None:
@@ -1233,7 +1276,9 @@ class ProcessingWorkbenchWidget(QWidget):
         layout.setFormAlignment(Qt.AlignmentFlag.AlignTop)
         layout.setRowWrapPolicy(QFormLayout.RowWrapPolicy.DontWrapRows)
 
-        from roc_mcs.theory.crystals import available_crystal_models, xraylib_available
+        from roc_mcs.theory.crystals import (
+            available_crystal_models, get_crystal_model, xraylib_available,
+        )
         crystal_selector = QComboBox()
         try:
             crystal_models = available_crystal_models()
@@ -1248,30 +1293,67 @@ class ProcessingWorkbenchWidget(QWidget):
         default_index = crystal_selector.findData("caf2_fluorite")
         crystal_selector.setCurrentIndex(max(0, default_index))
         crystal_selector.setToolTip(
-            "CaF₂ использует встроенную проверенную модель Fm-3m. Остальные материалы "
-            "берутся из встроенного каталога кристаллов XrayLib, если пакет установлен."
+            "CaF₂ использует встроенную модель Fm-3m. Параметры остальных материалов "
+            "читаются из выбранной записи базы XrayLib и не редактируются здесь."
         )
         layout.addRow("Кристаллическая модель:", crystal_selector)
 
+        # The active page makes the provenance of the unit-cell constants
+        # explicit: CaF2's cubic a is editable; XrayLib constants are database-owned.
+        unit_cell_stack = QStackedWidget()
+        unit_cell_stack.setObjectName("hklUnitCellEditor")
+        builtin_cell_page = QWidget(unit_cell_stack)
+        builtin_cell_row = QHBoxLayout(builtin_cell_page)
+        builtin_cell_row.setContentsMargins(0, 0, 0, 0)
+        builtin_cell_row.setSpacing(5)
         lattice = self._float_spin(0.1, 100.0, 5.4635, 6)
         lattice.setSuffix(" Å")
         lattice.setToolTip(
-            "Параметр a для встроенной кубической модели CaF₂. Для материалов XrayLib "
-            "все параметры ячейки a,b,c,α,β,γ берутся из базы и это поле игнорируется."
+            "Параметр a кубической решётки встроенной модели CaF₂; "
+            "для неё a=b=c и α=β=γ=90°."
         )
-        layout.addRow("Параметр a (CaF₂):", lattice)
+        lattice_caption = QLabel("a =")
+        lattice_caption.setObjectName("hklInlineFieldCaption")
+        builtin_cell_row.addWidget(lattice_caption)
+        builtin_cell_row.addWidget(lattice)
+        builtin_cell_row.addStretch(1)
+        database_cell_page = QWidget(unit_cell_stack)
+        database_cell_layout = QHBoxLayout(database_cell_page)
+        database_cell_layout.setContentsMargins(0, 0, 0, 0)
+        database_cell_layout.setSpacing(0)
+        database_cell_label = QLabel("Параметры ячейки загружаются из XrayLib")
+        database_cell_label.setObjectName("hklDatabaseCell")
+        database_cell_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        database_cell_label.setWordWrap(False)
+        database_cell_layout.addWidget(database_cell_label)
+        unit_cell_stack.addWidget(builtin_cell_page)
+        unit_cell_stack.addWidget(database_cell_page)
+        layout.addRow("Параметры ячейки:", unit_cell_stack)
 
         def update_crystal_controls(_index: int = -1) -> None:
-            is_builtin_caf2 = crystal_selector.currentData() == "caf2_fluorite"
-            lattice.setEnabled(is_builtin_caf2)
-            if is_builtin_caf2:
-                lattice.setToolTip(
-                    "Параметр кубической решётки CaF₂; значение по умолчанию 5.4635 Å."
+            model_id = str(crystal_selector.currentData() or "caf2_fluorite")
+            if model_id == "caf2_fluorite":
+                unit_cell_stack.setCurrentWidget(builtin_cell_page)
+                lattice.setEnabled(True)
+                return
+            try:
+                model = get_crystal_model(model_id)
+                cell = model.unit_cell_parameters_A
+                angles = model.unit_cell_angles_deg
+                database_cell_label.setText(
+                    f"a={float(cell['a']):.6g}, b={float(cell['b']):.6g}, "
+                    f"c={float(cell['c']):.6g} Å   ·   "
+                    f"α={float(angles['alpha']):.5g}°, β={float(angles['beta']):.5g}°, "
+                    f"γ={float(angles['gamma']):.5g}°   ·   XrayLib"
                 )
-            else:
-                lattice.setToolTip(
-                    "Отключено: параметры некубической ячейки берутся из выбранной записи XrayLib."
-                )
+                # Do not overwrite the independent editable CaF2 value when
+                # switching to a database crystal. The validator takes the
+                # database cell as authoritative for this model.
+            except Exception as exc:
+                database_cell_label.setText(f"Не удалось прочитать параметры ячейки: {exc}")
+            unit_cell_stack.setCurrentWidget(database_cell_page)
+            lattice.setEnabled(False)
+
         crystal_selector.currentIndexChanged.connect(update_crystal_controls)
         update_crystal_controls()
 
@@ -1279,23 +1361,31 @@ class ProcessingWorkbenchWidget(QWidget):
         lambda_1.setSuffix(" Å")
         lambda_2 = self._float_spin(0.1, 10.0, 0.7135900, 7)
         lambda_2.setSuffix(" Å")
-        layout.addRow("λ(Kα₁):", lambda_1)
-        layout.addRow("λ(Kα₂):", lambda_2)
+        wavelength_row = QWidget()
+        wavelength_layout = QHBoxLayout(wavelength_row)
+        wavelength_layout.setContentsMargins(0, 0, 0, 0)
+        wavelength_layout.setSpacing(8)
+        for caption, control in (("Kα₁", lambda_1), ("Kα₂", lambda_2)):
+            field_group = QWidget(wavelength_row)
+            field_layout = QHBoxLayout(field_group)
+            field_layout.setContentsMargins(0, 0, 0, 0)
+            field_layout.setSpacing(3)
+            field_label = QLabel(caption, field_group)
+            field_label.setObjectName("hklInlineFieldCaption")
+            field_layout.addWidget(field_label)
+            field_layout.addWidget(control)
+            wavelength_layout.addWidget(field_group)
+        wavelength_layout.addStretch(1)
+        layout.addRow("Длины волн:", wavelength_row)
 
         max_index = self._int_spin(1, 30, 10)
         max_index.setToolTip(
-            "Максимум |h|, |k|, |l|. Для базы XrayLib перебирается полный знаковый "
-            "куб индексов; эквивалентные направления не скрываются, погасания проверяются F_H."
+            "Максимум |h|, |k|, |l|. Для XrayLib перебирается полный знаковый "
+            "куб индексов; систематические погасания проверяются по F_H."
         )
         layout.addRow("Максимальный индекс:", max_index)
 
-        bin_width = self._float_spin(0.5, 100.0, 7.0, 1)
-        bin_width.setSuffix(" ″")
-        layout.addRow("Ширина бина гистограммы:", bin_width)
-
-        include_crystalpy = QCheckBox(
-            "Дополнительно рассчитать |Fₕₖₗ|² и Darwin widths"
-        )
+        include_crystalpy = QCheckBox("Рассчитать структурные факторы и Darwin widths")
         try:
             from roc_mcs.theory.crystalpy_caf2 import crystalpy_available
             crystalpy_ready = bool(crystalpy_available())
@@ -1307,54 +1397,60 @@ class ProcessingWorkbenchWidget(QWidget):
         thickness.setSuffix(" m")
         thickness.setEnabled(crystalpy_ready)
         thickness.setToolTip(
-            "Толщина кристалла для динамических параметров CrystalPy; для CaF₂ сохранена "
-            "исходная настройка из notebook."
+            "Толщина кристалла для дополнительного расчёта динамической дифракции CrystalPy."
         )
-        layout.addRow("Толщина CrystalPy:", thickness)
+        dynamic_row = QWidget()
+        dynamic_layout = QHBoxLayout(dynamic_row)
+        dynamic_layout.setContentsMargins(0, 0, 0, 0)
+        dynamic_layout.setSpacing(7)
+        dynamic_layout.addWidget(include_crystalpy)
+        dynamic_layout.addWidget(QLabel("Толщина:", dynamic_row))
+        dynamic_layout.addWidget(thickness)
+        dynamic_layout.addStretch(1)
+        layout.addRow("Динамическая теория:", dynamic_row)
         include_crystalpy.setToolTip(
             "Дополнительный расчёт F0/FH/FH̄, ψH/ψH̄ и Darwin widths через CrystalPy/XrayLib. "
-            "Для CaF₂ применяется явная basis из notebook, для остальных материалов — "
+            "Для CaF₂ используется явная basis-модель; для остальных материалов — "
             "атомная ячейка выбранной записи XrayLib."
         )
-        layout.addRow(include_crystalpy)
         if crystalpy_ready:
             dependency_message = (
-                "XrayLib и CrystalPy доступны: каталог материалов, структурные факторы "
-                "и дополнительные σ/π Darwin widths можно рассчитывать для выбранного кристалла."
+                "XrayLib и CrystalPy доступны. Для других кристаллов используются "
+                "параметры ячейки из XrayLib; дополнительные σ/π Darwin widths доступны."
             )
         elif xraylib_ready:
             dependency_message = (
-                "XrayLib доступен: каталог материалов и F_H участвуют в теоретическом отборе. "
-                "CrystalPy не обнаружен — дополнительные σ/π Darwin widths отключены."
+                "XrayLib доступен для базы материалов и F_H; CrystalPy не обнаружен, "
+                "поэтому дополнительные σ/π Darwin widths отключены."
             )
         else:
             dependency_message = (
-                "XrayLib не обнаружен: доступна встроенная геометрическая модель CaF₂. "
-                "Для каталога других кристаллов и структурных факторов установите xraylib; "
-                "для Darwin widths дополнительно нужен crystalpy."
+                "Без XrayLib доступна встроенная геометрическая модель CaF₂. "
+                "Для каталога других кристаллов установите xraylib; для Darwin widths "
+                "дополнительно требуется crystalpy."
             )
         dependency_hint = QLabel(dependency_message)
         dependency_hint.setWordWrap(True)
-        dependency_hint.setStyleSheet("color: palette(placeholderText); font-size: 9px;")
+        dependency_hint.setObjectName("hklDependencyHint")
         layout.addRow(dependency_hint)
 
         explanation = QLabel(
-            "Экспериментальная |Δθ| восстанавливается по исходным θ двух пиков "
-            "из принятых assignments (точный join по peak_id). Остаток после 3D-совмещения "
-            "не используется. Рефлексы ранжируются по |Δθтеория − median(|Δθэксп|)|. "
-            "Для XrayLib учитываются полная метрика ячейки и систематические погасания "
-            "по F_H; это ранжирование геометрического совпадения, не формальная вероятность "
-            "и не оценка измеренной интенсивности."
+            "Измеренное |Δθ| восстанавливается из исходных θ по точным peak_id в "
+            "branch_catalog; остатки после совмещения не используются. Теоретические "
+            "Δθ ранжируются по абсолютному отклонению от медианы измерений. Ранг — "
+            "геометрическое совпадение, не вероятность и не оценка интенсивности."
         )
         explanation.setWordWrap(True)
         explanation.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         explanation.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        explanation.setObjectName("hklFormExplanation")
         layout.addRow(explanation)
         self._forms["theory.identify_hkl"].update(
             crystal_model_id=crystal_selector, lattice_a_A=lattice,
             lambda_ka1_A=lambda_1, lambda_ka2_A=lambda_2,
-            max_miller_index=max_index, histogram_bin_width_arcsec=bin_width,
+            max_miller_index=max_index,
             include_crystalpy=include_crystalpy, crystal_thickness_m=thickness,
+            unit_cell_stack=unit_cell_stack,
         )
 
     def _request_branch_stats(self, parent_id: str) -> None:
@@ -1637,7 +1733,6 @@ class ProcessingWorkbenchWidget(QWidget):
                 "lambda_ka1_A": form["lambda_ka1_A"].value(),
                 "lambda_ka2_A": form["lambda_ka2_A"].value(),
                 "max_miller_index": form["max_miller_index"].value(),
-                "histogram_bin_width_arcsec": form["histogram_bin_width_arcsec"].value(),
                 "include_crystalpy": form["include_crystalpy"].isChecked(),
                 "crystal_thickness_m": form["crystal_thickness_m"].value(),
             }
@@ -1744,13 +1839,15 @@ class ProcessingWorkbenchWidget(QWidget):
         except Exception as exc:
             QMessageBox.warning(self, "Не удалось добавить ветвь", str(exc))
 
-    def _open_stage_configuration(self, parent_id: str, operation_id: str) -> None:
-        """Open a movable, non-modal editor for one canonical stage form."""
+    def _open_stage_configuration(
+        self, parent_id: str, operation_id: str, *, existing_node_id: str | None = None
+    ) -> None:
+        """Open the canonical stage form, optionally as a read-only result view."""
         if self.is_busy:
             return
         parent = self.project.history.get(parent_id)
         operation_ids = self._available_operations_for_parent(parent_id)
-        if operation_id not in operation_ids:
+        if existing_node_id is None and operation_id not in operation_ids:
             QMessageBox.warning(
                 self, "Недоступный этап",
                 "Выбранную операцию нельзя создать от этого узла. "
@@ -1778,18 +1875,24 @@ class ProcessingWorkbenchWidget(QWidget):
         popup = _StageConfigurationPopup(self)
         popup.setObjectName("processingStagePopup")
         root = QVBoxLayout(popup)
-        root.setContentsMargins(8, 6, 8, 7)
-        root.setSpacing(5)
+        root.setContentsMargins(8, 5, 8, 6)
+        root.setSpacing(4)
 
         header = QHBoxLayout()
         header.setContentsMargins(1, 0, 1, 0)
         header.setSpacing(6)
         title = _PopupDragTitle(
-            f"<b>{spec.label}</b>"
-            f"<span style='color:palette(mid)'>  ·  вход: {parent.label}</span>",
+            f"<b>{html_escape(spec.label)}</b>"
+            f"  ·  вход: {html_escape(parent.label)}",
             popup,
         )
         title.setTextFormat(Qt.TextFormat.RichText)
+        if existing_node_id is not None:
+            saved_node = self.project.history.get(existing_node_id)
+            title.setText(
+                f"<b>{html_escape(saved_node.label)}</b>"
+                "  ·  просмотр сохранённого результата"
+            )
         title.setWordWrap(False)
         title.setToolTip("Перетащите за эту строку, чтобы переместить окно")
         header.addWidget(title, 1)
@@ -1813,37 +1916,91 @@ class ProcessingWorkbenchWidget(QWidget):
 
         # Re-use the canonical parameter widgets: no parallel form, no copied
         # defaults, and no second parameter-to-operation mapping.
+        original_page_minimum_width = page.minimumWidth()
         self.form_stack.removeWidget(page)
-        page.setParent(None)
+        # QStackedWidget hides the page on removal. It is reparented directly
+        # into the destination container below, without an intermediate
+        # parentless/top-level state. Explicit show() is repeated after popup
+        # activation to make the Qt visibility transition deterministic.
         page.setMinimumWidth(0)
-        scroll.setWidget(page)
+        page.setEnabled(existing_node_id is None)
+        is_hkl_stage = operation_id == "theory.identify_hkl"
+        original_control_metrics = []
+        original_layout_metrics = None
+        if is_hkl_stage:
+            for control_type in (QSpinBox, QDoubleSpinBox, QComboBox, QLineEdit):
+                for control in page.findChildren(control_type):
+                    symbols = (
+                        control.buttonSymbols()
+                        if isinstance(control, QAbstractSpinBox) else None
+                    )
+                    original_control_metrics.append((
+                        control, control.minimumHeight(), control.maximumHeight(),
+                        control.minimumWidth(), symbols,
+                    ))
+            original_layout = form_info.get("layout")
+            if original_layout is not None:
+                margins = original_layout.contentsMargins()
+                original_layout_metrics = (
+                    margins.left(), margins.top(), margins.right(), margins.bottom(),
+                    original_layout.verticalSpacing(), original_layout.horizontalSpacing(),
+                )
+        stage_content = None
+        hkl_panel = None
+        hkl_status = None
+        if is_hkl_stage:
+            stage_content = QWidget(scroll)
+            stage_content.setObjectName("hklStageContent")
+            stage_content_layout = QVBoxLayout(stage_content)
+            stage_content_layout.setContentsMargins(2, 2, 2, 2)
+            stage_content_layout.setSpacing(4)
+            page.setParent(stage_content)
+            stage_content_layout.addWidget(page)
+            page.setVisible(True)
+            hkl_status = QLabel(
+                "Результат появится здесь после выполнения этапа.", stage_content
+            )
+            hkl_status.setObjectName("hklStageStatus")
+            hkl_status.setWordWrap(True)
+            stage_content_layout.addWidget(hkl_status)
+            hkl_panel = HklResultsPanel(stage_content)
+            hkl_panel.apply_theme(self._theme)
+            hkl_panel.hide()
+            stage_content_layout.addWidget(hkl_panel)
+            scroll.setWidget(stage_content)
+            stage_content.show()
+        else:
+            scroll.setWidget(page)
+            page.show()
+
         for widget_type in (QSpinBox, QDoubleSpinBox, QComboBox, QLineEdit):
             for field in page.findChildren(widget_type):
                 compact_peak_control = (
                     operation_id == "peaks.detect"
                     and isinstance(field, QAbstractSpinBox)
                 )
-                field.setMinimumHeight(18 if compact_peak_control else 21)
-                field.setMaximumHeight(20 if compact_peak_control else 25)
-                if compact_peak_control:
+                compact_hkl_control = is_hkl_stage
+                field.setMinimumHeight(18 if compact_peak_control or compact_hkl_control else 21)
+                field.setMaximumHeight(21 if compact_peak_control or compact_hkl_control else 25)
+                if (
+                    (compact_peak_control or compact_hkl_control)
+                    and isinstance(field, QAbstractSpinBox)
+                ):
                     field.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
                 if isinstance(field, QDoubleSpinBox):
-                    field.setMinimumWidth(82)
+                    field.setMinimumWidth(82 if is_hkl_stage else 78)
                 elif isinstance(field, QSpinBox):
                     field.setMinimumWidth(68)
                 elif isinstance(field, QComboBox):
-                    field.setMinimumWidth(112)
-        for checkbox in page.findChildren(QCheckBox):
-            checkbox.setStyleSheet("QCheckBox { font-size: 10px; spacing: 5px; }")
-        for label in page.findChildren(QLabel):
-            label.setStyleSheet("QLabel { font-size: 10px; }")
+                    field.setMinimumWidth(112 if is_hkl_stage else 112)
         page_layout = form_info.get("layout")
         if page_layout is not None:
             compact_peak_form = operation_id == "peaks.detect"
-            margin = 3 if compact_peak_form else 4
+            compact_hkl_form = is_hkl_stage
+            margin = 2 if (compact_peak_form or compact_hkl_form) else 4
             page_layout.setContentsMargins(margin, margin, margin, margin)
-            page_layout.setVerticalSpacing(3 if compact_peak_form else 5)
-            page_layout.setHorizontalSpacing(7 if compact_peak_form else 8)
+            page_layout.setVerticalSpacing(2 if compact_hkl_form else (3 if compact_peak_form else 5))
+            page_layout.setHorizontalSpacing(6 if compact_hkl_form else (7 if compact_peak_form else 8))
         root.addWidget(scroll, 1)
 
         footer = QHBoxLayout()
@@ -1865,6 +2022,8 @@ class ProcessingWorkbenchWidget(QWidget):
             footer.addWidget(reset_button)
         cancel_button = QPushButton("Отмена", popup)
         run_button = QPushButton("Создать и запустить", popup)
+        popup._stage_run_button = run_button
+        popup._stage_cancel_button = cancel_button
         run_button.setDefault(True)
         for button in (cancel_button, run_button):
             button.setMinimumHeight(24)
@@ -1874,20 +2033,23 @@ class ProcessingWorkbenchWidget(QWidget):
 
         apply_popup_theme(popup, self._theme)
         apply_widget_palette(popup, self._theme)
-        spin_min_height = 18 if operation_id == "peaks.detect" else 21
-        spin_max_height = 20 if operation_id == "peaks.detect" else 25
+        compact_form = operation_id in {"peaks.detect", "theory.identify_hkl"}
+        spin_min_height = 18 if compact_form else 21
+        spin_max_height = 21 if compact_form else 25
+        popup_colors = theme_colors(self._theme)
         popup.setStyleSheet(
             "QFrame#processingStagePopup { background:palette(window); color:palette(window-text); "
             "border:1px solid palette(mid); border-radius:5px; }"
-            "QFrame#processingStagePopup QLabel { background:transparent; color:palette(window-text); font-size:10px; }"
+            "QFrame#processingStagePopup QLabel { background:transparent; color:palette(window-text); font-size:9px; }"
+            f"QFrame#processingStagePopup QLabel#hklStageStatus {{ color:{popup_colors['muted']}; font-size:9px; padding:3px 2px; }}"
             "QFrame#processingStagePopup QSpinBox, QFrame#processingStagePopup QDoubleSpinBox { "
             f"font-size:10px; min-height:{spin_min_height}px; max-height:{spin_max_height}px; padding:0px 3px; "
             "background:palette(base); color:palette(text); border:1px solid palette(mid); border-radius:3px; }"
             "QFrame#processingStagePopup QComboBox, QFrame#processingStagePopup QLineEdit { "
-            "font-size:10px; min-height:21px; max-height:25px; padding:1px 3px; "
+            f"font-size:9px; min-height:{18 if compact_form else 21}px; max-height:{21 if compact_form else 25}px; padding:1px 3px; "
             "background:palette(base); color:palette(text); border:1px solid palette(mid); border-radius:3px; }"
-            "QFrame#processingStagePopup QCheckBox { font-size:10px; spacing:5px; }"
-            "QFrame#processingStagePopup QPushButton { font-size:10px; padding:3px 8px; "
+            "QFrame#processingStagePopup QCheckBox { font-size:9px; spacing:4px; }"
+            "QFrame#processingStagePopup QPushButton { font-size:9px; padding:3px 8px; "
             "background:palette(button); color:palette(button-text); border:1px solid palette(mid); border-radius:3px; }"
             "QFrame#processingStagePopup QPushButton:hover, QFrame#processingStagePopup QToolButton:hover { "
             "background:palette(midlight); }"
@@ -1899,13 +2061,18 @@ class ProcessingWorkbenchWidget(QWidget):
         cursor_pos = QCursor.pos()
         screen = QApplication.screenAt(cursor_pos) or QApplication.primaryScreen()
         available = screen.availableGeometry() if screen is not None else self.frameGeometry()
-        popup_width = max(340, min(440, available.width() - 16))
+        if is_hkl_stage:
+            popup_width = min(640, max(320, available.width() - 16))
+        else:
+            popup_width = max(340, min(440, available.width() - 16))
         popup.setFixedWidth(popup_width)
-        content_height = max(140, page.sizeHint().height() + 8)
-        max_popup_height = max(190, int(available.height() * 0.82))
-        desired_height = min(content_height + 85, max_popup_height)
+        content_height = max(140, (stage_content.sizeHint().height() if stage_content is not None else page.sizeHint().height()) + 8)
+        max_popup_height = max(190, int(available.height() * (0.80 if is_hkl_stage else 0.82)))
+        desired_height = min(content_height + 78, max_popup_height)
+        if is_hkl_stage:
+            desired_height = max(min(320, max_popup_height), desired_height)
         popup.setMaximumHeight(max_popup_height)
-        scroll.setMinimumHeight(min(max(115, content_height), max(115, desired_height - 90)))
+        scroll.setMinimumHeight(min(max(115, content_height), max(115, desired_height - 82)))
         popup.resize(popup_width, desired_height)
         popup.adjustSize()
         x = min(max(cursor_pos.x(), available.left() + 4), available.right() - popup.width() + 1)
@@ -1916,6 +2083,15 @@ class ProcessingWorkbenchWidget(QWidget):
         self._active_stage_operation = operation_id
         popup._stage_form_page = page
         popup._stage_form_scroll = scroll
+        popup._stage_content = stage_content
+        popup._stage_original_page_minimum_width = original_page_minimum_width
+        popup._stage_original_control_metrics = original_control_metrics
+        popup._stage_original_layout_metrics = original_layout_metrics
+        popup._stage_hkl_panel = hkl_panel
+        popup._stage_hkl_status = hkl_status
+        popup._stage_read_only = existing_node_id is not None
+        popup._stage_temporary_model_item_index = None
+        popup._stage_node_id = existing_node_id
         popup._stage_parent_id = parent_id
 
         def restore_page() -> None:
@@ -1926,11 +2102,32 @@ class ProcessingWorkbenchWidget(QWidget):
                 gate_control = form_info.get("theta_gate")
                 if gate_control is not None:
                     self._branch_gate_values[str(parent_id)] = float(gate_control.value())
-            if scroll.widget() is page:
+            if scroll.widget() is page or (stage_content is not None and scroll.widget() is stage_content):
                 scroll.takeWidget()
             page.setParent(self.form_stack)
+            page.setEnabled(True)
+            if is_hkl_stage:
+                temporary_model_index = getattr(popup, "_stage_temporary_model_item_index", None)
+                if temporary_model_index is not None:
+                    form_info["crystal_model_id"].removeItem(temporary_model_index)
+                    popup._stage_temporary_model_item_index = None
+                page.setMinimumWidth(original_page_minimum_width)
+                for control, minimum_height, maximum_height, minimum_width, symbols in original_control_metrics:
+                    control.setMinimumHeight(minimum_height)
+                    control.setMaximumHeight(maximum_height)
+                    control.setMinimumWidth(minimum_width)
+                    if symbols is not None:
+                        control.setButtonSymbols(symbols)
+                if page_layout is not None and original_layout_metrics is not None:
+                    left, top, right, bottom, vertical, horizontal = original_layout_metrics
+                    page_layout.setContentsMargins(left, top, right, bottom)
+                    page_layout.setVerticalSpacing(vertical)
+                    page_layout.setHorizontalSpacing(horizontal)
+            if stage_content is not None:
+                stage_content.deleteLater()
             if self.form_stack.indexOf(page) < 0:
                 self.form_stack.addWidget(page)
+            page.show()
             if self._active_stage_popup is popup:
                 self._active_stage_popup = None
                 self._active_stage_operation = None
@@ -1947,6 +2144,33 @@ class ProcessingWorkbenchWidget(QWidget):
                 self.pixel_pick_mode_requested.emit(False, parent_id, False)
             self._show_operation_form()
 
+        if existing_node_id is not None:
+            saved_node = self.project.history.get(existing_node_id)
+            saved_parameters = dict(saved_node.parameters or {})
+            crystal_combo = form_info["crystal_model_id"]
+            saved_model_id = str(saved_parameters.get("crystal_model_id", "caf2_fluorite"))
+            saved_index = crystal_combo.findData(saved_model_id)
+            if saved_index < 0:
+                saved_label = str(saved_parameters.get("crystal_model_label", saved_model_id))
+                crystal_combo.addItem(f"{saved_label} · модель из сохранённого узла", saved_model_id)
+                popup._stage_temporary_model_item_index = crystal_combo.count() - 1
+                saved_index = crystal_combo.findData(saved_model_id)
+            crystal_combo.setCurrentIndex(saved_index)
+            if saved_model_id == "caf2_fluorite":
+                form_info["lattice_a_A"].setValue(
+                    float(saved_parameters.get("lattice_a_A", 5.4635))
+                )
+            form_info["lambda_ka1_A"].setValue(float(saved_parameters.get("lambda_ka1_A", 0.7093000)))
+            form_info["lambda_ka2_A"].setValue(float(saved_parameters.get("lambda_ka2_A", 0.7135900)))
+            form_info["max_miller_index"].setValue(int(saved_parameters.get("max_miller_index", 10)))
+            form_info["include_crystalpy"].setChecked(bool(saved_parameters.get("include_crystalpy", False)))
+            form_info["crystal_thickness_m"].setValue(float(saved_parameters.get("crystal_thickness_m", 1e-5)))
+            page.setEnabled(False)
+            run_button.hide()
+            cancel_button.setText("Закрыть")
+            if hkl_status is not None:
+                hkl_status.setText("Загрузка сохранённого HKL-артефакта…")
+
         popup.about_to_close.connect(restore_page)
         cancel_button.clicked.connect(popup.close)
 
@@ -1957,18 +2181,66 @@ class ProcessingWorkbenchWidget(QWidget):
             except Exception as exc:
                 QMessageBox.warning(popup, "Проверьте параметры этапа", str(exc))
                 return
-            popup.close()
             try:
-                node_id = self._create_stage_candidate(
-                    parent_id, operation_id, parameters, run_immediately=True
-                )
-                if node_id:
-                    self.graph.select_node(node_id)
+                if is_hkl_stage:
+                    if hkl_status is not None:
+                        hkl_status.setText("Выполняется теоретический расчёт HKL…")
+                    if page is not None:
+                        page.setEnabled(False)
+                    run_button.setEnabled(False)
+                    run_button.setText("Выполняется…")
+                    cancel_button.setText("Закрыть")
+                    node_id = self._create_stage_candidate(
+                        parent_id, operation_id, parameters, run_immediately=True
+                    )
+                    popup._stage_node_id = node_id
+                    if node_id:
+                        self.graph.select_node(node_id)
+                    else:
+                        raise RuntimeError("Не удалось создать узел HKL-этапа")
+                else:
+                    popup.close()
+                    node_id = self._create_stage_candidate(
+                        parent_id, operation_id, parameters, run_immediately=True
+                    )
+                    if node_id:
+                        self.graph.select_node(node_id)
             except Exception as exc:
-                QMessageBox.warning(self, "Не удалось создать этап", str(exc))
+                if is_hkl_stage:
+                    if page is not None:
+                        page.setEnabled(True)
+                    run_button.setEnabled(True)
+                    run_button.setText("Создать и запустить")
+                    if hkl_status is not None:
+                        hkl_status.setText(f"Не удалось запустить этап: {exc}")
+                else:
+                    QMessageBox.warning(self, "Не удалось создать этап", str(exc))
 
         run_button.clicked.connect(validate_create_and_run)
         popup.show()
+        if is_hkl_stage:
+            # QStackedWidget::removeWidget hides pages. Repair parent/layout if
+            # necessary and re-activate visibility after Qt completes the
+            # popup's first layout pass. This avoids a blank HKL form on reopen.
+            def ensure_hkl_form_visible() -> None:
+                if (
+                    stage_content is None
+                    or self._active_stage_popup is not popup
+                    or not popup.isVisible()
+                ):
+                    return
+                if page.parentWidget() is not stage_content:
+                    page.setParent(stage_content)
+                    stage_content_layout.insertWidget(0, page)
+                page.setVisible(True)
+                page.updateGeometry()
+                stage_content_layout.activate()
+                stage_content.updateGeometry()
+                scroll.updateGeometry()
+
+            QTimer.singleShot(0, ensure_hkl_form_visible)
+            if page.layout() is None or page.layout().count() == 0:
+                self._log("HKL form page has no layout rows after reparenting")
         popup.raise_()
         popup.activateWindow()
 
@@ -2298,9 +2570,17 @@ class ProcessingWorkbenchWidget(QWidget):
                 "Не закрывайте приложение до успешного сохранения.\n\n" + persistence_error,
             )
             return
-        # A new run is a candidate, not an accepted data revision. Show its
-        # result immediately so the user can inspect it before making a decision.
-        self._preview_selected()
+        # HKL is an analysis-only stage. Its result window needs only the small
+        # HKL artifact; loading the full upstream 3D scan and rebuilding maps/ROC
+        # for an unchanged input would add latency without changing the science.
+        if node.operation_id == "theory.identify_hkl":
+            popup = self._active_stage_popup
+            if popup is not None and getattr(popup, "_stage_node_id", None) == node_id:
+                self._start_hkl_result_preview(node_id)
+            return
+
+        # Other operations retain the established generic Scan/ROI preview.
+        self._start_preview_for_node(node_id, switch_tab=True, show_error_dialog=True)
 
     def _on_run_failed(self, node_id: str, error: str) -> None:
         persistence_error = None
@@ -2325,6 +2605,28 @@ class ProcessingWorkbenchWidget(QWidget):
         # A failed workflow node must expose its real exception immediately.
         # The full traceback remains in node.error and in the execution log;
         # QMessageBox's details section makes it accessible without opening JSON.
+        stage_popup = self._active_stage_popup
+        if (
+            stage_popup is not None
+            and self._active_stage_operation == "theory.identify_hkl"
+            and getattr(stage_popup, "_stage_node_id", None) == node_id
+        ):
+            stage_page = getattr(stage_popup, "_stage_form_page", None)
+            stage_status = getattr(stage_popup, "_stage_hkl_status", None)
+            stage_run_button = getattr(stage_popup, "_stage_run_button", None)
+            stage_cancel_button = getattr(stage_popup, "_stage_cancel_button", None)
+            if stage_page is not None:
+                stage_page.setEnabled(True)
+            if stage_status is not None:
+                stage_status.setText(
+                    "Расчёт не выполнен. Исправьте параметры и запустите новую попытку. "
+                    "Полная диагностика сохранена в журнале workflow."
+                )
+            if stage_run_button is not None:
+                stage_run_button.setText("Создать новую попытку")
+                stage_run_button.setEnabled(True)
+            if stage_cancel_button is not None:
+                stage_cancel_button.setText("Закрыть")
         node = self.project.history.get(node_id)
         lines = [line.strip() for line in str(error).splitlines() if line.strip()]
         cause = lines[-1] if lines else "Причина не была записана; откройте журнал выполнения."
@@ -2557,7 +2859,128 @@ class ProcessingWorkbenchWidget(QWidget):
         node_id = self._selected_node_id()
         if not node_id:
             return
+        node = self.project.history.get(node_id)
+        if node.operation_id == "theory.identify_hkl":
+            if node.status != NodeStatus.SUCCEEDED:
+                QMessageBox.information(
+                    self, "Предпросмотр HKL",
+                    "Сначала успешно выполните выбранный HKL-этап.",
+                )
+                return
+            popup_matches_node = (
+                self._active_stage_popup is not None
+                and getattr(self._active_stage_popup, "_stage_node_id", None) == node_id
+            )
+            if not popup_matches_node:
+                if not node.parent_ids:
+                    QMessageBox.warning(
+                        self, "Предпросмотр HKL",
+                        "У сохранённого HKL-узла отсутствует родительская ветвь.",
+                    )
+                    return
+                self._open_stage_configuration(
+                    node.parent_ids[0], "theory.identify_hkl", existing_node_id=node_id
+                )
+            if (
+                self._active_stage_popup is not None
+                and getattr(self._active_stage_popup, "_stage_node_id", None) == node_id
+            ):
+                self._start_hkl_result_preview(node_id)
+            return
         self._start_preview_for_node(node_id, switch_tab=True, show_error_dialog=True)
+
+    def _start_hkl_result_preview(self, node_id: str) -> bool:
+        """Attach cached data or start a lightweight artifact-only HKL read."""
+        popup = self._active_stage_popup
+        if popup is None or getattr(popup, "_stage_node_id", None) != node_id:
+            return False
+        cached = self._hkl_preview_cache.get(node_id)
+        if cached is not None:
+            self._apply_hkl_result_preview(node_id, cached)
+            return True
+        if node_id in self._hkl_preview_tasks:
+            return True
+        try:
+            task = _HklResultPreviewTask(
+                node_id, WorkflowHistory(list(self.project.history.nodes)),
+                str(self.project.artifact_store.directory),
+            )
+            task.signals.succeeded.connect(self._on_hkl_result_preview_ready)
+            task.signals.failed.connect(self._on_hkl_result_preview_failed)
+            self._hkl_preview_tasks[node_id] = task
+            status = getattr(popup, "_stage_hkl_status", None)
+            if status is not None:
+                status.setText("Загрузка таблиц HKL из сохранённого артефакта…")
+                status.show()
+            self.thread_pool.start(task)
+            return True
+        except Exception:
+            self._on_hkl_result_preview_failed(node_id, traceback.format_exc())
+            return False
+
+    def _on_hkl_result_preview_ready(self, node_id: str, preview: Any) -> None:
+        self._hkl_preview_tasks.pop(node_id, None)
+        self._hkl_preview_cache[node_id] = preview
+        # Keep only a small number of immutable result views in memory.
+        while len(self._hkl_preview_cache) > 3:
+            oldest_id = next(iter(self._hkl_preview_cache))
+            if oldest_id == node_id and len(self._hkl_preview_cache) > 1:
+                oldest_id = next(key for key in self._hkl_preview_cache if key != node_id)
+            self._hkl_preview_cache.pop(oldest_id, None)
+        self._apply_hkl_result_preview(node_id, preview)
+
+    def _apply_hkl_result_preview(self, node_id: str, preview: Any) -> None:
+        popup = self._active_stage_popup
+        if popup is None or getattr(popup, "_stage_node_id", None) != node_id:
+            return
+        panel = getattr(popup, "_stage_hkl_panel", None)
+        status = getattr(popup, "_stage_hkl_status", None)
+        if panel is None:
+            return
+        # The panel received its current theme when the popup was created and
+        # is updated by _apply_theme(). set_result() already performs the first
+        # complete draw; re-applying the theme here would render every chart a
+        # second time during the latency-sensitive preview path.
+        panel.set_result(preview)
+        panel.show()
+        if status is not None:
+            status.hide()
+        run_button = getattr(popup, "_stage_run_button", None)
+        if run_button is not None:
+            run_button.setText("Расчёт завершён")
+            run_button.setEnabled(False)
+            run_button.hide()
+        cancel_button = getattr(popup, "_stage_cancel_button", None)
+        if cancel_button is not None:
+            cancel_button.setText("Закрыть")
+        popup.adjustSize()
+        screen = QApplication.screenAt(popup.frameGeometry().center()) or QApplication.primaryScreen()
+        if screen is not None:
+            available = screen.availableGeometry()
+            max_height = max(260, int(available.height() * 0.80))
+            desired_height = min(max(360, popup.sizeHint().height()), max_height)
+            desired_width = min(popup.width(), max(320, available.width() - 16))
+            scroll = getattr(popup, "_stage_form_scroll", None)
+            if scroll is not None:
+                scroll.setMinimumHeight(0)
+                scroll.setMaximumHeight(max(180, desired_height - 82))
+            popup.setMaximumHeight(max_height)
+            popup.resize(desired_width, desired_height)
+        self.status_label.setText("Результат HKL загружен из сохранённого артефакта.")
+        self._log(f"HKL-предпросмотр загружен: {node_id}")
+
+    def _on_hkl_result_preview_failed(self, node_id: str, error: str) -> None:
+        self._hkl_preview_tasks.pop(node_id, None)
+        popup = self._active_stage_popup
+        if popup is not None and getattr(popup, "_stage_node_id", None) == node_id:
+            status = getattr(popup, "_stage_hkl_status", None)
+            if status is not None:
+                status.setText(
+                    "HKL-расчёт сохранён, но таблицы результата не удалось открыть. "
+                    "Подробности приведены в журнале workflow."
+                )
+                status.show()
+        self._log("Не удалось загрузить HKL-артефакт:\n" + error)
 
     def _start_preview_for_node(
         self, node_id: str, *, switch_tab: bool, show_error_dialog: bool
@@ -2657,6 +3080,31 @@ class ProcessingWorkbenchWidget(QWidget):
             view_state = context.get("view_state")
             if view_state is not None:
                 self.preview_state_ready.emit(view_state)
+            stage_popup = self._active_stage_popup
+            if (
+                node.operation_id == "theory.identify_hkl"
+                and stage_popup is not None
+                and getattr(stage_popup, "_stage_node_id", None) == node_id
+            ):
+                hkl_preview = getattr(view_state, "hkl_identification_preview", None)
+                stage_panel = getattr(stage_popup, "_stage_hkl_panel", None)
+                stage_status = getattr(stage_popup, "_stage_hkl_status", None)
+                if hkl_preview is not None and stage_panel is not None:
+                    if not getattr(stage_panel, "has_result", False):
+                        self._apply_hkl_result_preview(node_id, hkl_preview)
+                elif stage_status is not None:
+                    warning = (getattr(view_state, "metadata", {}) or {}).get(
+                        "hkl_identification_preview_warning"
+                    ) if view_state is not None else None
+                    stage_status.setText(
+                        "Расчёт завершён и сохранён, но подготовка таблиц предпросмотра не удалась. "
+                        + (str(warning) if warning else "Подробности доступны в журнале workflow.")
+                    )
+                    stage_status.show()
+                    stage_run_button = getattr(stage_popup, "_stage_run_button", None)
+                    if stage_run_button is not None:
+                        stage_run_button.setText("Расчёт завершён")
+                        stage_run_button.setEnabled(False)
             if node.operation_id == "theory.identify_hkl" and context.get("hkl_analysis") is not None:
                 hkl_bundle = context["hkl_analysis"]
                 theory_meta = (hkl_bundle.metadata or {}).get("theory", {})
@@ -2675,7 +3123,7 @@ class ProcessingWorkbenchWidget(QWidget):
                     f"пар с данными={theory_meta.get('pair_count', 0)}. "
                     + ("Ближайшие геометрические совпадения: " + "; ".join(best[:4])
                        if best else "Недостаточно принятых соответствий для ранжирования.")
-                    + " Вероятности не вычислялись; откройте секцию «Теоретическая идентификация HKL» в ROI Explorer."
+                    + " Вероятности не вычислялись; подробные таблицы и гистограммы расположены в окне HKL-этапа."
                 )
             elif node.operation_id == "peaks.branch_correlation" and context.get("branch_correlation") is not None:
                 correlation_bundle = context["branch_correlation"]
@@ -2748,6 +3196,23 @@ class ProcessingWorkbenchWidget(QWidget):
 
     def _on_preview_failed(self, node_id: str, error: str) -> None:
         self._active_preview_task = None
+        stage_popup = self._active_stage_popup
+        if (
+            stage_popup is not None
+            and self._active_stage_operation == "theory.identify_hkl"
+            and getattr(stage_popup, "_stage_node_id", None) == node_id
+        ):
+            stage_status = getattr(stage_popup, "_stage_hkl_status", None)
+            stage_run_button = getattr(stage_popup, "_stage_run_button", None)
+            if stage_status is not None:
+                stage_status.setText(
+                    "HKL-расчёт завершён, но предпросмотр результата не загрузился. "
+                    "Артефакт расчёта сохранён; подробности — в журнале workflow."
+                )
+                stage_status.show()
+            if stage_run_button is not None:
+                stage_run_button.setText("Расчёт сохранён")
+                stage_run_button.setEnabled(False)
         self.progress.setRange(0, 1)
         self.progress.setValue(0)
         self.status_label.setText("Не удалось загрузить предпросмотр")
