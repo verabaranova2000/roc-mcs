@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
+import pandas as pd
 
 
 @dataclass(frozen=True, slots=True)
@@ -348,6 +349,166 @@ def _fit_valid_mask(fit: Any, shape: tuple[int, int, int]) -> np.ndarray | None:
     return None
 
 
+
+def _hkl_alignment_map_layers(
+    preview: Any, branch_catalog: Any, shape_yx: tuple[int, int],
+) -> tuple[list[PreviewMapLayer], dict[str, Any], str | None]:
+    """Build sparse signed post-registration Δθ maps on either branch grid.
+
+    Correlation applies ``theta_partner + theta_shift_final`` in source
+    coordinates. Thus the residual is ``(theta_partner + shift) - theta_source``.
+    The same event residual is indexed once by source pixels and once by partner
+    pixels; no nearest-neighbour coordinate reconstruction is performed.
+    Many-to-one assignments are averaged per target pixel and described in the
+    layer metadata.
+    """
+    measurements = getattr(preview, "measurements", None)
+    statistics = getattr(preview, "pair_statistics", None)
+    required_catalog = {"peak_id", "branch_id", "x", "y"}
+    required_measurements = {
+        "pair_id", "source_branch_id", "partner_branch_id",
+        "source_peak_id", "matched_partner_peak_id",
+    }
+    required_statistics = {"pair_id", "theta_shift_final_arcsec"}
+    if measurements is None or statistics is None or branch_catalog is None:
+        return [], {}, "Недостаточно таблиц для построения карт выровненной Δθ."
+    if not required_catalog.issubset(getattr(branch_catalog, "columns", ())):
+        return [], {}, "branch_catalog не содержит peak_id, branch_id, x, y."
+    if not required_measurements.issubset(getattr(measurements, "columns", ())):
+        return [], {}, "Таблица HKL measurements не содержит точные идентификаторы назначенных пиков."
+    if not required_statistics.issubset(getattr(statistics, "columns", ())):
+        return [], {}, "Таблица HKL pair_statistics не содержит итоговый θ-сдвиг регистрации."
+    if getattr(measurements, "empty", True) or getattr(statistics, "empty", True):
+        return [], {}, "В HKL-результате нет измеренных соответствий для карты Δθ."
+
+    ny, nx = map(int, shape_yx)
+    catalog = branch_catalog.loc[:, ["peak_id", "branch_id", "x", "y"]].copy(deep=False)
+    if catalog["peak_id"].duplicated().any():
+        duplicated = catalog.loc[catalog["peak_id"].duplicated(keep=False), "peak_id"].head(5).tolist()
+        return [], {}, f"branch_catalog содержит неуникальные peak_id ({duplicated}); карту нельзя привязать однозначно."
+
+    source_catalog = catalog.rename(columns={
+        "peak_id": "source_peak_id", "branch_id": "catalog_source_branch_id",
+        "x": "source_x", "y": "source_y",
+    })
+    partner_catalog = catalog.rename(columns={
+        "peak_id": "matched_partner_peak_id", "branch_id": "catalog_partner_branch_id",
+        "x": "partner_x", "y": "partner_y",
+    })
+    merged = measurements.merge(
+        source_catalog, on="source_peak_id", how="inner", validate="many_to_one",
+    ).merge(
+        partner_catalog, on="matched_partner_peak_id", how="inner", validate="many_to_one",
+    )
+    stats = statistics.loc[:, ["pair_id", "theta_shift_final_arcsec"]].copy(deep=False)
+    if stats["pair_id"].duplicated().any():
+        return [], {}, "pair_statistics содержит повторные pair_id; θ-сдвиг неоднозначен."
+    merged = merged.merge(stats, on="pair_id", how="inner", validate="many_to_one")
+    if merged.empty:
+        return [], {}, "Ни одно HKL-соответствие не удалось однозначно связать с branch_catalog и θ-сдвигом."
+
+    # Prefer the stored signed measurement; for older compatible artifacts,
+    # derive it only from the exact per-event θ values (never from proximity).
+    if "delta_theta_signed_arcsec" in merged.columns:
+        signed = pd.to_numeric(merged["delta_theta_signed_arcsec"], errors="coerce")
+    elif {"theta_source_arcsec", "theta_partner_arcsec"}.issubset(merged.columns):
+        signed = (
+            pd.to_numeric(merged["theta_partner_arcsec"], errors="coerce")
+            - pd.to_numeric(merged["theta_source_arcsec"], errors="coerce")
+        )
+    else:
+        return [], {}, "В measurements отсутствуют знаковая Δθ или точные θ обеих назначенных вершин."
+    shifts = pd.to_numeric(merged["theta_shift_final_arcsec"], errors="coerce")
+    merged = merged.copy()
+    merged["_aligned_delta_theta"] = signed.to_numpy(dtype=np.float64) + shifts.to_numpy(dtype=np.float64)
+
+    layers: list[PreviewMapLayer] = []
+    pair_summary: dict[str, Any] = {}
+    group_name = "HKL · Δθ после совмещения"
+
+    def aggregate_on_grid(frame: Any, x_column: str, y_column: str) -> tuple[np.ndarray | None, int, int]:
+        x = pd.to_numeric(frame[x_column], errors="coerce").to_numpy(dtype=np.float64)
+        y = pd.to_numeric(frame[y_column], errors="coerce").to_numpy(dtype=np.float64)
+        values = pd.to_numeric(frame["_aligned_delta_theta"], errors="coerce").to_numpy(dtype=np.float64)
+        valid = np.isfinite(x) & np.isfinite(y) & np.isfinite(values)
+        valid &= (x == np.floor(x)) & (y == np.floor(y))
+        valid &= (x >= 0) & (x < nx) & (y >= 0) & (y < ny)
+        if not np.any(valid):
+            return None, 0, 0
+        xi = x[valid].astype(np.int64)
+        yi = y[valid].astype(np.int64)
+        vals = values[valid]
+        sums = np.zeros((ny, nx), dtype=np.float64)
+        counts = np.zeros((ny, nx), dtype=np.int64)
+        np.add.at(sums, (yi, xi), vals)
+        np.add.at(counts, (yi, xi), 1)
+        result = np.full((ny, nx), np.nan, dtype=np.float64)
+        occupied = counts > 0
+        result[occupied] = sums[occupied] / counts[occupied]
+        return result, int(vals.size), int(np.count_nonzero(counts > 1))
+
+    for pair_id, frame in merged.groupby("pair_id", sort=False):
+        source_ids = pd.to_numeric(frame["source_branch_id"], errors="coerce").to_numpy(dtype=np.float64)
+        partner_ids = pd.to_numeric(frame["partner_branch_id"], errors="coerce").to_numpy(dtype=np.float64)
+        source_ids = source_ids[np.isfinite(source_ids)]
+        partner_ids = partner_ids[np.isfinite(partner_ids)]
+        if source_ids.size == 0 or partner_ids.size == 0:
+            continue
+        source_value, partner_value = float(source_ids[0]), float(partner_ids[0])
+        if not source_value.is_integer() or not partner_value.is_integer():
+            continue
+        source_branch = int(source_value)
+        partner_branch = int(partner_value)
+        valid_branch_rows = (
+            pd.to_numeric(frame["source_branch_id"], errors="coerce").eq(source_branch)
+            & pd.to_numeric(frame["partner_branch_id"], errors="coerce").eq(partner_branch)
+            & pd.to_numeric(frame["catalog_source_branch_id"], errors="coerce").eq(source_branch)
+            & pd.to_numeric(frame["catalog_partner_branch_id"], errors="coerce").eq(partner_branch)
+        )
+        pair_frame = frame.loc[valid_branch_rows]
+        if pair_frame.empty:
+            continue
+        delta_source, n_source, duplicate_source = aggregate_on_grid(pair_frame, "source_x", "source_y")
+        delta_partner, n_partner, duplicate_partner = aggregate_on_grid(pair_frame, "partner_x", "partner_y")
+        source_key = f"hkl.delta_theta.pair_{source_branch}_{partner_branch}.source"
+        partner_key = f"hkl.delta_theta.pair_{source_branch}_{partner_branch}.partner"
+        formula = "остаток регистрации: (θпартнёр + θ-сдвиг) − θисходной; единицы — arcsec"
+        if delta_source is not None:
+            layers.append(PreviewMapLayer(
+                key=source_key,
+                label=f"Δθ · {source_branch}↔{partner_branch} · координаты {source_branch}",
+                data_yx=delta_source, group=group_name, unit="″",
+                description=(
+                    f"{formula}. Значения нанесены в пиксели исходной ветви {source_branch}; "
+                    f"N={n_source} точных назначений. "
+                    f"При нескольких назначениях в одном пикселе показано среднее "
+                    f"(таких пикселей: {duplicate_source})."
+                ),
+            ))
+        if delta_partner is not None:
+            layers.append(PreviewMapLayer(
+                key=partner_key,
+                label=f"Δθ · {source_branch}↔{partner_branch} · координаты {partner_branch}",
+                data_yx=delta_partner, group=group_name, unit="″",
+                description=(
+                    f"{formula}. Значения нанесены в пиксели партнёрской ветви {partner_branch}; "
+                    f"знак остатка по-прежнему определён относительно исходной ветви {source_branch}. "
+                    f"N={n_partner} точных назначений. "
+                    f"При нескольких назначениях в одном пикселе показано среднее "
+                    f"(таких пикселей: {duplicate_partner})."
+                ),
+            ))
+        pair_summary[str(pair_id)] = {
+            "source_branch_id": source_branch, "partner_branch_id": partner_branch,
+            "matched_events": int(len(pair_frame)),
+            "source_occupied_pixels": int(np.isfinite(delta_source).sum()) if delta_source is not None else 0,
+            "partner_occupied_pixels": int(np.isfinite(delta_partner).sum()) if delta_partner is not None else 0,
+        }
+
+    if not layers:
+        return [], {}, "Не удалось построить карты: после проверки peak_id, сдвигов и координат не осталось валидных точек."
+    return layers, pair_summary, None
+
 def build_workflow_preview_state(
     node: Any,
     context: dict[str, Any],
@@ -638,6 +799,26 @@ def build_workflow_preview_state(
                 "measurement_count": int(len(hkl_identification_preview.measurements)),
                 "crystal_name": hkl_identification_preview.metadata.get("crystal_name", ""),
             }
+            try:
+                alignment_layers, alignment_summary, alignment_warning = _hkl_alignment_map_layers(
+                    hkl_identification_preview, branch_catalog, (ny, nx),
+                )
+                layers.extend(alignment_layers)
+                if alignment_layers:
+                    metadata["hkl_alignment_maps"] = {
+                        "layer_count": len(alignment_layers),
+                        "pairs": alignment_summary,
+                        "definition": "(theta_partner + theta_shift_final_arcsec) - theta_source",
+                        "unit": "arcsec",
+                        "aggregation": "mean_per_reference_pixel",
+                    }
+                elif alignment_warning:
+                    metadata["hkl_alignment_map_warning"] = alignment_warning
+            except Exception as exc:
+                # A spatial-map adapter failure must not hide valid HKL tables.
+                metadata["hkl_alignment_map_warning"] = (
+                    f"Карта выровненной Δθ недоступна: {type(exc).__name__}: {exc}"
+                )
         except Exception as exc:
             # The scientific HDF5 artifact remains available for explicit
             # inspection even if a future schema cannot be rendered.
@@ -660,7 +841,12 @@ def build_workflow_preview_state(
         default_map = "peaks.count"
     elif node.operation_id == "fit.scan":
         default_map = next((key for key in ("fit.rmse", "fit.redchi", "fit.n_fitted", "fit.n_fitted_map") if any(layer.key == key for layer in layers)), default_map)
-    elif node.operation_id in {"peaks.branches", "peaks.branch_correlation", "theory.identify_hkl"} and any(
+    elif node.operation_id == "theory.identify_hkl":
+        default_map = next(
+            (layer.key for layer in layers if layer.key.startswith("hkl.delta_theta.")),
+            "branches.count" if any(layer.key == "branches.count" for layer in layers) else default_map,
+        )
+    elif node.operation_id in {"peaks.branches", "peaks.branch_correlation"} and any(
         layer.key == "branches.count" for layer in layers
     ):
         default_map = "branches.count"

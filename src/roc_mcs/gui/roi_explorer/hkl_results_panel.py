@@ -14,7 +14,7 @@ from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
 from matplotlib.ticker import ScalarFormatter
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QSize
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -24,7 +24,7 @@ from PyQt6.QtWidgets import (
     QHeaderView,
     QHBoxLayout,
     QLabel,
-    QScrollBar,
+    QToolButton,
     QSizePolicy,
     QTabWidget,
     QTableWidget,
@@ -36,11 +36,12 @@ from PyQt6.QtWidgets import (
 from roc_mcs.gui.roi_explorer.hkl_plot_utils import (
     build_histogram_edges,
     histogram_view_bounds,
-    zoomed_view_bounds,
     suggest_histogram_bin_width,
     comparison_axis_parameters,
 )
 from roc_mcs.gui.roi_explorer.theme import theme_colors
+from roc_mcs.gui.roi_explorer.plot_toolbar_style import ICON_DIR
+from roc_mcs.gui.components.icon_provider import svg_icon
 
 
 class HklResultsPanel(QWidget):
@@ -48,7 +49,6 @@ class HklResultsPanel(QWidget):
 
     _DEFAULT_BIN_WIDTH_ARCSEC = 0.25
     _MAX_HISTOGRAM_BINS = 1200
-    _ZOOM_FACTORS = (1.0, 2.0, 4.0, 8.0, 16.0)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -62,6 +62,16 @@ class HklResultsPanel(QWidget):
         self._reflection_x = np.empty(0, dtype=np.float64)
         self._ranking_by_pair: dict[str, pd.DataFrame] = {}
         self._histogram_cache: dict[str, Any] | None = None
+        self._histogram_axes = None
+        self._histogram_full_xlim: tuple[float, float] | None = None
+        self._histogram_full_ylim: tuple[float, float] | None = None
+        self._histogram_view_limits: tuple[float, float, float, float] | None = None
+        self._histogram_drag_state: dict[str, Any] | None = None
+        self._selected_reflection_row = -1
+        self._reflection_catalog = pd.DataFrame()
+        self._rank_label_artists = []
+        self._selected_reflection_artist = None
+        self._selected_reflection_marker = None
 
         root = QVBoxLayout(self)
         root.setContentsMargins(2, 2, 2, 2)
@@ -119,36 +129,6 @@ class HklResultsPanel(QWidget):
         pair_row.addWidget(self.bin_width_effective_label)
         root.addLayout(pair_row)
 
-        range_row = QHBoxLayout()
-        range_row.setContentsMargins(0, 0, 0, 0)
-        range_row.setSpacing(6)
-        zoom_label = QLabel("Масштаб:", self)
-        zoom_label.setObjectName("hklControlLabel")
-        range_row.addWidget(zoom_label)
-        self.zoom_combo = QComboBox(self)
-        self.zoom_combo.setObjectName("hklHistogramZoom")
-        for factor, label in zip(
-            self._ZOOM_FACTORS,
-            ("Весь диапазон", "2×", "4×", "8×", "16×"),
-        ):
-            self.zoom_combo.addItem(label, factor)
-        self.zoom_combo.setCurrentIndex(0)
-        self.zoom_combo.setFixedWidth(104)
-        self.zoom_combo.currentIndexChanged.connect(self._on_zoom_changed)
-        range_row.addWidget(self.zoom_combo)
-        self.range_scrollbar = QScrollBar(Qt.Orientation.Horizontal, self)
-        self.range_scrollbar.setObjectName("hklHistogramRangeScroll")
-        self.range_scrollbar.setRange(0, 1000)
-        self.range_scrollbar.setPageStep(100)
-        self.range_scrollbar.setSingleStep(20)
-        self.range_scrollbar.setEnabled(False)
-        self.range_scrollbar.setToolTip(
-            "Перемещение по оси |Δθ| при увеличенном масштабе."
-        )
-        self.range_scrollbar.valueChanged.connect(self._draw_histogram_view)
-        range_row.addWidget(self.range_scrollbar, 1)
-        root.addLayout(range_row)
-
         self.tabs = QTabWidget(self)
         self.tabs.setObjectName("hklResultTabs")
         self.tabs.setMinimumHeight(0)
@@ -159,13 +139,45 @@ class HklResultsPanel(QWidget):
         pair_layout = QVBoxLayout(self.pair_tab)
         pair_layout.setContentsMargins(1, 1, 1, 1)
         pair_layout.setSpacing(2)
-        self.pair_chart_figure = Figure(figsize=(5.2, 1.58), dpi=96)
+        plot_toolbar = QHBoxLayout()
+        plot_toolbar.setContentsMargins(2, 0, 2, 0)
+        plot_toolbar.setSpacing(4)
+        self.plot_hint_label = QLabel(
+            "Колесо — масштаб · перетаскивание — сдвиг · Ctrl — θ · Shift — Y",
+            self.pair_tab,
+        )
+        self.plot_hint_label.setObjectName("hklPlotHint")
+        self.plot_hint_label.setToolTip(
+            "Колесо мыши: приблизить/отдалить обе оси вокруг курсора. "
+            "Ctrl + колесо или перетаскивание: только θ; Shift: только частота Y. "
+            "Перетаскивание левой кнопкой перемещает диапазон по обеим осям."
+        )
+        plot_toolbar.addWidget(self.plot_hint_label, 1)
+        self.reset_view_button = QToolButton(self.pair_tab)
+        self.reset_view_button.setObjectName("hklResetViewButton")
+        self.reset_view_button.setAutoRaise(True)
+        self.reset_view_button.setFixedSize(23, 21)
+        self.reset_view_button.setIcon(svg_icon(ICON_DIR / "zoom_out_map.svg", widget=self.reset_view_button))
+        self.reset_view_button.setIconSize(QSize(14, 14))
+        self.reset_view_button.setToolTip("Сбросить масштаб и положение обеих осей")
+        self.reset_view_button.setAccessibleName("Сбросить масштаб гистограммы HKL")
+        self.reset_view_button.clicked.connect(self._reset_histogram_view)
+        plot_toolbar.addWidget(self.reset_view_button, 0, Qt.AlignmentFlag.AlignRight)
+        pair_layout.addLayout(plot_toolbar)
+
+        self.pair_chart_figure = Figure(figsize=(5.2, 2.42), dpi=96)
         self.pair_canvas = FigureCanvasQTAgg(self.pair_chart_figure)
-        self.pair_canvas.setMinimumHeight(142)
-        self.pair_canvas.setMaximumHeight(174)
+        self.pair_canvas.setMinimumHeight(220)
+        self.pair_canvas.setMaximumHeight(258)
         self.pair_canvas.setMinimumWidth(0)
         self.pair_canvas.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         pair_layout.addWidget(self.pair_canvas)
+        self._histogram_event_ids = [
+            self.pair_canvas.mpl_connect("scroll_event", self._on_histogram_scroll),
+            self.pair_canvas.mpl_connect("button_press_event", self._on_histogram_press),
+            self.pair_canvas.mpl_connect("button_release_event", self._on_histogram_release),
+            self.pair_canvas.mpl_connect("motion_notify_event", self._on_histogram_motion),
+        ]
 
         self.pair_stats_label = QLabel("", self.pair_tab)
         self.pair_stats_label.setWordWrap(True)
@@ -176,8 +188,9 @@ class HklResultsPanel(QWidget):
         self.reflection_table = self._make_table(
             ["#", "HKL", "d, Å", "θ₁, °", "Δθтеор, ″", "|Δ−med|, ″", "|F_H|²", "Darwin σ/π, ″"],
             [34, 64, 70, 70, 82, 82, 74, 96],
-            max_height=132,
+            max_height=202,
         )
+        self.reflection_table.currentCellChanged.connect(self._on_reflection_row_changed)
         pair_layout.addWidget(self.reflection_table)
         self.tabs.addTab(self.pair_tab, "Пара и рефлексы")
 
@@ -185,17 +198,17 @@ class HklResultsPanel(QWidget):
         all_layout = QVBoxLayout(self.all_pairs_tab)
         all_layout.setContentsMargins(1, 1, 1, 1)
         all_layout.setSpacing(2)
-        self.all_chart_figure = Figure(figsize=(5.2, 1.58), dpi=96)
+        self.all_chart_figure = Figure(figsize=(5.2, 2.22), dpi=96)
         self.all_canvas = FigureCanvasQTAgg(self.all_chart_figure)
-        self.all_canvas.setMinimumHeight(146)
-        self.all_canvas.setMaximumHeight(180)
+        self.all_canvas.setMinimumHeight(210)
+        self.all_canvas.setMaximumHeight(238)
         self.all_canvas.setMinimumWidth(0)
         self.all_canvas.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         all_layout.addWidget(self.all_canvas)
         self.pair_table = self._make_table(
             ["Пара", "Назнач. / uniq.", "Медиана, ″", "Q10–Q90, ″", "HKL", "Ошибка, ″", "Статус"],
             [68, 96, 84, 96, 58, 80, 98],
-            max_height=132,
+            max_height=176,
         )
         all_layout.addWidget(self.pair_table)
         self.tabs.addTab(self.all_pairs_tab, "Сравнение пар")
@@ -305,11 +318,11 @@ class HklResultsPanel(QWidget):
             f"QLabel#hklSummary {{ color:{colors['text']}; font-size:9px; font-weight:600; }}"
             f"QLabel#hklControlLabel, QLabel#hklMethodNote {{ color:{colors['muted']}; font-size:8px; }}"
             f"QLabel#hklPairStatistics {{ color:{colors['text']}; font-size:8px; }}"
-            f"QComboBox#hklPairSelector, QComboBox#hklHistogramZoom, "
+            f"QComboBox#hklPairSelector, "
             f"QDoubleSpinBox#hklHistogramBinWidth {{ color:{colors['text']}; background:{colors['base']}; "
             f"border:1px solid {colors['border']}; min-height:20px; max-height:22px; "
             f"padding:0px 3px; font-size:9px; }}"
-            f"QComboBox#hklPairSelector QAbstractItemView, QComboBox#hklHistogramZoom QAbstractItemView {{ "
+            f"QComboBox#hklPairSelector QAbstractItemView {{ "
             f"background:{colors['base']}; color:{colors['text']}; selection-background-color:{colors['highlight']}; }}"
             f"QTableWidget {{ background:{colors['base']}; color:{colors['text']}; "
             f"alternate-background-color:{colors['alternate']}; gridline-color:{colors['border']}; "
@@ -322,10 +335,13 @@ class HklResultsPanel(QWidget):
             f"QTabBar::tab {{ background:{colors['button']}; color:{colors['text']}; "
             f"border:1px solid {colors['border']}; padding:3px 8px; font-size:8px; }}"
             f"QTabBar::tab:selected {{ background:{colors['base']}; border-bottom-color:{colors['base']}; }}"
-            f"QScrollBar:horizontal {{ background:{colors['window']}; height:11px; margin:1px 0px; }}"
-            f"QScrollBar::handle:horizontal {{ background:{colors['border']}; min-width:24px; border-radius:4px; }}"
-            f"QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width:0px; }}"
+            f"QLabel#hklPlotHint {{ color:{colors['muted']}; font-size:7px; }}"
+            f"QToolButton#hklResetViewButton {{ border:1px solid transparent; border-radius:2px; padding:0px; }}"
+            f"QToolButton#hklResetViewButton:hover {{ background:{colors['button']}; border:1px solid {colors['border']}; }}"
         )
+        self.reset_view_button.setIcon(svg_icon(
+            ICON_DIR / "zoom_out_map.svg", color=colors["text"], widget=self.reset_view_button
+        ))
         if self._result is None:
             self._draw_empty(self.pair_chart_figure, self.pair_canvas, "Ожидается результат HKL")
             self._draw_empty(self.all_chart_figure, self.all_canvas, "Нет данных для сравнения пар")
@@ -355,8 +371,15 @@ class HklResultsPanel(QWidget):
             self.pair_combo.setEnabled(False)
             self.bin_width_spin.setEnabled(False)
             self.bin_width_effective_label.setText("")
-            self.zoom_combo.setEnabled(False)
-            self.range_scrollbar.setEnabled(False)
+            self._histogram_view_limits = None
+            self._histogram_axes = None
+            self._histogram_full_xlim = None
+            self._histogram_full_ylim = None
+            self._selected_reflection_row = -1
+            self._reflection_catalog = pd.DataFrame()
+            self._rank_label_artists = []
+            self._selected_reflection_artist = None
+            self._selected_reflection_marker = None
             self.pair_combo.blockSignals(False)
             return
 
@@ -390,12 +413,12 @@ class HklResultsPanel(QWidget):
             self.pair_combo.addItem(f"{row.pair_id} · N={count}", str(row.pair_id))
         self.pair_combo.setEnabled(self.pair_combo.count() > 0)
         self.bin_width_spin.setEnabled(self.pair_combo.count() > 0)
-        self.zoom_combo.setEnabled(self.pair_combo.count() > 0)
-        self.range_scrollbar.setEnabled(False)
-        self.range_scrollbar.setValue(0)
-        self.zoom_combo.blockSignals(True)
-        self.zoom_combo.setCurrentIndex(0)
-        self.zoom_combo.blockSignals(False)
+        self._histogram_view_limits = None
+        self._selected_reflection_row = -1
+        self._reflection_catalog = reflections.loc[:, [
+            name for name in ("hkl", "delta_theta_arcsec", "theta_ka1_deg", "d_A")
+            if name in reflections.columns
+        ]].copy(deep=True)
         all_measurements = (
             np.concatenate(tuple(self._measurement_values_by_pair.values()))
             if self._measurement_values_by_pair else np.empty(0, dtype=np.float64)
@@ -441,6 +464,19 @@ class HklResultsPanel(QWidget):
             self._draw_empty(self.pair_chart_figure, self.pair_canvas, "Нет измеренных пар")
 
     def _draw_empty(self, figure: Figure, canvas: FigureCanvasQTAgg, message: str) -> None:
+        if figure is self.pair_chart_figure:
+            self._histogram_axes = None
+            self._histogram_full_xlim = None
+            self._histogram_full_ylim = None
+            self._histogram_view_limits = None
+            self._histogram_drag_state = None
+            self._rank_label_artists = []
+            self._selected_reflection_artist = None
+            self._selected_reflection_marker = None
+            self._selected_reflection_row = -1
+            self.plot_hint_label.setText(
+                "Колесо — масштаб · перетаскивание — сдвиг · Ctrl — θ · Shift — Y"
+            )
         figure.clear()
         ax = figure.add_subplot(111)
         colors = theme_colors(self._theme)
@@ -454,21 +490,11 @@ class HklResultsPanel(QWidget):
         canvas.draw_idle()
 
     def _on_pair_changed(self, _index: int) -> None:
+        self._selected_reflection_row = -1
         self._render_selected_pair(reset_view=True)
 
     def _on_bin_width_changed(self, _value: float) -> None:
         self._render_selected_pair(reset_view=True)
-
-    def _on_zoom_changed(self, _index: int) -> None:
-        factor = float(self.zoom_combo.currentData() or 1.0)
-        zoomed = factor > 1.0
-        self.range_scrollbar.setEnabled(zoomed and self._histogram_cache is not None)
-        previous_block = self.range_scrollbar.blockSignals(True)
-        try:
-            self.range_scrollbar.setValue(500 if zoomed else 0)
-        finally:
-            self.range_scrollbar.blockSignals(previous_block)
-        self._draw_histogram_view()
 
     def _render_selected_pair(self, _value: Any = None, *, reset_view: bool = False) -> None:
         if self._result is None or self.pair_combo.currentIndex() < 0:
@@ -506,6 +532,9 @@ class HklResultsPanel(QWidget):
                 "для ранжирования требуется не менее двух назначений."
             )
 
+        previous_selected_row = (
+            self.reflection_table.currentRow() if not reset_view else -1
+        )
         rows: list[list[str]] = []
         for row in ranking.head(15).itertuples(index=False):
             structure_factor_sq = getattr(row, "FH_sq", np.nan)
@@ -520,16 +549,13 @@ class HklResultsPanel(QWidget):
                 f"{self._fmt(getattr(row, 'darwin_pi_arcsec', np.nan), 3)}",
             ])
         self._set_table(self.reflection_table, rows)
+        self.reflection_table.clearSelection()
+        self.reflection_table.setCurrentCell(-1, -1)
+        self._selected_reflection_row = -1
         if reset_view:
-            zoom_blocked = self.zoom_combo.blockSignals(True)
-            scroll_blocked = self.range_scrollbar.blockSignals(True)
-            try:
-                self.zoom_combo.setCurrentIndex(0)
-                self.range_scrollbar.setValue(0)
-                self.range_scrollbar.setEnabled(False)
-            finally:
-                self.zoom_combo.blockSignals(zoom_blocked)
-                self.range_scrollbar.blockSignals(scroll_blocked)
+            self._histogram_view_limits = None
+        elif 0 <= previous_selected_row < self.reflection_table.rowCount():
+            self.reflection_table.setCurrentCell(previous_selected_row, 0)
         self._draw_histogram_view()
 
     def _prepare_pair_histogram(
@@ -538,9 +564,11 @@ class HklResultsPanel(QWidget):
         if values.size == 0:
             self._histogram_cache = None
             self.bin_width_effective_label.setText("")
+            self._histogram_axes = None
+            self._histogram_full_xlim = None
+            self._histogram_full_ylim = None
+            self._histogram_view_limits = None
             self._draw_empty(self.pair_chart_figure, self.pair_canvas, "Нет конечных измеренных Δθ")
-            self.range_scrollbar.setEnabled(False)
-            self.zoom_combo.setEnabled(False)
             return
 
         edges = build_histogram_edges(
@@ -592,23 +620,22 @@ class HklResultsPanel(QWidget):
             "median": self._as_float(stats.get("delta_theta_abs_median_arcsec")),
             "mean": self._as_float(stats.get("delta_theta_abs_mean_arcsec")),
         }
-        self.zoom_combo.setEnabled(True)
-        self.range_scrollbar.setEnabled(float(self.zoom_combo.currentData() or 1.0) > 1.0)
+        self._histogram_full_xlim = tuple(map(float, full_bounds))
+        self._histogram_full_ylim = (0.0, max(1.0, float(counts.max(initial=0))) * 1.48)
 
     def _draw_histogram_view(self, _value: int | None = None) -> None:
         cache = self._histogram_cache
         if cache is None:
             return
 
-        factor = float(self.zoom_combo.currentData() or 1.0)
-        fraction = self.range_scrollbar.value() / 1000.0
-        view_low, view_high = zoomed_view_bounds(
-            cache["full_bounds"], factor, fraction
-        )
-
         figure = self.pair_chart_figure
         figure.clear()
+        self._rank_label_artists = []
+        self._selected_reflection_artist = None
+        self._selected_reflection_marker = None
         ax = figure.add_subplot(111)
+        self._histogram_axes = ax
+        self._histogram_drag_state = None
         colors = theme_colors(self._theme)
         figure.patch.set_facecolor(colors["canvas"])
         ax.set_facecolor(colors["axes"])
@@ -622,6 +649,7 @@ class HklResultsPanel(QWidget):
             counts, edges, baseline=0,
             fill=True, color=histogram_color,
             edgecolor=colors["border"], linewidth=0.45, alpha=0.78, zorder=2,
+            label="Измеренные назначения",
         )
 
         median = float(cache["median"])
@@ -637,27 +665,34 @@ class HklResultsPanel(QWidget):
                 label=f"Среднее {mean:.2f}″", zorder=4,
             )
 
+        full_low, full_high = cache["full_bounds"]
+        full_y_low, full_y_high = self._histogram_full_ylim or (0.0, max_count * 1.48)
+        limits = self._histogram_view_limits
+        if limits is None:
+            view_low, view_high, view_y_low, view_y_high = full_low, full_high, full_y_low, full_y_high
+        else:
+            view_low, view_high, view_y_low, view_y_high = limits
+            view_low, view_high = self._clamp_interval(view_low, view_high, full_low, full_high)
+            view_y_low, view_y_high = self._clamp_interval(view_y_low, view_y_high, full_y_low, full_y_high)
+            self._histogram_view_limits = (view_low, view_high, view_y_low, view_y_high)
+
         reflection_x = np.asarray(cache["reflection_x"], dtype=np.float64)
         left_index = int(np.searchsorted(reflection_x, view_low, side="left"))
         right_index = int(np.searchsorted(reflection_x, view_high, side="right"))
         visible_reflections = reflection_x[left_index:right_index]
-        # One LineCollection is substantially cheaper than creating one
-        # Line2D artist per theoretical reflection.
         if visible_reflections.size:
             visible_reflections = np.unique(visible_reflections)
-            # A line per sub-pixel reflection creates a dark solid block without
-            # adding information. Preserve one real position per display pixel.
             axes_width_px = max(1, int(ax.get_position().width * figure.get_figwidth() * figure.dpi))
             if visible_reflections.size > axes_width_px * 2:
                 pixel_index = np.floor(
-                    (visible_reflections - view_low) / (view_high - view_low) * axes_width_px
+                    (visible_reflections - view_low) / max(view_high - view_low, np.finfo(float).eps) * axes_width_px
                 ).astype(np.int64)
                 _, first_index = np.unique(pixel_index, return_index=True)
                 visible_reflections = visible_reflections[np.sort(first_index)]
             ax.vlines(
                 visible_reflections, 0.0, max_count * 1.30,
                 color=colors["muted"], linewidth=0.48, alpha=0.56, zorder=3,
-                rasterized=True,
+                rasterized=True, label="Теоретические рефлексы",
             )
 
         best_x = float(cache["best_x"])
@@ -667,7 +702,7 @@ class HklResultsPanel(QWidget):
                 label=f"Лучший HKL {best_x:.2f}″", zorder=6,
             )
 
-        ax.set_ylim(0.0, max_count * 1.48)
+        ax.set_ylim(view_y_low, view_y_high)
         ax.set_xlim(view_low, view_high)
         ax.set_xlabel("Абсолютное экспериментальное разделение |Δθ|, ″", fontsize=7.5, labelpad=2)
         ax.set_ylabel("Частота", fontsize=7.5, labelpad=2)
@@ -675,8 +710,9 @@ class HklResultsPanel(QWidget):
         ax.grid(axis="y", color=colors["grid"], linewidth=0.5, alpha=0.32, zorder=0)
         ax.set_axisbelow(True)
         legend = ax.legend(
-            frameon=False, fontsize=6.2, loc="upper right",
-            borderaxespad=0.25, ncol=3, handlelength=1.7,
+            frameon=False, fontsize=5.9, loc="upper center",
+            bbox_to_anchor=(0.5, -0.29), borderaxespad=0.0,
+            ncol=3, handlelength=1.45, columnspacing=0.9, labelspacing=0.35,
         )
         if legend is not None:
             for label in legend.get_texts():
@@ -695,36 +731,211 @@ class HklResultsPanel(QWidget):
         ax.xaxis.label.set_color(colors["text"])
         ax.yaxis.label.set_color(colors["text"])
         ax.title.set_color(colors["text"])
-        figure.subplots_adjust(left=0.085, right=0.992, bottom=0.23, top=0.82)
-        self._add_rank_labels(
+        figure.subplots_adjust(left=0.085, right=0.992, bottom=0.27, top=0.81)
+        self._rank_label_artists = self._add_rank_labels(
             ax, cache["ranking_x"], cache["ranking_ranks"],
             view_low, view_high, label_color=colors["text"],
         )
+        self._draw_selected_reflection_overlay()
         self.pair_canvas.draw_idle()
+
+    @staticmethod
+    def _clamp_interval(low: float, high: float, bound_low: float, bound_high: float) -> tuple[float, float]:
+        """Clamp a finite viewport while preserving its span where possible."""
+        low, high = float(low), float(high)
+        if not (np.isfinite(low) and np.isfinite(high) and high > low):
+            return float(bound_low), float(bound_high)
+        bound_span = float(bound_high - bound_low)
+        span = min(high - low, bound_span)
+        if low < bound_low:
+            low = bound_low
+            high = low + span
+        if high > bound_high:
+            high = bound_high
+            low = high - span
+        return float(low), float(high)
+
+    @staticmethod
+    def _event_modifier(event, modifier: str) -> bool:
+        key = str(getattr(event, "key", "") or "").lower()
+        return modifier in key
+
+    def _on_histogram_scroll(self, event) -> None:
+        ax = self._histogram_axes
+        if ax is None or event.inaxes is not ax or event.xdata is None or event.ydata is None:
+            return
+        x_only = self._event_modifier(event, "control") or self._event_modifier(event, "ctrl")
+        y_only = self._event_modifier(event, "shift")
+        if x_only and y_only:
+            return
+        scale = 1.22 if getattr(event, "step", 0) > 0 else (1.0 / 1.22)
+        xlim = tuple(map(float, ax.get_xlim()))
+        ylim = tuple(map(float, ax.get_ylim()))
+        new_xlim, new_ylim = xlim, ylim
+        if not y_only:
+            new_xlim = self._zoom_interval(xlim, float(event.xdata), scale, self._histogram_full_xlim)
+        if not x_only:
+            new_ylim = self._zoom_interval(ylim, float(event.ydata), scale, self._histogram_full_ylim)
+        self._apply_histogram_limits(new_xlim, new_ylim)
+
+    @staticmethod
+    def _zoom_interval(limits, anchor: float, scale: float, bounds) -> tuple[float, float]:
+        low, high = map(float, limits)
+        span = (high - low) / float(scale)
+        if not np.isfinite(span) or span <= 0.0:
+            return low, high
+        fraction = float(np.clip((anchor - low) / max(high - low, np.finfo(float).eps), 0.0, 1.0))
+        new_low = anchor - fraction * span
+        new_high = new_low + span
+        if bounds is not None:
+            new_low, new_high = HklResultsPanel._clamp_interval(new_low, new_high, *bounds)
+        return float(new_low), float(new_high)
+
+    def _on_histogram_press(self, event) -> None:
+        ax = self._histogram_axes
+        if ax is None or event.inaxes is not ax or event.button != 1 or event.xdata is None or event.ydata is None:
+            return
+        x_only = self._event_modifier(event, "control") or self._event_modifier(event, "ctrl")
+        y_only = self._event_modifier(event, "shift")
+        xlim = tuple(map(float, ax.get_xlim()))
+        ylim = tuple(map(float, ax.get_ylim()))
+        bbox = ax.get_window_extent()
+        self._histogram_drag_state = {
+            "pixel_x": float(event.x), "pixel_y": float(event.y),
+            "xlim": xlim, "ylim": ylim,
+            "x_per_pixel": (xlim[1] - xlim[0]) / max(float(bbox.width), 1.0),
+            "y_per_pixel": (ylim[1] - ylim[0]) / max(float(bbox.height), 1.0),
+            "x_only": x_only, "y_only": y_only,
+        }
+        self.pair_canvas.setCursor(Qt.CursorShape.ClosedHandCursor)
+
+    def _on_histogram_release(self, _event) -> None:
+        if self._histogram_drag_state is not None:
+            self._histogram_drag_state = None
+            self.pair_canvas.unsetCursor()
+
+    def _on_histogram_motion(self, event) -> None:
+        ax = self._histogram_axes
+        if ax is None:
+            return
+        state = self._histogram_drag_state
+        if state is not None and event.inaxes is ax and event.x is not None and event.y is not None:
+            dx = (float(event.x) - state["pixel_x"]) * state["x_per_pixel"]
+            dy = (float(event.y) - state["pixel_y"]) * state["y_per_pixel"]
+            xlim = state["xlim"]
+            ylim = state["ylim"]
+            new_xlim = xlim if state["y_only"] else (xlim[0] - dx, xlim[1] - dx)
+            new_ylim = ylim if state["x_only"] else (ylim[0] - dy, ylim[1] - dy)
+            if self._histogram_full_xlim is not None:
+                new_xlim = self._clamp_interval(*new_xlim, *self._histogram_full_xlim)
+            if self._histogram_full_ylim is not None:
+                new_ylim = self._clamp_interval(*new_ylim, *self._histogram_full_ylim)
+            self._apply_histogram_limits(new_xlim, new_ylim)
+            return
+        if event.inaxes is ax and event.x is not None and event.y is not None:
+            self._update_reflection_hover(float(event.x))
+        elif self.plot_hint_label is not None:
+            self.plot_hint_label.setText("Колесо — масштаб · перетаскивание — сдвиг · Ctrl — θ · Shift — Y")
+
+    def _apply_histogram_limits(self, xlim, ylim) -> None:
+        ax = self._histogram_axes
+        if ax is None:
+            return
+        xlim = self._clamp_interval(*xlim, *(self._histogram_full_xlim or xlim))
+        ylim = self._clamp_interval(*ylim, *(self._histogram_full_ylim or ylim))
+        ax.set_xlim(*xlim)
+        ax.set_ylim(*ylim)
+        self._histogram_view_limits = (*xlim, *ylim)
+        self._refresh_rank_labels()
+        self._draw_selected_reflection_overlay()
+        self.pair_canvas.draw_idle()
+
+    def _reset_histogram_view(self) -> None:
+        if self._histogram_cache is None:
+            return
+        self._histogram_view_limits = None
+        self._draw_histogram_view()
+
+    def _on_reflection_row_changed(self, row: int, _column: int, _previous_row: int, _previous_column: int) -> None:
+        self._selected_reflection_row = int(row) if row >= 0 else -1
+        self._draw_selected_reflection_overlay()
+        if self._histogram_axes is not None:
+            self.pair_canvas.draw_idle()
+
+    def _draw_selected_reflection_overlay(self) -> None:
+        ax = self._histogram_axes
+        if ax is None or self._histogram_cache is None:
+            return
+        for old in (
+            getattr(self, "_selected_reflection_artist", None),
+            getattr(self, "_selected_reflection_marker", None),
+        ):
+            if old is not None:
+                try:
+                    old.remove()
+                except (ValueError, AttributeError):
+                    pass
+        self._selected_reflection_artist = None
+        self._selected_reflection_marker = None
+        row = self._selected_reflection_row
+        ranking_x = np.asarray(self._histogram_cache.get("ranking_x", ()), dtype=np.float64)
+        if row < 0 or row >= ranking_x.size or not np.isfinite(ranking_x[row]):
+            return
+        x_value = float(ranking_x[row])
+        low, high = ax.get_xlim()
+        if not low <= x_value <= high:
+            return
+        colors = theme_colors(self._theme)
+        self._selected_reflection_artist = ax.axvline(
+            x_value, color=colors["roi"], linewidth=2.0, linestyle=(0, (3, 1)),
+            alpha=1.0, zorder=12,
+        )
+        marker = ax.plot(
+            [x_value], [0.985], marker="v", markersize=4.2,
+            markerfacecolor=colors["roi"], markeredgecolor=colors["canvas"],
+            markeredgewidth=0.45, transform=ax.get_xaxis_transform(),
+            clip_on=True, zorder=13,
+        )
+        self._selected_reflection_marker = marker[0]
+
+    def _refresh_rank_labels(self) -> None:
+        ax = self._histogram_axes
+        cache = self._histogram_cache
+        if ax is None or cache is None:
+            return
+        for artist in self._rank_label_artists:
+            try:
+                artist.remove()
+            except (ValueError, AttributeError):
+                pass
+        colors = theme_colors(self._theme)
+        low, high = map(float, ax.get_xlim())
+        self._rank_label_artists = self._add_rank_labels(
+            ax, cache["ranking_x"], cache["ranking_ranks"], low, high,
+            label_color=colors["text"],
+        )
 
     @staticmethod
     def _add_rank_labels(
         ax, ranking_x: np.ndarray, ranking_ranks: np.ndarray,
         view_low: float, view_high: float, *, label_color: str,
     ) -> None:
-        """Annotate only well-separated top candidates without a renderer pass.
+        """Place sparse rank tags vertically, anchored to their exact x-line.
 
-        Labels are ordinal ranks and map directly to the first column of the
-        reflection table. Dense neighbouring candidates are deliberately left
-        unlabeled on the plot; their complete records remain in the table.
+        The blended data/axes transform keeps every tag attached to its
+        reflection in θ while holding the text row just inside the top frame.
+        Labels that would collide at the current zoom are omitted; hover still
+        exposes the full reflection record.
         """
         if ranking_x.size == 0 or ranking_ranks.size == 0 or not view_high > view_low:
-            return
+            return []
+        artists = []
         axes_width_px = max(
             1.0, float(ax.get_position().width * ax.figure.get_figwidth() * ax.figure.dpi)
         )
-        # A conservative pixel exclusion zone is intentional: labels are a
-        # convenience, not primary data. Dense ranks remain fully available in
-        # the table, while no two visible labels are allowed to collide.
-        minimum_spacing_px = 30.0
+        minimum_spacing_px = 12.5
         accepted_x_px: list[float] = []
-        lanes = (0.955, 0.835, 0.715)
-        for x_value, rank_value in zip(ranking_x[:12], ranking_ranks[:12]):
+        for x_value, rank_value in zip(ranking_x[:15], ranking_ranks[:15]):
             if not np.isfinite(x_value) or not np.isfinite(rank_value):
                 continue
             x_value = float(x_value)
@@ -733,15 +944,54 @@ class HklResultsPanel(QWidget):
             x_px = (x_value - view_low) / (view_high - view_low) * axes_width_px
             if any(abs(x_px - previous) < minimum_spacing_px for previous in accepted_x_px):
                 continue
-            lane_index = len(accepted_x_px) % len(lanes)
             accepted_x_px.append(x_px)
-            ax.text(
-                x_value, lanes[lane_index], f"#{int(rank_value)}",
-                transform=ax.get_xaxis_transform(), rotation=45,
-                rotation_mode="anchor", ha="center", va="bottom",
-                fontsize=5.8, fontweight="medium", color=label_color,
+            artists.append(ax.text(
+                x_value, 0.985, f"#{int(rank_value)}",
+                transform=ax.get_xaxis_transform(), rotation=90,
+                rotation_mode="anchor", ha="center", va="top",
+                fontsize=5.6, fontweight="medium", color=label_color,
                 clip_on=True, zorder=8,
-            )
+            ))
+        return artists
+
+    def _update_reflection_hover(self, mouse_x_px: float) -> None:
+        ax = self._histogram_axes
+        cache = self._histogram_cache
+        if ax is None or cache is None or self._reflection_catalog.empty:
+            return
+        x_min, x_max = map(float, ax.get_xlim())
+        bbox = ax.get_window_extent()
+        if bbox.width <= 0:
+            return
+        x_value = x_min + (mouse_x_px - bbox.x0) / bbox.width * (x_max - x_min)
+        values = self._reflection_x
+        if values.size == 0:
+            return
+        index = int(np.searchsorted(values, x_value))
+        candidates = [i for i in (index - 1, index) if 0 <= i < values.size]
+        if not candidates:
+            return
+        nearest_index = min(candidates, key=lambda i: abs(float(values[i]) - x_value))
+        nearest = float(values[nearest_index])
+        distance_px = abs(nearest - x_value) / max(x_max - x_min, np.finfo(float).eps) * bbox.width
+        if distance_px > 8.5:
+            self.plot_hint_label.setText("Колесо — масштаб · перетаскивание — сдвиг · Ctrl — θ · Shift — Y")
+            return
+        catalog = self._reflection_catalog
+        positions = pd.to_numeric(catalog["delta_theta_arcsec"], errors="coerce")
+        matched = catalog.loc[np.isclose(positions.to_numpy(dtype=float), nearest, rtol=0.0, atol=max(abs(nearest), 1.0) * 1e-10)]
+        hkl_names = [str(value) for value in matched.get("hkl", pd.Series(dtype=str)).tolist()]
+        hkl_text = ", ".join(hkl_names[:3]) + (f" +{len(hkl_names) - 3}" if len(hkl_names) > 3 else "")
+        rank_text = ""
+        ranking_x = np.asarray(cache.get("ranking_x", ()), dtype=float)
+        ranking_ranks = np.asarray(cache.get("ranking_ranks", ()), dtype=float)
+        for rx, rr in zip(ranking_x, ranking_ranks):
+            if np.isfinite(rx) and np.isclose(rx, nearest, rtol=0.0, atol=max(abs(nearest), 1.0) * 1e-10):
+                rank_text = f"#{int(rr)} · "
+                break
+        self.plot_hint_label.setText(
+            f"{rank_text}HKL {hkl_text or '—'} · Δθтеор={nearest:.4f}″"
+        )
 
     def _render_all_pairs(self) -> None:
         """Render measured ranges and theoretical candidates with distinct marks.
@@ -882,9 +1132,10 @@ class HklResultsPanel(QWidget):
                 Line2D([0], [0], marker="D", color="none", markerfacecolor=theory_color,
                        markeredgecolor=colors["canvas"], markersize=4.2, label="Лучший теоретический HKL"),
             ]
-            legend = ax.legend(handles=handles, frameon=False, fontsize=6.0,
-                               loc="upper right", ncol=3, handlelength=1.45,
-                               borderaxespad=0.2, columnspacing=0.9)
+            legend = ax.legend(handles=handles, frameon=False, fontsize=5.9,
+                               loc="upper center", bbox_to_anchor=(0.5, -0.24),
+                               ncol=3, handlelength=1.45,
+                               borderaxespad=0.0, columnspacing=0.9, labelspacing=0.35)
             if legend is not None:
                 for label in legend.get_texts():
                     label.set_color(colors["text"])
@@ -903,6 +1154,6 @@ class HklResultsPanel(QWidget):
                 "—", "—", "—", "—", "нет измерений",
             ])
         self._set_table(self.pair_table, rows)
-        figure.subplots_adjust(left=0.13, right=0.992, bottom=0.25, top=0.80)
+        figure.subplots_adjust(left=0.13, right=0.992, bottom=0.25, top=0.84)
         self.all_canvas.draw_idle()
 

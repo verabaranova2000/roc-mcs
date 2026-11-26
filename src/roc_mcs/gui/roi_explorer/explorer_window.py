@@ -137,6 +137,7 @@ class RockingCurveExplorerWindow(QMainWindow):
         self._analysis_curve_key = None
         self._analysis_display_identity = None
         self._analysis_display_preferences = {}
+        self._analysis_layer_cmap_preferences = {}
         self._analysis_quantitative_contrast = False
         self._analysis_contrast_snapshot: tuple[float, float] | None = None
 
@@ -1425,6 +1426,23 @@ class RockingCurveExplorerWindow(QMainWindow):
             self._analysis_display_preferences[self._analysis_display_identity] = (
                 self._analysis_map_key, self._analysis_curve_key,
             )
+            if self._analysis_map_key:
+                self._analysis_layer_cmap_preferences[(
+                    self._analysis_display_identity, self._analysis_map_key
+                )] = str(self.map_widget.current_cmap)
+
+    def _apply_analysis_layer_colormap(self, identity, map_key: str | None, *, default_hkl: bool) -> None:
+        if not map_key:
+            return
+        saved = self._analysis_layer_cmap_preferences.get((identity, str(map_key)))
+        if saved:
+            cmap_name = str(saved)
+        elif default_hkl and str(map_key).startswith("hkl.delta_theta."):
+            cmap_name = "RdBu_r"
+        else:
+            return
+        self.map_widget.current_cmap = cmap_name
+        self.map_widget.tools.set_current_cmap(cmap_name)
 
     @staticmethod
     def _analysis_menu_items(state, attribute: str):
@@ -1546,7 +1564,11 @@ class RockingCurveExplorerWindow(QMainWindow):
             return
         if not any(layer.key == str(key) for layer in state.map_layers):
             return
+        self._remember_analysis_display_preferences()
         self._analysis_map_key = str(key)
+        self._apply_analysis_layer_colormap(
+            self._analysis_display_identity, self._analysis_map_key, default_hkl=True,
+        )
         self._set_analysis_contrast_mode(self._analysis_map_key)
         self._remember_analysis_display_preferences()
         self._set_result_menu_checked(self.map_widget.tools.results_menu, self._analysis_map_key)
@@ -1632,6 +1654,7 @@ class RockingCurveExplorerWindow(QMainWindow):
         curve_keys = {source.key for source in getattr(state, "curve_sources", ())}
         self._analysis_map_key = saved[0] if saved[0] in map_keys else getattr(state, "default_map_key", None)
         self._analysis_curve_key = saved[1] if saved[1] in curve_keys else getattr(state, "default_curve_key", None)
+        self._apply_analysis_layer_colormap(identity, self._analysis_map_key, default_hkl=True)
         self._set_analysis_contrast_mode(self._analysis_map_key)
         self._sync_analysis_result_menus(state)
         self._analysis_curve_cache.clear()
@@ -2157,10 +2180,23 @@ class RockingCurveExplorerWindow(QMainWindow):
             quantitative = self._is_quantitative_analysis_map(self._analysis_map_key)
             p_lo = float(self.map_widget.low_pct.value())
             p_hi = float(self.map_widget.high_pct.value())
+            display_cmap = self.map_widget.current_cmap
             try:
                 finite = np.asarray(img, dtype=float)
                 finite = finite[np.isfinite(finite)]
-                vmin, vmax = np.percentile(finite, [p_lo, p_hi]) if finite.size else (None, None)
+                is_hkl_residual = str(self._analysis_map_key or "").startswith("hkl.delta_theta.")
+                if is_hkl_residual:
+                    # Δθ residuals are signed deviations around a physical zero.
+                    # Keep zero exactly at the neutral midpoint and use one
+                    # symmetric range for both signs; the high percentile is
+                    # the only contrast control applied to the absolute values.
+                    absolute = np.abs(finite)
+                    limit = float(np.percentile(absolute, np.clip(p_hi, 0.0, 100.0))) if absolute.size else 1.0
+                    if not np.isfinite(limit) or limit <= 0.0:
+                        limit = max(float(np.max(absolute)) if absolute.size else 0.0, 1e-12)
+                    vmin, vmax = -limit, limit
+                else:
+                    vmin, vmax = np.percentile(finite, [p_lo, p_hi]) if finite.size else (None, None)
                 if quantitative and self._analysis_map_key in {
                     "spikes.count", "branches.count", "fit.n_detected", "fit.n_fitted", "fit.n_fitted_map",
                 }:
@@ -2174,10 +2210,17 @@ class RockingCurveExplorerWindow(QMainWindow):
             except Exception:
                 vmin = vmax = None
             self.map_widget.draw_map(
-                img, title, self.map_widget.current_cmap, vmin, vmax,
+                img, title, display_cmap, vmin, vmax,
                 x_coords=state.x_coords, y_coords=state.y_coords,
                 colorbar_mode="quantitative" if quantitative else "continuous",
             )
+            if self.map_widget.cbar is not None:
+                colorbar_unit = (
+                    "Δθ, ″"
+                    if str(self._analysis_map_key or "").startswith("hkl.delta_theta.")
+                    else ""
+                )
+                self.map_widget.cbar.set_label(colorbar_unit, labelpad=3)
             self._draw_pinned_rois(); self.map_widget.canvas.draw_idle()
             return
         if self.repo is None or self.selected_scan is None or (self.selected_map is None and not self._theta_slice_mode):

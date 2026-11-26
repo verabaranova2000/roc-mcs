@@ -15,6 +15,7 @@ NAPARI_STYLE_COLORMAPS = (
     "gray", "gray_r", "blue", "cyan", "green", "magenta", "red", "yellow",
     "viridis", "plasma", "inferno", "magma", "cividis", "turbo",
     "twilight", "twilight_shifted", "hsv", "gist_earth", "fire", "ice",
+    "RdBu_r",
     "bop blue", "bop orange", "bop purple", "I Blue", "I Bordeaux",
     "I Forest", "I Orange", "I Purple", "PiYG", "HiLo",
 )

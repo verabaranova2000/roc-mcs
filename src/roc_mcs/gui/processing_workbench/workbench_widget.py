@@ -2067,10 +2067,12 @@ class ProcessingWorkbenchWidget(QWidget):
             popup_width = max(340, min(440, available.width() - 16))
         popup.setFixedWidth(popup_width)
         content_height = max(140, (stage_content.sizeHint().height() if stage_content is not None else page.sizeHint().height()) + 8)
-        max_popup_height = max(190, int(available.height() * (0.80 if is_hkl_stage else 0.82)))
+        max_popup_height = max(190, int(available.height() * (0.89 if is_hkl_stage else 0.82)))
         desired_height = min(content_height + 78, max_popup_height)
         if is_hkl_stage:
-            desired_height = max(min(320, max_popup_height), desired_height)
+            # Keep the existing 640 px width cap intact; only give the result
+            # panel a materially taller vertical viewport.
+            desired_height = max(min(390, max_popup_height), desired_height)
         popup.setMaximumHeight(max_popup_height)
         scroll.setMinimumHeight(min(max(115, content_height), max(115, desired_height - 82)))
         popup.resize(popup_width, desired_height)
@@ -2570,13 +2572,15 @@ class ProcessingWorkbenchWidget(QWidget):
                 "Не закрывайте приложение до успешного сохранения.\n\n" + persistence_error,
             )
             return
-        # HKL is an analysis-only stage. Its result window needs only the small
-        # HKL artifact; loading the full upstream 3D scan and rebuilding maps/ROC
-        # for an unchanged input would add latency without changing the science.
+        # HKL has two independent result views: the compact table/fit panel
+        # reads only its small artifact, while spatial Δθ layers are assembled
+        # through the established full WorkflowPreviewState path. Keep both
+        # available and do not switch away from the currently open stage popup.
         if node.operation_id == "theory.identify_hkl":
             popup = self._active_stage_popup
             if popup is not None and getattr(popup, "_stage_node_id", None) == node_id:
                 self._start_hkl_result_preview(node_id)
+            self._start_preview_for_node(node_id, switch_tab=False, show_error_dialog=False)
             return
 
         # Other operations retain the established generic Scan/ROI preview.
@@ -2886,6 +2890,11 @@ class ProcessingWorkbenchWidget(QWidget):
                 and getattr(self._active_stage_popup, "_stage_node_id", None) == node_id
             ):
                 self._start_hkl_result_preview(node_id)
+                # The eye controls the spatial result independently of the
+                # read-only HKL dialog. Reload the selected node through the
+                # normal preview path so its Δθ result layers are selectable
+                # in the host 2D map while the dialog remains open.
+                self._start_preview_for_node(node_id, switch_tab=False, show_error_dialog=True)
             return
         self._start_preview_for_node(node_id, switch_tab=True, show_error_dialog=True)
 
@@ -2957,13 +2966,15 @@ class ProcessingWorkbenchWidget(QWidget):
         screen = QApplication.screenAt(popup.frameGeometry().center()) or QApplication.primaryScreen()
         if screen is not None:
             available = screen.availableGeometry()
-            max_height = max(260, int(available.height() * 0.80))
-            desired_height = min(max(360, popup.sizeHint().height()), max_height)
+            max_height = max(260, int(available.height() * 0.89))
+            desired_height = min(max(560, popup.sizeHint().height()), max_height)
+            # Width is intentionally not increased: retain the width already
+            # chosen by _open_stage_configuration (maximum 640 px for HKL).
             desired_width = min(popup.width(), max(320, available.width() - 16))
             scroll = getattr(popup, "_stage_form_scroll", None)
             if scroll is not None:
-                scroll.setMinimumHeight(0)
-                scroll.setMaximumHeight(max(180, desired_height - 82))
+                scroll.setMinimumHeight(max(180, desired_height - 82))
+                scroll.setMaximumHeight(max(180, max_height - 82))
             popup.setMaximumHeight(max_height)
             popup.resize(desired_width, desired_height)
         self.status_label.setText("Результат HKL загружен из сохранённого артефакта.")
