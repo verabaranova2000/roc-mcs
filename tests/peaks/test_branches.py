@@ -204,3 +204,108 @@ def test_branch_operation_persists_branch_catalog_and_provenance():
     assert result.bundle.metadata["n_branches"] == 2
     assert result.bundle.metadata["position_kind"] == "detected"
     assert result.bundle.metadata["theta_unit"] == "arcsec"
+
+
+def test_branch_size_recommendation_uses_clear_multiplicative_gap_conservatively():
+    from roc_mcs.peaks.branches import recommend_min_branch_events
+
+    threshold, info = recommend_min_branch_events([1, 1, 5])
+    assert threshold == 3
+    assert info["status"] == "clear_gap"
+    assert info["ratio"] == pytest.approx(5.0)
+
+    threshold, info = recommend_min_branch_events([1, 2, 3, 4, 5])
+    assert threshold == 1
+    assert info["status"] == "no_clear_gap"
+
+    # A single tiny component is not enough evidence for an automatic cut.
+    threshold, info = recommend_min_branch_events([1, 30])
+    assert threshold == 1
+    assert info["status"] == "insufficient_components"
+
+
+def test_branch_analysis_mask_preserves_legacy_catalogue_compatibility():
+    from roc_mcs.peaks.branches import branch_analysis_mask
+
+    legacy = pd.DataFrame({"branch_id": [0, 1, 2]})
+    assert branch_analysis_mask(legacy).tolist() == [True, True, True]
+
+    selected = pd.DataFrame({
+        "branch_id": [0, 0, 1, 2],
+        "analysis_included": [True, True, False, None],
+    })
+    assert branch_analysis_mask(selected).tolist() == [True, True, False, False]
+
+
+def test_branch_operation_persists_non_destructive_automatic_size_selection():
+    # One five-event spatial/angular component and two isolated singletons.
+    # The latter remain in the catalogue but are not consumed downstream.
+    catalog = pd.DataFrame([
+        {"peak_id": i, "x": i, "y": 0, "theta": 100.0} for i in range(5)
+    ] + [
+        {"peak_id": 5, "x": 10, "y": 3, "theta": 700.0},
+        {"peak_id": 6, "x": 20, "y": 7, "theta": 900.0},
+    ])
+    positions = ArtifactBundle(
+        tables={"peak_catalog": catalog},
+        metadata={"grid_id": "grid-size-selection", "position_kind": "detected"},
+    )
+    result = default_registry().execute(
+        "peaks.branches", {"positions": positions}, {"theta_gate": 1.0}
+    )
+    branch_catalog = result.bundle.tables["branch_catalog"]
+    branch_sizes = result.bundle.tables["branch_sizes"].sort_values("event_count")
+
+    assert len(branch_catalog) == len(catalog)
+    assert set(branch_catalog["peak_id"]) == set(catalog["peak_id"])
+    assert branch_catalog["branch_id"].nunique() == 3
+    assert branch_catalog.groupby("branch_id")["analysis_included"].nunique().max() == 1
+    assert branch_catalog.loc[branch_catalog["analysis_included"], "branch_id"].nunique() == 1
+    assert branch_catalog.loc[~branch_catalog["analysis_included"], "branch_id"].nunique() == 2
+    assert branch_sizes["event_count"].tolist() == [1, 1, 5]
+    assert result.bundle.metadata["n_branches"] == 3
+    assert result.bundle.metadata["n_analysis_branches"] == 1
+    assert result.bundle.metadata["n_excluded_branches"] == 2
+    assert result.bundle.metadata["branch_selection"]["min_branch_events"] == 3
+
+
+def test_manual_branch_size_threshold_overrides_automatic_selection():
+    catalog = pd.DataFrame([
+        {"peak_id": i, "x": i, "y": 0, "theta": 100.0} for i in range(5)
+    ] + [
+        {"peak_id": 5, "x": 10, "y": 3, "theta": 700.0},
+        {"peak_id": 6, "x": 20, "y": 7, "theta": 900.0},
+    ])
+    positions = ArtifactBundle(tables={"peak_catalog": catalog}, metadata={"grid_id": "grid-manual"})
+    result = default_registry().execute(
+        "peaks.branches", {"positions": positions},
+        {"theta_gate": 1.0, "min_branch_events": 1},
+    )
+    assert result.bundle.tables["branch_catalog"]["analysis_included"].all()
+    assert result.bundle.metadata["branch_selection"]["mode"] == "manual"
+    assert result.bundle.metadata["n_analysis_branches"] == 3
+
+
+def test_branch_inclusion_flags_roundtrip_in_immutable_artifact(tmp_path):
+    from roc_mcs.analysis.artifacts import ArtifactStore
+
+    catalog = pd.DataFrame([
+        {"peak_id": 0, "x": 0, "y": 0, "theta": 100.0},
+        {"peak_id": 1, "x": 1, "y": 0, "theta": 105.0},
+        {"peak_id": 2, "x": 10, "y": 3, "theta": 900.0},
+    ])
+    result = default_registry().execute(
+        "peaks.branches",
+        {"positions": ArtifactBundle(tables={"peak_catalog": catalog}, metadata={"grid_id": "roundtrip"})},
+        {"theta_gate": 10.0},
+    )
+    store = ArtifactStore(tmp_path / "artifacts")
+    artifact_id = store.write(result.bundle)
+    restored = store.read(artifact_id)
+    restored_catalog = restored.tables["branch_catalog"]
+
+    assert restored_catalog["analysis_included"].dtype == bool
+    assert restored_catalog["peak_id"].tolist() == [0, 1, 2]
+    assert restored_catalog["branch_id"].nunique() == 2
+    assert restored_catalog.groupby("branch_id")["analysis_included"].nunique().max() == 1
+    assert restored.metadata["branch_selection"]["preserves_all_catalog_rows"] is True

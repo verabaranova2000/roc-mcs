@@ -1007,14 +1007,31 @@ def _validate_branches(parameters: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("theta_gate должен быть положительным числом в единицах оси θ") from exc
     if not np.isfinite(theta_gate) or theta_gate <= 0:
         raise ValueError("theta_gate должен быть конечным положительным числом")
-    return {"theta_gate": theta_gate, "algorithm": "4-connected one-to-one minimum-|Δθ|"}
+    raw_minimum = parameters.get("min_branch_events", None)
+    if raw_minimum is None or (isinstance(raw_minimum, str) and raw_minimum.strip().lower() == "auto"):
+        minimum = None
+    else:
+        if isinstance(raw_minimum, (bool, np.bool_)):
+            raise ValueError("min_branch_events должен быть положительным целым числом или auto")
+        try:
+            numeric = float(raw_minimum)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("min_branch_events должен быть положительным целым числом или auto") from exc
+        if not np.isfinite(numeric) or not numeric.is_integer() or numeric < 1:
+            raise ValueError("min_branch_events должен быть положительным целым числом или auto")
+        minimum = int(numeric)
+    return {
+        "theta_gate": theta_gate,
+        "min_branch_events": minimum,
+        "algorithm": "4-connected one-to-one minimum-|Δθ|",
+    }
 
 
 def _run_branches(inputs: Mapping[str, ArtifactBundle], parameters: Mapping[str, Any]) -> OperationResult:
     import pandas as pd
     from roc_mcs.peaks.branches import (
         build_peak_branch_graph, label_peak_branches, summarize_peak_spacing,
-        fitted_peak_positions,
+        fitted_peak_positions, recommend_min_branch_events,
     )
 
     positions = inputs["positions"]
@@ -1043,6 +1060,31 @@ def _run_branches(inputs: Mapping[str, ArtifactBundle], parameters: Mapping[str,
     )
     spacing_rows = pd.DataFrame(spacing.get("internal_gap_by_n", ()))
     branch_sizes = catalog.groupby("branch_id", sort=True).size().rename("event_count").reset_index()
+    auto_minimum, selection_diagnostics = recommend_min_branch_events(
+        branch_sizes["event_count"].to_numpy(dtype=np.int64, copy=False)
+    )
+    requested_minimum = parameters.get("min_branch_events")
+    effective_minimum = int(auto_minimum if requested_minimum is None else requested_minimum)
+    branch_sizes["analysis_included"] = (
+        pd.to_numeric(branch_sizes["event_count"], errors="coerce") >= effective_minimum
+    ).astype(bool)
+    include_by_id = branch_sizes.set_index("branch_id")["analysis_included"].to_dict()
+    catalog["analysis_included"] = catalog["branch_id"].map(include_by_id).fillna(False).astype(bool)
+    n_analysis_branches = int(branch_sizes["analysis_included"].sum())
+    n_excluded_branches = int(len(branch_sizes) - n_analysis_branches)
+    n_analysis_events = int(branch_sizes.loc[branch_sizes["analysis_included"], "event_count"].sum())
+    n_excluded_events = int(len(catalog) - n_analysis_events)
+    selection_metadata = {
+        **selection_diagnostics,
+        "mode": "auto" if requested_minimum is None else "manual",
+        "recommended_min_branch_events": int(auto_minimum),
+        "min_branch_events": effective_minimum,
+        "n_analysis_branches": n_analysis_branches,
+        "n_excluded_branches": n_excluded_branches,
+        "n_analysis_events": n_analysis_events,
+        "n_excluded_events": n_excluded_events,
+        "preserves_all_catalog_rows": True,
+    }
     metadata = dict(positions.metadata)
     metadata.update({
         "operation": "spatial diffraction peak-branch assignment",
@@ -1053,6 +1095,11 @@ def _run_branches(inputs: Mapping[str, ArtifactBundle], parameters: Mapping[str,
         "theta_unit": spacing.get("theta_unit", "arcsec"),
         "n_peak_events": int(len(catalog)),
         "n_branches": int(n_branches),
+        "n_analysis_branches": n_analysis_branches,
+        "n_excluded_branches": n_excluded_branches,
+        "n_analysis_events": n_analysis_events,
+        "n_excluded_events": n_excluded_events,
+        "branch_selection": selection_metadata,
         "n_edges": int(len(edges)),
         "spacing_diagnostics": spacing,
     })
@@ -1069,7 +1116,9 @@ def _run_branches(inputs: Mapping[str, ArtifactBundle], parameters: Mapping[str,
         output_ports=("branches",),
         summary=(
             f"Ветви определены: событий={len(catalog):,}; ветвей={n_branches:,}; "
-            f"связей={len(edges):,}; θ-gate={parameters['theta_gate']:g}″; "
+            f"для анализа={n_analysis_branches:,}, исключено={n_excluded_branches:,} "
+            f"(минимум {effective_minimum} событий); связей={len(edges):,}; "
+            f"θ-gate={parameters['theta_gate']:g}″; "
             f"позиции={'после Fit' if position_kind == 'fitted' else 'после детектора пиков'}"
         ),
     )
@@ -1205,17 +1254,31 @@ def _run_branch_correlation(
         or np.any(branch_values < 0)
     ):
         raise ValueError("branch_catalog содержит пустые или некорректные branch_id")
-    available_branch_ids = set(branch_values.astype(np.int64).tolist())
-    if len(available_branch_ids) < 2:
-        raise ValueError(
-            "3D-кросс-корреляция требует как минимум две различные дифракционные ветви. "
-            "В текущем branch_catalog обнаружена только одна ветвь или каталог пуст."
-        )
+    all_branch_ids = set(branch_values.astype(np.int64).tolist())
+    from roc_mcs.peaks.branches import branch_analysis_mask
+    inclusion_mask = branch_analysis_mask(catalog)
+    if inclusion_mask.size != len(catalog):
+        raise ValueError("Маска analysis_included не согласована с branch_catalog")
+    analysis_catalog = catalog.loc[inclusion_mask].copy()
+    analysis_values = pd.to_numeric(analysis_catalog["branch_id"], errors="coerce").to_numpy(dtype=float)
+    available_branch_ids = set(analysis_values.astype(np.int64).tolist())
     requested_branch_ids = {
         int(parameters["source_branch_id"]),
         *(int(value) for value in parameters["partner_branch_ids"]),
     }
-    missing_branch_ids = sorted(requested_branch_ids - available_branch_ids)
+    excluded_requested = sorted((requested_branch_ids & all_branch_ids) - available_branch_ids)
+    if excluded_requested:
+        raise ValueError(
+            f"Выбранные ветви branch_id: {excluded_requested} исключены из анализа порогом размера. "
+            "Измените порог в исходном этапе определения ветвей либо выберите принятую ветвь."
+        )
+    if len(available_branch_ids) < 2:
+        raise ValueError(
+            "3D-кросс-корреляция требует как минимум две различные дифракционные "
+            "ветви, принятые для анализа. Уменьшите порог размера в настройках "
+            "этапа определения ветвей либо проверьте выбранный theta-gate."
+        )
+    missing_branch_ids = sorted(requested_branch_ids - all_branch_ids)
     if missing_branch_ids:
         raise ValueError(
             f"В выбранном branch_catalog отсутствуют branch_id: {missing_branch_ids}. "
@@ -1247,10 +1310,10 @@ def _run_branch_correlation(
         int(parameters["source_branch_id"]),
         *(int(value) for value in parameters["partner_branch_ids"]),
     ]
-    geometry_summary = _branch_correlation_geometry_summary(catalog, selected_ids)
+    geometry_summary = _branch_correlation_geometry_summary(analysis_catalog, selected_ids)
     try:
         result = correlate_branch_catalog(
-            catalog,
+            analysis_catalog,
             source_branch_id=parameters["source_branch_id"],
             partner_branch_ids=parameters["partner_branch_ids"],
             config=BranchCorrelationConfig(
@@ -1277,6 +1340,8 @@ def _run_branch_correlation(
         "branch_correlation": dict(result.metadata),
         "parent_branch_algorithm": parent.metadata.get("branch_algorithm"),
         "parent_branch_count": parent.metadata.get("n_branches"),
+        "parent_analysis_branch_count": parent.metadata.get("n_analysis_branches", parent.metadata.get("n_branches")),
+        "parent_branch_selection": parent.metadata.get("branch_selection", {}),
         "parent_grid_id": parent.metadata.get("grid_id"),
         "theta_index_step_arcsec": theta_step,
         "theta_index_step_uniform": True,

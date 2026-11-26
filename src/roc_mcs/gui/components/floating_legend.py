@@ -10,10 +10,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable
 
-from PyQt6.QtCore import QEvent, QPoint, QRect, QSize, Qt
+from PyQt6.QtCore import QEvent, QPoint, QRect, QSize, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QLinearGradient, QMouseEvent, QPainter, QPen, QPalette
 from PyQt6.QtWidgets import (
     QFrame,
+    QCheckBox,
     QHBoxLayout,
     QLabel,
     QScrollArea,
@@ -31,6 +32,8 @@ class LegendEntry:
     label: str
     color: str
     detail: str = ""
+    action_key: str | None = None
+    checked: bool = False
 
 
 class _AlphaGradientRows(QWidget):
@@ -110,14 +113,14 @@ class _AlphaGradientRows(QWidget):
 
 
 class _LegendEntryList(QWidget):
-    """Scrollable categorical list used by long peak-branch/component legends."""
+    """Scrollable categorical list with optional compact action rows."""
 
-    def __init__(self, entries: Iterable[LegendEntry], parent=None):
+    def __init__(self, entries: Iterable[LegendEntry], parent=None, on_action=None):
         super().__init__(parent)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(7, 6, 7, 6)
         layout.setSpacing(4)
-        self._entry_labels: list[tuple[QLabel, QLabel | None]] = []
+        self._entry_labels: list[tuple[QWidget, QLabel | None]] = []
         self.font_scale = 0.84
         for entry in entries:
             row = QHBoxLayout()
@@ -133,11 +136,20 @@ class _LegendEntryList(QWidget):
             text_column = QVBoxLayout()
             text_column.setContentsMargins(0, 0, 0, 0)
             text_column.setSpacing(0)
-            label = QLabel(entry.label, self)
-            label.setWordWrap(True)
+            if entry.action_key:
+                label = QCheckBox(entry.label, self)
+                label.setChecked(bool(entry.checked))
+                label.setToolTip(entry.detail or "Показать или скрыть исключённые по порогу ветви.")
+                if on_action is not None:
+                    label.toggled.connect(
+                        lambda checked, key=str(entry.action_key): on_action(key, bool(checked))
+                    )
+            else:
+                label = QLabel(entry.label, self)
+                label.setWordWrap(True)
             text_column.addWidget(label)
             detail = None
-            if entry.detail:
+            if entry.detail and not entry.action_key:
                 detail = QLabel(entry.detail, self)
                 detail.setWordWrap(True)
                 text_column.addWidget(detail)
@@ -151,7 +163,10 @@ class _LegendEntryList(QWidget):
     def set_font_scale(self, scale: float) -> None:
         self.font_scale = max(0.70, min(1.20, float(scale)))
         for label, detail in self._entry_labels:
-            label.setStyleSheet(f"font-size:{9.0 * self.font_scale:.1f}pt;")
+            if isinstance(label, QCheckBox):
+                label.setStyleSheet(f"font-size:{9.0 * self.font_scale:.1f}pt;")
+            else:
+                label.setStyleSheet(f"font-size:{9.0 * self.font_scale:.1f}pt;")
             if detail is not None:
                 detail.setStyleSheet(
                     "color: palette(placeholderText); "
@@ -160,34 +175,49 @@ class _LegendEntryList(QWidget):
 
 
 class _DragHeader(QFrame):
+    """Move the overlay from an absolute drag origin (no cumulative drift)."""
+
     def __init__(self, panel: "FloatingLegendPanel"):
         super().__init__(panel)
         self._panel = panel
-        self._last_global: QPoint | None = None
+        self._cursor_origin: QPoint | None = None
+        self._panel_origin_global: QPoint | None = None
         self.setObjectName("floatingLegendHeader")
         self.setFixedHeight(27)
         self.setCursor(Qt.CursorShape.SizeAllCursor)
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
-            self._last_global = event.globalPosition().toPoint()
+            self._cursor_origin = event.globalPosition().toPoint()
+            self._panel_origin_global = self._panel.mapToGlobal(QPoint(0, 0))
+            # QWidget receives the subsequent move/release sequence through
+            # Qt's implicit mouse grab; an explicit grab here can compete with
+            # QVTKRenderWindowInteractor on some window systems.
             event.accept()
             return
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
-        if self._last_global is not None and event.buttons() & Qt.MouseButton.LeftButton:
+        if (
+            self._cursor_origin is not None
+            and self._panel_origin_global is not None
+            and event.buttons() & Qt.MouseButton.LeftButton
+        ):
             current = event.globalPosition().toPoint()
-            delta = current - self._last_global
-            self._last_global = current
-            self._panel._move_by(delta)
+            desired_global = self._panel_origin_global + (current - self._cursor_origin)
+            parent = self._panel.parentWidget()
+            if parent is not None:
+                self._panel._move_to_position(parent.mapFromGlobal(desired_global))
             event.accept()
             return
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
-            self._last_global = None
+            self._cursor_origin = None
+            self._panel_origin_global = None
+            event.accept()
+            return
         super().mouseReleaseEvent(event)
 
 
@@ -239,6 +269,7 @@ class _ResizeGrip(QWidget):
 
 
 class FloatingLegendPanel(QFrame):
+    entry_toggled = pyqtSignal(str, bool)
     """Movable, resizable, collapsible and internally scrollable canvas legend.
 
     Create it as a child of the canvas/viewport it should overlay.  Content is
@@ -362,7 +393,7 @@ class FloatingLegendPanel(QFrame):
 
     def set_entries(self, entries: Iterable[LegendEntry]) -> None:
         """Set a scrollable categorical list (e.g. diffraction branch IDs)."""
-        content = _LegendEntryList(entries)
+        content = _LegendEntryList(entries, on_action=self.entry_toggled.emit)
         content.set_font_scale(self._font_scale)
         self.set_content_widget(content)
 
@@ -445,9 +476,23 @@ class FloatingLegendPanel(QFrame):
         self.move(x, y)
 
     def _move_by(self, delta: QPoint) -> None:
+        # Kept for older callers; drag handling itself uses absolute positions.
+        self._move_to_position(self.pos() + delta)
+
+    def _move_to_position(self, position: QPoint) -> None:
         self._user_moved = True
-        self.move(self.pos() + delta)
-        self._clamp_to_parent()
+        parent = self.parentWidget()
+        if parent is None:
+            self.move(position)
+            return
+        max_x = max(self._margin, parent.width() - self.width() - self._margin)
+        max_y = max(self._margin, parent.height() - self.height() - self._margin)
+        target = QPoint(
+            min(max(self._margin, int(position.x())), max_x),
+            min(max(self._margin, int(position.y())), max_y),
+        )
+        if target != self.pos():
+            self.move(target)
 
     def _clamp_to_parent(self) -> None:
         parent = self.parentWidget()

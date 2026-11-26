@@ -34,8 +34,8 @@ class BranchDetectionPreview(QWidget):
         }
         self._message = "Выберите родительский результат с каталогом пиков."
         self.setObjectName("branchDetectionPreview")
-        self.setMinimumSize(380, 154)
-        self.setMaximumHeight(198)
+        self.setMinimumSize(320, 126)
+        self.setMaximumSize(560, 148)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.setAccessibleName(
             "Трёхмерная иллюстрация сопоставления пиков в пространственно-угловых ветвях"
@@ -51,7 +51,7 @@ class BranchDetectionPreview(QWidget):
         )
 
     def sizeHint(self) -> QSize:
-        return QSize(560, 182)
+        return QSize(470, 140)
 
     def set_catalog(self, catalog: Any | None, info: dict[str, Any] | None = None) -> None:
         """Replace the compact real-data patch selected by the stats worker."""
@@ -265,64 +265,16 @@ class BranchDetectionPreview(QWidget):
         painter.drawText(QPointF(axis_y.x() + 3, axis_y.y() + 1), "Y")
         painter.drawText(QPointF(axis_theta.x() + 3, axis_theta.y() - 2), "θ, ″")
 
-        accepted_keys = {
-            (min(int(a), int(b)), max(int(a), int(b)))
-            for a, b, _delta in accepted_edges
-        }
-        components = sorted({int(value) for value in branch_by_id.values()})
-
-        # A tinted sheet cell is drawn only if the four actual corner events
-        # belong to one component and all four perimeter links are accepted.
-        # Multiple events from the same component at a single pixel are kept
-        # separate; ambiguous cells are not fabricated.
-        pixel_nodes: dict[tuple[int, int, int], list[int]] = {}
-        for peak_id, event in events.items():
-            component = int(branch_by_id.get(int(peak_id), -1))
-            key = (int(event["x"]), int(event["y"]), component)
-            pixel_nodes.setdefault(key, []).append(int(peak_id))
-
-        for x in range(x_min, x_max):
-            for y in range(y_min, y_max):
-                for component in components:
-                    corners = [
-                        pixel_nodes.get((x, y, component), []),
-                        pixel_nodes.get((x + 1, y, component), []),
-                        pixel_nodes.get((x + 1, y + 1, component), []),
-                        pixel_nodes.get((x, y + 1, component), []),
-                    ]
-                    if any(len(values) != 1 for values in corners):
-                        continue
-                    p00, p10, p11, p01 = (values[0] for values in corners)
-                    perimeter = {
-                        (min(p00, p10), max(p00, p10)),
-                        (min(p10, p11), max(p10, p11)),
-                        (min(p11, p01), max(p11, p01)),
-                        (min(p01, p00), max(p01, p00)),
-                    }
-                    if not perimeter.issubset(accepted_keys):
-                        continue
-                    polygon = QPolygonF([
-                        projected[p00], projected[p10],
-                        projected[p11], projected[p01],
-                    ])
-                    fill = self._component_color(component, alpha=48)
-                    edge = self._component_color(component, alpha=165)
-                    painter.setPen(QPen(edge, 1.0))
-                    painter.setBrush(QBrush(fill))
-                    painter.drawPolygon(polygon)
-
-        # Every accepted edge gets a translucent wide under-stroke (a small
-        # ribbon) and a narrow centreline.  The broad colour patches evoke a
-        # spatial-angular sheet while preserving the exact graph topology.
+        # Accepted links are drawn as fine, flat centrelines. The previous broad
+        # ribbons and translucent cells made the diagnostic look illustrative
+        # rather than like a restrained topology view; the exact adjacency is
+        # now carried by line style/colour and real point markers only.
         for peak_a, peak_b, _delta in accepted_edges:
             component = int(branch_by_id.get(int(peak_a), 0))
             start_point = projected[int(peak_a)]
             end_point = projected[int(peak_b)]
-            ribbon = self._component_color(component, alpha=58)
-            painter.setPen(QPen(ribbon, 7.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-            painter.drawLine(start_point, end_point)
-            core = self._component_color(component, alpha=238)
-            painter.setPen(QPen(core, 1.9, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            core = self._component_color(component, alpha=220)
+            painter.setPen(QPen(core, 1.25, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
             painter.drawLine(start_point, end_point)
 
         # Dashed candidates are the real one-to-one minimum-|Δθ| assignments
@@ -340,38 +292,35 @@ class BranchDetectionPreview(QWidget):
             ))
             painter.drawLine(start_point, end_point)
 
-        # Peak events are explicit graph vertices. The dark outline survives
-        # the colored ribbons, and a small light highlight makes each dot read
-        # as a point in 3D rather than a flat node label.
+        # Peak events use a consistent small marker with a crisp outline.
         for peak_id, point in projected.items():
             component = int(branch_by_id.get(int(peak_id), 0))
             color = self._component_color(component)
-            painter.setPen(QPen(QColor(17, 22, 30, 235), 1.2))
+            painter.setPen(QPen(QColor(25, 30, 38, 225), 0.8))
             painter.setBrush(QBrush(color))
-            painter.drawEllipse(point, 4.8, 4.8)
-            highlight = QColor(255, 255, 255, 180)
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QBrush(highlight))
-            painter.drawEllipse(QPointF(point.x() - 1.2, point.y() - 1.3), 1.1, 1.1)
+            painter.drawEllipse(point, 3.0, 3.0)
 
-        # Small, consistent legend: node, accepted ribbon, rejected assignment.
-        legend_y = float(card.bottom()) - 8.0
-        x_cursor = float(card.left()) + 12.0
-        painter.setPen(QPen(QColor(17, 22, 30, 230), 1.0))
+        # One-line restrained key; font scale follows the actual compact card.
+        legend_y = float(card.bottom()) - 7.0
+        x_cursor = float(card.left()) + 10.0
+        small_font = QFont(painter.font())
+        small_font.setPointSizeF(max(6.0, small_font.pointSizeF() * 0.78))
+        painter.setFont(small_font)
+        painter.setPen(QPen(QColor(25, 30, 38, 225), 0.8))
         painter.setBrush(QBrush(self._component_color(0)))
-        painter.drawEllipse(QPointF(x_cursor + 3.0, legend_y - 2.5), 3.2, 3.2)
+        painter.drawEllipse(QPointF(x_cursor + 2.5, legend_y - 2.0), 2.5, 2.5)
         painter.setPen(QPen(muted, 1.0))
-        painter.drawText(QPointF(x_cursor + 11.0, legend_y + 1.0), "пик")
-        x_cursor += 42.0
-        ribbon_color = QColor(63, 155, 193, 185)
-        painter.setPen(QPen(ribbon_color, 5.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-        painter.drawLine(QPointF(x_cursor, legend_y - 2.5), QPointF(x_cursor + 15.0, legend_y - 2.5))
+        painter.drawText(QPointF(x_cursor + 9.0, legend_y + 1.0), "peak-event")
+        x_cursor += 72.0
+        accepted_color = self._component_color(0, alpha=220)
+        painter.setPen(QPen(accepted_color, 1.3, Qt.PenStyle.SolidLine))
+        painter.drawLine(QPointF(x_cursor, legend_y - 2.0), QPointF(x_cursor + 13.0, legend_y - 2.0))
         painter.setPen(QPen(muted, 1.0))
-        painter.drawText(QPointF(x_cursor + 20.0, legend_y + 1.0), "связь принята")
-        x_cursor += 102.0
-        rejected = QColor("#D18B55")
-        painter.setPen(QPen(rejected, 1.6, Qt.PenStyle.DashLine))
-        painter.drawLine(QPointF(x_cursor, legend_y - 2.5), QPointF(x_cursor + 15.0, legend_y - 2.5))
+        painter.drawText(QPointF(x_cursor + 18.0, legend_y + 1.0), "связь в графе")
+        x_cursor += 92.0
+        rejected = QColor("#C98753")
+        painter.setPen(QPen(rejected, 1.2, Qt.PenStyle.DashLine))
+        painter.drawLine(QPointF(x_cursor, legend_y - 2.0), QPointF(x_cursor + 13.0, legend_y - 2.0))
         painter.setPen(QPen(muted, 1.0))
-        painter.drawText(QPointF(x_cursor + 20.0, legend_y + 1.0), "назначение отклонено")
+        painter.drawText(QPointF(x_cursor + 18.0, legend_y + 1.0), "отклонённое назначение")
         painter.end()

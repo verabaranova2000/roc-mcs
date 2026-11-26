@@ -135,6 +135,7 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
         self._peak_catalog = None
         self._peak_position_kind = "detected"
         self._branch_edges = None
+        self._show_excluded_branches = False
         # Immutable, renderer-neutral view model built from the stored
         # correlation artifact. It is deliberately excluded from the volume
         # worker request and never triggers a second scientific calculation.
@@ -260,6 +261,7 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
             default_size=QtCore.QSize(224, 248),
             margin=8,
         )
+        self.branch_legend.entry_toggled.connect(self._on_branch_legend_entry_toggled)
         self.branch_legend.hide_on_canvas()
         self.branch_correlation_legend = FloatingLegendPanel(
             self.viewport,
@@ -838,6 +840,9 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
             self._payload = payload
             return
         self._hide_peak_tooltip()
+        # Excluded-component visibility is a per-dataset inspection choice;
+        # never carry it silently into another scan/preview.
+        self._show_excluded_branches = False
         settings = self._transfer_settings()
         info = self._scene.set_payload(payload, settings, axis_scales=self.tools.axis_scales)
         request = self._dataset_request or {}
@@ -857,6 +862,7 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
                 opacity=float(self.peak_marker_opacity.value()),
                 color_by_branch=bool(self.peak_color_by_branch.isChecked()),
                 uniform_color=self.tools.peak_marker_color,
+                show_excluded_branches=False,
                 render=False,
             )
         except Exception as exc:
@@ -1742,6 +1748,10 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
         else:
             branch_label = f"branch_id {int(branch_id)}"
             count_label = f"точек в ветви: {int(info.get('branch_event_count', 0)):,}"
+        selection_label = (
+            "включена в анализ" if bool(info.get("analysis_included", True))
+            else "исключена по порогу размера"
+        )
         peak_id = info.get("peak_id")
         peak_label = f"peak_id {int(peak_id)}" if peak_id is not None else "peak_id —"
         html = (
@@ -1749,6 +1759,7 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
             f'<span style="color:{color}; font-size:15px;">●</span> '
             f'<b style="color:{color};">{branch_label}</b><br>'
             f'<span>{count_label}</span><br>'
+            f'<span style="color:#888;">{selection_label}</span><br>'
             f'<span>{peak_label}</span><br>'
             f'<span style="color:#888;">X={float(info["x"]):.4g}; '
             f'Y={float(info["y"]):.4g}; θ={float(info["theta"]):.5g}</span>'
@@ -1758,34 +1769,48 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
             QtWidgets.QToolTip.showText(QtGui.QCursor.pos(), html, self._qvtk)
 
     def _update_branch_legend(self) -> None:
-        """Synchronize floating branch colour key with the visible peak layer."""
+        """Show accepted branches individually and excluded branches as one toggle."""
         panel = getattr(self, "branch_legend", None)
         scene = self._scene
         if panel is None:
             return
-        should_show = (
-            scene is not None
-            and self.tools.is_overlay_tool_checked("peaks")
-            and bool(self.peak_color_by_branch.isChecked())
-        )
-        if not should_show:
+        if scene is None or not self.tools.is_overlay_tool_checked("peaks"):
             panel.hide_on_canvas()
             return
         data = scene.branch_legend_data(limit=48)
         entries = data.get("entries", ())
-        if not entries:
+        excluded_count = int(data.get("excluded_branches", 0))
+        color_by_branch = bool(self.peak_color_by_branch.isChecked())
+        if (not color_by_branch or not entries) and excluded_count <= 0:
             panel.hide_on_canvas()
             return
+        # Individual color keys are meaningful only in branch-colour mode.
+        # The aggregate excluded-branch switch remains reachable in uniform
+        # marker-colour mode so hidden components are still explicitly inspectable.
         legend_entries = [
             LegendEntry(
                 label=f"branch_id {int(item['branch_id'])}",
                 color=str(item["color"]),
                 detail=f"{int(item['event_count']):,} пиков",
             )
-            for item in entries
+            for item in (entries if color_by_branch else ())
         ]
-        suffix = f" · TOP {len(entries)} / {data['total_branches']}" if data.get("truncated") else ""
-        panel.set_title(f"ВЕТВИ · {data['total_branches']} BRANCH_ID{suffix}")
+        if excluded_count:
+            legend_entries.append(LegendEntry(
+                label=(
+                    f"Исключённые · {excluded_count:,} ветвей · "
+                    f"{int(data.get('excluded_events', 0)):,} пиков"
+                ),
+                color="#858B95",
+                detail="Показать или скрыть отдельным нейтральным слоем; в корреляцию не входят.",
+                action_key="show_excluded",
+                checked=bool(data.get("show_excluded", False)),
+            ))
+        if color_by_branch:
+            suffix = f" · TOP {len(entries)} / {data['total_branches']}" if data.get("truncated") else ""
+            panel.set_title(f"ВЕТВИ · {data['total_branches']} ПРИНЯТЫХ{suffix}")
+        else:
+            panel.set_title("ВЕТВИ · ФИЛЬТР ОТОБРАЖЕНИЯ")
         panel.set_entries(legend_entries)
         panel.show_on_canvas(
             position=QtCore.QPoint(
@@ -1793,6 +1818,14 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
                 max(8, self.viewport.height() - panel.height() - 8),
             )
         )
+
+    def _on_branch_legend_entry_toggled(self, action_key: str, checked: bool) -> None:
+        if action_key != "show_excluded" or self._scene is None:
+            return
+        self._show_excluded_branches = bool(checked)
+        self._scene.set_excluded_branches_visible(bool(checked), render=False)
+        self._update_branch_legend()
+        self._render()
 
     def _sync_branch_correlation_pair_combo(self) -> None:
         """Populate the pair filter without causing intermediate scene updates."""
@@ -2058,6 +2091,7 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
             opacity=float(self.peak_marker_opacity.value()),
             color_by_branch=bool(self.peak_color_by_branch.isChecked()),
             uniform_color=self.tools.peak_marker_color,
+            show_excluded_branches=self._show_excluded_branches,
             render=False,
         )
         self._update_branch_legend()
@@ -2108,8 +2142,10 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
             opacity=float(self.peak_marker_opacity.value()),
             color_by_branch=bool(self.peak_color_by_branch.isChecked()),
             uniform_color=str(color),
+            show_excluded_branches=self._show_excluded_branches,
             render=False,
         )
+        self._update_branch_legend()
         self._render()
 
     def _set_roi_color(self, color):

@@ -715,7 +715,11 @@ class VTKVolumeScene:
         self._peak_marker_colors = np.empty((0, 4), dtype=np.uint8)
         self._peak_marker_peak_ids = np.empty(0, dtype=np.int64)
         self._peak_marker_branch_ids = np.empty(0, dtype=np.int64)
+        self._peak_marker_analysis_included = np.empty(0, dtype=bool)
+        self._peak_marker_rendered_indices = np.empty(0, dtype=np.int64)
+        self._show_excluded_branches = False
         self._peak_branch_event_counts: dict[int, int] = {}
+        self._peak_excluded_branch_event_counts: dict[int, int] = {}
         self._peak_point_picker = vtk.vtkPointPicker()
         self._peak_point_picker.SetTolerance(0.012)
         self._peak_point_picker.PickFromListOn()
@@ -2651,7 +2655,11 @@ class VTKVolumeScene:
         self._peak_marker_base_colors = np.empty((0, 4), dtype=np.uint8)
         self._peak_marker_peak_ids = np.empty(0, dtype=np.int64)
         self._peak_marker_branch_ids = np.empty(0, dtype=np.int64)
+        self._peak_marker_analysis_included = np.empty(0, dtype=bool)
+        self._peak_marker_rendered_indices = np.empty(0, dtype=np.int64)
+        self._show_excluded_branches = False
         self._peak_branch_event_counts = {}
+        self._peak_excluded_branch_event_counts = {}
         self._peak_marker_visible = False
         self._branch_edge_actor.SetVisibility(0)
         self._branch_edge_polydata.Initialize()
@@ -3310,6 +3318,7 @@ class VTKVolumeScene:
         opacity: float = 0.95,
         color_by_branch: bool = True,
         uniform_color: str = "#FFC857",
+        show_excluded_branches: bool | None = None,
         render: bool = True,
     ) -> int:
         """Set detected/fitted peak centres as a separate display-only layer.
@@ -3347,7 +3356,19 @@ class VTKVolumeScene:
             peak_ids[peak_id_valid] = np.rint(peak_id_values[peak_id_valid]).astype(np.int64)
 
         branch_ids = np.full(physical.shape[0], -1, dtype=np.int64)
+        if "analysis_included" in columns and physical.shape[0]:
+            raw_included = np.asarray(peak_catalog["analysis_included"], dtype=object)[valid_rows]
+            analysis_included = np.asarray([
+                (bool(value) if isinstance(value, (bool, np.bool_))
+                 else str(value).strip().lower() in {"true", "1", "yes", "y"})
+                for value in raw_included
+            ], dtype=bool)
+        else:
+            # Older immutable artifacts predate branch size selection.
+            analysis_included = np.ones(physical.shape[0], dtype=bool)
+
         self._peak_branch_event_counts = {}
+        self._peak_excluded_branch_event_counts = {}
         if "branch_id" in columns and physical.shape[0]:
             branch_values = self._numeric_column(peak_catalog["branch_id"])[valid_rows]
             branch_valid = (
@@ -3355,16 +3376,33 @@ class VTKVolumeScene:
                 & (branch_values == np.rint(branch_values))
             )
             branch_ids[branch_valid] = np.rint(branch_values[branch_valid]).astype(np.int64)
-            if np.any(branch_valid):
-                branch_values_int, branch_counts = np.unique(
-                    branch_ids[branch_valid], return_counts=True
+            if np.any(branch_valid & analysis_included):
+                accepted_ids, accepted_counts = np.unique(
+                    branch_ids[branch_valid & analysis_included], return_counts=True
                 )
                 self._peak_branch_event_counts = {
                     int(branch_id): int(count)
-                    for branch_id, count in zip(branch_values_int, branch_counts)
+                    for branch_id, count in zip(accepted_ids, accepted_counts)
                 }
-            if color_by_branch and np.any(branch_valid):
-                colors[branch_valid] = self._branch_rgba(branch_ids[branch_valid])
+            if np.any(branch_valid & ~analysis_included):
+                excluded_ids, excluded_counts = np.unique(
+                    branch_ids[branch_valid & ~analysis_included], return_counts=True
+                )
+                self._peak_excluded_branch_event_counts = {
+                    int(branch_id): int(count)
+                    for branch_id, count in zip(excluded_ids, excluded_counts)
+                }
+            if color_by_branch and np.any(branch_valid & analysis_included):
+                colors[branch_valid & analysis_included] = self._branch_rgba(
+                    branch_ids[branch_valid & analysis_included]
+                )
+
+        # Excluded components are always visually neutral, even when their
+        # optional grouped display is enabled. They never inherit branch hues.
+        if np.any(~analysis_included):
+            colors[~analysis_included] = np.asarray([132, 139, 149, 255], dtype=np.uint8)
+        if show_excluded_branches is not None:
+            self._show_excluded_branches = bool(show_excluded_branches)
 
         if physical.shape[0] > 150_000:
             # Deterministic display-only thinning. Scientific catalogues remain
@@ -3374,17 +3412,23 @@ class VTKVolumeScene:
             colors = colors[indices]
             peak_ids = peak_ids[indices]
             branch_ids = branch_ids[indices]
+            analysis_included = analysis_included[indices]
 
         self._peak_marker_positions_physical = np.ascontiguousarray(physical, dtype=np.float64)
         self._peak_marker_base_colors = np.ascontiguousarray(colors, dtype=np.uint8)
         self._peak_marker_peak_ids = np.ascontiguousarray(peak_ids, dtype=np.int64)
         self._peak_marker_branch_ids = np.ascontiguousarray(branch_ids, dtype=np.int64)
+        self._peak_marker_analysis_included = np.ascontiguousarray(analysis_included, dtype=bool)
         self._apply_branch_correlation_peak_emphasis(update_polydata=False)
         self._update_peak_marker_polydata()
-        self._peak_marker_visible = bool(visible and physical.shape[0] > 0)
-        self._peak_marker_actor.SetVisibility(self._peak_marker_visible)
+        self._peak_marker_visible = bool(visible)
+        has_rendered_points = bool(self._peak_marker_rendered_indices.size)
+        self._peak_marker_actor.SetVisibility(self._peak_marker_visible and has_rendered_points)
         if render:
             self._request_render()
+        # Return the available catalog-overlay point count, not the current
+        # visible subset: the legend may still offer an opt-in to show excluded
+        # branches even when the default accepted-only subset is empty.
         return int(physical.shape[0])
 
     @staticmethod
@@ -3393,15 +3437,19 @@ class VTKVolumeScene:
         return "#{:02X}{:02X}{:02X}".format(int(rgba[0]), int(rgba[1]), int(rgba[2]))
 
     def branch_legend_data(self, *, limit: int = 40) -> dict[str, Any]:
-        """Return exact in-ROI branch event counts and stable marker colours."""
+        """Return accepted branch rows plus one aggregate for excluded branches."""
         limit = max(1, min(200, int(limit)))
         ordered = sorted(
             self._peak_branch_event_counts.items(),
             key=lambda item: (-int(item[1]), int(item[0])),
         )
+        excluded = self._peak_excluded_branch_event_counts
         return {
             "total_branches": int(len(ordered)),
             "total_events": int(sum(count for _, count in ordered)),
+            "excluded_branches": int(len(excluded)),
+            "excluded_events": int(sum(excluded.values())),
+            "show_excluded": bool(getattr(self, "_show_excluded_branches", False)),
             "entries": [
                 {
                     "branch_id": int(branch_id),
@@ -3412,6 +3460,15 @@ class VTKVolumeScene:
             ],
             "truncated": bool(len(ordered) > limit),
         }
+
+    def set_excluded_branches_visible(self, visible: bool, *, render: bool = True) -> None:
+        """Toggle the neutral, aggregate display of branches excluded by size."""
+        self._show_excluded_branches = bool(visible)
+        self._apply_branch_correlation_peak_emphasis(update_polydata=True)
+        has_points = bool(self._peak_marker_display_positions.size)
+        self._peak_marker_actor.SetVisibility(bool(self._peak_marker_visible and has_points))
+        if render:
+            self._request_render()
 
     def pick_peak_at_display(
         self, x: float, y: float, *, tolerance: float = 0.012
@@ -3440,19 +3497,25 @@ class VTKVolumeScene:
             if picked_actor is None or picked_actor != self._peak_marker_actor:
                 return None
             point_id = int(self._peak_point_picker.GetPointId())
-            if point_id < 0 or point_id >= self._peak_marker_positions_physical.shape[0]:
+            if point_id < 0 or point_id >= self._peak_marker_rendered_indices.size:
                 return None
-            position = self._peak_marker_positions_physical[point_id]
-            peak_id = int(self._peak_marker_peak_ids[point_id])
-            branch_id = int(self._peak_marker_branch_ids[point_id])
+            source_index = int(self._peak_marker_rendered_indices[point_id])
+            position = self._peak_marker_positions_physical[source_index]
+            peak_id = int(self._peak_marker_peak_ids[source_index])
+            branch_id = int(self._peak_marker_branch_ids[source_index])
+            analysis_included = bool(self._peak_marker_analysis_included[source_index])
             if branch_id >= 0:
-                event_count = int(self._peak_branch_event_counts.get(branch_id, 0))
+                count_map = (
+                    self._peak_branch_event_counts if analysis_included
+                    else self._peak_excluded_branch_event_counts
+                )
+                event_count = int(count_map.get(branch_id, 0))
             else:
                 event_count = 0
             # Reflect the actual color uploaded to this glyph. When colouring
             # by branch is disabled this is the user's uniform color, not the
             # branch palette; missing branch IDs use the marker fallback.
-            rgba = self._peak_marker_colors[point_id]
+            rgba = self._peak_marker_colors[source_index]
             color = "#{:02X}{:02X}{:02X}".format(
                 int(rgba[0]), int(rgba[1]), int(rgba[2])
             )
@@ -3461,6 +3524,7 @@ class VTKVolumeScene:
                 "peak_id": peak_id if peak_id >= 0 else None,
                 "branch_id": branch_id if branch_id >= 0 else None,
                 "branch_event_count": event_count,
+                "analysis_included": analysis_included,
                 "x": float(position[0]),
                 "y": float(position[1]),
                 "theta": float(position[2]),
@@ -3521,12 +3585,23 @@ class VTKVolumeScene:
                 if key is not None:
                     position_by_id[key] = position
             branch_by_id = {}
+            inclusion_by_id = {}
             if "branch_id" in catalog_columns:
                 raw_branch_ids = self._numeric_column(peak_catalog["branch_id"])[valid_rows]
-                for peak_id, branch_id in zip(ids, raw_branch_ids):
+                if "analysis_included" in catalog_columns:
+                    raw_flags = np.asarray(peak_catalog["analysis_included"], dtype=object)[valid_rows]
+                    flags = np.asarray([
+                        (bool(value) if isinstance(value, (bool, np.bool_))
+                         else str(value).strip().lower() in {"true", "1", "yes", "y"})
+                        for value in raw_flags
+                    ], dtype=bool)
+                else:
+                    flags = np.ones(len(ids), dtype=bool)
+                for peak_id, branch_id, included in zip(ids, raw_branch_ids, flags):
                     key = self._stable_id_key(peak_id)
                     if key is not None and np.isfinite(branch_id):
                         branch_by_id[key] = int(round(float(branch_id)))
+                        inclusion_by_id[key] = bool(included)
             edge_a = np.asarray(branch_edges["peak_id_a"], dtype=object)
             edge_b = np.asarray(branch_edges["peak_id_b"], dtype=object)
             valid_pairs = []
@@ -3534,6 +3609,8 @@ class VTKVolumeScene:
             for left, right in zip(edge_a, edge_b):
                 key_a, key_b = self._stable_id_key(left), self._stable_id_key(right)
                 if key_a not in position_by_id or key_b not in position_by_id:
+                    continue
+                if not inclusion_by_id.get(key_a, True) or not inclusion_by_id.get(key_b, True):
                     continue
                 valid_pairs.append((position_by_id[key_a], position_by_id[key_b]))
                 branch_values.append(branch_by_id.get(key_a))
@@ -3741,6 +3818,12 @@ class VTKVolumeScene:
             if np.any(residual):
                 factor = float(np.clip(getattr(self, "_branch_correlation_residual_opacity", 0.28), 0.05, 1.0))
                 colors[residual, 3] = np.rint(colors[residual, 3].astype(np.float64) * factor).astype(np.uint8)
+        included = np.asarray(
+            getattr(self, "_peak_marker_analysis_included", np.ones(colors.shape[0], dtype=bool)),
+            dtype=bool,
+        )
+        if included.size == colors.shape[0] and np.any(~included):
+            colors[~included] = np.asarray([132, 139, 149, 255], dtype=np.uint8)
         self._peak_marker_colors = np.ascontiguousarray(colors, dtype=np.uint8)
         if update_polydata and getattr(self, "_peak_marker_positions_physical", np.empty((0, 3))).size:
             self._update_peak_marker_polydata()
@@ -4085,18 +4168,27 @@ class VTKVolumeScene:
         return float(median_radius)
 
     def _update_peak_marker_polydata(self) -> None:
-        """Replace event points and their camera-calibrated sphere glyph scales."""
+        """Rebuild VTK glyph data from the currently visible event subset."""
         vtk, numpy_to_vtk = _vtk()
         physical = self._peak_marker_positions_physical
-        count = int(physical.shape[0])
-        if count == 0:
+        included = np.asarray(
+            getattr(self, "_peak_marker_analysis_included", np.ones(len(physical), dtype=bool)),
+            dtype=bool,
+        )
+        if included.size != len(physical):
+            included = np.ones(len(physical), dtype=bool)
+        show_excluded = bool(getattr(self, "_show_excluded_branches", False))
+        visible_mask = included | (show_excluded & ~included)
+        visible_indices = np.flatnonzero(visible_mask).astype(np.int64, copy=False)
+        self._peak_marker_rendered_indices = np.ascontiguousarray(visible_indices, dtype=np.int64)
+        if visible_indices.size == 0:
             self._peak_marker_display_positions = np.empty((0, 3), dtype=np.float64)
             self._peak_marker_polydata.Initialize()
             self._peak_marker_polydata.Modified()
             self._update_peak_marker_glyph_scale()
             return
 
-        display = physical.copy()
+        display = physical[visible_indices].copy()
         for column, axis, factor in zip(
             range(3), (self._physical_x, self._physical_y, self._physical_theta),
             self._axis_scales,
@@ -4112,19 +4204,21 @@ class VTKVolumeScene:
         from vtk.util.numpy_support import numpy_to_vtkIdTypeArray
         if hasattr(cells, "SetData"):
             offsets = numpy_to_vtkIdTypeArray(
-                np.arange(count + 1, dtype=np.int64), deep=True
+                np.arange(len(visible_indices) + 1, dtype=np.int64), deep=True
             )
             connectivity = numpy_to_vtkIdTypeArray(
-                np.arange(count, dtype=np.int64), deep=True
+                np.arange(len(visible_indices), dtype=np.int64), deep=True
             )
             cells.SetData(offsets, connectivity)
         else:  # pragma: no cover - compatibility with older VTK releases
-            packed = np.empty((count, 2), dtype=np.int64)
+            packed = np.empty((len(visible_indices), 2), dtype=np.int64)
             packed[:, 0] = 1
-            packed[:, 1] = np.arange(count, dtype=np.int64)
-            cells.SetCells(count, numpy_to_vtkIdTypeArray(packed.ravel(), deep=True))
+            packed[:, 1] = np.arange(len(visible_indices), dtype=np.int64)
+            cells.SetCells(len(visible_indices), numpy_to_vtkIdTypeArray(packed.ravel(), deep=True))
         self._peak_marker_polydata.SetVerts(cells)
-        rgba = numpy_to_vtk(np.ascontiguousarray(self._peak_marker_colors), deep=True)
+        rgba = numpy_to_vtk(
+            np.ascontiguousarray(self._peak_marker_colors[visible_indices]), deep=True
+        )
         rgba.SetNumberOfComponents(4)
         rgba.SetName("PeakMarkerRGBA")
         self._peak_marker_polydata.GetPointData().SetScalars(rgba)
@@ -4132,8 +4226,10 @@ class VTKVolumeScene:
         self._update_peak_marker_glyph_scale()
 
     def set_peak_markers_visible(self, visible: bool, *, render: bool = True) -> None:
-        self._peak_marker_visible = bool(visible and self._peak_marker_positions_physical.size)
-        self._peak_marker_actor.SetVisibility(self._peak_marker_visible)
+        self._peak_marker_visible = bool(visible)
+        self._peak_marker_actor.SetVisibility(
+            bool(self._peak_marker_visible and self._peak_marker_rendered_indices.size)
+        )
         if render:
             self._request_render()
 
@@ -4964,7 +5060,11 @@ class VTKVolumeScene:
         self._peak_marker_base_colors = np.empty((0, 4), dtype=np.uint8)
         self._peak_marker_peak_ids = np.empty(0, dtype=np.int64)
         self._peak_marker_branch_ids = np.empty(0, dtype=np.int64)
+        self._peak_marker_analysis_included = np.empty(0, dtype=bool)
+        self._peak_marker_rendered_indices = np.empty(0, dtype=np.int64)
+        self._show_excluded_branches = False
         self._peak_branch_event_counts = {}
+        self._peak_excluded_branch_event_counts = {}
         self._peak_marker_visible = False
         if self._branch_edge_actor is not None:
             self._branch_edge_actor.SetVisibility(0)

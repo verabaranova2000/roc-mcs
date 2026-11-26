@@ -680,7 +680,16 @@ def build_workflow_preview_state(
             else:
                 valid_pixels = np.any(effective_valid, axis=2)
                 branch_counts[~valid_pixels] = np.nan
-            grouped = branch_catalog.groupby(["y", "x"], sort=False)["branch_id"].nunique()
+            selection_mask = np.ones(len(branch_catalog), dtype=bool)
+            if "analysis_included" in branch_catalog.columns:
+                raw_included = branch_catalog["analysis_included"].to_numpy(dtype=object)
+                selection_mask = np.asarray([
+                    (bool(value) if isinstance(value, (bool, np.bool_))
+                     else str(value).strip().lower() in {"true", "1", "yes", "y"})
+                    for value in raw_included
+                ], dtype=bool)
+            selected_catalog = branch_catalog.loc[selection_mask]
+            grouped = selected_catalog.groupby(["y", "x"], sort=False)["branch_id"].nunique()
             for (y_value, x_value), count in grouped.items():
                 try:
                     x_idx, y_idx = int(x_value), int(y_value)
@@ -691,7 +700,10 @@ def build_workflow_preview_state(
             _add_map(
                 layers, key="branches.count", label="Число ветвей в пикселе",
                 value=branch_counts, shape_yx=(ny, nx), group="Дифракционные ветви",
-                unit="ветвей", description="Число различных branch_id среди пиков данного пикселя.",
+                unit="ветвей", description=(
+                    "Число различных branch_id, включённых в дальнейший анализ, "
+                    "среди пиков данного пикселя. Исключённые по порогу ветви сохранены в каталоге."
+                ),
             )
 
     peak_points = None

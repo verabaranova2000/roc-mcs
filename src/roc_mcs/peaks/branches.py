@@ -140,6 +140,106 @@ def label_peak_branches(peak_catalog, edges):
     return int(n_branches), np.asarray(labels, dtype=np.int32)
 
 
+
+def recommend_min_branch_events(
+    branch_sizes, *, min_multiplicative_gap: float = 4.0,
+) -> tuple[int, dict[str, Any]]:
+    """Suggest a conservative event-count cutoff from a clear size gap.
+
+    The rule is intentionally descriptive, not a physical law: unique positive
+    component sizes are ordered, the largest adjacent multiplicative gap is
+    considered, and a cutoff is proposed only when the gap is at least
+    ``min_multiplicative_gap`` and at least two components lie below it.
+    The threshold is the geometric midpoint (natural on a log-size axis).
+    When no clear gap exists, return 1, i.e. retain every branch.
+    """
+    values = np.asarray(branch_sizes, dtype=np.float64).reshape(-1)
+    if values.size == 0:
+        return 1, {"method": "largest_multiplicative_gap_v1", "status": "empty",
+                    "ratio": None, "lower_size": None, "upper_size": None}
+    if (not np.isfinite(values).all() or np.any(values < 1)
+            or not np.equal(values, np.rint(values)).all()):
+        raise ValueError("Размеры ветвей должны быть конечными положительными целыми числами")
+    values_int = values.astype(np.int64)
+    unique = np.unique(values_int)
+    gap_min = float(min_multiplicative_gap)
+    if not np.isfinite(gap_min) or gap_min <= 1.0:
+        raise ValueError("min_multiplicative_gap должен быть конечным числом больше 1")
+    if unique.size < 2:
+        return 1, {"method": "largest_multiplicative_gap_v1", "status": "no_size_gap",
+                    "ratio": None, "lower_size": int(unique[0]),
+                    "upper_size": None, "min_multiplicative_gap": gap_min}
+
+    # Candidate boundaries split *observed* sizes. Branches do not receive a
+    # model-derived probability; ties are resolved toward the larger gap.
+    candidates = []
+    for index in range(unique.size - 1):
+        lower = int(unique[index])
+        upper = int(unique[index + 1])
+        n_lower = int(np.count_nonzero(values_int <= lower))
+        n_upper = int(values_int.size - n_lower)
+        if n_lower < 2 or n_upper < 1:
+            continue
+        ratio = float(upper) / float(lower)
+        candidates.append((ratio, lower, upper, n_lower, n_upper))
+    if not candidates:
+        return 1, {"method": "largest_multiplicative_gap_v1", "status": "insufficient_components",
+                    "ratio": None, "lower_size": None, "upper_size": None,
+                    "min_multiplicative_gap": gap_min}
+    ratio, lower, upper, n_lower, n_upper = max(
+        candidates, key=lambda item: (item[0], -item[1])
+    )
+    if ratio < gap_min:
+        return 1, {"method": "largest_multiplicative_gap_v1", "status": "no_clear_gap",
+                    "ratio": ratio, "lower_size": lower, "upper_size": upper,
+                    "branches_below": n_lower, "branches_above": n_upper,
+                    "min_multiplicative_gap": gap_min}
+    # There are no observed sizes between lower and upper. Any integer in this
+    # interval yields the same classification; choose the log-space midpoint.
+    threshold = int(np.floor(np.sqrt(float(lower) * float(upper)))) + 1
+    threshold = max(lower + 1, min(upper, threshold))
+    return threshold, {"method": "largest_multiplicative_gap_v1", "status": "clear_gap",
+                      "ratio": ratio, "lower_size": lower, "upper_size": upper,
+                      "branches_below": n_lower, "branches_above": n_upper,
+                      "min_multiplicative_gap": gap_min,
+                      "threshold": threshold}
+
+
+def branch_analysis_mask(branch_catalog) -> np.ndarray:
+    """Return event-aligned inclusion flags; legacy catalogues include all rows."""
+    if branch_catalog is None:
+        return np.zeros(0, dtype=bool)
+    columns = set(getattr(branch_catalog, "columns", ()))
+    if "analysis_included" not in columns:
+        return np.ones(len(branch_catalog), dtype=bool)
+    values = np.asarray(branch_catalog["analysis_included"], dtype=object)
+    result = np.zeros(values.size, dtype=bool)
+    for index, value in enumerate(values):
+        if isinstance(value, (bool, np.bool_)):
+            result[index] = bool(value)
+        elif value is not None:
+            text = str(value).strip().lower()
+            result[index] = text in {"true", "1", "yes", "y"}
+    return result
+
+
+def calculate_branch_size_distribution(peak_catalog, theta_gate: float) -> dict[str, Any]:
+    """Calculate exact global connected-component sizes for the supplied gate."""
+    edges, _ = build_peak_branch_graph(peak_catalog, theta_gate=theta_gate)
+    count, labels = label_peak_branches(peak_catalog, edges)
+    if count <= 0:
+        sizes = np.empty(0, dtype=np.int64)
+    else:
+        sizes = np.bincount(labels.astype(np.int64), minlength=count).astype(np.int64)
+    recommended, diagnostics = recommend_min_branch_events(sizes)
+    return {
+        "sizes": sizes.astype(int).tolist(),
+        "recommended_min": int(recommended),
+        "diagnostics": diagnostics,
+        "n_branches": int(count),
+        "n_events": int(len(peak_catalog)),
+    }
+
 def summarize_peak_spacing(
     peak_catalog, *, reference_theta_gate: float = 60.0
 ) -> dict[str, Any]:

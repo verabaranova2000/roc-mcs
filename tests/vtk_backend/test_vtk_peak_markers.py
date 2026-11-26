@@ -407,3 +407,70 @@ def test_peak_markers_remain_visible_with_descending_y_and_theta_axes():
         vtk_to_numpy(scene._peak_marker_polydata.GetPoints().GetData()),
         [[0.0, 20.0, 5.0], [1.0, 10.0, 3.0], [2.0, 0.0, 1.0]],
     )
+
+
+def test_size_excluded_branches_are_hidden_by_default_and_toggle_as_one_neutral_group():
+    scene = _marker_scene()
+    catalog = pd.DataFrame({
+        "peak_id": [10, 11, 20, 21],
+        "x": [0, 1, 2, 3],
+        "y": [1, 1, 1, 1],
+        "theta": [1.0, 1.1, 2.0, 2.1],
+        "branch_id": [0, 0, 1, 1],
+        "analysis_included": [True, True, False, False],
+    })
+    count = scene.set_peak_markers(
+        catalog, np.arange(4.0), np.arange(3.0), visible=True,
+        color_by_branch=True, render=False,
+    )
+
+    # The source catalog is still complete, but only accepted events enter the
+    # default VTK polydata and branch palette.
+    assert count == 4
+    assert scene._peak_marker_polydata.GetNumberOfPoints() == 2
+    np.testing.assert_array_equal(scene._peak_marker_rendered_indices, [0, 1])
+    assert scene.branch_legend_data() == {
+        "total_branches": 1,
+        "total_events": 2,
+        "excluded_branches": 1,
+        "excluded_events": 2,
+        "show_excluded": False,
+        "entries": [{
+            "branch_id": 0,
+            "event_count": 2,
+            "color": scene._branch_hex_color(0),
+        }],
+        "truncated": False,
+    }
+
+    scene.set_excluded_branches_visible(True, render=False)
+    assert scene._peak_marker_polydata.GetNumberOfPoints() == 4
+    np.testing.assert_array_equal(scene._peak_marker_rendered_indices, [0, 1, 2, 3])
+    rgba = vtk_to_numpy(scene._peak_marker_polydata.GetPointData().GetScalars())
+    np.testing.assert_array_equal(rgba[2:], [[132, 139, 149, 255], [132, 139, 149, 255]])
+
+    scene.set_excluded_branches_visible(False, render=False)
+    assert scene._peak_marker_polydata.GetNumberOfPoints() == 2
+
+
+def test_branch_edges_never_render_edges_touching_size_excluded_components():
+    scene = _marker_scene()
+    catalog = pd.DataFrame({
+        "peak_id": [10, 11, 20, 21],
+        "x": [0, 1, 2, 3],
+        "y": [0, 0, 1, 1],
+        "theta": [1.0, 1.1, 2.0, 2.1],
+        "branch_id": [0, 0, 1, 1],
+        "analysis_included": [True, True, False, False],
+    })
+    edges = pd.DataFrame({
+        "peak_id_a": [10, 20],
+        "peak_id_b": [11, 21],
+        "delta_theta": [0.1, 0.1],
+    })
+    count = scene.set_branch_edges(
+        catalog, edges, np.arange(4.0), np.arange(3.0),
+        visible=True, render=False,
+    )
+    assert count == 1
+    assert scene._branch_edge_polydata.GetNumberOfLines() == 1

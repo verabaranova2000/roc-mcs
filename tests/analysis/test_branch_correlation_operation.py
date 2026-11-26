@@ -259,3 +259,69 @@ def test_algorithm_failure_is_wrapped_with_selected_ids_and_geometry(monkeypatch
                 "assignment_margin": 0.2,
             },
         )
+
+
+
+def test_branch_correlation_consumes_only_size_accepted_components():
+    catalog = _catalog().copy()
+    excluded = pd.DataFrame([{
+        "peak_id": 999, "branch_id": 30, "theta_index": 6,
+        "theta": 90.0, "x": 3, "y": 2,
+    }])
+    catalog = pd.concat([catalog, excluded], ignore_index=True)
+    catalog["analysis_included"] = True
+    catalog.loc[catalog["branch_id"] == 30, "analysis_included"] = False
+    parent = ArtifactBundle(
+        tables={"branch_catalog": catalog},
+        metadata={
+            "grid_id": "selection-grid",
+            "n_branches": 3,
+            "n_analysis_branches": 2,
+            "theta_index_step_arcsec": 15.0,
+            "theta_index_step_uniform": True,
+        },
+    )
+    result = default_registry().execute(
+        "peaks.branch_correlation", {"branches": parent},
+        {
+            "source_branch_id": 10,
+            "partner_branch_ids": [20],
+            "xy_tolerance_px": 1.5,
+            "theta_tolerance_arcsec": 20.0,
+            "assignment_margin": 0.2,
+        },
+    )
+    assert result.bundle.metadata["parent_branch_count"] == 3
+    assert result.bundle.metadata["parent_analysis_branch_count"] == 2
+    assignments = result.bundle.tables["branch_correlation_assignments"]
+    assert 30 not in set(assignments["source_branch_id"].dropna().astype(int))
+    assert 30 not in set(assignments["assigned_partner_branch_id"].dropna().astype(int))
+
+
+def test_branch_correlation_refuses_a_branch_excluded_by_the_size_threshold():
+    catalog = _catalog().copy()
+    excluded = pd.DataFrame([{
+        "peak_id": 999, "branch_id": 30, "theta_index": 6,
+        "theta": 90.0, "x": 3, "y": 2,
+    }])
+    catalog = pd.concat([catalog, excluded], ignore_index=True)
+    catalog["analysis_included"] = True
+    catalog.loc[catalog["branch_id"] == 30, "analysis_included"] = False
+    parent = ArtifactBundle(
+        tables={"branch_catalog": catalog},
+        metadata={
+            "theta_index_step_arcsec": 15.0,
+            "theta_index_step_uniform": True,
+        },
+    )
+    with pytest.raises(ValueError, match=r"branch_id.*30.*исключены из анализа"):
+        default_registry().execute(
+            "peaks.branch_correlation", {"branches": parent},
+            {
+                "source_branch_id": 10,
+                "partner_branch_ids": [30],
+                "xy_tolerance_px": 1.5,
+                "theta_tolerance_arcsec": 20.0,
+                "assignment_margin": 0.2,
+            },
+        )

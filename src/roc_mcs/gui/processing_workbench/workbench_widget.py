@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from PyQt6.QtCore import Qt, QObject, QRunnable, QThreadPool, pyqtSignal, QEvent, QSize, QTimer
+from PyQt6.QtCore import Qt, QObject, QRunnable, QThreadPool, pyqtSignal, QEvent, QSize, QTimer, QSignalBlocker
 from PyQt6.QtGui import QCursor, QPalette
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QSplitter, QFormLayout, QComboBox,
@@ -35,6 +35,7 @@ from roc_mcs.analysis.preview_context import load_node_preview_context
 from .graph_canvas import ProcessingGraphView
 from .peak_detection_preview import PeakDetectionPreview
 from .branch_detection_preview import BranchDetectionPreview
+from .branch_size_histogram import BranchSizeHistogram
 from roc_mcs.visualization.peak_count_map import integrated_intensity_map, peak_count_rgba
 from roc_mcs.gui.components.icon_provider import svg_icon
 from roc_mcs.gui.roi_explorer.plot_toolbar_style import ICON_DIR
@@ -239,34 +240,70 @@ class _PeakPixelInputTask(QRunnable):
             self.signals.failed.emit(self.parent_id, traceback.format_exc())
 
 
-class _BranchStatsTask(QRunnable):
-    """Compute per-scan gate diagnostics from a completed peak/fit artifact."""
+def _read_branch_position_catalog(artifact_store: ArtifactStore, artifact_id: str, parent_operation: str):
+    """Read only the peak tables/columns required for branch diagnostics."""
+    from roc_mcs.peaks.branches import fitted_peak_positions
 
-    def __init__(self, parent_id: str, parent_operation: str, artifact_id: str, artifact_directory: str):
+    if parent_operation == "fit.scan":
+        bundle = artifact_store.read_subset(
+            artifact_id,
+            table_names=("peak_catalog", "fitted_peak_catalog"),
+            column_names_by_table={
+                "peak_catalog": ("peak_id", "x", "y", "theta", "theta_index", "component_id"),
+                "fitted_peak_catalog": (
+                    "x", "y", "component_id", "theta0", "theta_fit", "center_theta", "theta",
+                    "peak_id",
+                ),
+            },
+            missing_ok=True,
+            missing_columns_ok=True,
+        )
+        return fitted_peak_positions(bundle), "позиции после Fit"
+    bundle = artifact_store.read_subset(
+        artifact_id,
+        table_names=("peak_catalog",),
+        column_names_by_table={
+            "peak_catalog": ("peak_id", "x", "y", "theta", "theta_index"),
+        },
+        missing_ok=True,
+        missing_columns_ok=True,
+    )
+    catalog = bundle.tables.get("peak_catalog")
+    if catalog is None:
+        raise ValueError("В артефакте поиска пиков отсутствует peak_catalog")
+    if getattr(catalog, "empty", False):
+        raise ValueError("Каталог пиков пуст: для диагностики ветвей нет peak-events")
+    return catalog, "обнаруженные пики"
+
+
+class _BranchStatsTask(QRunnable):
+    """Compute gate diagnostics and exact branch sizes outside the GUI thread."""
+
+    def __init__(
+        self, parent_id: str, parent_operation: str, artifact_id: str,
+        artifact_directory: str, theta_gate: float,
+    ):
         super().__init__()
         self.parent_id = str(parent_id)
         self.parent_operation = str(parent_operation)
         self.artifact_id = str(artifact_id)
         self.artifact_directory = str(artifact_directory)
+        self.theta_gate = float(theta_gate)
         self.signals = _WorkerSignals()
 
     def run(self) -> None:
         try:
-            from roc_mcs.peaks.branches import summarize_peak_spacing, fitted_peak_positions
+            from roc_mcs.peaks.branches import (
+                summarize_peak_spacing, calculate_branch_size_distribution,
+            )
             from .branch_preview_data import select_preview_patch
 
-            bundle = ArtifactStore(self.artifact_directory).read(self.artifact_id)
-            if self.parent_operation == "fit.scan":
-                catalog = fitted_peak_positions(bundle)
-                position_label = "позиции после Fit"
-            else:
-                catalog = bundle.tables.get("peak_catalog")
-                if catalog is None:
-                    raise ValueError("В артефакте поиска пиков отсутствует peak_catalog")
-                if getattr(catalog, "empty", False):
-                    raise ValueError("Каталог пиков пуст: для диагностики ветвей нет peak-events")
-                position_label = "обнаруженные пики"
+            store = ArtifactStore(self.artifact_directory)
+            catalog, position_label = _read_branch_position_catalog(
+                store, self.artifact_id, self.parent_operation
+            )
             stats = summarize_peak_spacing(catalog, reference_theta_gate=60.0)
+            size_distribution = calculate_branch_size_distribution(catalog, self.theta_gate)
             preview_catalog, preview_info = select_preview_patch(catalog)
             preview_rows = [
                 (int(row.peak_id), int(row.x), int(row.y), float(row.theta))
@@ -274,10 +311,42 @@ class _BranchStatsTask(QRunnable):
             ]
             self.signals.succeeded.emit(self.parent_id, {
                 "stats": stats,
+                "branch_size": size_distribution,
+                "theta_gate": self.theta_gate,
                 "preview_rows": preview_rows,
                 "preview_info": preview_info,
                 "position_label": position_label,
             })
+        except Exception:
+            self.signals.failed.emit(self.parent_id, traceback.format_exc())
+
+
+class _BranchSizeTask(QRunnable):
+    """Recalculate only the size distribution after a θ-gate edit."""
+
+    def __init__(
+        self, parent_id: str, parent_operation: str, artifact_id: str,
+        artifact_directory: str, theta_gate: float,
+    ):
+        super().__init__()
+        self.parent_id = str(parent_id)
+        self.parent_operation = str(parent_operation)
+        self.artifact_id = str(artifact_id)
+        self.artifact_directory = str(artifact_directory)
+        self.theta_gate = float(theta_gate)
+        self.signals = _WorkerSignals()
+
+    def run(self) -> None:
+        try:
+            from roc_mcs.peaks.branches import calculate_branch_size_distribution
+            catalog, _label = _read_branch_position_catalog(
+                ArtifactStore(self.artifact_directory), self.artifact_id, self.parent_operation
+            )
+            payload = {
+                "theta_gate": self.theta_gate,
+                "branch_size": calculate_branch_size_distribution(catalog, self.theta_gate),
+            }
+            self.signals.succeeded.emit(self.parent_id, payload)
         except Exception:
             self.signals.failed.emit(self.parent_id, traceback.format_exc())
 
@@ -311,7 +380,14 @@ class ProcessingWorkbenchWidget(QWidget):
         self._hkl_preview_cache: dict[str, Any] = {}
         self._active_peak_input_task: _PeakPixelInputTask | None = None
         self._active_branch_stats_task: _BranchStatsTask | None = None
+        self._active_branch_size_task: _BranchSizeTask | None = None
         self._branch_gate_values: dict[str, float] = {}
+        self._branch_selection_values: dict[str, dict[str, Any]] = {}
+        self._active_branch_artifact: tuple[str, str, str] | None = None
+        self._branch_size_update_timer = QTimer(self)
+        self._branch_size_update_timer.setSingleShot(True)
+        self._branch_size_update_timer.setInterval(260)
+        self._branch_size_update_timer.timeout.connect(self._request_branch_size_update)
         # Branch outputs are immutable artifacts. Cache only their small metadata
         # (not the peak catalog) so graph rebuilds never reload large tables.
         self._branch_count_cache: dict[str, tuple[int | None, str | None]] = {}
@@ -1392,6 +1468,50 @@ class ProcessingWorkbenchWidget(QWidget):
         )
         layout.addRow(table)
 
+        selection_title = QLabel("<b>Размер ветвей · включение в дальнейший анализ</b>")
+        selection_title.setTextFormat(Qt.TextFormat.RichText)
+        selection_title.setToolTip(
+            "Распределение рассчитывается тем же 4-связным one-to-one алгоритмом, "
+            "что и итоговый этап. Малые компоненты не удаляются: они лишь исключаются "
+            "из последующих расчётов, сохраняя исходные branch_id и peak_id."
+        )
+        layout.addRow(selection_title)
+        size_histogram = BranchSizeHistogram()
+        layout.addRow(size_histogram)
+        threshold_row = QWidget()
+        threshold_layout = QHBoxLayout(threshold_row)
+        threshold_layout.setContentsMargins(0, 0, 0, 0)
+        threshold_layout.setSpacing(6)
+        threshold_layout.addWidget(QLabel("Минимум событий:"))
+        min_events = self._int_spin(1, 100_000_000, 1)
+        min_events.setSuffix(" событий")
+        min_events.setToolTip(
+            "Ветви с числом событий не меньше порога включаются в корреляцию и последующие этапы. "
+            "Исходный каталог и исключённые ветви сохраняются без изменений."
+        )
+        threshold_layout.addWidget(min_events)
+        auto_button = QToolButton()
+        auto_button.setText("Авто")
+        auto_button.setCheckable(True)
+        auto_button.setChecked(True)
+        auto_button.setToolTip(
+            "Автоматический порог по крупнейшему мультипликативному разрыву "
+            "между наблюдаемыми размерами ветвей. При отсутствии отчётливого разрыва "
+            "автоматически сохраняются все ветви."
+        )
+        threshold_layout.addWidget(auto_button)
+        threshold_layout.addStretch(1)
+        layout.addRow(threshold_row)
+        selection_status = QLabel("Распределение размеров ветвей загружается…")
+        selection_status.setWordWrap(True)
+        selection_status.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addRow(selection_status)
+
+        size_histogram.threshold_changed.connect(min_events.setValue)
+        min_events.valueChanged.connect(self._on_branch_threshold_manual_changed)
+        auto_button.clicked.connect(self._set_branch_threshold_auto)
+        theta_gate.valueChanged.connect(self._on_branch_theta_gate_changed)
+
         hint = QLabel(
             "4-связность по X/Y · one-to-one assignment по минимуму |Δθ| · "
             "каждый пик остаётся отдельным узлом графа · несвязанные события образуют "
@@ -1404,6 +1524,8 @@ class ProcessingWorkbenchWidget(QWidget):
         self._forms["peaks.branches"].update(
             theta_gate=theta_gate, preview=preview,
             stats_label=stats_label, stats_table=table,
+            size_histogram=size_histogram, min_branch_events=min_events,
+            branch_threshold_auto=auto_button, branch_selection_status=selection_status,
         )
 
     def _build_branch_correlation_form(self) -> None:
@@ -1671,20 +1793,47 @@ class ProcessingWorkbenchWidget(QWidget):
         if preview is not None:
             preview.clear_catalog("Загрузка реального фрагмента каталога пиков…")
         if table is not None:
-            # Never leave another scan's diagnostic rows visible while this
-            # parent's statistics are being computed or if loading fails.
             table.setRowCount(0)
+        # Invalidate any size calculation started for the previously selected
+        # parent.  Clearing the plot prevents a stale scan's threshold from
+        # remaining visible while the new parent's exact graph is computed.
+        self._branch_size_update_timer.stop()
+        self._active_branch_size_task = None
+        histogram = form.get("size_histogram")
+        if histogram is not None:
+            histogram.set_distribution([], 1, {"status": "loading"})
+            histogram.set_threshold(1)
+        spin = form.get("min_branch_events")
+        if spin is not None:
+            blocker = QSignalBlocker(spin)
+            spin.setRange(1, 1)
+            spin.setValue(1)
+            del blocker
+        status = form.get("branch_selection_status")
+        if status is not None:
+            status.setText("Распределение размеров загружается для выбранного скана…")
         output_name = "fit" if node.operation_id == "fit.scan" else "peaks"
         artifact_id = node.output_refs.get(output_name)
+        self._active_branch_stats_parent_id = str(parent_id)
+        self._branch_parent_id = str(parent_id)
         if not artifact_id:
+            self._active_branch_artifact = None
             if label is not None:
                 label.setText("У выбранного родителя нет сохранённого каталога пиков.")
             if preview is not None:
                 preview.clear_catalog("У выбранного родителя нет каталога пиков для иллюстрации.")
             return
+        self._active_branch_artifact = (str(parent_id), str(node.operation_id), str(artifact_id))
+        gate_control = form.get("theta_gate")
+        saved_gate = self._branch_gate_values.get(str(parent_id))
+        if gate_control is not None and saved_gate is not None:
+            blocker = QSignalBlocker(gate_control)
+            gate_control.setValue(min(gate_control.maximum(), max(gate_control.minimum(), float(saved_gate))))
+            del blocker
+        theta_gate = float(gate_control.value()) if gate_control is not None else 60.0
         task = _BranchStatsTask(
             parent_id, node.operation_id, artifact_id,
-            str(self.project.artifact_store.directory),
+            str(self.project.artifact_store.directory), theta_gate,
         )
         task.signals.succeeded.connect(
             lambda pid, stats, source_task=task:
@@ -1695,10 +1844,193 @@ class ProcessingWorkbenchWidget(QWidget):
             self._on_branch_stats_failed(pid, error, source_task)
         )
         self._active_branch_stats_task = task
-        self._active_branch_stats_parent_id = str(parent_id)
         if label is not None:
-            label.setText("Вычисляется статистика θ для выбранной ветви…")
+            label.setText("Вычисляется статистика θ и размеры ветвей…")
         self.thread_pool.start(task)
+
+    def _on_branch_theta_gate_changed(self, value: float) -> None:
+        parent_id = self._branch_parent_id
+        if parent_id:
+            self._branch_gate_values[str(parent_id)] = float(value)
+        preview = self._forms.get("peaks.branches", {}).get("preview")
+        if preview is not None:
+            preview.set_theta_gate(float(value))
+        if self._active_branch_artifact and self._active_branch_artifact[0] == str(parent_id):
+            self._branch_size_update_timer.start()
+
+    def _request_branch_size_update(self) -> None:
+        active = self._active_branch_artifact
+        if not active or active[0] != str(self._branch_parent_id or ""):
+            return
+        parent_id, parent_operation, artifact_id = active
+        form = self._forms.get("peaks.branches", {})
+        gate = float(form["theta_gate"].value())
+        task = _BranchSizeTask(
+            parent_id, parent_operation, artifact_id,
+            str(self.project.artifact_store.directory), gate,
+        )
+        task.signals.succeeded.connect(
+            lambda pid, payload, source_task=task:
+            self._on_branch_size_ready(pid, payload, source_task)
+        )
+        task.signals.failed.connect(
+            lambda pid, error, source_task=task:
+            self._on_branch_size_failed(pid, error, source_task)
+        )
+        self._active_branch_size_task = task
+        status = form.get("branch_selection_status")
+        if status is not None:
+            status.setText("Пересчитываются размеры ветвей для нового θ-gate…")
+        self.thread_pool.start(task)
+
+    def _on_branch_size_ready(
+        self, parent_id: str, payload: dict[str, Any], source_task: _BranchSizeTask | None = None,
+    ) -> None:
+        if (
+            str(parent_id) != str(self._branch_parent_id or "")
+            or (source_task is not None and source_task is not self._active_branch_size_task)
+        ):
+            return
+        self._active_branch_size_task = None
+        form = self._forms.get("peaks.branches", {})
+        try:
+            result_gate = float(payload.get("theta_gate"))
+            current_gate = float(form["theta_gate"].value())
+        except (TypeError, ValueError, KeyError):
+            return
+        if abs(result_gate - current_gate) > max(1e-9, abs(current_gate) * 1e-10):
+            return
+        self._apply_branch_size_distribution(parent_id, payload.get("branch_size"))
+
+    def _on_branch_size_failed(
+        self, parent_id: str, error: str, source_task: _BranchSizeTask | None = None,
+    ) -> None:
+        if (
+            str(parent_id) != str(self._branch_parent_id or "")
+            or (source_task is not None and source_task is not self._active_branch_size_task)
+        ):
+            return
+        self._active_branch_size_task = None
+        status = self._forms.get("peaks.branches", {}).get("branch_selection_status")
+        if status is not None:
+            status.setText("Не удалось пересчитать размеры ветвей; последнее корректное распределение сохранено.")
+            status.setToolTip(error)
+
+    def _apply_branch_size_distribution(self, parent_id: str, distribution: Any) -> None:
+        form = self._forms.get("peaks.branches", {})
+        histogram = form.get("size_histogram")
+        spin = form.get("min_branch_events")
+        auto_button = form.get("branch_threshold_auto")
+        status = form.get("branch_selection_status")
+        if histogram is None or spin is None or auto_button is None or not isinstance(distribution, dict):
+            return
+        sizes = [int(value) for value in distribution.get("sizes", ())]
+        recommended = max(1, int(distribution.get("recommended_min", 1)))
+        histogram.set_distribution(sizes, recommended, distribution.get("diagnostics"))
+        maximum = max(1, max(sizes, default=1))
+        spin.setRange(1, maximum)
+        state = self._branch_selection_values.setdefault(
+            str(parent_id), {"auto": True, "minimum": recommended}
+        )
+        automatic = bool(state.get("auto", True))
+        threshold = recommended if automatic else int(state.get("minimum", recommended))
+        threshold = max(1, min(maximum, threshold))
+        state["minimum"] = int(threshold)
+        blocker_spin = QSignalBlocker(spin)
+        blocker_button = QSignalBlocker(auto_button)
+        spin.setValue(threshold)
+        auto_button.setChecked(automatic)
+        del blocker_spin, blocker_button
+        histogram.set_threshold(threshold)
+        n_total = len(sizes)
+        n_included = int(sum(int(value) >= threshold for value in sizes))
+        n_excluded = n_total - n_included
+        n_events_included = int(sum(int(value) for value in sizes if int(value) >= threshold))
+        n_events_excluded = int(sum(int(value) for value in sizes if int(value) < threshold))
+        diagnostics = distribution.get("diagnostics") or {}
+        if status is not None:
+            mode = "Авто" if automatic else "Вручную"
+            if automatic and diagnostics.get("status") != "clear_gap":
+                rationale = "отчётливый разрыв не найден; сохранены все ветви"
+            elif automatic:
+                ratio = diagnostics.get("ratio")
+                rationale = f"мультипликативный разрыв ×{float(ratio):.1f}" if ratio is not None else "по распределению размеров"
+            else:
+                rationale = "порог задан пользователем"
+            status.setText(
+                f"{mode}: ≥{threshold} событий · включено {n_included:,}/{n_total:,} ветвей "
+                f"({n_events_included:,} событий), исключено {n_excluded:,} ветвей "
+                f"({n_events_excluded:,} событий) · {rationale}."
+            )
+            status.setToolTip(
+                "Порог действует только на последующие аналитические этапы. "
+                "Все ветви остаются в branch_catalog с исходными branch_id/peak_id. "
+                "Автоматический критерий: крупнейший мультипликативный разрыв "
+                "между наблюдаемыми размерами ветвей; при отсутствии разрыва ≥4 "
+                "автоматически включаются все ветви."
+            )
+
+    def _on_branch_threshold_manual_changed(self, value: int) -> None:
+        parent_id = str(self._branch_parent_id or "")
+        if not parent_id:
+            return
+        state = self._branch_selection_values.setdefault(parent_id, {"auto": True, "minimum": 1})
+        state.update({"auto": False, "minimum": int(value)})
+        form = self._forms.get("peaks.branches", {})
+        auto_button = form.get("branch_threshold_auto")
+        if auto_button is not None:
+            blocker = QSignalBlocker(auto_button)
+            auto_button.setChecked(False)
+            del blocker
+        histogram = form.get("size_histogram")
+        if histogram is not None:
+            histogram.set_threshold(int(value))
+        self._refresh_branch_selection_status(parent_id)
+
+    def _set_branch_threshold_auto(self, *_args) -> None:
+        parent_id = str(self._branch_parent_id or "")
+        form = self._forms.get("peaks.branches", {})
+        if not parent_id:
+            return
+        state = self._branch_selection_values.setdefault(parent_id, {"auto": True, "minimum": 1})
+        state["auto"] = True
+        button = form.get("branch_threshold_auto")
+        spin = form.get("min_branch_events")
+        histogram = form.get("size_histogram")
+        if button is not None:
+            blocker = QSignalBlocker(button)
+            button.setChecked(True)
+            del blocker
+        if histogram is not None:
+            threshold = int(histogram.recommended_threshold)
+            if spin is not None:
+                blocker = QSignalBlocker(spin)
+                spin.setValue(min(spin.maximum(), threshold))
+                del blocker
+            histogram.set_threshold(threshold)
+            state["minimum"] = threshold
+        self._refresh_branch_selection_status(parent_id)
+
+    def _refresh_branch_selection_status(self, parent_id: str) -> None:
+        form = self._forms.get("peaks.branches", {})
+        histogram = form.get("size_histogram")
+        spin = form.get("min_branch_events")
+        status = form.get("branch_selection_status")
+        if histogram is None or spin is None or status is None:
+            return
+        # The widget retains exact event counts; ask it for the currently drawn
+        # distribution rather than constructing a second, potentially stale model.
+        sizes = getattr(histogram, "_sizes", np.empty(0, dtype=np.int64))
+        threshold = int(spin.value())
+        included = sizes[sizes >= threshold]
+        excluded = sizes[sizes < threshold]
+        state = self._branch_selection_values.get(str(parent_id), {})
+        mode = "Авто" if state.get("auto", True) else "Вручную"
+        status.setText(
+            f"{mode}: ≥{threshold} событий · включено {included.size:,}/{sizes.size:,} ветвей "
+            f"({int(included.sum()) if included.size else 0:,} событий), исключено "
+            f"{excluded.size:,} ветвей ({int(excluded.sum()) if excluded.size else 0:,} событий)."
+        )
 
     def _on_branch_stats_ready(
         self, parent_id: str, stats: dict[str, Any], source_task: _BranchStatsTask | None = None
@@ -1717,6 +2049,20 @@ class ProcessingWorkbenchWidget(QWidget):
         if label is None or table is None:
             return
         result = stats if isinstance(stats, dict) else {}
+        if "branch_size" in result:
+            try:
+                computed_gate = float(result.get("theta_gate"))
+                current_gate = float(form["theta_gate"].value())
+            except (TypeError, ValueError, KeyError):
+                computed_gate = current_gate = float("nan")
+            if np.isfinite(computed_gate) and np.isclose(
+                computed_gate, current_gate, rtol=1e-10, atol=1e-9
+            ):
+                self._apply_branch_size_distribution(parent_id, result.get("branch_size"))
+            else:
+                status = form.get("branch_selection_status")
+                if status is not None:
+                    status.setText("θ-gate изменён во время загрузки; ожидается пересчёт распределения…")
         preview = form.get("preview")
         if "stats" in result:
             try:
@@ -1792,6 +2138,12 @@ class ProcessingWorkbenchWidget(QWidget):
             table.setRowCount(0)
         if preview is not None:
             preview.clear_catalog("Не удалось загрузить каталог из выбранной ветви workflow.")
+        histogram = form.get("size_histogram")
+        if histogram is not None:
+            histogram.set_distribution([], 1, {"status": "unavailable"})
+            histogram.set_threshold(1)
+        if form.get("branch_selection_status") is not None:
+            form["branch_selection_status"].setText("Распределение размеров недоступно; при запуске будет применён автоматический режим.")
         if label is not None:
             label.setText("Не удалось вычислить статистику θ; доступно исходное значение 60″.")
             label.setToolTip(error)
@@ -1926,7 +2278,13 @@ class ProcessingWorkbenchWidget(QWidget):
                 "allow_center_shift": form["allow_center_shift"].isChecked(),
             }
         if operation_id == "peaks.branches":
-            return {"theta_gate": form["theta_gate"].value()}
+            return {
+                "theta_gate": form["theta_gate"].value(),
+                "min_branch_events": (
+                    None if form["branch_threshold_auto"].isChecked()
+                    else int(form["min_branch_events"].value())
+                ),
+            }
         if operation_id == "peaks.branch_correlation":
             return {
                 "source_branch_id": form["source_branch_id"].text().strip(),
@@ -1960,7 +2318,7 @@ class ProcessingWorkbenchWidget(QWidget):
             return cached
         try:
             metadata = self.project.artifact_store.read_metadata(str(artifact_id))
-            raw_count = metadata.get("n_branches")
+            raw_count = metadata.get("n_analysis_branches", metadata.get("n_branches"))
             if isinstance(raw_count, bool):
                 raise ValueError("n_branches содержит bool вместо целого числа")
             count_float = float(raw_count)
@@ -2068,9 +2426,26 @@ class ProcessingWorkbenchWidget(QWidget):
 
         self._branch_parent_id = parent_id
         if operation_id == "peaks.branches":
-            gate_control = self._forms.get("peaks.branches", {}).get("theta_gate")
+            form_info = self._forms.get("peaks.branches", {})
+            gate_control = form_info.get("theta_gate")
             if gate_control is not None:
+                blocker = QSignalBlocker(gate_control)
                 gate_control.setValue(float(self._branch_gate_values.get(str(parent_id), 60.0)))
+                del blocker
+                preview_widget = form_info.get("preview")
+                if preview_widget is not None:
+                    preview_widget.set_theta_gate(float(gate_control.value()))
+            threshold_state = self._branch_selection_values.get(str(parent_id), {"auto": True, "minimum": 1})
+            auto_button = form_info.get("branch_threshold_auto")
+            min_spin = form_info.get("min_branch_events")
+            if auto_button is not None:
+                blocker = QSignalBlocker(auto_button)
+                auto_button.setChecked(bool(threshold_state.get("auto", True)))
+                del blocker
+            if min_spin is not None:
+                blocker = QSignalBlocker(min_spin)
+                min_spin.setValue(max(1, int(threshold_state.get("minimum", 1))))
+                del blocker
         combo_index = self.operation_combo.findData(operation_id)
         if combo_index < 0:
             return

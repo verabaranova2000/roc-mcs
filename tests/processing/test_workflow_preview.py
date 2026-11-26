@@ -177,3 +177,41 @@ def test_branch_map_uses_zero_for_valid_pixels_without_branch_and_preserves_edge
         equal_nan=True,
     )
     assert state.branch_edges is edges
+
+
+def test_branch_count_map_uses_included_components_but_retains_full_peak_catalog():
+    import pandas as pd
+
+    raw = np.ones((2, 2, 3), dtype=float)
+    scan = SimpleNamespace(arrays={
+        "data_yxt": raw,
+        "theta": np.array([0.0, 1.0, 2.0]),
+        "x_coords": np.array([0.0, 1.0]),
+        "y_coords": np.array([0.0, 1.0]),
+        "valid_mask_yxt": np.ones(raw.shape, dtype=bool),
+        "analysis_valid_mask_yx": np.array([[True, True], [True, False]]),
+    }, metadata={})
+    catalog = pd.DataFrame([
+        {"peak_id": 10, "x": 0, "y": 0, "theta": 0.5,
+         "branch_id": 0, "analysis_included": True},
+        {"peak_id": 11, "x": 0, "y": 0, "theta": 0.6,
+         "branch_id": 1, "analysis_included": False},
+        {"peak_id": 12, "x": 1, "y": 0, "theta": 0.7,
+         "branch_id": 2, "analysis_included": False},
+    ])
+    branches = SimpleNamespace(
+        tables={"branch_catalog": catalog, "branch_edges": None}, metadata={}
+    )
+
+    state = build_workflow_preview_state(
+        _node("peaks.branches"), {"scan": scan, "branches": branches}
+    )
+    np.testing.assert_allclose(
+        state.map_layer("branches.count").data_yx,
+        [[1.0, 0.0], [0.0, np.nan]],
+        equal_nan=True,
+    )
+    # The source catalogue stays complete for optional inspection; filtering is
+    # a renderer/analysis inclusion mask, not destructive row removal.
+    assert len(state.peak_points) == 3
+    assert state.peak_points["peak_id"].tolist() == [10, 11, 12]

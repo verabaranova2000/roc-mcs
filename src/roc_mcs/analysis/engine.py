@@ -434,7 +434,9 @@ def make_operation_label(operation_id: str, parameters: Mapping[str, Any]) -> st
     if operation_id == "fit.scan":
         return f"Fit · {parameters['model']} · {parameters['backend']}"
     if operation_id == "peaks.branches":
-        return f"Ветви · θ-gate {parameters['theta_gate']:g}″"
+        minimum = parameters.get("min_branch_events")
+        selection = "авто" if minimum is None else f"≥{int(minimum)} событий"
+        return f"Ветви · θ-gate {parameters['theta_gate']:g}″ · {selection}"
     if operation_id == "peaks.branch_correlation":
         partners = ",".join(str(value) for value in parameters["partner_branch_ids"])
         return f"3D-корреляция · {parameters['source_branch_id']} ↔ {partners}"

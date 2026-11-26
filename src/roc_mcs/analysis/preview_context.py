@@ -93,7 +93,9 @@ def _branch_preview_context(node: Any, history: Any, executor: Any) -> dict[str,
     scientific calculations. Required signal cubes remain full resolution;
     unrelated arrays and wide table columns are not decoded a second time.
     """
-    branch_catalog_columns = ("peak_id", "branch_id", "x", "y", "theta", "theta_index")
+    branch_catalog_columns = (
+        "peak_id", "branch_id", "x", "y", "theta", "theta_index", "analysis_included",
+    )
     branch_bundle_selection = {
         "tables": ("branch_catalog", "branch_edges"),
         "columns": {"branch_catalog": branch_catalog_columns},
