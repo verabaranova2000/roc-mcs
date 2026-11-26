@@ -10,11 +10,84 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from PyQt6.QtCore import QStandardPaths, pyqtSignal
+from PyQt6.QtCore import QStandardPaths, QTimer, Qt, pyqtSignal
+from PyQt6.QtGui import QColor, QPainter, QPen, QPalette
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QLabel
 
 from roc_mcs.analysis.project import WorkflowProject
 from .workbench_widget import ProcessingWorkbenchWidget
+
+
+class _VerticalResizeGrip(QWidget):
+    """Small splitter-like handle that grows the workflow section in the sidebar."""
+
+    def __init__(self, owner: "ProcessingStepsPanel"):
+        super().__init__(owner)
+        self._owner = owner
+        self._drag_origin_y: int | None = None
+        self._start_height = 0
+        self.setObjectName("processingGraphHeightGrip")
+        # A narrow, in-flow splitter handle. It is inserted directly below
+        # the graph, not at the bottom of the processing controls.
+        self.setFixedHeight(7)
+        self.setMinimumWidth(44)
+        self.setCursor(Qt.CursorShape.SplitVCursor)
+        self.setToolTip(
+            "Перетащите вверх или вниз, чтобы изменить высоту области дерева обработки"
+        )
+        self.setAccessibleName("Изменить высоту дерева обработки")
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def paintEvent(self, _event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        color = self.palette().color(
+            QPalette.ColorRole.Highlight if self.underMouse() else QPalette.ColorRole.Mid
+        )
+        color.setAlpha(175 if self.underMouse() else 115)
+        painter.setPen(QPen(color, 1.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        cx = self.width() / 2.0
+        cy = self.height() / 2.0
+        painter.drawLine(round(cx - 15), round(cy), round(cx + 15), round(cy))
+        painter.setPen(QPen(color, 1.5, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        for offset in (-3, 0, 3):
+            painter.drawPoint(round(cx + offset), round(cy))
+        painter.end()
+
+    def enterEvent(self, event) -> None:
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self.update()
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_origin_y = int(event.globalPosition().toPoint().y())
+            self._start_height = int(self._owner._workbench_host.height())
+            if self._start_height <= 0:
+                self._start_height = int(self._owner._workbench_host.minimumHeight())
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        if self._drag_origin_y is not None and event.buttons() & Qt.MouseButton.LeftButton:
+            delta = int(event.globalPosition().toPoint().y()) - self._drag_origin_y
+            self._owner._set_workbench_host_height(
+                self._start_height + delta, manual=True
+            )
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton and self._drag_origin_y is not None:
+            self._drag_origin_y = None
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
 
 class ProcessingStepsPanel(QWidget):
@@ -45,11 +118,62 @@ class ProcessingStepsPanel(QWidget):
         self._workbench_layout = QVBoxLayout(self._workbench_host)
         self._workbench_layout.setContentsMargins(0, 0, 0, 0)
         self._workbench_layout.setSpacing(0)
+        # No hard-coded 320 px: the empty host has zero height.  Once a
+        # Workbench is attached, its own layout computes a safe compact height
+        # that keeps the graph viewport and every action/status control visible.
+        self._workbench_host.setFixedHeight(0)
         root.addWidget(self._workbench_host, 1)
+        # The handle is moved into the Workbench layout immediately below the
+        # graph when a scan is opened. Keeping it owned here lets its drag update
+        # the host height while placing it next to the area it resizes.
+        self._height_grip = _VerticalResizeGrip(self)
+        self._height_grip.hide()
         self.status = QLabel("Выберите HDF5 и скан", self)
         self.status.setWordWrap(True)
         self.status.setStyleSheet("color: palette(placeholderText); font-size: 8pt;")
         root.addWidget(self.status)
+
+    def _set_workbench_host_height(self, requested: int, *, manual: bool = False) -> None:
+        """Apply a safe, exact height to the embedded Workbench host.
+
+        The lower bound comes from the current Workbench layout size hint, not
+        an arbitrary constant.  It includes the graph header, graph viewport,
+        resize grip, Run/Restore/Accept/Reject controls and status indicators.
+        Thus the graph can never consume the space reserved for its own controls.
+        """
+        workbench = self.workbench
+        safe_minimum = (
+            workbench.embedded_graph_compact_host_height()
+            if workbench is not None else 0
+        )
+        height = max(safe_minimum, min(100_000, int(requested)))
+        if (
+            self._workbench_host.minimumHeight() == height
+            and self._workbench_host.maximumHeight() == height
+            and self._workbench_host.height() == height
+        ):
+            if manual and workbench is not None:
+                workbench._on_manual_graph_height_changed()
+            return
+        self._workbench_host.setFixedHeight(height)
+        self._workbench_host.updateGeometry()
+        self.updateGeometry()
+        parent = self.parentWidget()
+        if parent is not None:
+            parent.updateGeometry()
+        if workbench is not None:
+            if manual:
+                workbench._on_manual_graph_height_changed()
+            else:
+                QTimer.singleShot(0, workbench._sync_graph_scroll_button)
+
+    def _initialize_workbench_height(self, workbench: ProcessingWorkbenchWidget) -> None:
+        """Set the initial compact size after Qt has activated the child layouts."""
+        if workbench is not self.workbench:
+            return
+        workbench._auto_fit_graph_height = False
+        self._set_workbench_host_height(workbench.embedded_graph_compact_host_height())
+        QTimer.singleShot(0, workbench._sync_graph_scroll_button)
 
     @property
     def is_busy(self) -> bool:
@@ -76,6 +200,14 @@ class ProcessingStepsPanel(QWidget):
         # workbench is detached, then persist its workflow history atomically.
         old._restore_preview()
         old.project.save()
+        # The grip is owned by the embedded graph area while a Workbench is
+        # alive. Remove it from the old layout explicitly before reparenting so
+        # a scan swap cannot leave a stale layout item behind.
+        old._left_graph_layout.removeWidget(self._height_grip)
+        self._height_grip.setParent(self)
+        self._height_grip.hide()
+        self._workbench_host.setFixedHeight(0)
+        self._workbench_host.updateGeometry()
         self._workbench_layout.removeWidget(old)
         old.setParent(None)
         old.deleteLater()
@@ -144,10 +276,26 @@ class ProcessingStepsPanel(QWidget):
             workbench.preview_restore_requested.connect(self.restore_requested.emit)
             workbench.pixel_pick_mode_requested.connect(self.pixel_pick_mode_requested.emit)
             workbench.busy_changed.connect(self.busy_changed.emit)
+            workbench.graph_full_height_requested.connect(
+                self._set_workbench_host_height
+            )
+            workbench.graph_compact_height_requested.connect(
+                self._set_workbench_host_height
+            )
             self._workbench_layout.addWidget(workbench)
+            # Keep the resize affordance visually and semantically attached to
+            # the graph: it sits between the viewport and action controls.
+            graph_layout = workbench._left_graph_layout
+            graph_index = graph_layout.indexOf(workbench.graph)
+            self._height_grip.setParent(workbench.graph.parentWidget())
+            graph_layout.insertWidget(
+                graph_index + 1, self._height_grip, 0, Qt.AlignmentFlag.AlignHCenter
+            )
+            self._height_grip.show()
             self.project = project
             self.workbench = workbench
             self._source_key = key
+            QTimer.singleShot(0, lambda wb=workbench: self._initialize_workbench_height(wb))
             self.project_label.setText(project.directory.name)
             self.project_label.setToolTip(str(project.directory))
             self._set_status(

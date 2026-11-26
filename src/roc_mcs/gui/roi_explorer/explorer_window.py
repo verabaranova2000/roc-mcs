@@ -130,6 +130,10 @@ class RockingCurveExplorerWindow(QMainWindow):
         # they cannot keep postponing the coalesced 2D refresh.
         self._theta_range_last_requested_indices: tuple[int, int] | None = None
         self._analysis_view = None
+        # The analysis preview may temporarily choose a semantic palette (e.g.
+        # RdBu_r for signed Δθ). Keep the source-map palette for the whole
+        # preview session and restore it on every exit path.
+        self._analysis_previous_cmap: str | None = None
         self._volume_refresh_pending = True
         self._analysis_previous_pool = None
         self._analysis_curve_cache = {}
@@ -474,6 +478,7 @@ class RockingCurveExplorerWindow(QMainWindow):
         # Drop it before swapping repositories; its saved PoolSpec must not be
         # applied to the newly opened source.
         self._analysis_view = None
+        self._restore_analysis_source_colormap()
         self._analysis_previous_pool = None
         self._analysis_curve_cache.clear()
         self._theta_projection_accumulator.clear()
@@ -810,7 +815,7 @@ class RockingCurveExplorerWindow(QMainWindow):
     def _on_scan_changed(self, *args) -> None:
         if self.repo is None or self.map_widget.scan_combo.currentText() == "":
             return
-        if self._analysis_view is not None:
+        if self._analysis_view is not None or self._analysis_previous_cmap is not None:
             self.restore_analysis_preview()
         self.selected_scan = self.map_widget.scan_combo.currentText()
         self._theta_scan_cache_key = None; self._theta_scan_cache = None; self._theta_levels_cache.clear()
@@ -1421,6 +1426,19 @@ class RockingCurveExplorerWindow(QMainWindow):
         node = str(getattr(state, "node_id", metadata.get("workflow_node_id", "")))
         return source, scan, node
 
+    def _restore_analysis_source_colormap(self) -> None:
+        """Restore the palette that was active before entering a result preview."""
+        previous = self._analysis_previous_cmap
+        self._analysis_previous_cmap = None
+        if previous is None:
+            return
+        set_colormap = getattr(self.map_widget, "set_colormap", None)
+        if callable(set_colormap):
+            set_colormap(str(previous))
+        else:  # compatibility with alternate map-widget adapters
+            self.map_widget.current_cmap = str(previous)
+            self.map_widget.tools.set_current_cmap(str(previous))
+
     def _remember_analysis_display_preferences(self) -> None:
         if self._analysis_display_identity is not None:
             self._analysis_display_preferences[self._analysis_display_identity] = (
@@ -1639,6 +1657,8 @@ class RockingCurveExplorerWindow(QMainWindow):
             self.status.showMessage("Предпросмотр относится к другому HDF5-файлу", 8000)
             return
         self._remember_analysis_display_preferences()
+        if self._analysis_view is None and self._analysis_previous_cmap is None:
+            self._analysis_previous_cmap = str(self.map_widget.current_cmap)
         identity = self._analysis_display_key(state)
         if self._analysis_previous_pool is None:
             self._analysis_previous_pool = self.repo.pool
@@ -1674,9 +1694,10 @@ class RockingCurveExplorerWindow(QMainWindow):
             self.status.showMessage(f"Workflow preview: {state.label}")
 
     def restore_analysis_preview(self) -> None:
-        """Возвращает исходный HDF5-view и прежний spatial pooling."""
+        """Возвращает исходный HDF5-view, палитру и прежний spatial pooling."""
         self._remember_analysis_display_preferences()
         self._analysis_view = None
+        self._restore_analysis_source_colormap()
         self._set_analysis_contrast_mode(None)
         self._analysis_map_key = None
         self._analysis_curve_key = None

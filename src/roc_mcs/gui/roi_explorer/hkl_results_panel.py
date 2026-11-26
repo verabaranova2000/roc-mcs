@@ -11,16 +11,20 @@ import numpy as np
 import pandas as pd
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
+from matplotlib.backend_bases import MouseButton
 from matplotlib.lines import Line2D
 from matplotlib.ticker import ScalarFormatter
+import matplotlib.patheffects as path_effects
 
-from PyQt6.QtCore import Qt, QSize
-from PyQt6.QtGui import QFont
+from PyQt6.QtCore import QEvent, Qt, QSize, QTimer
+from PyQt6.QtGui import QCursor, QFont
 from PyQt6.QtWidgets import (
+    QApplication,
     QAbstractItemView,
     QAbstractSpinBox,
     QComboBox,
     QDoubleSpinBox,
+    QFrame,
     QHeaderView,
     QHBoxLayout,
     QLabel,
@@ -60,6 +64,14 @@ class HklResultsPanel(QWidget):
         self._theme = "light"
         self._measurement_values_by_pair: dict[str, np.ndarray] = {}
         self._reflection_x = np.empty(0, dtype=np.float64)
+        self._reflection_hover_text_by_x: dict[float, str] = {}
+        self._hovered_reflection_key: float | None = None
+        self._pinned_reflection_key: float | None = None
+        self._pending_reflection_key: float | None = None
+        self._pending_reflection_anchor = None
+        self._reflection_tooltip_frame: QFrame | None = None
+        self._reflection_tooltip_label: QLabel | None = None
+        self._application_event_filter_installed = False
         self._ranking_by_pair: dict[str, pd.DataFrame] = {}
         self._histogram_cache: dict[str, Any] | None = None
         self._histogram_axes = None
@@ -69,7 +81,6 @@ class HklResultsPanel(QWidget):
         self._histogram_drag_state: dict[str, Any] | None = None
         self._selected_reflection_row = -1
         self._reflection_catalog = pd.DataFrame()
-        self._rank_label_artists = []
         self._selected_reflection_artist = None
         self._selected_reflection_marker = None
 
@@ -143,14 +154,14 @@ class HklResultsPanel(QWidget):
         plot_toolbar.setContentsMargins(2, 0, 2, 0)
         plot_toolbar.setSpacing(4)
         self.plot_hint_label = QLabel(
-            "Колесо — масштаб · перетаскивание — сдвиг · Ctrl — θ · Shift — Y",
+            "Колесо — масштаб · средняя кнопка — сдвиг · наведение — сведения о рефлексе",
             self.pair_tab,
         )
         self.plot_hint_label.setObjectName("hklPlotHint")
         self.plot_hint_label.setToolTip(
-            "Колесо мыши: приблизить/отдалить обе оси вокруг курсора. "
-            "Ctrl + колесо или перетаскивание: только θ; Shift: только частота Y. "
-            "Перетаскивание левой кнопкой перемещает диапазон по обеим осям."
+            "Колесо мыши масштабирует обе оси относительно положения курсора. "
+            "Перетаскивание средней кнопкой перемещает диапазоны θ и частоты. "
+            "Наведите указатель на линию рефлекса, чтобы увидеть его параметры."
         )
         plot_toolbar.addWidget(self.plot_hint_label, 1)
         self.reset_view_button = QToolButton(self.pair_tab)
@@ -172,11 +183,20 @@ class HklResultsPanel(QWidget):
         self.pair_canvas.setMinimumWidth(0)
         self.pair_canvas.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         pair_layout.addWidget(self.pair_canvas)
+        self._create_reflection_tooltip()
+        app = QApplication.instance()
+        if app is not None:
+            # Catch clicks in the table, toolbar and the rest of the application
+            # as well as clicks in the plot. A pinned reflection card is a
+            # transient inspection state, so any click outside it dismisses it.
+            app.installEventFilter(self)
+            self._application_event_filter_installed = True
         self._histogram_event_ids = [
             self.pair_canvas.mpl_connect("scroll_event", self._on_histogram_scroll),
             self.pair_canvas.mpl_connect("button_press_event", self._on_histogram_press),
             self.pair_canvas.mpl_connect("button_release_event", self._on_histogram_release),
             self.pair_canvas.mpl_connect("motion_notify_event", self._on_histogram_motion),
+            self.pair_canvas.mpl_connect("figure_leave_event", self._on_histogram_figure_leave),
         ]
 
         self.pair_stats_label = QLabel("", self.pair_tab)
@@ -342,6 +362,7 @@ class HklResultsPanel(QWidget):
         self.reset_view_button.setIcon(svg_icon(
             ICON_DIR / "zoom_out_map.svg", color=colors["text"], widget=self.reset_view_button
         ))
+        self._style_reflection_tooltip()
         if self._result is None:
             self._draw_empty(self.pair_chart_figure, self.pair_canvas, "Ожидается результат HKL")
             self._draw_empty(self.all_chart_figure, self.all_canvas, "Нет данных для сравнения пар")
@@ -358,6 +379,8 @@ class HklResultsPanel(QWidget):
         self._measurement_values_by_pair.clear()
         self._ranking_by_pair.clear()
         self._reflection_x = np.empty(0, dtype=np.float64)
+        self._hide_reflection_tooltip(clear_pinned=True)
+        self._reflection_hover_text_by_x.clear()
 
         self.pair_combo.blockSignals(True)
         self.pair_combo.clear()
@@ -377,7 +400,6 @@ class HklResultsPanel(QWidget):
             self._histogram_full_ylim = None
             self._selected_reflection_row = -1
             self._reflection_catalog = pd.DataFrame()
-            self._rank_label_artists = []
             self._selected_reflection_artist = None
             self._selected_reflection_marker = None
             self.pair_combo.blockSignals(False)
@@ -416,9 +438,12 @@ class HklResultsPanel(QWidget):
         self._histogram_view_limits = None
         self._selected_reflection_row = -1
         self._reflection_catalog = reflections.loc[:, [
-            name for name in ("hkl", "delta_theta_arcsec", "theta_ka1_deg", "d_A")
-            if name in reflections.columns
-        ]].copy(deep=True)
+            name for name in (
+                "hkl", "delta_theta_arcsec", "theta_ka1_deg", "d_A",
+                "FH_sq", "F_H_sq_at_ka1", "darwin_sigma_arcsec", "darwin_pi_arcsec",
+            ) if name in reflections.columns
+        ]].copy(deep=False)
+        self._build_reflection_hover_index(self._reflection_catalog)
         all_measurements = (
             np.concatenate(tuple(self._measurement_values_by_pair.values()))
             if self._measurement_values_by_pair else np.empty(0, dtype=np.float64)
@@ -470,12 +495,12 @@ class HklResultsPanel(QWidget):
             self._histogram_full_ylim = None
             self._histogram_view_limits = None
             self._histogram_drag_state = None
-            self._rank_label_artists = []
             self._selected_reflection_artist = None
             self._selected_reflection_marker = None
             self._selected_reflection_row = -1
+            self._hide_reflection_tooltip()
             self.plot_hint_label.setText(
-                "Колесо — масштаб · перетаскивание — сдвиг · Ctrl — θ · Shift — Y"
+                "Колесо — масштаб · средняя кнопка — сдвиг · наведение — сведения о рефлексе"
             )
         figure.clear()
         ax = figure.add_subplot(111)
@@ -490,6 +515,7 @@ class HklResultsPanel(QWidget):
         canvas.draw_idle()
 
     def _on_pair_changed(self, _index: int) -> None:
+        self._hide_reflection_tooltip()
         self._selected_reflection_row = -1
         self._render_selected_pair(reset_view=True)
 
@@ -497,6 +523,7 @@ class HklResultsPanel(QWidget):
         self._render_selected_pair(reset_view=True)
 
     def _render_selected_pair(self, _value: Any = None, *, reset_view: bool = False) -> None:
+        self._hide_reflection_tooltip(clear_pinned=True)
         if self._result is None or self.pair_combo.currentIndex() < 0:
             return
         pair_id = str(self.pair_combo.currentData())
@@ -602,9 +629,6 @@ class HklResultsPanel(QWidget):
         ranking_x = pd.to_numeric(
             ranking.get("delta_theta_arcsec", pd.Series(dtype=float)), errors="coerce"
         ).to_numpy(dtype=np.float64, na_value=np.nan)
-        ranking_ranks = pd.to_numeric(
-            ranking.get("rank", pd.Series(dtype=float)), errors="coerce"
-        ).to_numpy(dtype=np.float64, na_value=np.nan)
         best_x = float(ranking_x[0]) if ranking_x.size and np.isfinite(ranking_x[0]) else float("nan")
 
         self._histogram_cache = {
@@ -615,7 +639,6 @@ class HklResultsPanel(QWidget):
             "max_count": max(1.0, float(counts.max(initial=0))),
             "reflection_x": self._reflection_x,
             "ranking_x": ranking_x,
-            "ranking_ranks": ranking_ranks,
             "best_x": best_x,
             "median": self._as_float(stats.get("delta_theta_abs_median_arcsec")),
             "mean": self._as_float(stats.get("delta_theta_abs_mean_arcsec")),
@@ -630,7 +653,6 @@ class HklResultsPanel(QWidget):
 
         figure = self.pair_chart_figure
         figure.clear()
-        self._rank_label_artists = []
         self._selected_reflection_artist = None
         self._selected_reflection_marker = None
         ax = figure.add_subplot(111)
@@ -704,7 +726,7 @@ class HklResultsPanel(QWidget):
 
         ax.set_ylim(view_y_low, view_y_high)
         ax.set_xlim(view_low, view_high)
-        ax.set_xlabel("Абсолютное экспериментальное разделение |Δθ|, ″", fontsize=7.5, labelpad=2)
+        ax.set_xlabel("Абсолютная разность угловых положений пиков |Δθ|, ″", fontsize=7.5, labelpad=2)
         ax.set_ylabel("Частота", fontsize=7.5, labelpad=2)
         ax.set_title("Δθ: измерения и теоретические положения", fontsize=8, pad=3)
         ax.grid(axis="y", color=colors["grid"], linewidth=0.5, alpha=0.32, zorder=0)
@@ -732,10 +754,6 @@ class HklResultsPanel(QWidget):
         ax.yaxis.label.set_color(colors["text"])
         ax.title.set_color(colors["text"])
         figure.subplots_adjust(left=0.085, right=0.992, bottom=0.27, top=0.81)
-        self._rank_label_artists = self._add_rank_labels(
-            ax, cache["ranking_x"], cache["ranking_ranks"],
-            view_low, view_high, label_color=colors["text"],
-        )
         self._draw_selected_reflection_overlay()
         self.pair_canvas.draw_idle()
 
@@ -755,27 +773,19 @@ class HklResultsPanel(QWidget):
             low = high - span
         return float(low), float(high)
 
-    @staticmethod
-    def _event_modifier(event, modifier: str) -> bool:
-        key = str(getattr(event, "key", "") or "").lower()
-        return modifier in key
-
     def _on_histogram_scroll(self, event) -> None:
         ax = self._histogram_axes
         if ax is None or event.inaxes is not ax or event.xdata is None or event.ydata is None:
             return
-        x_only = self._event_modifier(event, "control") or self._event_modifier(event, "ctrl")
-        y_only = self._event_modifier(event, "shift")
-        if x_only and y_only:
-            return
         scale = 1.22 if getattr(event, "step", 0) > 0 else (1.0 / 1.22)
         xlim = tuple(map(float, ax.get_xlim()))
         ylim = tuple(map(float, ax.get_ylim()))
-        new_xlim, new_ylim = xlim, ylim
-        if not y_only:
-            new_xlim = self._zoom_interval(xlim, float(event.xdata), scale, self._histogram_full_xlim)
-        if not x_only:
-            new_ylim = self._zoom_interval(ylim, float(event.ydata), scale, self._histogram_full_ylim)
+        new_xlim = self._zoom_interval(
+            xlim, float(event.xdata), scale, self._histogram_full_xlim
+        )
+        new_ylim = self._zoom_interval(
+            ylim, float(event.ydata), scale, self._histogram_full_ylim
+        )
         self._apply_histogram_limits(new_xlim, new_ylim)
 
     @staticmethod
@@ -791,12 +801,59 @@ class HklResultsPanel(QWidget):
             new_low, new_high = HklResultsPanel._clamp_interval(new_low, new_high, *bounds)
         return float(new_low), float(new_high)
 
+    def eventFilter(self, watched, event):
+        """Dismiss a pinned reflection card on a click anywhere else.
+
+        Matplotlib only receives mouse presses over its own canvas. Installing
+        this lightweight filter on QApplication also covers clicks on the
+        reflection table, other tabs and neighbouring ROI Explorer controls.
+        Clicks in the card itself are consumed so they cannot accidentally hit
+        a reflection drawn underneath its transparent overlay.
+        """
+        if (
+            event.type() == QEvent.Type.MouseButtonPress
+            and self._pinned_reflection_key is not None
+            and self._reflection_tooltip_frame is not None
+            and self._reflection_tooltip_frame.isVisible()
+        ):
+            global_position = event.globalPosition().toPoint()
+            canvas_position = self.pair_canvas.mapFromGlobal(global_position)
+            if self._reflection_tooltip_frame.geometry().contains(canvas_position):
+                return True
+            if not self.pair_canvas.rect().contains(canvas_position):
+                self._hide_reflection_tooltip(clear_pinned=True)
+        return super().eventFilter(watched, event)
+
     def _on_histogram_press(self, event) -> None:
         ax = self._histogram_axes
-        if ax is None or event.inaxes is not ax or event.button != 1 or event.xdata is None or event.ydata is None:
+        is_left_click = event.button in (MouseButton.LEFT, 1)
+        is_middle_click = event.button in (MouseButton.MIDDLE, 2)
+
+        if is_left_click:
+            if ax is not None and event.inaxes is ax and event.x is not None:
+                reflection_key = self._reflection_at_mouse(float(event.x))
+                if reflection_key is not None:
+                    # A click pins the scientific record. Pointer motion no
+                    # longer changes or dismisses this popup; another click does.
+                    self._show_reflection_tooltip(
+                        reflection_key, pinned=True, anchor=self._cursor_canvas_position()
+                    )
+                else:
+                    self._hide_reflection_tooltip(clear_pinned=True)
+            else:
+                self._hide_reflection_tooltip(clear_pinned=True)
             return
-        x_only = self._event_modifier(event, "control") or self._event_modifier(event, "ctrl")
-        y_only = self._event_modifier(event, "shift")
+
+        if not is_middle_click:
+            self._hide_reflection_tooltip(clear_pinned=True)
+            return
+        if (
+            ax is None or event.inaxes is not ax
+            or event.xdata is None or event.ydata is None
+        ):
+            self._hide_reflection_tooltip(clear_pinned=True)
+            return
+        self._hide_reflection_tooltip(clear_pinned=True)
         xlim = tuple(map(float, ax.get_xlim()))
         ylim = tuple(map(float, ax.get_ylim()))
         bbox = ax.get_window_extent()
@@ -805,7 +862,6 @@ class HklResultsPanel(QWidget):
             "xlim": xlim, "ylim": ylim,
             "x_per_pixel": (xlim[1] - xlim[0]) / max(float(bbox.width), 1.0),
             "y_per_pixel": (ylim[1] - ylim[0]) / max(float(bbox.height), 1.0),
-            "x_only": x_only, "y_only": y_only,
         }
         self.pair_canvas.setCursor(Qt.CursorShape.ClosedHandCursor)
 
@@ -824,18 +880,37 @@ class HklResultsPanel(QWidget):
             dy = (float(event.y) - state["pixel_y"]) * state["y_per_pixel"]
             xlim = state["xlim"]
             ylim = state["ylim"]
-            new_xlim = xlim if state["y_only"] else (xlim[0] - dx, xlim[1] - dx)
-            new_ylim = ylim if state["x_only"] else (ylim[0] - dy, ylim[1] - dy)
+            new_xlim = (xlim[0] - dx, xlim[1] - dx)
+            new_ylim = (ylim[0] - dy, ylim[1] - dy)
             if self._histogram_full_xlim is not None:
                 new_xlim = self._clamp_interval(*new_xlim, *self._histogram_full_xlim)
             if self._histogram_full_ylim is not None:
                 new_ylim = self._clamp_interval(*new_ylim, *self._histogram_full_ylim)
             self._apply_histogram_limits(new_xlim, new_ylim)
             return
+
+        if self._pinned_reflection_key is not None:
+            return
+
+        # When the pointer is over the popup itself, keep the current hover
+        # bubble stable instead of treating its overlay rectangle as a new plot
+        # location. Mouse events pass through the transparent overlay.
+        local_cursor = self._cursor_canvas_position()
+        if (
+            self._reflection_tooltip_frame is not None
+            and self._reflection_tooltip_frame.isVisible()
+            and self._reflection_tooltip_frame.geometry().contains(local_cursor)
+        ):
+            self._hover_hide_timer.stop()
+            return
+
         if event.inaxes is ax and event.x is not None and event.y is not None:
-            self._update_reflection_hover(float(event.x))
-        elif self.plot_hint_label is not None:
-            self.plot_hint_label.setText("Колесо — масштаб · перетаскивание — сдвиг · Ctrl — θ · Shift — Y")
+            self._update_reflection_hover(float(event.x), anchor=local_cursor)
+        else:
+            self._schedule_reflection_tooltip_hide()
+
+    def _on_histogram_figure_leave(self, _event) -> None:
+        self._schedule_reflection_tooltip_hide()
 
     def _apply_histogram_limits(self, xlim, ylim) -> None:
         ax = self._histogram_axes
@@ -846,13 +921,13 @@ class HklResultsPanel(QWidget):
         ax.set_xlim(*xlim)
         ax.set_ylim(*ylim)
         self._histogram_view_limits = (*xlim, *ylim)
-        self._refresh_rank_labels()
         self._draw_selected_reflection_overlay()
         self.pair_canvas.draw_idle()
 
     def _reset_histogram_view(self) -> None:
         if self._histogram_cache is None:
             return
+        self._hide_reflection_tooltip(clear_pinned=True)
         self._histogram_view_limits = None
         self._draw_histogram_view()
 
@@ -886,112 +961,251 @@ class HklResultsPanel(QWidget):
         if not low <= x_value <= high:
             return
         colors = theme_colors(self._theme)
+        # Neutral contour + subtle offset shadow gives the selected reflection
+        # a raised, high-contrast appearance without reusing the median's yellow
+        # accent or introducing a second scientific colour encoding.
         self._selected_reflection_artist = ax.axvline(
-            x_value, color=colors["roi"], linewidth=2.0, linestyle=(0, (3, 1)),
-            alpha=1.0, zorder=12,
+            x_value, color=colors["text"], linewidth=1.55, linestyle="-",
+            alpha=1.0, zorder=14,
         )
+        self._selected_reflection_artist.set_path_effects([
+            path_effects.SimpleLineShadow(
+                offset=(0.9, -0.9), shadow_color=colors["muted"], alpha=0.62
+            ),
+            path_effects.Stroke(linewidth=3.8, foreground=colors["axes"], alpha=1.0),
+            path_effects.Normal(),
+        ])
         marker = ax.plot(
-            [x_value], [0.985], marker="v", markersize=4.2,
-            markerfacecolor=colors["roi"], markeredgecolor=colors["canvas"],
-            markeredgewidth=0.45, transform=ax.get_xaxis_transform(),
-            clip_on=True, zorder=13,
+            [x_value], [0.985], marker="D", markersize=4.8,
+            markerfacecolor=colors["axes"], markeredgecolor=colors["text"],
+            markeredgewidth=1.0, transform=ax.get_xaxis_transform(),
+            clip_on=True, zorder=15,
         )
         self._selected_reflection_marker = marker[0]
 
-    def _refresh_rank_labels(self) -> None:
-        ax = self._histogram_axes
-        cache = self._histogram_cache
-        if ax is None or cache is None:
+    def _build_reflection_hover_index(self, catalog: pd.DataFrame) -> None:
+        """Prepare immutable line→record text once; mouse motion does O(log N) lookup."""
+        self._reflection_hover_text_by_x.clear()
+        if catalog.empty or "delta_theta_arcsec" not in catalog.columns:
             return
-        for artist in self._rank_label_artists:
-            try:
-                artist.remove()
-            except (ValueError, AttributeError):
-                pass
+        positions = pd.to_numeric(
+            catalog["delta_theta_arcsec"], errors="coerce"
+        ).to_numpy(dtype=np.float64, na_value=np.nan)
+        valid = np.isfinite(positions)
+        if not np.any(valid):
+            return
+        frame = catalog.loc[valid].copy(deep=False)
+        frame_positions = positions[valid]
+        grouped = frame.groupby(frame_positions, sort=False, dropna=True)
+        for raw_delta, rows in grouped:
+            delta = float(raw_delta)
+            hkls = [str(value) for value in rows.get("hkl", pd.Series(dtype=object)).tolist()]
+            shown = hkls[:5]
+            hkl_text = ", ".join(shown) if shown else "—"
+            if len(hkls) > len(shown):
+                hkl_text += f" · ещё {len(hkls) - len(shown)}"
+            lines = [f"HKL: {hkl_text}"]
+            first = rows.iloc[0]
+            d_value = self._as_float(first.get("d_A", np.nan))
+            theta_value = self._as_float(first.get("theta_ka1_deg", np.nan))
+            if np.isfinite(d_value):
+                lines.append(f"d = {d_value:.5f} Å")
+            if np.isfinite(theta_value):
+                lines.append(f"θ(Kα₁) = {theta_value:.5f}°")
+            lines.append(f"Δθтеор = {delta:.4f}″")
+            structure = self._as_float(first.get("FH_sq", np.nan))
+            if not np.isfinite(structure):
+                structure = self._as_float(first.get("F_H_sq_at_ka1", np.nan))
+            if np.isfinite(structure):
+                lines.append(f"|F_H|² = {structure:.5g}")
+            darwin_sigma = self._as_float(first.get("darwin_sigma_arcsec", np.nan))
+            darwin_pi = self._as_float(first.get("darwin_pi_arcsec", np.nan))
+            if np.isfinite(darwin_sigma) or np.isfinite(darwin_pi):
+                sigma_text = f"{darwin_sigma:.4g}" if np.isfinite(darwin_sigma) else "—"
+                pi_text = f"{darwin_pi:.4g}" if np.isfinite(darwin_pi) else "—"
+                lines.append(f"Ширина Дарвина σ/π = {sigma_text} / {pi_text}″")
+            self._reflection_hover_text_by_x[delta] = "\n".join(lines)
+
+    def _create_reflection_tooltip(self) -> None:
+        """Create a persistent, mouse-transparent popup attached to the plot canvas."""
+        frame = QFrame(self.pair_canvas)
+        frame.setObjectName("hklReflectionInfoPopup")
+        frame.setFrameShape(QFrame.Shape.StyledPanel)
+        frame.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        frame.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        frame.setMaximumWidth(286)
+        label = QLabel(frame)
+        label.setObjectName("hklReflectionInfoText")
+        label.setWordWrap(True)
+        label.setTextFormat(Qt.TextFormat.PlainText)
+        label.setMaximumWidth(270)
+        layout = QVBoxLayout(frame)
+        layout.setContentsMargins(8, 6, 8, 6)
+        layout.setSpacing(0)
+        layout.addWidget(label)
+        self._reflection_tooltip_frame = frame
+        self._reflection_tooltip_label = label
+        frame.hide()
+
+        self._hover_show_timer = QTimer(self)
+        self._hover_show_timer.setSingleShot(True)
+        self._hover_show_timer.setInterval(135)
+        self._hover_show_timer.timeout.connect(self._commit_hover_reflection_tooltip)
+        self._hover_hide_timer = QTimer(self)
+        self._hover_hide_timer.setSingleShot(True)
+        self._hover_hide_timer.setInterval(155)
+        self._hover_hide_timer.timeout.connect(self._hide_hover_tooltip_if_unpinned)
+        self._style_reflection_tooltip()
+
+    def _style_reflection_tooltip(self) -> None:
+        frame = self._reflection_tooltip_frame
+        if frame is None:
+            return
         colors = theme_colors(self._theme)
-        low, high = map(float, ax.get_xlim())
-        self._rank_label_artists = self._add_rank_labels(
-            ax, cache["ranking_x"], cache["ranking_ranks"], low, high,
-            label_color=colors["text"],
+        frame.setStyleSheet(
+            f"QFrame#hklReflectionInfoPopup {{ background:{colors['base']}; "
+            f"border:1px solid {colors['border']}; border-radius:5px; }} "
+            f"QLabel#hklReflectionInfoText {{ color:{colors['text']}; "
+            f"background:transparent; border:0px; font-size:8pt; }}"
         )
+        if frame.isVisible():
+            frame.update()
 
-    @staticmethod
-    def _add_rank_labels(
-        ax, ranking_x: np.ndarray, ranking_ranks: np.ndarray,
-        view_low: float, view_high: float, *, label_color: str,
-    ) -> None:
-        """Place sparse rank tags vertically, anchored to their exact x-line.
+    def _cursor_canvas_position(self):
+        return self.pair_canvas.mapFromGlobal(QCursor.pos())
 
-        The blended data/axes transform keeps every tag attached to its
-        reflection in θ while holding the text row just inside the top frame.
-        Labels that would collide at the current zoom are omitted; hover still
-        exposes the full reflection record.
-        """
-        if ranking_x.size == 0 or ranking_ranks.size == 0 or not view_high > view_low:
-            return []
-        artists = []
-        axes_width_px = max(
-            1.0, float(ax.get_position().width * ax.figure.get_figwidth() * ax.figure.dpi)
-        )
-        minimum_spacing_px = 12.5
-        accepted_x_px: list[float] = []
-        for x_value, rank_value in zip(ranking_x[:15], ranking_ranks[:15]):
-            if not np.isfinite(x_value) or not np.isfinite(rank_value):
-                continue
-            x_value = float(x_value)
-            if not view_low <= x_value <= view_high:
-                continue
-            x_px = (x_value - view_low) / (view_high - view_low) * axes_width_px
-            if any(abs(x_px - previous) < minimum_spacing_px for previous in accepted_x_px):
-                continue
-            accepted_x_px.append(x_px)
-            artists.append(ax.text(
-                x_value, 0.985, f"#{int(rank_value)}",
-                transform=ax.get_xaxis_transform(), rotation=90,
-                rotation_mode="anchor", ha="center", va="top",
-                fontsize=5.6, fontweight="medium", color=label_color,
-                clip_on=True, zorder=8,
-            ))
-        return artists
-
-    def _update_reflection_hover(self, mouse_x_px: float) -> None:
-        ax = self._histogram_axes
-        cache = self._histogram_cache
-        if ax is None or cache is None or self._reflection_catalog.empty:
+    def _position_reflection_tooltip(self, anchor) -> None:
+        frame = self._reflection_tooltip_frame
+        if frame is None:
             return
+        width = min(286, max(120, self.pair_canvas.width() - 16))
+        frame.setMaximumWidth(width)
+        self._reflection_tooltip_label.setMaximumWidth(max(104, width - 16))
+        frame.adjustSize()
+        popup_width = frame.width()
+        popup_height = frame.height()
+        canvas_width = self.pair_canvas.width()
+        canvas_height = self.pair_canvas.height()
+        margin = 8
+        offset = 13
+
+        x_right = int(anchor.x()) + offset
+        x_left = int(anchor.x()) - popup_width - offset
+        if x_right + popup_width <= canvas_width - margin:
+            x = x_right
+        elif x_left >= margin:
+            x = x_left
+        else:
+            x = max(margin, min(x_right, canvas_width - popup_width - margin))
+
+        y_below = int(anchor.y()) + offset
+        y_above = int(anchor.y()) - popup_height - offset
+        if y_below + popup_height <= canvas_height - margin:
+            y = y_below
+        elif y_above >= margin:
+            y = y_above
+        else:
+            y = max(margin, min(y_below, canvas_height - popup_height - margin))
+
+        frame.move(x, y)
+        frame.show()
+        frame.raise_()
+
+    def _show_reflection_tooltip(self, key: float, *, pinned: bool, anchor=None) -> None:
+        text = self._reflection_hover_text_by_x.get(float(key))
+        if not text or self._reflection_tooltip_label is None:
+            self._hide_reflection_tooltip(clear_pinned=True)
+            return
+        self._hover_show_timer.stop()
+        self._hover_hide_timer.stop()
+        self._pending_reflection_key = None
+        self._pending_reflection_anchor = None
+        self._hovered_reflection_key = float(key)
+        self._pinned_reflection_key = float(key) if pinned else None
+        self._reflection_tooltip_label.setText(text)
+        self._position_reflection_tooltip(
+            anchor if anchor is not None else self._cursor_canvas_position()
+        )
+
+    def _hide_hover_tooltip_if_unpinned(self) -> None:
+        if self._pinned_reflection_key is not None:
+            return
+        if self._reflection_tooltip_frame is not None:
+            self._reflection_tooltip_frame.hide()
+        self._hovered_reflection_key = None
+
+    def _schedule_reflection_tooltip_hide(self) -> None:
+        if self._pinned_reflection_key is not None:
+            return
+        self._hover_show_timer.stop()
+        self._pending_reflection_key = None
+        self._pending_reflection_anchor = None
+        if self._reflection_tooltip_frame is not None and self._reflection_tooltip_frame.isVisible():
+            self._hover_hide_timer.start()
+
+    def _hide_reflection_tooltip(self, *, clear_pinned: bool = True) -> None:
+        if hasattr(self, "_hover_show_timer"):
+            self._hover_show_timer.stop()
+        if hasattr(self, "_hover_hide_timer"):
+            self._hover_hide_timer.stop()
+        self._pending_reflection_key = None
+        self._pending_reflection_anchor = None
+        if clear_pinned:
+            self._pinned_reflection_key = None
+        self._hovered_reflection_key = None
+        if self._reflection_tooltip_frame is not None:
+            self._reflection_tooltip_frame.hide()
+
+    def _commit_hover_reflection_tooltip(self) -> None:
+        if self._pinned_reflection_key is not None or self._pending_reflection_key is None:
+            return
+        key = float(self._pending_reflection_key)
+        anchor = self._pending_reflection_anchor
+        self._show_reflection_tooltip(key, pinned=False, anchor=anchor)
+
+    def _reflection_at_mouse(self, mouse_x_px: float) -> float | None:
+        ax = self._histogram_axes
+        values = self._reflection_x
+        if ax is None or values.size == 0:
+            return None
         x_min, x_max = map(float, ax.get_xlim())
         bbox = ax.get_window_extent()
-        if bbox.width <= 0:
-            return
-        x_value = x_min + (mouse_x_px - bbox.x0) / bbox.width * (x_max - x_min)
-        values = self._reflection_x
-        if values.size == 0:
-            return
+        if bbox.width <= 0 or not x_max > x_min:
+            return None
+        x_value = x_min + (float(mouse_x_px) - bbox.x0) / bbox.width * (x_max - x_min)
         index = int(np.searchsorted(values, x_value))
         candidates = [i for i in (index - 1, index) if 0 <= i < values.size]
         if not candidates:
-            return
+            return None
         nearest_index = min(candidates, key=lambda i: abs(float(values[i]) - x_value))
         nearest = float(values[nearest_index])
         distance_px = abs(nearest - x_value) / max(x_max - x_min, np.finfo(float).eps) * bbox.width
-        if distance_px > 8.5:
-            self.plot_hint_label.setText("Колесо — масштаб · перетаскивание — сдвиг · Ctrl — θ · Shift — Y")
+        if distance_px > 9.0 or nearest not in self._reflection_hover_text_by_x:
+            return None
+        return nearest
+
+    def _update_reflection_hover(self, mouse_x_px: float, *, anchor=None) -> None:
+        if self._pinned_reflection_key is not None:
             return
-        catalog = self._reflection_catalog
-        positions = pd.to_numeric(catalog["delta_theta_arcsec"], errors="coerce")
-        matched = catalog.loc[np.isclose(positions.to_numpy(dtype=float), nearest, rtol=0.0, atol=max(abs(nearest), 1.0) * 1e-10)]
-        hkl_names = [str(value) for value in matched.get("hkl", pd.Series(dtype=str)).tolist()]
-        hkl_text = ", ".join(hkl_names[:3]) + (f" +{len(hkl_names) - 3}" if len(hkl_names) > 3 else "")
-        rank_text = ""
-        ranking_x = np.asarray(cache.get("ranking_x", ()), dtype=float)
-        ranking_ranks = np.asarray(cache.get("ranking_ranks", ()), dtype=float)
-        for rx, rr in zip(ranking_x, ranking_ranks):
-            if np.isfinite(rx) and np.isclose(rx, nearest, rtol=0.0, atol=max(abs(nearest), 1.0) * 1e-10):
-                rank_text = f"#{int(rr)} · "
-                break
-        self.plot_hint_label.setText(
-            f"{rank_text}HKL {hkl_text or '—'} · Δθтеор={nearest:.4f}″"
-        )
+        nearest = self._reflection_at_mouse(mouse_x_px)
+        if nearest is None:
+            self._schedule_reflection_tooltip_hide()
+            return
+        self._hover_hide_timer.stop()
+        if self._hovered_reflection_key == nearest and (
+            self._reflection_tooltip_frame is not None
+            and self._reflection_tooltip_frame.isVisible()
+        ):
+            self._hover_show_timer.stop()
+            self._pending_reflection_key = None
+            self._pending_reflection_anchor = None
+            return
+        if self._pending_reflection_key != nearest:
+            self._pending_reflection_key = nearest
+            self._pending_reflection_anchor = (
+                anchor if anchor is not None else self._cursor_canvas_position()
+            )
+            self._hover_show_timer.start()
 
     def _render_all_pairs(self) -> None:
         """Render measured ranges and theoretical candidates with distinct marks.
@@ -1101,9 +1315,9 @@ class HklResultsPanel(QWidget):
             )
             if scale_mode == "symlog" and linthresh is not None:
                 ax.set_xscale("symlog", linthresh=linthresh, linscale=1.0, base=10)
-                axis_caption = "Абсолютное разделение |Δθ|, ″ · symlog"
+                axis_caption = "Абсолютная разность угловых положений пиков |Δθ|, ″ · symlog"
             else:
-                axis_caption = "Абсолютное разделение |Δθ|, ″"
+                axis_caption = "Абсолютная разность угловых положений пиков |Δθ|, ″"
             ax.set_xlim(0.0, x_max * 1.08)
             ax.set_xlabel(axis_caption, fontsize=7.2, labelpad=2)
             if scale_mode == "linear":

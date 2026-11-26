@@ -513,9 +513,17 @@ class MapPlotWidget(QWidget):
     # ============================================================
     # ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ КЛАССА
     # ============================================================
+    def set_colormap(self, cmap_name: str, *, redraw: bool = True) -> None:
+        """Set the active map palette through the same path as the user action."""
+        self.current_cmap = str(cmap_name)
+        self.tools.set_current_cmap(self.current_cmap)
+        if redraw:
+            # Reuse the established percentile-change signal so the map image,
+            # toolbar check state and colour bar are refreshed consistently.
+            self.low_pct.valueChanged.emit(self.low_pct.value())
+
     def _on_cmap_selected(self, cmap_name: str) -> None:
-        self.current_cmap = cmap_name; self.tools.set_current_cmap(cmap_name)
-        self.low_pct.valueChanged.emit(self.low_pct.value())   # вызываем перерисовку холста (сигнал будет подхвачен Главным окном)
+        self.set_colormap(cmap_name)
 
     def _on_pool_size_changed(self, value: int) -> None:
         self._keep_pool_size_odd(value)

@@ -110,6 +110,29 @@ def test_branch_correlation_preview_resolves_scan_via_branch_ancestry(tmp_path):
     assert context["branch_correlation"].tables["branch_correlation_assignments"].shape[0] == 1
 
 
+def test_branch_preview_reads_artifact_subsets_without_full_bundle_materialization(tmp_path, monkeypatch):
+    history, store, executor, _branches_node, correlation_node, _catalog = (
+        _make_branch_correlation_workflow(tmp_path)
+    )
+
+    def fail_full_read(_artifact_id):
+        raise AssertionError("branch preview must not materialize unrelated full artifacts")
+
+    monkeypatch.setattr(store, "read", fail_full_read)
+    context = load_node_preview_context(correlation_node, history, executor)
+
+    assert set(context["scan"].arrays) == {
+        "data_yxt", "theta", "x_coords", "y_coords", "valid_mask_yxt",
+    }
+    assert set(context["branches"].tables["branch_catalog"].columns) == {
+        "peak_id", "branch_id", "x", "y", "theta", "theta_index",
+    }
+    assert set(context["branch_correlation"].tables) == {
+        "branch_correlation_pairs", "branch_correlation_assignments",
+        "branch_correlation_candidates",
+    }
+
+
 def test_branch_correlation_preview_keeps_original_points_edges_and_branch_map(tmp_path):
     history, _store, executor, _branches_node, correlation_node, _catalog = (
         _make_branch_correlation_workflow(tmp_path)
@@ -170,7 +193,7 @@ def test_branch_correlation_preview_rejects_broken_lineage_with_specific_error(t
         raise AssertionError("Ожидалась диагностируемая ошибка lineage")
 
 
-def test_hkl_preview_resolves_original_branch_catalog_and_correlation_lineage(tmp_path):
+def test_hkl_preview_resolves_original_branch_catalog_and_correlation_lineage(tmp_path, monkeypatch):
     from roc_mcs.analysis.engine import build_input_refs
     from roc_mcs.analysis.hkl_preview import build_hkl_identification_preview
     from roc_mcs.analysis.workflow_history import ReviewStatus
@@ -214,10 +237,22 @@ def test_hkl_preview_resolves_original_branch_catalog_and_correlation_lineage(tm
     )
     hkl_artifact = store.write(hkl_bundle)
     # The dedicated result path must be able to open the HKL artifact directly;
-    # it must not need a Scan/branch lineage or generic ROI preview construction.
+    # it must not need a Scan/branch lineage or materialize unrelated arrays/tables.
     from roc_mcs.analysis.hkl_preview import load_hkl_identification_preview
+
+    def fail_full_read(_artifact_id):
+        raise AssertionError("HKL preview must use the selective table reader")
+
+    monkeypatch.setattr(store, "read", fail_full_read)
     direct_view = load_hkl_identification_preview(store, hkl_artifact)
     assert direct_view.pair_statistics.shape[0] == 1
+    assert set(direct_view.theoretical_reflections.columns) == {
+        "hkl", "d_A", "theta_ka1_deg", "delta_theta_arcsec",
+    }
+    assert set(direct_view.measurements.columns) == {
+        "pair_id", "source_peak_id",
+        "matched_partner_peak_id", "delta_theta_abs_arcsec",
+    }
     assert direct_view.pair_statistics.iloc[0]["pair_id"] == "3↔7"
 
     hkl_node = history.add_node(

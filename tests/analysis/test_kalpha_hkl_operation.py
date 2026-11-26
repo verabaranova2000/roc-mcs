@@ -342,6 +342,60 @@ def test_artifact_store_reads_only_requested_tables(tmp_path):
         store.read_tables(artifact_id, ())
 
 
+def test_artifact_store_read_subset_decodes_only_selected_arrays_and_columns(tmp_path, monkeypatch):
+    store = ArtifactStore(tmp_path / "artifacts")
+    artifact_id = store.write(ArtifactBundle(
+        arrays={"needed": np.arange(6), "unrelated_cube": np.ones((8, 8, 8))},
+        tables={
+            "catalog": pd.DataFrame({"peak_id": [1, 2], "x": [3, 4], "unused": [5, 6]}),
+            "unrelated": pd.DataFrame({"large_column": [7, 8]}),
+        },
+    ))
+
+    accessed = []
+    original_reader = ArtifactStore._read_dataset
+
+    def tracked_reader(dataset, selection=None):
+        accessed.append(dataset.name)
+        return original_reader(dataset, selection=selection)
+
+    monkeypatch.setattr(ArtifactStore, "_read_dataset", staticmethod(tracked_reader))
+    subset = store.read_subset(
+        artifact_id,
+        array_names=("needed",),
+        table_names=("catalog",),
+        column_names_by_table={"catalog": ("peak_id", "x")},
+    )
+
+    assert set(subset.arrays) == {"needed"}
+    assert list(subset.tables["catalog"].columns) == ["peak_id", "x"]
+    assert accessed == ["/arrays/needed", "/tables/catalog/c0000", "/tables/catalog/c0001"]
+    # The immutable stored artefact is still complete and unchanged.
+    full = store.read(artifact_id)
+    assert set(full.arrays) == {"needed", "unrelated_cube"}
+    assert "unused" in full.tables["catalog"].columns
+
+
+def test_artifact_store_subset_allows_optional_missing_projection_columns(tmp_path):
+    store = ArtifactStore(tmp_path / "artifacts")
+    artifact_id = store.write(ArtifactBundle(tables={
+        "values": pd.DataFrame({"required": [1], "present_optional": [2]}),
+    }))
+
+    with pytest.raises(KeyError, match="отсутств"):
+        store.read_subset(
+            artifact_id, table_names=("values",),
+            column_names_by_table={"values": ("required", "legacy_optional")},
+        )
+    subset = store.read_subset(
+        artifact_id, table_names=("values",),
+        column_names_by_table={"values": ("required", "legacy_optional")},
+        missing_columns_ok=True,
+    )
+    assert list(subset.tables["values"].columns) == ["required"]
+    assert subset.tables["values"].iloc[0, 0] == 1
+
+
 def test_artifact_store_limits_preview_rows_per_group_without_changing_artifact(tmp_path):
     store = ArtifactStore(tmp_path / "artifacts")
     ranking = pd.DataFrame({

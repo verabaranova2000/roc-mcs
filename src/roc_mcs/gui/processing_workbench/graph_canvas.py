@@ -13,7 +13,9 @@ from PyQt6.QtWidgets import (
 )
 
 from roc_mcs.analysis.workflow_history import NodeStatus, ReviewStatus, WorkflowHistory
-from .graph_layout import vertical_dag_positions, vertical_dag_edge_ports
+from .graph_layout import (
+    scaled_graph_viewport_height, vertical_dag_positions, vertical_dag_edge_ports,
+)
 
 
 class _WorkflowNodeItem(QGraphicsObject):
@@ -213,6 +215,8 @@ class ProcessingGraphView(QGraphicsView):
     node_selected = pyqtSignal(str)
     add_stage_requested = pyqtSignal(str)
     preview_requested = pyqtSignal(str)
+    scene_geometry_changed = pyqtSignal()
+    view_transform_changed = pyqtSignal()
 
     H_GAP = 34.0
     V_GAP = 38.0
@@ -279,7 +283,7 @@ class ProcessingGraphView(QGraphicsView):
         if not visible_nodes:
             self._graph_scene.setSceneRect(QRectF(0, 0, 480, 240))
             self._selected_id = None
-            QTimer.singleShot(0, self.fit_graph)
+            QTimer.singleShot(0, self._finish_scene_update)
             return
 
         positions_xy = vertical_dag_positions(
@@ -391,9 +395,40 @@ class ProcessingGraphView(QGraphicsView):
             self.select_node(self._selected_id)
         else:
             self._selected_id = None
-        # Refit after the scene geometry is committed. The scroll/fit-all mode
-        # is retained, and the graph never forces a preferred-size change.
-        QTimer.singleShot(0, self.fit_graph)
+        # Refit only after the scene geometry is committed, then notify the host.
+        # An embedded host in automatic full-height mode can now recalculate its
+        # requested height from the new scene and the resulting view transform.
+        QTimer.singleShot(0, self._finish_scene_update)
+
+    def _finish_scene_update(self) -> None:
+        self.fit_graph()
+        self.scene_geometry_changed.emit()
+
+    def required_viewport_height(self) -> int:
+        """Height needed to display the complete DAG at the *current* zoom.
+
+        This is derived from the scene's logical extent and current transform,
+        never from the widget's current height.  Consequently shrinking the
+        sidebar cannot feed back into an oversized or undersized expansion
+        request, and zooming out proportionally reduces the requested height.
+        """
+        scene_rect = self._graph_scene.sceneRect()
+        if not scene_rect.isValid() or scene_rect.height() <= 0.0:
+            return 0
+        mapped_rect = self.transform().mapRect(scene_rect)
+        horizontal_extra = 0
+        # Predict the horizontal scrollbar from the transformed scene width
+        # rather than its current range: immediately after a zoom event Qt may
+        # not have recalculated scrollbar ranges yet.
+        if mapped_rect.width() > max(1, int(self.viewport().width())):
+            horizontal_extra = max(0, int(self.horizontalScrollBar().sizeHint().height()))
+        frame_extra = max(0, 2 * int(self.frameWidth())) + 12
+        return scaled_graph_viewport_height(
+            mapped_rect.height(),
+            1.0,
+            padding=frame_extra,
+            extra=horizontal_extra,
+        )
 
     @property
     def vertical_scroll_enabled(self) -> bool:
@@ -457,6 +492,7 @@ class ProcessingGraphView(QGraphicsView):
             # The first node remains at the top when the viewport is shorter
             # than the graph; users can scroll through the complete history.
             self.verticalScrollBar().setValue(self.verticalScrollBar().minimum())
+        self.view_transform_changed.emit()
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
@@ -467,6 +503,7 @@ class ProcessingGraphView(QGraphicsView):
         if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
             factor = 1.15 if event.angleDelta().y() > 0 else (1.0 / 1.15)
             self.scale(factor, factor)
+            self.view_transform_changed.emit()
             event.accept()
             return
         super().wheelEvent(event)

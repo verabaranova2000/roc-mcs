@@ -11,8 +11,9 @@ import pandas as pd
 class HklIdentificationPreview:
     """Detached table snapshots needed by the HKL results panel.
 
-    DataFrames are deep-copied at construction time so the UI cannot mutate the
-    immutable scientific ArtifactBundle held by the workflow.
+    By default, DataFrames are deep-copied so callers cannot mutate the
+    immutable workflow artifact. The HDF5 preview loader may retain its freshly
+    decoded, privately owned frames to avoid a redundant second full copy.
     """
 
     theoretical_reflections: pd.DataFrame
@@ -104,6 +105,46 @@ def load_hkl_identification_preview(artifact_store: Any, artifact_id: str) -> Hk
     # Avoid decoding potentially large peer tables and arrays. The selected
     # frames are fresh HDF5-decoded objects, so another deep copy would add
     # memory/time without improving isolation.
+    if hasattr(artifact_store, "read_subset"):
+        # Read only data used by the result panel and the post-registration
+        # Δθ layers. Optional display columns are schema-tolerant for projects
+        # created by older releases; the required scientific fields are still
+        # validated by build_hkl_identification_preview below.
+        projections = {
+            "hkl_theoretical_reflections": (
+                "hkl", "d_A", "theta_ka1_deg", "delta_theta_arcsec",
+                "FH_sq", "F_H_sq_at_ka1", "darwin_sigma_arcsec", "darwin_pi_arcsec",
+            ),
+            "hkl_bragg_rejected": ("hkl", "d_A", "reason"),
+            "hkl_pair_measurements": (
+                "pair_id", "source_branch_id", "partner_branch_id",
+                "source_peak_id", "matched_partner_peak_id",
+                "delta_theta_abs_arcsec", "delta_theta_signed_arcsec",
+                "theta_source_arcsec", "theta_partner_arcsec",
+            ),
+            "hkl_pair_statistics": (
+                "pair_id", "matched_assignment_count", "identification_status",
+                "delta_theta_abs_median_arcsec", "delta_theta_abs_mean_arcsec",
+                "delta_theta_abs_q10_arcsec", "delta_theta_abs_q90_arcsec",
+                "delta_theta_abs_mad_arcsec", "unique_source_peak_count",
+                "unique_partner_peak_count", "reused_partner_assignment_count",
+                "best_hkl", "best_abs_difference_arcsec",
+                "best_theory_delta_theta_arcsec", "theta_shift_final_arcsec",
+            ),
+            "hkl_pair_ranking": (
+                "pair_id", "rank", "hkl", "d_A", "theta_ka1_deg",
+                "delta_theta_arcsec", "difference_from_exp_median_arcsec",
+                "FH_sq", "F_H_sq_at_ka1", "darwin_sigma_arcsec", "darwin_pi_arcsec",
+            ),
+        }
+        bundle = artifact_store.read_subset(
+            artifact_id,
+            table_names=table_names,
+            column_names_by_table=projections,
+            group_head_limits={"hkl_pair_ranking": ("pair_id", 15)},
+            missing_columns_ok=True,
+        )
+        return build_hkl_identification_preview(bundle, copy_tables=False)
     if hasattr(artifact_store, "read_tables"):
         bundle = artifact_store.read_tables(
             artifact_id,

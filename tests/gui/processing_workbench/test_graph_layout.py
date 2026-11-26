@@ -3,6 +3,7 @@ from dataclasses import dataclass
 import pytest
 
 from roc_mcs.gui.processing_workbench.graph_layout import (
+    scaled_graph_viewport_height,
     vertical_dag_edge_ports,
     vertical_dag_positions,
 )
@@ -89,3 +90,20 @@ def test_branch_ports_are_compact_and_deterministic():
     # the far left/right edges, which caused the old broad fan of arrows.
     assert max(starts) - min(starts) <= 32.0
     assert all(positions["root"][0] + 105.0 <= x <= positions["root"][0] + 137.0 for x in starts)
+
+
+def test_required_graph_height_tracks_current_zoom_instead_of_current_viewport():
+    # The same DAG requires proportionally less sidebar height after zoom-out.
+    assert scaled_graph_viewport_height(1000.0, 0.5) == 516
+    assert scaled_graph_viewport_height(1000.0, 0.25) == 266
+    assert scaled_graph_viewport_height(1000.0, 1.0) == 1016
+
+
+def test_required_graph_height_adds_scrollbar_and_layout_slack_once():
+    assert scaled_graph_viewport_height(500.0, 0.4, padding=12.0, extra=15.0) == 227
+
+
+def test_required_graph_height_handles_empty_scene_and_rejects_bad_scale():
+    assert scaled_graph_viewport_height(0.0, 1.0) == 0
+    with pytest.raises(ValueError, match="положительным"):
+        scaled_graph_viewport_height(100.0, 0.0)

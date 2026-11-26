@@ -2,7 +2,30 @@
 from __future__ import annotations
 
 from collections import defaultdict, deque
+from math import ceil, isfinite
 from typing import Iterable
+
+
+def scaled_graph_viewport_height(
+    scene_height: float, scale_y: float, *, padding: float = 16.0, extra: float = 0.0,
+) -> int:
+    """Return the viewport height needed to show the scene at its current zoom.
+
+    ``scene_height`` is the logical QGraphicsScene height; ``scale_y`` is the
+    current vertical view transform.  This deliberately does not inspect the
+    current widget/viewport geometry: the answer therefore stays stable while
+    the containing sidebar is being resized.
+    """
+    height = float(scene_height)
+    scale = float(scale_y)
+    pad = float(padding) + float(extra)
+    if not isfinite(height) or height <= 0.0:
+        return 0
+    if not isfinite(scale) or scale <= 0.0:
+        raise ValueError("Масштаб графа должен быть конечным положительным числом.")
+    if not isfinite(pad) or pad < 0.0:
+        raise ValueError("Отступ графа должен быть конечным неотрицательным числом.")
+    return max(1, int(ceil(height * scale + pad)))
 
 
 def _reduced_graph(nodes: Iterable[object]):

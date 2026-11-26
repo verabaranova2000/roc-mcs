@@ -295,6 +295,8 @@ class ProcessingWorkbenchWidget(QWidget):
     preview_restore_requested = pyqtSignal()
     pixel_pick_mode_requested = pyqtSignal(bool, str, bool)
     busy_changed = pyqtSignal(bool)
+    graph_full_height_requested = pyqtSignal(int)
+    graph_compact_height_requested = pyqtSignal(int)
 
     def __init__(self, project: WorkflowProject, parent: QWidget | None = None, *, embedded: bool = False):
         super().__init__(parent)
@@ -324,9 +326,13 @@ class ProcessingWorkbenchWidget(QWidget):
         self._pending_peak_map_parent_id: str | None = None
         self._theme = resolve_theme(parent if parent is not None else self)
         self._applying_theme = False
+        self._auto_fit_graph_height = False
+        self._graph_height_sync_pending = False
         self._build_ui()
         self._apply_theme(self._theme)
         self._rebuild_graph()
+        if self.embedded:
+            QTimer.singleShot(0, self._sync_graph_scroll_button)
         if self.project.history.nodes:
             self.graph.select_node(self.project.history.nodes[-1].id)
             self._on_graph_node_selected(self.project.history.nodes[-1].id)
@@ -367,6 +373,7 @@ class ProcessingWorkbenchWidget(QWidget):
         left = QWidget()
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 4, 0)
+        left_layout.setSpacing(3)
         graph_header = QHBoxLayout()
         graph_header.addWidget(QLabel("<b>Пайплайн обработки</b>"), 1)
         self.show_rejected_check = QCheckBox("Отклонённые")
@@ -385,20 +392,35 @@ class ProcessingWorkbenchWidget(QWidget):
         self.graph_scroll_button = QToolButton(self)
         self.graph_scroll_button.setObjectName("processingGraphScrollModeButton")
         self.graph_scroll_button.setAutoRaise(True)
-        self.graph_scroll_button.setCheckable(True)
-        self.graph_scroll_button.setChecked(True)
-        self.graph_scroll_button.setToolTip(
-            "Вертикальная прокрутка включена. Выключите, чтобы целиком вписать дерево по высоте."
-        )
-        self.graph_scroll_button.setAccessibleName("Переключить вертикальную прокрутку дерева")
+        if self.embedded:
+            # In ROI Explorer this is a two-way action: fit the complete DAG
+            # at the current zoom, or restore the safe compact viewport.  It is
+            # intentionally not a checkable proxy for scrollbar visibility.
+            self.graph_scroll_button.setCheckable(False)
+            self.graph_scroll_button.setToolTip(
+                "Развернуть область дерева до высоты всей последовательности при текущем масштабе."
+            )
+            self.graph_scroll_button.setAccessibleName("Развернуть дерево целиком")
+        else:
+            self.graph_scroll_button.setCheckable(True)
+            self.graph_scroll_button.setChecked(True)
+            self.graph_scroll_button.setToolTip(
+                "Вертикальная прокрутка включена. Выключите, чтобы целиком вписать дерево по высоте."
+            )
+            self.graph_scroll_button.setAccessibleName("Переключить вертикальную прокрутку дерева")
         graph_header.addWidget(self.graph_scroll_button)
         left_layout.addLayout(graph_header)
         self._left_graph_layout = left_layout
 
         self.graph = ProcessingGraphView(left)
         self.fit_graph_button.clicked.connect(self.graph.fit_graph)
-        self.graph.set_vertical_scroll_enabled(self.graph_scroll_button.isChecked())
-        self.graph_scroll_button.toggled.connect(self._on_graph_scroll_mode_changed)
+        self.graph.set_vertical_scroll_enabled(True if self.embedded else self.graph_scroll_button.isChecked())
+        if self.embedded:
+            self.graph_scroll_button.clicked.connect(self._toggle_embedded_graph_height)
+            self.graph.scene_geometry_changed.connect(self._on_graph_scene_geometry_changed)
+            self.graph.view_transform_changed.connect(self._on_graph_view_transform_changed)
+        else:
+            self.graph_scroll_button.toggled.connect(self._on_graph_scroll_mode_changed)
         self.graph.node_selected.connect(self._on_graph_node_selected)
         self.graph.add_stage_requested.connect(self._on_graph_add_stage_requested)
         self.graph.preview_requested.connect(self._on_graph_preview_requested)
@@ -609,6 +631,7 @@ class ProcessingWorkbenchWidget(QWidget):
         self._show_operation_form()
 
     def _on_graph_scroll_mode_changed(self, enabled: bool) -> None:
+        """Standalone Workbench's original explicit scrollbar/fit-all switch."""
         self.graph.set_vertical_scroll_enabled(bool(enabled))
         if enabled:
             self.graph_scroll_button.setToolTip(
@@ -619,6 +642,186 @@ class ProcessingWorkbenchWidget(QWidget):
                 "Режим полного дерева включён: всё дерево вписано по высоте и ширине. "
                 "Включите, чтобы вернуть вертикальную прокрутку и более крупные узлы."
             )
+
+    def _embedded_graph_host_overhead_height(self) -> int:
+        """Height of every Workbench control except the graph viewport itself.
+
+        Compute this from layout size hints, not current widget geometries.  The
+        latter are already clipped in compact mode and were the source of the
+        previous feedback error (a clipped container was used to size itself).
+        """
+        if not self.embedded:
+            return 0
+        outer_layout = self.layout()
+        left_layout = getattr(self, "_left_graph_layout", None)
+        if outer_layout is None or left_layout is None:
+            return 0
+        outer_layout.invalidate()
+        left_layout.invalidate()
+
+        # The Workbench is embedded with the right-hand tabs hidden.  Measure
+        # only the visible left graph column explicitly, so a hidden standalone
+        # panel can never inflate the sidebar's requested height.
+        outer_margins = outer_layout.contentsMargins()
+        outer_spacing = max(0, int(outer_layout.spacing()))
+        header_item = outer_layout.itemAt(0)
+        header_height = int(header_item.sizeHint().height()) if header_item is not None else 0
+        outer_fixed = (
+            int(outer_margins.top()) + int(outer_margins.bottom())
+            + outer_spacing + header_height
+        )
+        left_total = max(0, int(left_layout.sizeHint().height()))
+        graph_hint = max(0, int(self.graph.sizeHint().height()))
+        left_fixed = max(0, left_total - graph_hint)
+
+        # A few pixels of reserved slack cover splitter/layout rounding and
+        # prevent the last control row from being clipped at high DPI.
+        return outer_fixed + left_fixed + 8
+
+    def embedded_graph_compact_host_height(self) -> int:
+        """Minimum safe host height with the full control row kept visible."""
+        graph_minimum = max(240, int(self.graph.minimumHeight()))
+        return self._embedded_graph_host_overhead_height() + graph_minimum
+
+    def embedded_graph_full_host_height(self) -> int:
+        """Host height required for the DAG at its current visual zoom."""
+        graph_height = max(
+            int(self.graph.minimumHeight()), int(self.graph.required_viewport_height())
+        )
+        return min(100_000, self._embedded_graph_host_overhead_height() + graph_height)
+
+    def _toggle_embedded_graph_height(self) -> None:
+        if not self.embedded or self.is_busy:
+            return
+        host = self.parentWidget()
+        current_height = int(host.height()) if host is not None else 0
+        compact_height = self.embedded_graph_compact_host_height()
+        required_graph_height = int(self.graph.required_viewport_height())
+        graph_is_fully_visible = int(self.graph.height()) >= required_graph_height - 2
+        # The same action returns to compact mode if the complete sequence is
+        # currently visible in an enlarged host (whether expanded by this button
+        # or manually with the grip). Otherwise it expands to the exact current
+        # zoomed scene extent.
+        is_expanded = graph_is_fully_visible and current_height > compact_height + 3
+        if is_expanded:
+            self._auto_fit_graph_height = False
+            self.graph_compact_height_requested.emit(compact_height)
+        else:
+            self._auto_fit_graph_height = True
+            self.graph_full_height_requested.emit(
+                max(compact_height, self.embedded_graph_full_host_height())
+            )
+        self._sync_graph_scroll_button()
+
+    def _on_manual_graph_height_changed(self) -> None:
+        """A user drag takes control away from automatic fit-to-content sizing."""
+        self._auto_fit_graph_height = False
+        self._sync_graph_scroll_button()
+
+    def _on_graph_scene_geometry_changed(self) -> None:
+        if self._auto_fit_graph_height:
+            self._request_graph_full_height()
+        else:
+            self._sync_graph_scroll_button()
+
+    def _on_graph_view_transform_changed(self) -> None:
+        if self._auto_fit_graph_height:
+            self._request_graph_full_height()
+        else:
+            self._sync_graph_scroll_button()
+
+    def _request_graph_full_height(self) -> None:
+        if not self.embedded or not self._auto_fit_graph_height:
+            return
+        self.graph_full_height_requested.emit(
+            max(
+                self.embedded_graph_compact_host_height(),
+                self.embedded_graph_full_host_height(),
+            )
+        )
+
+    def _sync_graph_scroll_button(self, *_args) -> None:
+        """Choose the next action from actual layout/content geometry.
+
+        Scrollbar visibility alone is not a mode: at a small zoom the complete
+        graph may fit in the compact viewport, while a manually enlarged host may
+        already show all nodes.  The icon and tooltip therefore describe the
+        action that the button will perform next.
+        """
+        if not self.embedded or not hasattr(self, "graph_scroll_button"):
+            return
+        if self._graph_height_sync_pending:
+            return
+        self._graph_height_sync_pending = True
+
+        def apply_state() -> None:
+            self._graph_height_sync_pending = False
+            if self.graph is None or self.graph_scroll_button is None:
+                return
+            host = self.parentWidget()
+            current_height = int(host.height()) if host is not None else 0
+            compact_height = self.embedded_graph_compact_host_height()
+            full_height = max(
+                compact_height, self.embedded_graph_full_host_height()
+            )
+            required_graph_height = int(self.graph.required_viewport_height())
+            graph_is_fully_visible = int(self.graph.height()) >= required_graph_height - 2
+            is_expanded = (
+                graph_is_fully_visible and current_height > compact_height + 3
+            )
+
+            # Newly shown controls (notably Accept/Reject) increase the layout
+            # hint. Raise the host to the safe compact minimum before the graph
+            # can ever compress those controls into or over the viewport.
+            if self._auto_fit_graph_height:
+                safe_target = full_height
+                # Layout engines can differ by a few pixels at high DPI.  Once
+                # the requested host size has actually been applied, correct any
+                # remaining viewport deficit from the measured graph geometry.
+                if (
+                    current_height >= full_height - 3
+                    and int(self.graph.height()) < required_graph_height - 2
+                ):
+                    safe_target = min(
+                        100_000,
+                        current_height + required_graph_height - int(self.graph.height()) + 4,
+                    )
+                if current_height != safe_target:
+                    self.graph_full_height_requested.emit(safe_target)
+            elif current_height < compact_height:
+                self.graph_compact_height_requested.emit(compact_height)
+
+            colors = theme_colors(self._theme)
+            if is_expanded:
+                icon_name = "workflow_panel_full_height.svg"
+                tooltip = "Вернуть компактную высоту дерева и внутреннюю прокрутку."
+                accessible = "Вернуть компактную область дерева"
+                enabled = True
+            elif full_height <= compact_height + 3:
+                icon_name = "workflow_panel_full_height.svg"
+                tooltip = "Всё дерево уже помещается при текущем масштабе."
+                accessible = "Всё дерево уже помещается"
+                enabled = False
+            else:
+                icon_name = "workflow_expand_vertical.svg"
+                tooltip = (
+                    "Развернуть область дерева ровно до высоты всей последовательности "
+                    "при текущем масштабе."
+                )
+                accessible = "Развернуть дерево целиком"
+                enabled = True
+
+            self.graph_scroll_button.setIcon(
+                svg_icon(ICON_DIR / icon_name, color=colors["text"], widget=self.graph_scroll_button)
+            )
+            icon_size = max(18, self._global_icon_size())
+            self.graph_scroll_button.setIconSize(QSize(icon_size, icon_size))
+            self.graph_scroll_button.setFixedSize(max(27, icon_size + 9), max(27, icon_size + 9))
+            self.graph_scroll_button.setToolTip(tooltip)
+            self.graph_scroll_button.setAccessibleName(accessible)
+            self.graph_scroll_button.setEnabled(bool(enabled and not self.is_busy))
+
+        QTimer.singleShot(0, apply_state)
 
     @staticmethod
     def _global_icon_size() -> int:
@@ -651,14 +854,15 @@ class ProcessingWorkbenchWidget(QWidget):
             target = "тёмную" if self._theme == "light" else "светлую"
             self.theme_button.setToolTip(f"Переключить Workbench на {target} тему")
             self.theme_button.setAccessibleName(f"Переключить Workbench на {target} тему")
-            icon_size = self._global_icon_size()
+            icon_size = max(18, self._global_icon_size())
+            button_size = max(27, icon_size + 9)
             for button, name in (
                 (self.fit_graph_button, "zoom_out_map.svg"),
-                (self.graph_scroll_button, "vertical_scroll.svg"),
+                (self.graph_scroll_button, "workflow_expand_vertical.svg" if self.embedded else "vertical_scroll.svg"),
             ):
                 button.setIcon(svg_icon(ICON_DIR / name, color=colors["text"], widget=button))
                 button.setIconSize(QSize(icon_size, icon_size))
-                button.setFixedSize(icon_size + 8, icon_size + 8)
+                button.setFixedSize(button_size, button_size)
             self.graph.setBackgroundBrush(self.graph.palette().color(QPalette.ColorRole.Base))
             self._style_matplotlib_figure(self.figure)
             self._style_matplotlib_figure(self.diagnostic_figure)
@@ -678,6 +882,11 @@ class ProcessingWorkbenchWidget(QWidget):
                 )
         finally:
             self._applying_theme = False
+        if self.embedded:
+            # Reapply the state-dependent expand/compact icon after the theme
+            # pass; otherwise a theme switch could show the generic expand icon
+            # while the graph is already in full-height mode.
+            self._sync_graph_scroll_button()
 
     def _style_matplotlib_figure(self, figure: Figure) -> None:
         colors = theme_colors(self._theme)
@@ -2835,7 +3044,10 @@ class ProcessingWorkbenchWidget(QWidget):
         self.accept_button.setEnabled(not busy and accept_enabled)
         self.reject_button.setEnabled(not busy and reject_enabled)
         self.fit_graph_button.setEnabled(not busy)
-        self.graph_scroll_button.setEnabled(not busy)
+        if not self.embedded:
+            self.graph_scroll_button.setEnabled(not busy)
+        else:
+            self._sync_graph_scroll_button()
         self.show_rejected_check.setEnabled(not busy)
         if self.embedded:
             self.embedded_run_button.setEnabled(not busy and runnable)

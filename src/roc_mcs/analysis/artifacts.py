@@ -227,84 +227,163 @@ class ArtifactStore:
                 tables[table_name] = self._read_table(group)
         return ArtifactBundle(arrays=arrays, tables=tables, metadata=metadata)
 
-    def read_tables(
+    def read_subset(
         self,
         artifact_id: str,
-        table_names: Iterable[str],
         *,
+        array_names: Iterable[str] = (),
+        table_names: Iterable[str] = (),
+        column_names_by_table: Mapping[str, Iterable[str]] | None = None,
         group_head_limits: Mapping[str, tuple[str, int]] | None = None,
+        missing_ok: bool = False,
+        missing_columns_ok: bool = False,
     ) -> ArtifactBundle:
-        """Read only the requested HDF5 tables, without materializing arrays or peers.
+        """Read a precise subset of an immutable artifact in one HDF5 pass.
 
-        This is intended for analysis views that need a small subset of a larger
-        immutable artifact. ``group_head_limits`` optionally limits a table to
-        its first N stored rows per group-key value, without modifying the
-        original artifact. Returned DataFrames are detached HDF5-decoded values.
+        Only explicitly requested arrays/tables/columns are decoded. Optional
+        missing objects may be skipped with ``missing_ok``; optional columns may
+        be skipped with ``missing_columns_ok``. Malformed selected objects and
+        invalid projections still raise. This is intended for
+        preview consumers that need a small renderer-specific view of a larger
+        scientific result without materializing unrelated cubes and tables.
         """
-        names = tuple(dict.fromkeys(str(name) for name in table_names))
-        if not names:
-            raise ValueError("Необходимо запросить хотя бы одну таблицу артефакта")
-        for name in names:
+        arrays_requested = tuple(dict.fromkeys(str(name) for name in array_names))
+        tables_requested = tuple(dict.fromkeys(str(name) for name in table_names))
+        if not arrays_requested and not tables_requested:
+            raise ValueError("Необходимо запросить хотя бы один массив или таблицу артефакта")
+        for name in (*arrays_requested, *tables_requested):
             if not _KEY_RE.fullmatch(name):
-                raise ValueError(f"Некорректное имя таблицы: {name!r}")
+                raise ValueError(f"Некорректное имя объекта артефакта: {name!r}")
+
+        projections = {
+            str(table): tuple(dict.fromkeys(str(column) for column in columns))
+            for table, columns in (column_names_by_table or {}).items()
+        }
+        unexpected_projections = set(projections).difference(tables_requested)
+        if unexpected_projections:
+            raise ValueError(
+                "Проекции столбцов заданы для невыбранных таблиц: "
+                f"{sorted(unexpected_projections)}"
+            )
+        for table, columns in projections.items():
+            if not columns:
+                raise ValueError(f"Проекция таблицы {table!r} не может быть пустой")
+
+        limits = dict(group_head_limits or {})
+        unexpected_limits = set(limits).difference(tables_requested)
+        if unexpected_limits:
+            raise ValueError(
+                "Лимиты групповых строк заданы для невыбранных таблиц: "
+                f"{sorted(unexpected_limits)}"
+            )
 
         path = self._path(artifact_id)
         if not path.is_file():
             raise FileNotFoundError(f"Артефакт не найден: {artifact_id}")
+        arrays: dict[str, np.ndarray] = {}
         tables: dict[str, Any] = {}
         with h5py.File(path, "r") as handle:
             version = int(handle.attrs.get("format_version", -1))
             if version not in self.READABLE_FORMAT_VERSIONS:
                 raise ValueError(f"Неподдерживаемый формат артефакта: {version}")
             metadata = json.loads(handle.attrs.get("metadata_json", "{}"))
+
+            source_arrays = handle.get("arrays")
+            missing_arrays = [
+                name for name in arrays_requested
+                if source_arrays is None or name not in source_arrays
+            ]
             source_tables = handle.get("tables")
-            if source_tables is None:
-                raise ValueError("В артефакте отсутствует группа tables")
-            missing = [name for name in names if name not in source_tables]
-            if missing:
-                raise KeyError(f"В артефакте отсутствуют таблицы: {missing}")
-            limits = dict(group_head_limits or {})
-            unexpected_limits = set(limits).difference(names)
-            if unexpected_limits:
-                raise ValueError(
-                    "Лимиты групповых строк заданы для невыбранных таблиц: "
-                    f"{sorted(unexpected_limits)}"
-                )
-            for name in names:
-                group = source_tables[name]
-                row_indices = None
-                if name in limits:
-                    group_column, raw_limit = limits[name]
-                    if not isinstance(group_column, str) or not group_column.strip():
-                        raise ValueError("group_head_limits должен задавать имя столбца-группы")
-                    if isinstance(raw_limit, (bool, np.bool_)):
-                        raise ValueError("group_head_limits должен задавать положительный целый лимит")
-                    try:
-                        per_group_limit = int(raw_limit)
-                    except (TypeError, ValueError, OverflowError) as exc:
-                        raise ValueError(
-                            "group_head_limits должен задавать положительный целый лимит"
-                        ) from exc
-                    if per_group_limit < 1 or per_group_limit != raw_limit:
-                        raise ValueError("group_head_limits должен задавать положительный целый лимит")
-                    columns = json.loads(group.attrs["columns_json"])
-                    if group_column not in columns:
-                        raise KeyError(
-                            f"В таблице {name!r} отсутствует группирующий столбец {group_column!r}"
-                        )
-                    column_index = columns.index(group_column)
-                    group_values = self._read_dataset(group[f"c{column_index:04d}"])
-                    seen_per_group: dict[str, int] = {}
-                    selected_rows: list[int] = []
-                    for row_index, raw_key in enumerate(group_values):
-                        key = str(raw_key)
-                        current = seen_per_group.get(key, 0)
-                        if current < per_group_limit:
-                            selected_rows.append(row_index)
-                            seen_per_group[key] = current + 1
-                    row_indices = np.asarray(selected_rows, dtype=np.int64)
-                tables[name] = self._read_table(group, row_indices=row_indices)
-        return ArtifactBundle(tables=tables, metadata=metadata)
+            missing_tables = [
+                name for name in tables_requested
+                if source_tables is None or name not in source_tables
+            ]
+            if not missing_ok and missing_arrays:
+                raise KeyError(f"В артефакте отсутствуют массивы: {missing_arrays}")
+            if not missing_ok and missing_tables:
+                raise KeyError(f"В артефакте отсутствуют таблицы: {missing_tables}")
+
+            if source_arrays is not None:
+                for name in arrays_requested:
+                    if name in source_arrays:
+                        arrays[name] = self._read_dataset(source_arrays[name])
+
+            if source_tables is not None:
+                for name in tables_requested:
+                    if name not in source_tables:
+                        continue
+                    group = source_tables[name]
+                    row_indices = None
+                    if name in limits:
+                        group_column, raw_limit = limits[name]
+                        if not isinstance(group_column, str) or not group_column.strip():
+                            raise ValueError("group_head_limits должен задавать имя столбца-группы")
+                        if isinstance(raw_limit, (bool, np.bool_)):
+                            raise ValueError("group_head_limits должен задавать положительный целый лимит")
+                        try:
+                            per_group_limit = int(raw_limit)
+                        except (TypeError, ValueError, OverflowError) as exc:
+                            raise ValueError(
+                                "group_head_limits должен задавать положительный целый лимит"
+                            ) from exc
+                        if per_group_limit < 1 or per_group_limit != raw_limit:
+                            raise ValueError("group_head_limits должен задавать положительный целый лимит")
+                        stored_columns = json.loads(group.attrs["columns_json"])
+                        if group_column not in stored_columns:
+                            raise KeyError(
+                                f"В таблице {name!r} отсутствует группирующий столбец {group_column!r}"
+                            )
+                        column_index = stored_columns.index(group_column)
+                        group_values = self._read_dataset(group[f"c{column_index:04d}"])
+                        seen_per_group: dict[str, int] = {}
+                        selected_rows: list[int] = []
+                        for row_index, raw_key in enumerate(group_values):
+                            key = str(raw_key)
+                            current = seen_per_group.get(key, 0)
+                            if current < per_group_limit:
+                                selected_rows.append(row_index)
+                                seen_per_group[key] = current + 1
+                        row_indices = np.asarray(selected_rows, dtype=np.int64)
+                    tables[name] = self._read_table(
+                        group,
+                        row_indices=row_indices,
+                        column_names=projections.get(name),
+                        missing_columns_ok=missing_columns_ok,
+                    )
+        return ArtifactBundle(arrays=arrays, tables=tables, metadata=metadata)
+
+    def read_tables(
+        self,
+        artifact_id: str,
+        table_names: Iterable[str],
+        *,
+        group_head_limits: Mapping[str, tuple[str, int]] | None = None,
+        column_names_by_table: Mapping[str, Iterable[str]] | None = None,
+        missing_columns_ok: bool = False,
+    ) -> ArtifactBundle:
+        """Read selected tables (and optionally selected columns) only."""
+        table_names = tuple(table_names)
+        if not table_names:
+            raise ValueError("Необходимо запросить хотя бы одну таблицу")
+        return self.read_subset(
+            artifact_id,
+            table_names=table_names,
+            group_head_limits=group_head_limits,
+            column_names_by_table=column_names_by_table,
+            missing_columns_ok=missing_columns_ok,
+        )
+
+    def read_arrays(
+        self,
+        artifact_id: str,
+        array_names: Iterable[str],
+        *,
+        missing_ok: bool = False,
+    ) -> ArtifactBundle:
+        """Read selected arrays only, preserving the artifact metadata."""
+        return self.read_subset(
+            artifact_id, array_names=array_names, missing_ok=missing_ok,
+        )
 
     @staticmethod
     def _read_dataset(dataset: h5py.Dataset, selection=None) -> np.ndarray:
@@ -324,14 +403,39 @@ class ArtifactStore:
         return array
 
     @classmethod
-    def _read_table(cls, group: h5py.Group, *, row_indices: np.ndarray | None = None):
+    def _read_table(
+        cls,
+        group: h5py.Group,
+        *,
+        row_indices: np.ndarray | None = None,
+        column_names: Iterable[str] | None = None,
+        missing_columns_ok: bool = False,
+    ):
         import pandas as pd
 
-        columns = json.loads(group.attrs["columns_json"])
+        stored_columns = json.loads(group.attrs["columns_json"])
+        if column_names is None:
+            selected_indices = list(range(len(stored_columns)))
+        else:
+            requested = tuple(dict.fromkeys(str(name) for name in column_names))
+            missing = set(requested).difference(stored_columns)
+            if missing and not missing_columns_ok:
+                raise KeyError(
+                    f"В таблице {group.name!r} отсутствуют запрошенные столбцы {sorted(missing)}"
+                )
+            requested_set = set(requested).intersection(stored_columns)
+            # Preserve the physical artifact column order, including any
+            # duplicate labels outside the requested projection.
+            selected_indices = [
+                index for index, name in enumerate(stored_columns)
+                if name in requested_set
+            ]
+        columns = [stored_columns[index] for index in selected_indices]
         row_count = int(group.attrs.get("row_count", -1))
         selected_row_count = len(row_indices) if row_indices is not None else row_count
         restored_columns: list[Any] = []
-        for index, name in enumerate(columns):
+        for index in selected_indices:
+            name = stored_columns[index]
             dataset = group[f"c{index:04d}"]
             values = cls._read_dataset(dataset, selection=row_indices)
             if values.ndim != 1 or (selected_row_count >= 0 and len(values) != selected_row_count):
