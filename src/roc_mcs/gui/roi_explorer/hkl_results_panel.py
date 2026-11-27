@@ -16,7 +16,7 @@ from matplotlib.lines import Line2D
 from matplotlib.ticker import ScalarFormatter
 import matplotlib.patheffects as path_effects
 
-from PyQt6.QtCore import QEvent, Qt, QSize, QTimer
+from PyQt6.QtCore import QEvent, Qt, QSize, QTimer, QSignalBlocker
 from PyQt6.QtGui import QCursor, QFont
 from PyQt6.QtWidgets import (
     QApplication,
@@ -80,6 +80,7 @@ class HklResultsPanel(QWidget):
         self._histogram_view_limits: tuple[float, float, float, float] | None = None
         self._histogram_drag_state: dict[str, Any] | None = None
         self._selected_reflection_row = -1
+        self._selected_reflection_key: float | None = None
         self._reflection_catalog = pd.DataFrame()
         self._selected_reflection_artist = None
         self._selected_reflection_marker = None
@@ -399,6 +400,7 @@ class HklResultsPanel(QWidget):
             self._histogram_full_xlim = None
             self._histogram_full_ylim = None
             self._selected_reflection_row = -1
+            self._selected_reflection_key = None
             self._reflection_catalog = pd.DataFrame()
             self._selected_reflection_artist = None
             self._selected_reflection_marker = None
@@ -437,6 +439,7 @@ class HklResultsPanel(QWidget):
         self.bin_width_spin.setEnabled(self.pair_combo.count() > 0)
         self._histogram_view_limits = None
         self._selected_reflection_row = -1
+        self._selected_reflection_key = None
         self._reflection_catalog = reflections.loc[:, [
             name for name in (
                 "hkl", "delta_theta_arcsec", "theta_ka1_deg", "d_A",
@@ -498,6 +501,7 @@ class HklResultsPanel(QWidget):
             self._selected_reflection_artist = None
             self._selected_reflection_marker = None
             self._selected_reflection_row = -1
+            self._selected_reflection_key = None
             self._hide_reflection_tooltip()
             self.plot_hint_label.setText(
                 "Колесо — масштаб · средняя кнопка — сдвиг · наведение — сведения о рефлексе"
@@ -576,9 +580,12 @@ class HklResultsPanel(QWidget):
                 f"{self._fmt(getattr(row, 'darwin_pi_arcsec', np.nan), 3)}",
             ])
         self._set_table(self.reflection_table, rows)
+        blocker = QSignalBlocker(self.reflection_table)
         self.reflection_table.clearSelection()
         self.reflection_table.setCurrentCell(-1, -1)
+        del blocker
         self._selected_reflection_row = -1
+        self._selected_reflection_key = None
         if reset_view:
             self._histogram_view_limits = None
         elif 0 <= previous_selected_row < self.reflection_table.rowCount():
@@ -802,26 +809,35 @@ class HklResultsPanel(QWidget):
         return float(new_low), float(new_high)
 
     def eventFilter(self, watched, event):
-        """Dismiss a pinned reflection card on a click anywhere else.
+        """Dismiss reflection inspection and clear selection on outside clicks.
 
-        Matplotlib only receives mouse presses over its own canvas. Installing
-        this lightweight filter on QApplication also covers clicks on the
-        reflection table, other tabs and neighbouring ROI Explorer controls.
-        Clicks in the card itself are consumed so they cannot accidentally hit
-        a reflection drawn underneath its transparent overlay.
+        A click on a real reflection-table row is itself a selection operation
+        and is left to QTableWidget/currentCellChanged. A click elsewhere in the
+        application dismisses the card and clears the plot overlay. Clicks in
+        the popup are consumed so they cannot fall through to a line below it.
         """
-        if (
-            event.type() == QEvent.Type.MouseButtonPress
-            and self._pinned_reflection_key is not None
-            and self._reflection_tooltip_frame is not None
-            and self._reflection_tooltip_frame.isVisible()
-        ):
+        if event.type() == QEvent.Type.MouseButtonPress:
             global_position = event.globalPosition().toPoint()
             canvas_position = self.pair_canvas.mapFromGlobal(global_position)
-            if self._reflection_tooltip_frame.geometry().contains(canvas_position):
+            if (
+                self._reflection_tooltip_frame is not None
+                and self._reflection_tooltip_frame.isVisible()
+                and self._reflection_tooltip_frame.geometry().contains(canvas_position)
+            ):
                 return True
-            if not self.pair_canvas.rect().contains(canvas_position):
+
+            in_plot = self.pair_canvas.rect().contains(canvas_position)
+            in_selected_table_row = False
+            viewport = self.reflection_table.viewport()
+            table_position = viewport.mapFromGlobal(global_position)
+            if viewport.rect().contains(table_position):
+                index = self.reflection_table.indexAt(table_position)
+                in_selected_table_row = bool(index.isValid())
+
+            if not in_plot:
                 self._hide_reflection_tooltip(clear_pinned=True)
+                if not in_selected_table_row:
+                    self._clear_selected_reflection()
         return super().eventFilter(watched, event)
 
     def _on_histogram_press(self, event) -> None:
@@ -833,27 +849,29 @@ class HklResultsPanel(QWidget):
             if ax is not None and event.inaxes is ax and event.x is not None:
                 reflection_key = self._reflection_at_mouse(float(event.x))
                 if reflection_key is not None:
-                    # A click pins the scientific record. Pointer motion no
-                    # longer changes or dismisses this popup; another click does.
+                    self._set_selected_reflection_key(reflection_key)
                     self._show_reflection_tooltip(
                         reflection_key, pinned=True, anchor=self._cursor_canvas_position()
                     )
                 else:
                     self._hide_reflection_tooltip(clear_pinned=True)
+                    self._clear_selected_reflection()
             else:
                 self._hide_reflection_tooltip(clear_pinned=True)
+                self._clear_selected_reflection()
             return
 
         if not is_middle_click:
             self._hide_reflection_tooltip(clear_pinned=True)
+            self._clear_selected_reflection()
             return
+        self._hide_reflection_tooltip(clear_pinned=True)
+        self._clear_selected_reflection()
         if (
             ax is None or event.inaxes is not ax
             or event.xdata is None or event.ydata is None
         ):
-            self._hide_reflection_tooltip(clear_pinned=True)
             return
-        self._hide_reflection_tooltip(clear_pinned=True)
         xlim = tuple(map(float, ax.get_xlim()))
         ylim = tuple(map(float, ax.get_ylim()))
         bbox = ax.get_window_extent()
@@ -933,8 +951,58 @@ class HklResultsPanel(QWidget):
 
     def _on_reflection_row_changed(self, row: int, _column: int, _previous_row: int, _previous_column: int) -> None:
         self._selected_reflection_row = int(row) if row >= 0 else -1
+        ranking_x = np.asarray(
+            (self._histogram_cache or {}).get("ranking_x", ()), dtype=np.float64
+        )
+        self._selected_reflection_key = (
+            float(ranking_x[row])
+            if 0 <= row < ranking_x.size and np.isfinite(ranking_x[row])
+            else None
+        )
         self._draw_selected_reflection_overlay()
         if self._histogram_axes is not None:
+            self.pair_canvas.draw_idle()
+
+    def _set_selected_reflection_key(self, key: float) -> None:
+        """Select a picked theoretical line and mirror it in the ranking table."""
+        key = float(key)
+        self._selected_reflection_key = key
+        ranking_x = np.asarray(
+            (self._histogram_cache or {}).get("ranking_x", ()), dtype=np.float64
+        )
+        tolerance = max(1.0e-10, abs(key) * 1.0e-12)
+        matches = np.flatnonzero(
+            np.isfinite(ranking_x) & np.isclose(ranking_x, key, rtol=0.0, atol=tolerance)
+        )
+        blocker = QSignalBlocker(self.reflection_table)
+        if matches.size:
+            row = int(matches[0])
+            self.reflection_table.setCurrentCell(row, 0)
+            self.reflection_table.selectRow(row)
+            self._selected_reflection_row = row
+        else:
+            self.reflection_table.clearSelection()
+            self.reflection_table.setCurrentCell(-1, -1)
+            self._selected_reflection_row = -1
+        del blocker
+        self._draw_selected_reflection_overlay()
+        if self._histogram_axes is not None:
+            self.pair_canvas.draw_idle()
+
+    def _clear_selected_reflection(self) -> None:
+        """Clear the common selection state without triggering table callbacks."""
+        if self._selected_reflection_key is None and self._selected_reflection_row < 0:
+            return
+        self._selected_reflection_key = None
+        self._selected_reflection_row = -1
+        table = getattr(self, "reflection_table", None)
+        if table is not None:
+            blocker = QSignalBlocker(table)
+            table.clearSelection()
+            table.setCurrentCell(-1, -1)
+            del blocker
+        self._draw_selected_reflection_overlay()
+        if getattr(self, "_histogram_axes", None) is not None:
             self.pair_canvas.draw_idle()
 
     def _draw_selected_reflection_overlay(self) -> None:
@@ -952,11 +1020,11 @@ class HklResultsPanel(QWidget):
                     pass
         self._selected_reflection_artist = None
         self._selected_reflection_marker = None
-        row = self._selected_reflection_row
-        ranking_x = np.asarray(self._histogram_cache.get("ranking_x", ()), dtype=np.float64)
-        if row < 0 or row >= ranking_x.size or not np.isfinite(ranking_x[row]):
+        if self._selected_reflection_key is None:
             return
-        x_value = float(ranking_x[row])
+        x_value = float(self._selected_reflection_key)
+        if not np.isfinite(x_value):
+            return
         low, high = ax.get_xlim()
         if not low <= x_value <= high:
             return

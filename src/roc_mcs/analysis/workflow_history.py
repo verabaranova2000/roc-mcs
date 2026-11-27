@@ -297,6 +297,43 @@ class WorkflowHistory:
         self.get(node_id)
         return tuple(node for node in self._nodes.values() if node_id in node.parent_ids)
 
+    def descendants(
+        self, node_id: str, *, include_self: bool = True,
+    ) -> tuple[ProcessingNode, ...]:
+        """Return the transitive child closure in stable breadth-first order.
+
+        Workflow history is a DAG rather than a strict tree.  A node that has
+        several parents is still a descendant of *each* of them; removing one
+        of its dependencies therefore removes that node and everything below
+        it.  The visited set guarantees that shared descendants appear once.
+        """
+        self.get(node_id)
+        result: list[ProcessingNode] = []
+        seen: set[str] = set()
+        frontier = [node_id]
+        while frontier:
+            current = frontier.pop(0)
+            if current in seen:
+                continue
+            seen.add(current)
+            if include_self or current != node_id:
+                result.append(self.get(current))
+            frontier.extend(child.id for child in self.children(current))
+        return tuple(result)
+
+    def without_subgraph(
+        self, node_id: str,
+    ) -> tuple["WorkflowHistory", tuple[ProcessingNode, ...]]:
+        """Build a validated history without ``node_id`` and all descendants.
+
+        The current history is never mutated.  Callers can persist the returned
+        candidate atomically before committing it to the live project object.
+        """
+        removed = self.descendants(node_id, include_self=True)
+        removed_ids = {node.id for node in removed}
+        remaining = [node for node in self._nodes.values() if node.id not in removed_ids]
+        return WorkflowHistory(remaining), removed
+
     def ancestors(self, node_id: str, *, include_self: bool = True) -> tuple[ProcessingNode, ...]:
         """Возвращает узел и его предков в порядке ближайший → дальний."""
         self.get(node_id)

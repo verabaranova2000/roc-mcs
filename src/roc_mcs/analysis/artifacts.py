@@ -88,6 +88,22 @@ class ArtifactStore:
             raise ValueError("Некорректный artifact_id")
         return self.directory / f"{artifact_id}.h5"
 
+    def delete(self, artifact_id: str, *, missing_ok: bool = True) -> bool:
+        """Delete one store-owned artifact after validating its opaque ID.
+
+        Returns ``True`` when a file was removed and ``False`` when it was
+        already absent.  IDs are resolved through :meth:`_path`, so callers
+        cannot pass arbitrary paths or escape the artifact directory.
+        """
+        path = self._path(artifact_id)
+        try:
+            path.unlink()
+            return True
+        except FileNotFoundError:
+            if missing_ok:
+                return False
+            raise
+
     def write(self, bundle: ArtifactBundle) -> str:
         artifact_id = uuid4().hex
         target = self._path(artifact_id)

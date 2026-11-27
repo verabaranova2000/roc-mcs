@@ -22,6 +22,9 @@ class BranchSizeHistogram(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._sizes = np.empty(0, dtype=np.int64)
+        self._bin_edges = np.empty(0, dtype=np.float64)
+        self._bin_counts = np.empty(0, dtype=np.int64)
+        self._maximum = 1
         self._threshold = 1
         self._recommended = 1
         self._diagnostics: dict[str, Any] = {}
@@ -52,22 +55,42 @@ class BranchSizeHistogram(QWidget):
     def set_distribution(
         self, sizes, recommended_min: int = 1, diagnostics: dict[str, Any] | None = None,
     ) -> None:
-        values = np.asarray(sizes, dtype=np.float64).reshape(-1)
-        if values.size and (
-            not np.isfinite(values).all() or np.any(values < 1)
-            or not np.equal(values, np.rint(values)).all()
-        ):
-            raise ValueError("Размеры ветвей должны быть конечными положительными целыми числами")
-        self._sizes = values.astype(np.int64)
+        raw = np.asarray(sizes).reshape(-1)
+        if np.issubdtype(raw.dtype, np.integer):
+            if raw.size and (np.any(raw < 1) or np.any(raw > np.iinfo(np.int64).max)):
+                raise ValueError("Размеры ветвей должны быть положительными числами в диапазоне int64")
+            values = np.ascontiguousarray(raw, dtype=np.int64)
+        else:
+            numeric = np.asarray(raw, dtype=np.float64)
+            if numeric.size and (
+                not np.isfinite(numeric).all() or np.any(numeric < 1)
+                or np.any(numeric > np.iinfo(np.int64).max)
+                or not np.equal(numeric, np.rint(numeric)).all()
+            ):
+                raise ValueError("Размеры ветвей должны быть конечными положительными целыми числами")
+            values = np.ascontiguousarray(numeric, dtype=np.int64)
+        self._sizes = values
+        self._maximum = max(1, int(values.max()) if values.size else 1)
         self._recommended = max(1, int(recommended_min))
         self._diagnostics = dict(diagnostics or {})
-        self._threshold = min(max(1, self._threshold), max(1, int(self._sizes.max()) if self._sizes.size else 1))
+        self._threshold = min(max(1, self._threshold), self._maximum)
+        if values.size:
+            n_bins = max(8, min(22, int(np.ceil(np.log2(self._maximum + 1))) + 1))
+            edges = np.geomspace(1.0, max(1.01, self._maximum * 1.001), n_bins + 1)
+            edges[0] = 0.5
+            counts, edges = np.histogram(values, bins=edges)
+            self._bin_edges = np.ascontiguousarray(edges, dtype=np.float64)
+            self._bin_counts = np.ascontiguousarray(counts, dtype=np.int64)
+        else:
+            self._bin_edges = np.empty(0, dtype=np.float64)
+            self._bin_counts = np.empty(0, dtype=np.int64)
         self.update()
 
     def set_threshold(self, value: int, *, emit: bool = False) -> None:
-        maximum = max(1, int(self._sizes.max()) if self._sizes.size else 1)
-        value = min(max(1, int(value)), maximum)
+        value = min(max(1, int(value)), self._maximum)
         changed = value != self._threshold
+        if not changed:
+            return
         self._threshold = value
         self.update()
         if emit and changed:
@@ -101,7 +124,7 @@ class BranchSizeHistogram(QWidget):
         grid = palette.color(palette.ColorRole.Mid)
         accent = palette.color(palette.ColorRole.Highlight)
         left, top, right, bottom = self._geometry()
-        maximum = max(1, int(self._sizes.max()) if self._sizes.size else 1)
+        maximum = self._maximum
         plot_h = bottom - top
         plot_w = right - left
 
@@ -119,10 +142,8 @@ class BranchSizeHistogram(QWidget):
         if self._sizes.size:
             # Geometric bins retain visibility of both singleton noise and very
             # large diffraction sheets without clipping or linear-axis collapse.
-            n_bins = max(8, min(22, int(np.ceil(np.log2(maximum + 1))) + 1))
-            edges = np.geomspace(1.0, max(1.01, maximum * 1.001), n_bins + 1)
-            edges[0] = 0.5
-            counts, edges = np.histogram(self._sizes, bins=edges)
+            edges = self._bin_edges
+            counts = self._bin_counts
             ymax = max(1, int(counts.max()))
             for index, count in enumerate(counts):
                 if count <= 0:

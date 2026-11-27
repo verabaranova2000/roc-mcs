@@ -308,6 +308,14 @@ class RockingCurveExplorerWindow(QMainWindow):
         size = QSize(self._global_icon_size(), self._global_icon_size())
         for button in self.findChildren(QAbstractButton):
             if not button.icon().isNull(): button.setIconSize(size)
+        # Generic icon propagation above also visits VTK popup buttons. Re-run
+        # the 3D toolbar's geometry policy afterwards so its compact subcontrols
+        # and main-row button proportions remain consistent with 2D/ROC.
+        for widget in self.findChildren(QWidget):
+            if widget.objectName() == "EmbeddedVTKVolumeWidget":
+                apply_icon_size = getattr(widget, "apply_global_icon_size", None)
+                if callable(apply_icon_size):
+                    apply_icon_size()
         if hasattr(self, "display_settings_action"):
             self.display_settings_action.setIcon(resource_svg_icon("setting_icon.svg", size=self._global_icon_size()))
             if hasattr(self,"display_settings_btn"):self.display_settings_btn.setIconSize(size)
@@ -1458,7 +1466,10 @@ class RockingCurveExplorerWindow(QMainWindow):
         elif default_hkl and str(map_key).startswith("hkl.delta_theta."):
             cmap_name = "RdBu_r"
         else:
-            return
+            # Unsaved maps in the same preview session inherit the source-map
+            # palette, not the semantic Δθ diverging palette left by the prior
+            # layer. Saved per-layer preferences still take precedence above.
+            cmap_name = self._analysis_previous_cmap or self.map_widget.current_cmap
         self.map_widget.current_cmap = cmap_name
         self.map_widget.tools.set_current_cmap(cmap_name)
 

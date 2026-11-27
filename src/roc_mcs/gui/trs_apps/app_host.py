@@ -102,10 +102,13 @@ class TRSAppsWindow(QtWidgets.QMainWindow):
         colors = _THEME[self._active_theme]
         for _pane, _index, page in self._all_pages():
             set_icon_theme(page, colors["text"]); page.setProperty("rocMcsTheme", self._active_theme)
-            method = getattr(page, "apply_global_settings", None)
-            if callable(method): method(settings)
+            # Apply the global baseline first.  Embedded tools may then refine
+            # their own geometry/icon proportions (the 3D toolbar is one such
+            # component); a trailing blanket pass would undo that policy.
             for button in page.findChildren(QtWidgets.QAbstractButton):
                 if not button.icon().isNull(): button.setIconSize(QtCore.QSize(self._icon_size, self._icon_size))
+            method = getattr(page, "apply_global_settings", None)
+            if callable(method): method(settings)
 
     def open_resource_monitor(self) -> None:
         """Открывает закрепляемую панель; повторное нажатие только поднимает её."""

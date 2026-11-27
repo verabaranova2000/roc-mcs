@@ -344,23 +344,26 @@ class VTKToolsWidget(QWidget):
         self._theta_axis_values: list[float] = []
         self._theta_range_indices: tuple[int, int] | None = None
         self._theta_range_link_available = False
-        self.setFixedHeight(34)
+        # The toolbar geometry is derived from the same application icon-size
+        # property used by the 2D and ROC toolbars.  The stylesheet is refreshed
+        # by _set_icon_sizes() when the global preference changes.
+        self.setFixedHeight(26)
         self.setStyleSheet(
             """
-            QWidget#VTKToolBar QToolButton {
-                max-height: 27px; min-height: 25px; min-width: 27px;
+            QWidget#VTKToolBar QToolButton[toolbarControl="true"] {
+                max-height: 22px; min-height: 22px; min-width: 26px; max-width: 26px;
                 padding: 1px; margin: 0; border: 1px solid transparent;
                 border-radius: 3px; background: transparent;
                 color: palette(button-text);
             }
-            QWidget#VTKToolBar QToolButton:hover {
+            QWidget#VTKToolBar QToolButton[toolbarControl="true"]:hover {
                 background: palette(midlight); border-color: palette(mid);
             }
-            QWidget#VTKToolBar QToolButton:checked {
+            QWidget#VTKToolBar QToolButton[toolbarControl="true"]:checked {
                 background: palette(highlight); color: palette(highlighted-text);
                 border-color: palette(highlight);
             }
-            QWidget#VTKToolBar QToolButton[settingsActive="true"] {
+            QWidget#VTKToolBar QToolButton[toolbarControl="true"][settingsActive="true"] {
                 border-color: palette(highlight); background: palette(alternate-base);
             }
             QWidget#VTKToolBar QToolButton::menu-indicator { image: none; }
@@ -1980,35 +1983,78 @@ class VTKToolsWidget(QWidget):
             return 16
 
     def _set_icon_sizes(self) -> None:
-        """Apply the application-wide icon size to every 3D tool icon.
+        """Apply the global icon preference to 3D icons and toolbar geometry.
 
-        Colour swatches are intentionally excluded: their rectangular preview
-        geometry is part of the colour-control affordance, not an icon-size
-        preference.  Text-only popup controls are excluded as well.
+        Main-row controls use the same icon-to-button proportions as the 2D
+        plot toolbars.  Popup command grids retain their own denser geometry;
+        resizing them as if they were toolbar buttons would make menus jump.
+        Colour swatches and text-only controls are not icon controls.
         """
         size = QSize(self._icon_size(), self._icon_size())
-        icon_buttons = (
-            self.reset_btn,
-            self.volume_source_btn,
-            self.orientation_btn,
-            self.camera_btn,
-            self.overlays_btn,
-            self.theta_range_btn,
-            self.theme_btn,
-            self.perspective_button,
-            *self.camera_axis_buttons.values(),
-            self.axes_button,
-            self.bounding_box_button,
-            self.axis_ticks_button,
-            self.axis_scale_btn,
-            self.theta_range_swap_button,
-            self.theta_range_link_button,
-            self.axis_scale_reset_btn,
+        icon = size.width()
+        button_width = max(22, min(30, icon + 10))
+        button_height = max(18, min(26, icon + 6))
+        self.setFixedHeight(button_height + 4)
+        layout = self.layout()
+        if layout is not None:
+            margins = layout.contentsMargins()
+            # Preserve the embedding-specific horizontal insets while ensuring
+            # the vertical padding remains symmetric and compact.
+            layout.setContentsMargins(
+                margins.left(), 2, margins.right(), 2
+            )
+
+        main_buttons = (
+            self.reset_btn, self.volume_source_btn, self.orientation_btn,
+            self.camera_btn, self.overlays_btn, self.theta_range_btn,
+            self.theme_btn, self.perspective_button, self.axes_button,
+            self.bounding_box_button, self.axis_ticks_button, self.axis_scale_btn,
             *self._overlay_buttons.values(),
         )
-        for button in icon_buttons:
-            if button is not None and not button.icon().isNull():
+        for button in main_buttons:
+            if button is None:
+                continue
+            button.setProperty("toolbarControl", True)
+            button.setFixedSize(button_width, button_height)
+            if not button.icon().isNull():
                 button.setIconSize(size)
+
+        # Directional camera buttons live inside popup command strips, not the
+        # toolbar row.  Preserve their square popup geometry and scale only
+        # their glyphs.
+        popup_buttons = (
+            *self.camera_axis_buttons.values(),
+            self.theta_range_swap_button, self.theta_range_link_button,
+            self.axis_scale_reset_btn,
+        )
+        compact_size = QSize(max(10, icon - 2), max(10, icon - 2))
+        for button in popup_buttons:
+            if button is not None and not button.icon().isNull():
+                button.setIconSize(compact_size)
+
+        # Keep the row stylesheet's min/max geometry in lockstep with the
+        # actual fixed size.  This avoids style-engine-dependent oversizing.
+        self.setStyleSheet(f"""
+            QWidget#VTKToolBar QToolButton[toolbarControl=\"true\"] {{
+                min-width:{button_width}px; max-width:{button_width}px;
+                min-height:{button_height}px; max-height:{button_height}px;
+                padding:1px; margin:0; border:1px solid transparent;
+                border-radius:3px; background:transparent; color:palette(button-text);
+            }}
+            QWidget#VTKToolBar QToolButton[toolbarControl=\"true\"]:hover {{
+                background:palette(midlight); border-color:palette(mid);
+            }}
+            QWidget#VTKToolBar QToolButton[toolbarControl=\"true\"]:checked {{
+                background:palette(highlight); color:palette(highlighted-text);
+                border-color:palette(highlight);
+            }}
+            QWidget#VTKToolBar QToolButton[toolbarControl=\"true\"][settingsActive=\"true\"] {{
+                border-color:palette(highlight); background:palette(alternate-base);
+            }}
+            QWidget#VTKToolBar QToolButton::menu-indicator {{ image:none; }}
+            QWidget#VTKToolBar QMenu::indicator {{ background:palette(base); border:1px solid palette(mid); }}
+            QWidget#VTKToolBar QMenu::indicator:checked {{ background:palette(highlight); }}
+        """)
 
     def _color_swatch_icon(self, color: str) -> QIcon:
         pixmap = QPixmap(22, 16)

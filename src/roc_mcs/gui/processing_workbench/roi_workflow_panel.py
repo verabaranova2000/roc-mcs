@@ -7,14 +7,14 @@ share one implementation.
 """
 from __future__ import annotations
 
-import re
 from pathlib import Path
 
-from PyQt6.QtCore import QStandardPaths, QTimer, Qt, pyqtSignal
+from PyQt6.QtCore import QTimer, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QPainter, QPen, QPalette
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QLabel
 
-from roc_mcs.analysis.project import WorkflowProject
+from roc_mcs.analysis.project import WorkflowProject, project_directory_for_scan
+from roc_mcs.gui.app_settings import resolve_analysis_projects_directory
 from .workbench_widget import ProcessingWorkbenchWidget
 
 
@@ -237,12 +237,8 @@ class ProcessingStepsPanel(QWidget):
             if self.workbench is not None:
                 self._drop_workbench()
 
-            safe_scan = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(scan_key)).strip("._") or "scan"
-            documents = Path(
-                QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DocumentsLocation)
-                or (Path.home() / "Documents")
-            )
-            project_dir = documents / "ROC-MCS Analyses" / f"{path.stem}_{safe_scan}.roi-analysis"
+            project_root = resolve_analysis_projects_directory()
+            project_dir = project_directory_for_scan(path, str(scan_key), project_root)
             manifest = project_dir / WorkflowProject.MANIFEST_NAME
             container_revision_changed = False
             if manifest.is_file():

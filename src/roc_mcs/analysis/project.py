@@ -1,11 +1,28 @@
 """Local analysis-project layout and persistence."""
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
 from .artifacts import ArtifactStore
 from .workflow_history import NodeStatus, WorkflowHistory
+
+
+_ARTIFACT_ID_RE = re.compile(r"^[a-f0-9]{32}$")
+
+
+def project_directory_for_scan(
+    h5_path: str | Path, scan_key: str, root: str | Path,
+) -> Path:
+    """Return the canonical per-scan ROI project directory.
+
+    The HDF5 stem and scan key form a readable, deterministic folder name;
+    unsafe characters are collapsed to underscores so the path is portable.
+    """
+    source = Path(h5_path).expanduser().resolve()
+    safe_scan = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(scan_key)).strip("._") or "scan"
+    return Path(root).expanduser().resolve() / f"{source.stem}_{safe_scan}.roi-analysis"
 
 
 class WorkflowProject:
@@ -65,6 +82,63 @@ class WorkflowProject:
 
     def save(self) -> None:
         self.history.save(self.manifest_path)
+
+    def remove_subgraph(self, node_id: str) -> dict[str, Any]:
+        """Persistently remove a node and its full downstream dependency closure.
+
+        The source scan is the immutable root of a project and cannot be
+        removed.  A running operation also blocks deletion, avoiding races
+        between a worker writing an artifact and its parent branch disappearing.
+        The new manifest is committed atomically *before* unreachable artifacts
+        are unlinked.  Cleanup failures leave harmless orphan files and are
+        returned to the caller; the manifest is never rolled back to reference
+        partially deleted output.
+        """
+        selected = self.history.get(str(node_id))
+        if selected.operation_id == "source.scan":
+            raise ValueError("Исходный скан проекта нельзя удалить из пайплайна.")
+
+        candidate, removed_nodes = self.history.without_subgraph(str(node_id))
+        running = [node.label for node in removed_nodes if node.status == NodeStatus.RUNNING]
+        if running:
+            raise RuntimeError(
+                "Нельзя удалить ветвь, пока выполняется этап: " + ", ".join(running)
+            )
+
+        remaining_artifacts: set[str] = set()
+        for node in candidate.nodes:
+            for artifact_id in node.output_refs.values():
+                value = str(artifact_id)
+                if _ARTIFACT_ID_RE.fullmatch(value):
+                    remaining_artifacts.add(value)
+
+        removed_artifacts: set[str] = set()
+        for node in removed_nodes:
+            for artifact_id in node.output_refs.values():
+                value = str(artifact_id)
+                if _ARTIFACT_ID_RE.fullmatch(value):
+                    removed_artifacts.add(value)
+
+        # First commit the dependency graph.  If that fails, neither the live
+        # project nor any artifact file is changed.
+        candidate.save(self.manifest_path)
+        self.history = candidate
+
+        deleted: list[str] = []
+        cleanup_errors: dict[str, str] = {}
+        for artifact_id in sorted(removed_artifacts - remaining_artifacts):
+            try:
+                if self.artifact_store.delete(artifact_id, missing_ok=True):
+                    deleted.append(artifact_id)
+            except OSError as exc:
+                cleanup_errors[artifact_id] = str(exc)
+
+        return {
+            "removed_node_ids": tuple(node.id for node in removed_nodes),
+            "removed_labels": tuple(node.label for node in removed_nodes),
+            "deleted_artifact_ids": tuple(deleted),
+            "cleanup_errors": cleanup_errors,
+        }
 
     @property
     def source_node_id(self) -> str | None:

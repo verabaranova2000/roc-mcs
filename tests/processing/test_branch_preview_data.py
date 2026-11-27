@@ -71,3 +71,30 @@ def test_preview_patch_reports_missing_catalog_without_fabricating_events():
     assert preview.empty
     assert info["available"] is False
     assert "пуст" in info["message"].lower()
+
+
+def test_prepared_preview_reuses_hungarian_candidates_across_gate_updates(monkeypatch):
+    import roc_mcs.peaks.branches as branch_algorithms
+    from roc_mcs.gui.processing_workbench.branch_preview_data import prepare_branch_preview_graph
+
+    catalog = _two_sheet_catalog()
+    original_builder = branch_algorithms.build_peak_branch_candidate_graph
+    calls = 0
+
+    def counted_builder(frame):
+        nonlocal calls
+        calls += 1
+        return original_builder(frame)
+
+    monkeypatch.setattr(branch_algorithms, "build_peak_branch_candidate_graph", counted_builder)
+    prepared = prepare_branch_preview_graph(catalog)
+    narrow = build_branch_preview_graph(catalog, theta_gate=5.0, prepared=prepared)
+    wide = build_branch_preview_graph(catalog, theta_gate=45.0, prepared=prepared)
+    assert calls == 1
+
+    # Cached and standalone materialization must display the same exact graph.
+    reference = build_branch_preview_graph(catalog, theta_gate=45.0)
+    assert wide["accepted_edges"] == reference["accepted_edges"]
+    assert wide["candidate_edges"] == reference["candidate_edges"]
+    assert wide["branch_by_peak_id"] == reference["branch_by_peak_id"]
+    assert narrow["n_branches"] > wide["n_branches"]

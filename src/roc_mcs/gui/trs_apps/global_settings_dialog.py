@@ -2,7 +2,9 @@
 from __future__ import annotations
 from pathlib import Path
 from PyQt6 import QtCore, QtWidgets
-from roc_mcs.gui.app_settings import normalize_detector_bad_pixels
+from roc_mcs.gui.app_settings import (
+    default_analysis_projects_directory, normalize_detector_bad_pixels,
+)
 from roc_mcs.gui.components.dialog_chrome import install_dialog_titlebar
 from roc_mcs.gui.roi_explorer.theme import apply_popup_theme, resolve_theme
 
@@ -18,6 +20,16 @@ class TRSGlobalSettingsDialog(QtWidgets.QDialog):
         self.icon_size = QtWidgets.QSpinBox(self); self.icon_size.setRange(12, 20); self.icon_size.setValue(self._safe_int(self._settings.get("icon_size", 16), 16, 12, 20)); self.icon_size.setFixedWidth(82); self.icon_size.setKeyboardTracking(False); form.addRow("Размер значков, px", self.icon_size)
         self.h5_path = self._path_row(form, "Основной файл HDF5", str(self._settings.get("last_hdf5_database", "") or ""), is_file=True, filters="HDF5 (*.h5 *.hdf5 *.hdf);;Все файлы (*)")
         self.experiments_dir = self._path_row(form, "Папка экспериментов", str(self._settings.get("experiments_dir", "") or ""), is_file=False)
+        analysis_projects_default = str(default_analysis_projects_directory())
+        self.analysis_projects_dir = self._path_row(
+            form, "Папка проектов ROI Analysis",
+            str(self._settings.get("analysis_projects_dir", "") or analysis_projects_default),
+            is_file=False,
+        )
+        self.analysis_projects_dir.setToolTip(
+            "Корневая папка проектов ROI Analysis. Для каждого скана внутри создаётся "
+            "отдельный каталог <имя HDF5>_<имя скана>.roi-analysis."
+        )
         self.bad_pixels = QtWidgets.QLineEdit(self)
         try:
             pixels = normalize_detector_bad_pixels(self._settings.get("detector_bad_pixels"))
@@ -56,6 +68,7 @@ class TRSGlobalSettingsDialog(QtWidgets.QDialog):
 
     def _validate_and_accept(self):
         h5 = self.h5_path.text().strip(); folder = self.experiments_dir.text().strip()
+        analysis_root = self.analysis_projects_dir.text().strip()
         try:
             normalize_detector_bad_pixels(self.bad_pixels.text())
         except ValueError as exc:
@@ -64,7 +77,19 @@ class TRSGlobalSettingsDialog(QtWidgets.QDialog):
             QtWidgets.QMessageBox.warning(self, "Путь HDF5", "Указанный файл HDF5 не найден. Выберите существующий файл или очистите поле."); return
         if folder and not Path(folder).expanduser().is_dir():
             QtWidgets.QMessageBox.warning(self, "Папка экспериментов", "Указанная папка не найдена. Выберите существующую папку или очистите поле."); return
+        if analysis_root and Path(analysis_root).expanduser().exists() and not Path(analysis_root).expanduser().is_dir():
+            QtWidgets.QMessageBox.warning(
+                self, "Папка проектов ROI Analysis",
+                "Указанный путь существует, но не является папкой. Выберите папку или очистите поле.",
+            ); return
         self.accept()
 
     def values(self) -> dict:
-        return {"theme": str(self.theme.currentData() or "dark"), "icon_size": self.icon_size.value(), "last_hdf5_database": self.h5_path.text().strip(), "experiments_dir": self.experiments_dir.text().strip(), "detector_bad_pixels": normalize_detector_bad_pixels(self.bad_pixels.text())}
+        return {
+            "theme": str(self.theme.currentData() or "dark"),
+            "icon_size": self.icon_size.value(),
+            "last_hdf5_database": self.h5_path.text().strip(),
+            "experiments_dir": self.experiments_dir.text().strip(),
+            "analysis_projects_dir": self.analysis_projects_dir.text().strip(),
+            "detector_bad_pixels": normalize_detector_bad_pixels(self.bad_pixels.text()),
+        }

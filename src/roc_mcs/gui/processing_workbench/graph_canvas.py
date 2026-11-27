@@ -22,19 +22,22 @@ class _WorkflowNodeItem(QGraphicsObject):
     selected = pyqtSignal(str)
     add_requested = pyqtSignal(str)
     preview_requested = pyqtSignal(str)
+    delete_requested = pyqtSignal(str)
 
     WIDTH = 242.0
     HEIGHT = 78.0
 
     def __init__(
-        self, node, *, can_add: bool, can_preview: bool, is_selected: bool = False,
-        input_descriptions: tuple[str, ...] = (),
+        self, node, *, can_add: bool, can_preview: bool, can_delete: bool,
+        is_selected: bool = False, input_descriptions: tuple[str, ...] = (),
     ):
         super().__init__()
         self.node = node
         self.can_add = bool(can_add)
         self.can_preview = bool(can_preview)
+        self.can_delete = bool(can_delete)
         self._hovered = False
+        self._delete_hovered = False
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
         self.setAcceptHoverEvents(True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -47,7 +50,7 @@ class _WorkflowNodeItem(QGraphicsObject):
             f"Execution: {node.status}\nReview: {node.review_status}\n"
             f"Summary: {node.summary or '—'}\n"
             f"Parameters: {node.parameters}\nID: {node.id}\n"
-            "Глаз — открыть результат; + — добавить следующий допустимый этап обработки."
+            "Глаз — открыть результат; + — добавить следующий этап; × — удалить этот узел и все зависимые от него этапы."
         )
         if input_descriptions:
             tooltip += "\n\nСохранённые входы операции:\n" + "\n".join(
@@ -63,6 +66,9 @@ class _WorkflowNodeItem(QGraphicsObject):
 
     def _plus_rect(self) -> QRectF:
         return QRectF(self.WIDTH - 30.0, self.HEIGHT - 28.0, 20.0, 20.0)
+
+    def _delete_rect(self) -> QRectF:
+        return QRectF(self.WIDTH - 23.0, 5.0, 16.0, 16.0)
 
     def paint(self, painter: QPainter, _option, _widget=None) -> None:
         views = self.scene().views() if self.scene() is not None else []
@@ -114,7 +120,7 @@ class _WorkflowNodeItem(QGraphicsObject):
         title_font.setPointSizeF(max(8.0, title_font.pointSizeF()))
         painter.setFont(title_font)
         painter.setPen(text)
-        title_rect = QRectF(13.0, 10.0, self.WIDTH - 26.0, 25.0)
+        title_rect = QRectF(13.0, 10.0, self.WIDTH - (49.0 if self.can_delete else 26.0), 25.0)
         title = QFontMetricsF(title_font).elidedText(
             self.node.label, Qt.TextElideMode.ElideRight, int(title_rect.width())
         )
@@ -151,8 +157,8 @@ class _WorkflowNodeItem(QGraphicsObject):
         if self.can_preview:
             preview = self._preview_rect()
             preview_fill = QColor(highlight)
-            preview_fill.setAlpha(25 if self._hovered else 12)
-            painter.setPen(QPen(muted, 0.9))
+            preview_fill.setAlpha(58 if self._hovered else 38)
+            painter.setPen(QPen(highlight, 1.0))
             painter.setBrush(QBrush(preview_fill))
             painter.drawRoundedRect(preview, 5.0, 5.0)
             # Minimal eye glyph: explicit preview affordance without a raster icon.
@@ -161,7 +167,9 @@ class _WorkflowNodeItem(QGraphicsObject):
             eye_path.moveTo(cx - 6.0, cy)
             eye_path.quadTo(cx, cy - 6.0, cx + 6.0, cy)
             eye_path.quadTo(cx, cy + 6.0, cx - 6.0, cy)
-            painter.setPen(QPen(muted, 1.0))
+            eye_color = QColor(text)
+            eye_color.setAlpha(235)
+            painter.setPen(QPen(eye_color, 1.25))
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawPath(eye_path)
             painter.drawEllipse(QPointF(cx, cy), 1.65, 1.65)
@@ -169,28 +177,56 @@ class _WorkflowNodeItem(QGraphicsObject):
         if self.can_add:
             plus = self._plus_rect()
             plus_fill = QColor(highlight)
-            plus_fill.setAlpha(30 if self._hovered else 18)
+            plus_fill.setAlpha(58 if self._hovered else 38)
             painter.setPen(QPen(highlight, 1.0))
             painter.setBrush(QBrush(plus_fill))
             painter.drawRoundedRect(plus, 5.0, 5.0)
-            painter.setPen(QPen(highlight, 1.7, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            glyph_color = QColor(text)
+            glyph_color.setAlpha(245)
+            painter.setPen(QPen(glyph_color, 1.85, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
             cx, cy = plus.center().x(), plus.center().y()
             painter.drawLine(QPointF(cx - 4.0, cy), QPointF(cx + 4.0, cy))
             painter.drawLine(QPointF(cx, cy - 4.0), QPointF(cx, cy + 4.0))
+
+        if self.can_delete:
+            remove_rect = self._delete_rect()
+            remove_color = QColor("#D84F5B")
+            fill = QColor(remove_color)
+            fill.setAlpha(64 if self._delete_hovered else 24)
+            painter.setPen(QPen(remove_color, 0.8 if self._delete_hovered else 0.55))
+            painter.setBrush(QBrush(fill))
+            painter.drawRoundedRect(remove_rect, 4.0, 4.0)
+            inset = 5.0 if self._delete_hovered else 5.25
+            cx, cy = remove_rect.center().x(), remove_rect.center().y()
+            painter.setPen(QPen(remove_color, 1.65, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            painter.drawLine(QPointF(cx - inset / 2, cy - inset / 2), QPointF(cx + inset / 2, cy + inset / 2))
+            painter.drawLine(QPointF(cx + inset / 2, cy - inset / 2), QPointF(cx - inset / 2, cy + inset / 2))
 
     def hoverEnterEvent(self, event) -> None:
         self._hovered = True
         self.update()
         super().hoverEnterEvent(event)
 
+    def hoverMoveEvent(self, event) -> None:
+        delete_hovered = self.can_delete and self._delete_rect().contains(event.pos())
+        if delete_hovered != self._delete_hovered:
+            self._delete_hovered = delete_hovered
+            self.update(self._delete_rect())
+        super().hoverMoveEvent(event)
+
     def hoverLeaveEvent(self, event) -> None:
         self._hovered = False
+        self._delete_hovered = False
         self.update()
         super().hoverLeaveEvent(event)
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
             self.selected.emit(self.node.id)
+            if self.can_delete and self._delete_rect().contains(event.pos()):
+                self.delete_requested.emit(self.node.id)
+                event.accept()
+                return
             if self.can_preview and self._preview_rect().contains(event.pos()):
                 self.preview_requested.emit(self.node.id)
                 event.accept()
@@ -215,6 +251,7 @@ class ProcessingGraphView(QGraphicsView):
     node_selected = pyqtSignal(str)
     add_stage_requested = pyqtSignal(str)
     preview_requested = pyqtSignal(str)
+    delete_requested = pyqtSignal(str)
     scene_geometry_changed = pyqtSignal()
     view_transform_changed = pyqtSignal()
 
@@ -368,6 +405,7 @@ class ProcessingGraphView(QGraphicsView):
                 node,
                 input_descriptions=input_descriptions_by_node[node.id],
                 can_preview=node.status == NodeStatus.SUCCEEDED,
+                can_delete=(node.operation_id != "source.scan" and node.status != NodeStatus.RUNNING),
                 can_add=(
                     (
                         node.status == NodeStatus.SUCCEEDED
@@ -383,6 +421,7 @@ class ProcessingGraphView(QGraphicsView):
             item.selected.connect(self._on_item_selected)
             item.add_requested.connect(self.add_stage_requested)
             item.preview_requested.connect(self.preview_requested)
+            item.delete_requested.connect(self.delete_requested)
             self._graph_scene.addItem(item)
             self._items[node.id] = item
 

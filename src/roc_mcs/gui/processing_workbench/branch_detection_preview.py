@@ -8,7 +8,10 @@ from PyQt6.QtCore import Qt, QSize, QPointF
 from PyQt6.QtGui import QColor, QFont, QPainter, QPen, QBrush, QPalette, QPolygonF
 from PyQt6.QtWidgets import QWidget, QSizePolicy
 
-from .branch_preview_data import build_branch_preview_graph
+from .branch_preview_data import (
+    build_branch_preview_graph,
+    prepare_branch_preview_graph,
+)
 
 
 class BranchDetectionPreview(QWidget):
@@ -27,6 +30,7 @@ class BranchDetectionPreview(QWidget):
         super().__init__(parent)
         self._theta_gate = 60.0
         self._catalog = None
+        self._prepared_graph: dict[str, Any] | None = None
         self._patch_info: dict[str, Any] = {"available": False}
         self._graph: dict[str, Any] = {
             "events": {}, "candidate_edges": [], "accepted_edges": [],
@@ -68,11 +72,16 @@ class BranchDetectionPreview(QWidget):
             self._message = "В локальном фрагменте нет событий пиков."
         else:
             self._message = ""
+        self._prepared_graph = (
+            prepare_branch_preview_graph(self._catalog)
+            if self._catalog is not None else None
+        )
         self._recalculate()
         self.update()
 
     def clear_catalog(self, message: str = "Загрузка фрагмента каталога пиков…") -> None:
         self._catalog = None
+        self._prepared_graph = None
         self._patch_info = {"available": False}
         self._graph = {
             "events": {}, "candidate_edges": [], "accepted_edges": [],
@@ -102,7 +111,8 @@ class BranchDetectionPreview(QWidget):
             return
         try:
             self._graph = build_branch_preview_graph(
-                self._catalog, theta_gate=self._theta_gate
+                self._catalog, theta_gate=self._theta_gate,
+                prepared=self._prepared_graph,
             )
             self._message = ""
         except (KeyError, TypeError, ValueError, OverflowError) as exc:

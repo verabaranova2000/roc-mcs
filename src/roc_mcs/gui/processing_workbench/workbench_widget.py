@@ -60,6 +60,47 @@ _PEAK_FORM_DEFAULTS = {
 _PEAK_PROMINENCE_MODE_DEFAULTS = {"sigma": 3.0, "fraction": 0.07}
 
 
+class _ElidingStatusLabel(QLabel):
+    """Single-line status label with a stable row height and full tooltip text."""
+
+    def __init__(self, text: str = "", parent: QWidget | None = None):
+        self._full_text = ""
+        super().__init__(parent)
+        self.setWordWrap(False)
+        self.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._update_fixed_height()
+        self.setText(text)
+
+    def setText(self, text: str) -> None:  # noqa: N802 - Qt API
+        self._full_text = str(text or "")
+        super().setToolTip(self._full_text)
+        self._update_elision()
+
+    def fullText(self) -> str:  # noqa: N802 - Qt-style public accessor
+        return self._full_text
+
+    def _update_fixed_height(self) -> None:
+        self.setFixedHeight(max(18, self.fontMetrics().height() + 6))
+
+    def _update_elision(self) -> None:
+        width = max(0, self.contentsRect().width())
+        text = self.fontMetrics().elidedText(
+            self._full_text, Qt.TextElideMode.ElideRight, width
+        )
+        super().setText(text)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt API
+        super().resizeEvent(event)
+        self._update_elision()
+
+    def changeEvent(self, event) -> None:  # noqa: N802 - Qt API
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.FontChange:
+            self._update_fixed_height()
+            self._update_elision()
+
+
 class _PopupDragTitle(QLabel):
     """Small drag handle for non-modal tool popups."""
 
@@ -297,6 +338,7 @@ class _BranchStatsTask(QRunnable):
         try:
             from roc_mcs.peaks.branches import (
                 build_peak_branch_candidate_graph,
+                BranchSizeCalculator,
                 scan_theta_gate_stability,
                 summarize_peak_spacing,
                 calculate_branch_size_distribution,
@@ -312,6 +354,7 @@ class _BranchStatsTask(QRunnable):
             # estimator, the exact filtration, and both selected/recommended
             # branch-size distributions.
             candidate_graph = build_peak_branch_candidate_graph(catalog)
+            size_calculator = BranchSizeCalculator.prepare(catalog, candidate_graph)
             stats = summarize_peak_spacing(
                 catalog, reference_theta_gate=60.0, candidate_graph=candidate_graph
             )
@@ -337,13 +380,13 @@ class _BranchStatsTask(QRunnable):
             if self.prefer_recommendation:
                 effective_gate = recommended_gate
             size_distribution = calculate_branch_size_distribution(
-                catalog, effective_gate, candidate_graph=candidate_graph
+                None, effective_gate, candidate_graph=size_calculator
             )
             if np.isclose(effective_gate, recommended_gate, rtol=1e-10, atol=1e-9):
                 recommended_distribution = size_distribution
             else:
                 recommended_distribution = calculate_branch_size_distribution(
-                    catalog, recommended_gate, candidate_graph=candidate_graph
+                    None, recommended_gate, candidate_graph=size_calculator
                 )
             preview_catalog, preview_info = select_preview_patch(catalog)
             preview_rows = [
@@ -356,7 +399,7 @@ class _BranchStatsTask(QRunnable):
                 "branch_size": size_distribution,
                 "recommended_theta_gate": recommended_gate,
                 "recommended_branch_size": recommended_distribution,
-                "candidate_graph": candidate_graph,
+                "size_calculator": size_calculator,
                 "theta_gate": effective_gate,
                 "preview_rows": preview_rows,
                 "preview_info": preview_info,
@@ -371,7 +414,7 @@ class _BranchSizeTask(QRunnable):
 
     def __init__(
         self, parent_id: str, parent_operation: str, artifact_id: str,
-        artifact_directory: str, theta_gate: float, *, candidate_graph=None,
+        artifact_directory: str, theta_gate: float, *, size_calculator=None,
     ):
         super().__init__()
         self.parent_id = str(parent_id)
@@ -379,21 +422,39 @@ class _BranchSizeTask(QRunnable):
         self.artifact_id = str(artifact_id)
         self.artifact_directory = str(artifact_directory)
         self.theta_gate = float(theta_gate)
-        self.candidate_graph = candidate_graph
+        self.size_calculator = size_calculator
         self.signals = _WorkerSignals()
 
     def run(self) -> None:
         try:
             from roc_mcs.peaks.branches import calculate_branch_size_distribution
-            catalog, _label = _read_branch_position_catalog(
-                ArtifactStore(self.artifact_directory), self.artifact_id, self.parent_operation
-            )
-            payload = {
-                "theta_gate": self.theta_gate,
-                "branch_size": calculate_branch_size_distribution(
-                    catalog, self.theta_gate, candidate_graph=self.candidate_graph
-                ),
-            }
+            if self.size_calculator is not None:
+                # Slider updates reuse the catalog-independent prepared graph;
+                # no HDF5 lookup, dataframe construction, or peak rematching.
+                catalog = None
+                calculator = self.size_calculator
+            else:
+                # Backward-compatible fallback for callers outside this widget.
+                catalog, _label = _read_branch_position_catalog(
+                    ArtifactStore(self.artifact_directory), self.artifact_id, self.parent_operation
+                )
+                calculator = None
+            if self.size_calculator is not None:
+                from roc_mcs.peaks.branches import recommend_min_branch_events
+                sizes = self.size_calculator.sizes(self.theta_gate)
+                recommended, diagnostics = recommend_min_branch_events(sizes)
+                branch_size = {
+                    "sizes": sizes,
+                    "recommended_min": int(recommended),
+                    "diagnostics": diagnostics,
+                    "n_branches": int(sizes.size),
+                    "n_events": int(self.size_calculator.n_events),
+                }
+            else:
+                branch_size = calculate_branch_size_distribution(
+                    catalog, self.theta_gate, candidate_graph=calculator
+                )
+            payload = {"theta_gate": self.theta_gate, "branch_size": branch_size}
             self.signals.succeeded.emit(self.parent_id, payload)
         except Exception:
             self.signals.failed.emit(self.parent_id, traceback.format_exc())
@@ -435,11 +496,12 @@ class ProcessingWorkbenchWidget(QWidget):
         # Keep at most one weighted candidate graph: the active parent only.
         # It avoids repeating the Hungarian assignments during gate dragging
         # without retaining large graphs for every visited workflow parent.
-        self._branch_candidate_graph_cache: tuple[str, str, Any] | None = None
+        self._branch_size_calculator_cache: tuple[str, str, Any] | None = None
+        self._branch_size_update_pending = False
         self._active_branch_artifact: tuple[str, str, str] | None = None
         self._branch_size_update_timer = QTimer(self)
         self._branch_size_update_timer.setSingleShot(True)
-        self._branch_size_update_timer.setInterval(260)
+        self._branch_size_update_timer.setInterval(35)
         self._branch_size_update_timer.timeout.connect(self._request_branch_size_update)
         # Branch outputs are immutable artifacts. Cache only their small metadata
         # (not the peak catalog) so graph rebuilds never reload large tables.
@@ -505,13 +567,6 @@ class ProcessingWorkbenchWidget(QWidget):
         left_layout.setSpacing(3)
         graph_header = QHBoxLayout()
         graph_header.addWidget(QLabel("<b>Пайплайн обработки</b>"), 1)
-        self.show_rejected_check = QCheckBox("Отклонённые")
-        self.show_rejected_check.setToolTip(
-            "Показывать отклонённые результаты в архивном режиме. "
-            "Они остаются в истории, но недоступны как входы новых этапов."
-        )
-        self.show_rejected_check.toggled.connect(self._rebuild_graph)
-        graph_header.addWidget(self.show_rejected_check)
         self.fit_graph_button = QToolButton(self)
         self.fit_graph_button.setObjectName("processingGraphFitButton")
         self.fit_graph_button.setAutoRaise(True)
@@ -553,9 +608,10 @@ class ProcessingWorkbenchWidget(QWidget):
         self.graph.node_selected.connect(self._on_graph_node_selected)
         self.graph.add_stage_requested.connect(self._on_graph_add_stage_requested)
         self.graph.preview_requested.connect(self._on_graph_preview_requested)
+        self.graph.delete_requested.connect(self._on_graph_delete_requested)
         left_layout.addWidget(self.graph, 1)
         self.branch_hint = QLabel(
-            "Щелчок — инспектор · глаз — результат · + — новая ветвь. "
+            "Щелчок — инспектор · глаз — результат · + — новая ветвь · × — удалить этап и его потомков. "
             "Сплошная стрелка — вычислительный вход; пунктир — только происхождение ветви. "
             "Перетаскивание — панорама; Ctrl+колесо — масштаб."
         )
@@ -639,7 +695,7 @@ class ProcessingWorkbenchWidget(QWidget):
             "Зафиксировать результат как проверенный и разрешить использовать его дальше."
         )
         self.reject_button.setToolTip(
-            "Отклонить результат. Он исчезнет из активного графа, но останется в истории."
+            "Отклонить результат: скрыть его из активного графа, сохранив review-статус и происхождение в истории. Для необратимого удаления ветви используйте × на карточке."
         )
         preview_toolbar.addWidget(self.preview_button)
         preview_toolbar.addWidget(self.restore_button)
@@ -715,8 +771,6 @@ class ProcessingWorkbenchWidget(QWidget):
             # operation forms remain alive for the graph's contextual + popup.
             self.theme_button.hide()
             self.save_button.hide()
-            self.show_rejected_check.setText("Архив")
-            self.show_rejected_check.setToolTip("Показывать отклонённые ветви истории")
             self.branch_hint.hide()
             right.hide()
             self.tabs.hide()
@@ -1592,9 +1646,7 @@ class ProcessingWorkbenchWidget(QWidget):
         threshold_layout.addWidget(auto_button)
         threshold_layout.addStretch(1)
         layout.addRow(threshold_row)
-        selection_status = QLabel("Распределение размеров ветвей загружается…")
-        selection_status.setWordWrap(True)
-        selection_status.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        selection_status = _ElidingStatusLabel("Распределение размеров ветвей загружается…")
         layout.addRow(selection_status)
 
         size_histogram.threshold_changed.connect(min_events.setValue)
@@ -1871,7 +1923,9 @@ class ProcessingWorkbenchWidget(QWidget):
         node = self.project.history.get(parent_id)
         # The previous parent's candidate graph can be large. Keep only the
         # currently requested parent's graph, repopulated by its stats task.
-        self._branch_candidate_graph_cache = None
+        self._branch_size_calculator_cache = None
+        self._branch_size_update_pending = False
+        self._branch_size_update_timer.stop()
         # The recommendation contains a full size-distribution list; retain it
         # only for the active parent rather than accumulating large arrays.
         self._branch_recommendations.clear()
@@ -2019,21 +2073,27 @@ class ProcessingWorkbenchWidget(QWidget):
         active = self._active_branch_artifact
         if not active or active[0] != str(self._branch_parent_id or ""):
             return
+        # Coalesce rapid slider edits.  A single worker owns the active request;
+        # changes made while it runs are collapsed into one request at the latest
+        # gate instead of queuing stale work on the global thread pool.
+        if self._active_branch_size_task is not None:
+            self._branch_size_update_pending = True
+            return
         parent_id, parent_operation, artifact_id = active
         form = self._forms.get("peaks.branches", {})
         gate = float(form["theta_gate"].value())
-        cached_graph = self._branch_candidate_graph_cache
-        candidate_graph = None
+        cached = self._branch_size_calculator_cache
+        calculator = None
         if (
-            cached_graph is not None
-            and cached_graph[0] == str(parent_id)
-            and cached_graph[1] == str(artifact_id)
+            cached is not None
+            and cached[0] == str(parent_id)
+            and cached[1] == str(artifact_id)
         ):
-            candidate_graph = cached_graph[2]
+            calculator = cached[2]
         task = _BranchSizeTask(
             parent_id, parent_operation, artifact_id,
             str(self.project.artifact_store.directory), gate,
-            candidate_graph=candidate_graph,
+            size_calculator=calculator,
         )
         task.signals.succeeded.connect(
             lambda pid, payload, source_task=task:
@@ -2064,7 +2124,12 @@ class ProcessingWorkbenchWidget(QWidget):
             current_gate = float(form["theta_gate"].value())
         except (TypeError, ValueError, KeyError):
             return
-        if abs(result_gate - current_gate) > max(1e-9, abs(current_gate) * 1e-10):
+        if (
+            self._branch_size_update_pending
+            or abs(result_gate - current_gate) > max(1e-9, abs(current_gate) * 1e-10)
+        ):
+            self._branch_size_update_pending = False
+            self._branch_size_update_timer.start()
             return
         self._apply_branch_size_distribution(parent_id, payload.get("branch_size"))
 
@@ -2077,6 +2142,9 @@ class ProcessingWorkbenchWidget(QWidget):
         ):
             return
         self._active_branch_size_task = None
+        if self._branch_size_update_pending:
+            self._branch_size_update_pending = False
+            self._branch_size_update_timer.start()
         status = self._forms.get("peaks.branches", {}).get("branch_selection_status")
         if status is not None:
             status.setText("Не удалось пересчитать размеры ветвей; последнее корректное распределение сохранено.")
@@ -2090,10 +2158,10 @@ class ProcessingWorkbenchWidget(QWidget):
         status = form.get("branch_selection_status")
         if histogram is None or spin is None or auto_button is None or not isinstance(distribution, dict):
             return
-        sizes = [int(value) for value in distribution.get("sizes", ())]
+        sizes = np.asarray(distribution.get("sizes", ()), dtype=np.int64).reshape(-1)
         recommended = max(1, int(distribution.get("recommended_min", 1)))
         histogram.set_distribution(sizes, recommended, distribution.get("diagnostics"))
-        maximum = max(1, max(sizes, default=1))
+        maximum = max(1, int(sizes.max()) if sizes.size else 1)
         spin.setRange(1, maximum)
         state = self._branch_selection_values.setdefault(
             str(parent_id), {"auto": True, "minimum": recommended}
@@ -2108,11 +2176,12 @@ class ProcessingWorkbenchWidget(QWidget):
         auto_button.setChecked(automatic)
         del blocker_spin, blocker_button
         histogram.set_threshold(threshold)
-        n_total = len(sizes)
-        n_included = int(sum(int(value) >= threshold for value in sizes))
+        n_total = int(sizes.size)
+        included_mask = sizes >= threshold
+        n_included = int(np.count_nonzero(included_mask))
         n_excluded = n_total - n_included
-        n_events_included = int(sum(int(value) for value in sizes if int(value) >= threshold))
-        n_events_excluded = int(sum(int(value) for value in sizes if int(value) < threshold))
+        n_events_included = int(np.sum(sizes, where=included_mask, dtype=np.int64))
+        n_events_excluded = int(np.sum(sizes, where=~included_mask, dtype=np.int64))
         diagnostics = distribution.get("diagnostics") or {}
         if status is not None:
             mode = "Авто" if automatic else "Вручную"
@@ -2129,6 +2198,7 @@ class ProcessingWorkbenchWidget(QWidget):
                 f"({n_events_excluded:,} событий) · {rationale}."
             )
             status.setToolTip(
+                status.fullText() + "\n\n" +
                 "Порог действует только на последующие аналитические этапы. "
                 "Все ветви остаются в branch_catalog с исходными branch_id/peak_id. "
                 "Автоматический критерий: крупнейший мультипликативный разрыв "
@@ -2215,15 +2285,15 @@ class ProcessingWorkbenchWidget(QWidget):
         if label is None or table is None:
             return
         result = stats if isinstance(stats, dict) else {}
-        candidate_graph = result.get("candidate_graph")
+        size_calculator = result.get("size_calculator")
         active_artifact = self._active_branch_artifact
         if (
-            candidate_graph is not None
+            size_calculator is not None
             and active_artifact is not None
             and active_artifact[0] == str(parent_id)
         ):
-            self._branch_candidate_graph_cache = (
-                str(parent_id), str(active_artifact[2]), candidate_graph
+            self._branch_size_calculator_cache = (
+                str(parent_id), str(active_artifact[2]), size_calculator
             )
         gate_scan = result.get("theta_gate_scan")
         scan_widget = form.get("gate_sensitivity")
@@ -3319,6 +3389,132 @@ class ProcessingWorkbenchWidget(QWidget):
         self.status_label.setText("Не удалось загрузить реальную ROC выбранного пикселя")
         self._log(error)
 
+    def _on_graph_delete_requested(self, node_id: str) -> None:
+        """Confirm and persist removal of a workflow node and its descendants."""
+        if self.is_busy:
+            QMessageBox.information(
+                self, "Выполнение",
+                "Удаление недоступно во время выполнения этапа или загрузки предпросмотра.",
+            )
+            return
+        try:
+            selected = self.project.history.get(str(node_id))
+            if selected.operation_id == "source.scan":
+                QMessageBox.information(
+                    self, "Исходный скан", "Исходный узел — корень проекта; его нельзя удалить."
+                )
+                return
+            removal = self.project.history.descendants(str(node_id), include_self=True)
+            removal_ids = {node.id for node in removal}
+            active_stats_parent = self._active_branch_stats_parent_id
+            if (
+                self._active_branch_stats_task is not None
+                and active_stats_parent in removal_ids
+            ):
+                QMessageBox.information(
+                    self, "Пересчёт выполняется",
+                    "Дождитесь завершения чтения каталога пиков для этой ветви и повторите удаление.",
+                )
+                return
+            if (
+                self._active_peak_input_task is not None
+                and self._branch_parent_id in removal_ids
+            ):
+                QMessageBox.information(
+                    self, "Загрузка выполняется",
+                    "Дождитесь завершения загрузки каталога пиков для этой ветви и повторите удаление.",
+                )
+                return
+            if (
+                self._active_branch_size_task is not None
+                and self._branch_parent_id in removal_ids
+            ):
+                QMessageBox.information(
+                    self, "Пересчёт выполняется",
+                    "Дождитесь завершения пересчёта распределения размеров ветвей и повторите удаление.",
+                )
+                return
+
+            affected = len(removal)
+            details = (
+                f"Удалить этап «{selected.label}» и все зависимые от него этапы?\n\n"
+                f"Будет удалено карточек: {affected} (включая выбранную), "
+                f"зависимых последующих этапов: {max(0, affected - 1)}.\n\n"
+                "Из workflow.json будет удалена вся эта ветвь. HDF5-артефакты, "
+                "которые больше не используются оставшейся историей, будут удалены; "
+                "общие артефакты сохранятся. Операцию нельзя отменить."
+            )
+            answer = QMessageBox.question(
+                self, "Удалить ветвь обработки", details,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+
+            # Restore the host's original HDF5 display before deleting an artifact
+            # currently used by a preview from this subgraph.
+            preview_node = self._preview_context.get("node") if self._preview_context else None
+            if preview_node is not None and getattr(preview_node, "id", None) in removal_ids:
+                self._restore_preview()
+
+            fallback_id = None
+            for ancestor in self.project.history.ancestors(str(node_id), include_self=False):
+                if ancestor.id not in removal_ids:
+                    fallback_id = ancestor.id
+                    break
+
+            # WorkflowProject saves the candidate manifest atomically before it
+            # removes any unreferenced artifact. A failed manifest write changes
+            # neither the in-memory history nor the artifact files.
+            result = self.project.remove_subgraph(str(node_id))
+            # Remove UI-only state for every deleted node, not merely the X target.
+            # This also covers descendants in a multi-parent DAG merge.
+            for removed_id in removal_ids:
+                self._branch_gate_values.pop(removed_id, None)
+                self._branch_selection_values.pop(removed_id, None)
+                self._branch_recommendations.pop(removed_id, None)
+            removed_artifact_ids = {
+                str(artifact_id)
+                for node in removal
+                for artifact_id in node.output_refs.values()
+            }
+            for artifact_id in removed_artifact_ids:
+                self._branch_count_cache.pop(artifact_id, None)
+            if self._branch_parent_id in removal_ids:
+                self._branch_size_update_timer.stop()
+                self._branch_size_update_pending = False
+                self._branch_size_calculator_cache = None
+                self._active_branch_size_task = None  # guarded above for this parent
+                self._active_branch_artifact = None
+                self._branch_parent_id = None
+            if self._active_branch_stats_parent_id in removal_ids:
+                self._active_branch_stats_parent_id = None
+            self._rebuild_graph(select_id=fallback_id)
+            self.status_label.setText(
+                f"Удалена ветвь «{selected.label}»: {affected} этап(а/ов). История сохранена."
+            )
+            self._log(
+                f"Удалена ветвь {selected.label!r}: {affected} узлов; "
+                f"удалено артефактов: {len(result['deleted_artifact_ids'])}."
+            )
+            cleanup_errors = result.get("cleanup_errors") or {}
+            if cleanup_errors:
+                summary = "\n".join(
+                    f"{artifact_id}: {message}" for artifact_id, message in cleanup_errors.items()
+                )
+                QMessageBox.warning(
+                    self, "Ветка удалена; очистка артефактов не завершена",
+                    "История сохранена корректно, но некоторые больше не используемые "
+                    "файлы артефактов не удалось удалить. Они не подключены к оставшейся истории.\n\n"
+                    + summary,
+                )
+        except Exception as exc:
+            QMessageBox.warning(
+                self, "Не удалось удалить ветвь",
+                f"Не удалось завершить удаление: {exc}",
+            )
+
     def _on_graph_preview_requested(self, node_id: str) -> None:
         self.graph.select_node(node_id)
         self._on_graph_node_selected(node_id)
@@ -3562,7 +3758,9 @@ class ProcessingWorkbenchWidget(QWidget):
         self.graph.set_history(
             self.project.history,
             selected_id=previous,
-            show_rejected=self.show_rejected_check.isChecked(),
+            # Rejected candidates remain in workflow.json as review provenance,
+            # but there is intentionally no separate archive view in the UI.
+            show_rejected=False,
             addable_node_ids=addable_node_ids,
         )
         selected_id = self.graph.selected_node_id
@@ -3734,7 +3932,6 @@ class ProcessingWorkbenchWidget(QWidget):
             self.graph_scroll_button.setEnabled(not busy)
         else:
             self._sync_graph_scroll_button()
-        self.show_rejected_check.setEnabled(not busy)
         if self.embedded:
             self.embedded_run_button.setEnabled(not busy and runnable)
             self.embedded_restore_button.setEnabled(not busy and self._preview_context is not None)

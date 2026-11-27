@@ -12,6 +12,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "hdf5_databases": [],
     "last_hdf5_database": "",
     "experiments_dir": "",
+    "analysis_projects_dir": "",
     "mcs_temp_dir": "",
     "mcs32_exe": "",
     "theme": "dark",
@@ -138,6 +139,30 @@ def _configured_path(value: Any) -> Path | None:
         return None
     raw = Path(os.path.expandvars(value.strip())).expanduser()
     return raw.resolve() if raw.is_absolute() else (settings_path().parent / raw).resolve()
+
+
+def default_analysis_projects_directory() -> Path:
+    """Return the platform Documents folder's ROC-MCS Analyses subdirectory."""
+    documents: Path | None = None
+    try:
+        from PyQt6.QtCore import QStandardPaths
+        location = QStandardPaths.writableLocation(
+            QStandardPaths.StandardLocation.DocumentsLocation
+        )
+        if location:
+            documents = Path(location)
+    except Exception:
+        documents = None
+    if documents is None:
+        documents = Path.home() / "Documents"
+    return (documents / "ROC-MCS Analyses").expanduser().resolve()
+
+
+def resolve_analysis_projects_directory(settings: dict[str, Any] | None = None) -> Path:
+    """Resolve the configured ROI project root, defaulting to Documents."""
+    source = load_settings() if settings is None else settings
+    configured = _configured_path(source.get("analysis_projects_dir"))
+    return configured if configured is not None else default_analysis_projects_directory()
 
 
 def resolve_setting_path(key: str, *, require_exists: bool = False) -> Path | None:

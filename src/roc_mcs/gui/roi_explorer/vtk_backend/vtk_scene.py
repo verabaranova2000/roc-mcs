@@ -25,6 +25,71 @@ _MIN_VOLUME_PALETTE_CONTROL_POINTS = 2
 _INITIAL_VOLUME_OPACITY_CONTROL_POINTS = 17
 
 
+def _rebase_vtk_mouse_move(interactor, previous_position: tuple[int, int] | None):
+    """Set VTK's previous pointer sample before TrackballCamera handles a move.
+
+    This must be called by the Qt QVTK adapter *after* SetEventInformation and
+    immediately before MouseMoveEvent. While TrackballCamera has grabbed focus,
+    VTK intentionally routes events exclusively to the style and bypasses
+    ordinary interactor observers; doing this from an interactor MouseMove
+    observer is therefore too late / not delivered at all.
+    """
+    if interactor is None or previous_position is None:
+        return None
+    try:
+        style = interactor.GetInteractorStyle()
+        if style is None or int(style.GetState()) == 0:
+            return None
+        current = tuple(map(int, interactor.GetEventPosition()))
+        previous = tuple(map(int, previous_position))
+        interactor.SetLastEventPosition(*previous)
+        return current
+    except Exception:
+        logger.debug("Could not rebase VTK pointer sample before camera motion", exc_info=True)
+        return None
+
+
+def _stable_axis_corner_bits(
+    camera_position: Any,
+    ranges: tuple[tuple[float, float], ...] | list[tuple[float, float]],
+    previous: tuple[int, int, int] | None,
+    *,
+    hysteresis_fraction: float = 0.025,
+) -> tuple[int, int, int]:
+    """Choose camera-facing axis faces with a small center-plane hysteresis.
+
+    Without hysteresis, a camera aligned exactly with an axis lies on the
+    centre planes of the other two dimensions. Floating-point noise or the
+    first sub-degree mouse movement can then flip the grid/labels between
+    opposite faces, which looks like a camera snap although the camera pose is
+    continuous. Keep the prior face until the camera crosses a scale-relative
+    dead band; the physical volume and camera transform are not modified.
+    """
+    position = np.asarray(camera_position, dtype=np.float64)
+    if position.shape != (3,) or not np.isfinite(position).all() or len(ranges) != 3:
+        raise ValueError("Для выбора грани нужны конечные координаты камеры и три диапазона")
+    fraction = float(hysteresis_fraction)
+    if not np.isfinite(fraction) or not 0.0 <= fraction < 0.5:
+        raise ValueError("hysteresis_fraction должен лежать в [0, 0.5)")
+    bits: list[int] = []
+    for index, (low, high) in enumerate(ranges):
+        low, high = float(low), float(high)
+        center = 0.5 * (low + high)
+        span = max(high - low, np.finfo(np.float64).eps * max(abs(low), abs(high), 1.0))
+        offset = float(position[index] - center)
+        if previous is None:
+            bit = 1 if offset >= 0.0 else 0
+        else:
+            old = int(previous[index])
+            margin = span * fraction
+            if old == 1:
+                bit = 0 if offset < -margin else 1
+            else:
+                bit = 1 if offset > margin else 0
+        bits.append(bit)
+    return tuple(bits)  # type: ignore[return-value]
+
+
 def _vtk():
     try:
         # Import the OpenGL2 volume-rendering implementation explicitly.
@@ -1020,6 +1085,9 @@ class VTKVolumeScene:
             )
         except Exception:
             self._camera_observer_id = None
+        # QVTK's Qt adapter rebases every drag sample before dispatching it to
+        # TrackballCamera. Interactor observers cannot do this during a drag:
+        # GrabFocus intentionally routes events exclusively to the style.
 
         # Keep the screen-pixel diameter invariant while the camera zooms,
         # rotates, switches projection, or the embedded viewport is resized.
@@ -1731,8 +1799,12 @@ class VTKVolumeScene:
         ranges = [(float(axis[0]), float(axis[-1])) for axis in axes]
         center = np.asarray([(lo + hi) * 0.5 for lo, hi in ranges], dtype=np.float64)
         local_camera = self._camera_local_position()
-        corner = np.asarray([hi if local_camera[i] >= center[i] else lo for i, (lo, hi) in enumerate(ranges)])
-        corner_key = tuple(int(local_camera[i] >= center[i]) for i in range(3))
+        corner_key = _stable_axis_corner_bits(
+            local_camera, ranges, self._axis_corner, hysteresis_fraction=0.025
+        )
+        corner = np.asarray([
+            hi if corner_key[i] else lo for i, (lo, hi) in enumerate(ranges)
+        ], dtype=np.float64)
         if not force and self._axis_corner == corner_key:
             return
         self._axis_corner = corner_key
@@ -4898,38 +4970,113 @@ class VTKVolumeScene:
         camera.OrthogonalizeViewUp()
         camera.SetParallelProjection(int(projection_mode))
         self.renderer.ResetCameraClippingRange(*bounds_array.tolist())
+        self._prepare_camera_preset_interaction()
+        self._axis_corner = None
         self._update_geometry_axes(force=True)
         self._request_render()
 
-    def _prepare_camera_preset_interaction(self) -> None:
-        """End stale trackball state and synchronize VTK's previous/current pointer.
-
-        QVTK records current and previous mouse positions separately. A camera
-        preset is a programmatic camera change, not a mouse gesture. If it is
-        issued while a popup is completing its pointer sequence, the next
-        trackball event can otherwise be measured from an old position.
-        Stopping the interaction style and synchronizing both positions makes
-        the next real drag start with a zero stale delta; it does not alter the
-        camera pose or the user's subsequent mouse movement.
-        """
+    def _recover_trackball_interaction(self, interactor) -> None:
+        """Release any stale VTK gesture/focus and synchronize the baseline."""
         style = getattr(self, "interactor_style", None)
         if style is not None:
             try:
-                style.StopState()
+                # StopState emits EndInteractionEvent only when a gesture is
+                # actually active; ReleaseFocus is separate and is essential
+                # when Qt consumed a mouse-release event outside the viewport.
+                if int(style.GetState()) != 0:
+                    style.StopState()
             except Exception:
-                logger.debug("Could not stop VTK interaction state before camera preset", exc_info=True)
-
-        interactor = getattr(self, "interactor", None)
+                logger.debug("Could not stop stale VTK trackball state", exc_info=True)
+            try:
+                style.ReleaseFocus()
+            except Exception:
+                # ReleaseFocus is intentionally idempotent on current VTK
+                # builds; guard older wrappers that expose it differently.
+                logger.debug("Could not release stale VTK trackball focus", exc_info=True)
+            try:
+                style.SetDefaultRenderer(self.renderer)
+                style.SetCurrentRenderer(self.renderer)
+            except Exception:
+                logger.debug("Could not restore VTK trackball renderer", exc_info=True)
         if interactor is not None:
             try:
-                position = interactor.GetEventPosition()
-                x, y = int(position[0]), int(position[1])
-                # The interactor exposes an explicit previous-position setter;
-                # synchronize it rather than relying on a synthetic mouse move.
+                x, y = map(int, interactor.GetEventPosition())
+                # SetLastEventPosition does not synthesize a mouse event. Do
+                # not call SetEventPosition here: VTK's SetEventPosition also
+                # shifts the previous position automatically.
                 interactor.SetLastEventPosition(x, y)
-                interactor.SetEventPosition(x, y)
             except Exception:
-                logger.debug("Could not synchronize VTK pointer position before camera preset", exc_info=True)
+                logger.debug("Could not synchronize VTK pointer baseline", exc_info=True)
+
+    def capture_camera_state(self) -> dict[str, Any] | None:
+        """Return a JSON-safe camera pose and projection configuration."""
+        try:
+            camera = self.renderer.GetActiveCamera()
+            values = {
+                "position": [float(v) for v in camera.GetPosition()],
+                "focal_point": [float(v) for v in camera.GetFocalPoint()],
+                "view_up": [float(v) for v in camera.GetViewUp()],
+                "parallel_projection": bool(camera.GetParallelProjection()),
+                "parallel_scale": float(camera.GetParallelScale()),
+                "view_angle": float(camera.GetViewAngle()),
+            }
+            numeric = (
+                *values["position"], *values["focal_point"], *values["view_up"],
+                values["parallel_scale"], values["view_angle"],
+            )
+            if not np.isfinite(np.asarray(numeric, dtype=np.float64)).all():
+                return None
+            return values
+        except Exception:
+            logger.debug("Could not capture VTK camera state", exc_info=True)
+            return None
+
+    def restore_camera_state(self, state: dict[str, Any], *, render: bool = True) -> bool:
+        """Restore a previously validated camera pose for the current payload."""
+        try:
+            position = np.asarray(state.get("position"), dtype=np.float64)
+            focal = np.asarray(state.get("focal_point"), dtype=np.float64)
+            view_up = np.asarray(state.get("view_up"), dtype=np.float64)
+            parallel_scale = float(state.get("parallel_scale", 1.0))
+            view_angle = float(state.get("view_angle", 30.0))
+            if (
+                position.shape != (3,) or focal.shape != (3,) or view_up.shape != (3,)
+                or not np.isfinite(position).all() or not np.isfinite(focal).all()
+                or not np.isfinite(view_up).all()
+                or float(np.linalg.norm(position - focal)) <= 1.0e-10
+                or float(np.linalg.norm(view_up)) <= 1.0e-10
+                or not np.isfinite(parallel_scale) or parallel_scale <= 0.0
+                or not np.isfinite(view_angle) or not 1.0 <= view_angle <= 179.0
+            ):
+                return False
+            camera = self.renderer.GetActiveCamera()
+            camera.SetFocalPoint(*focal.tolist())
+            camera.SetPosition(*position.tolist())
+            camera.SetViewUp(*view_up.tolist())
+            camera.OrthogonalizeViewUp()
+            camera.SetParallelProjection(1 if bool(state.get("parallel_projection", False)) else 0)
+            camera.SetParallelScale(parallel_scale)
+            camera.SetViewAngle(view_angle)
+            self.renderer.ResetCameraClippingRange()
+            self._prepare_camera_preset_interaction()
+            self._axis_corner = None
+            self._update_geometry_axes(force=True)
+            if render:
+                self._request_render()
+            return True
+        except Exception:
+            logger.exception("Could not restore saved VTK camera state")
+            return False
+
+    def _prepare_camera_preset_interaction(self) -> None:
+        """End any stale gesture and anchor future drag to its first real press.
+
+        VTK's TrackballCamera grabs interactor focus on button-down and normally
+        releases it on button-up. Qt menus/toolbars can consume that release;
+        StopState alone changes the state but does not release the observer's
+        focus. Both are therefore reset before and after a programmatic preset.
+        """
+        self._recover_trackball_interaction(getattr(self, "interactor", None))
 
     def set_perspective_view(self) -> None:
         """Set the canonical oblique/isometric camera pose in perspective mode.
@@ -4982,6 +5129,8 @@ class VTKVolumeScene:
         camera.OrthogonalizeViewUp()
         camera.SetParallelProjection(0)
         self.renderer.ResetCameraClippingRange(*bounds_array.tolist())
+        self._prepare_camera_preset_interaction()
+        self._axis_corner = None
         self._update_geometry_axes(force=True)
         self._request_render()
 
@@ -5026,6 +5175,8 @@ class VTKVolumeScene:
         camera.OrthogonalizeViewUp()
         camera.SetParallelProjection(int(projection_mode))
         self.renderer.ResetCameraClippingRange(*[float(value) for value in bounds])
+        self._prepare_camera_preset_interaction()
+        self._axis_corner = None
         self._update_geometry_axes(force=True)
         self._request_render()
 

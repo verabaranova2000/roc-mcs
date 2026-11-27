@@ -7,6 +7,7 @@ matching. Connected components define branch IDs.
 from __future__ import annotations
 
 from collections import defaultdict
+from dataclasses import dataclass
 from typing import Any, Mapping
 
 import numpy as np
@@ -140,6 +141,134 @@ def _candidate_graph_or_build(peak_catalog, candidate_graph=None):
     if not np.isfinite(deltas).all() or np.any(deltas < 0.0):
         raise ValueError("Веса candidate-рёбер должны быть конечными и неотрицательными")
     return edges, deltas
+
+
+@dataclass(frozen=True, slots=True)
+class BranchSizeCalculator:
+    """Prepared weighted graph for repeated, exact θ-gate size updates.
+
+    Candidate edges are stably sorted by their original float64 |Δθ| weights
+    once, then collapsed into a Kruskal reconstruction forest. Leaves represent
+    peak events; each internal node represents one successful component merge
+    at the corresponding exact edge weight. For a gate, the roots of the
+    currently active components are exactly those tree nodes satisfying
+    ``merge_weight <= gate < parent_merge_weight``.
+
+    This makes each interactive update an O(V) NumPy mask over immutable
+    arrays. It avoids rebuilding a CSR graph and running a global sparse
+    connected-components traversal for every slider movement. The inclusive
+    scientific rule remains exactly ``edge_delta <= theta_gate``; no weights
+    or gates are rounded or quantized.
+    """
+
+    n_events: int
+    sorted_deltas: np.ndarray
+    _edge_rows: np.ndarray
+    _merge_weights: np.ndarray
+    _parent_weights: np.ndarray
+    _subtree_sizes: np.ndarray
+
+    @classmethod
+    def prepare(cls, peak_catalog, candidate_graph) -> "BranchSizeCalculator":
+        ids, _, _, _ = _validate_catalog(peak_catalog)
+        edges, deltas = _candidate_graph_or_build(peak_catalog, candidate_graph)
+        id_to_row = {int(peak_id): row for row, peak_id in enumerate(ids)}
+        edge_rows = np.empty((len(edges), 2), dtype=np.int64)
+        for index, edge in enumerate(edges):
+            if len(edge) != 2:
+                raise ValueError(f"Некорректное ребро peak graph: {edge!r}")
+            a, b = int(edge[0]), int(edge[1])
+            if a not in id_to_row or b not in id_to_row:
+                raise ValueError(f"Ребро ссылается на неизвестный peak_id: {(a, b)}")
+            edge_rows[index] = (id_to_row[a], id_to_row[b])
+
+        order = np.argsort(deltas, kind="stable")
+        sorted_edges = np.ascontiguousarray(edge_rows[order], dtype=np.int64)
+        sorted_deltas = np.ascontiguousarray(deltas[order], dtype=np.float64)
+        n_events = int(ids.size)
+
+        # A reconstruction forest has one leaf per event and at most one
+        # internal node per successful union. Cycles, self-loops and duplicate
+        # edges cannot create a merge node and are therefore discarded once.
+        max_nodes = max(1, 2 * n_events - 1)
+        tree_parent = np.full(max_nodes, -1, dtype=np.int64)
+        merge_weights = np.full(max_nodes, -np.inf, dtype=np.float64)
+        subtree_sizes = np.ones(max_nodes, dtype=np.int64)
+        dsu_parent = np.arange(n_events, dtype=np.int64)
+        dsu_size = np.ones(n_events, dtype=np.int64)
+        component_tree_node = np.arange(n_events, dtype=np.int64)
+        node_count = n_events
+
+        def find_root(value: int) -> int:
+            # Iterative path halving avoids recursion depth and keeps this
+            # one-time preparation bounded for large peak catalogs.
+            root = int(value)
+            while int(dsu_parent[root]) != root:
+                dsu_parent[root] = dsu_parent[int(dsu_parent[root])]
+                root = int(dsu_parent[root])
+            return root
+
+        for (row_a, row_b), delta in zip(sorted_edges, sorted_deltas):
+            root_a = find_root(int(row_a))
+            root_b = find_root(int(row_b))
+            if root_a == root_b:
+                continue
+
+            tree_node = node_count
+            node_count += 1
+            left_node = int(component_tree_node[root_a])
+            right_node = int(component_tree_node[root_b])
+            tree_parent[left_node] = tree_node
+            tree_parent[right_node] = tree_node
+            merge_weights[tree_node] = float(delta)
+            subtree_sizes[tree_node] = subtree_sizes[left_node] + subtree_sizes[right_node]
+
+            # Union by size keeps the disjoint-set forest shallow. The tree
+            # parent is independent of which DSU root wins this optimization.
+            if dsu_size[root_a] < dsu_size[root_b]:
+                root_a, root_b = root_b, root_a
+            dsu_parent[root_b] = root_a
+            dsu_size[root_a] += dsu_size[root_b]
+            component_tree_node[root_a] = tree_node
+
+        tree_parent = np.ascontiguousarray(tree_parent[:node_count])
+        merge_weights = np.ascontiguousarray(merge_weights[:node_count])
+        subtree_sizes = np.ascontiguousarray(subtree_sizes[:node_count])
+        parent_weights = np.full(node_count, np.inf, dtype=np.float64)
+        has_parent = tree_parent >= 0
+        parent_weights[has_parent] = merge_weights[tree_parent[has_parent]]
+
+        sorted_edges.setflags(write=False)
+        arrays = (sorted_deltas, tree_parent, merge_weights, parent_weights, subtree_sizes)
+        for array in arrays:
+            array.setflags(write=False)
+        return cls(
+            n_events=n_events,
+            sorted_deltas=sorted_deltas,
+            _edge_rows=sorted_edges,
+            _merge_weights=merge_weights,
+            _parent_weights=parent_weights,
+            _subtree_sizes=subtree_sizes,
+        )
+
+    @property
+    def edge_rows(self) -> np.ndarray:
+        """Return the stably Δθ-sorted undirected row pairs (compatibility API)."""
+        return self._edge_rows
+
+    def sizes(self, theta_gate: float) -> np.ndarray:
+        gate = _validate_theta_gate(theta_gate)
+        if self.n_events == 0:
+            return np.empty(0, dtype=np.int64)
+
+        # All edges at exactly `gate` are included. Equal-weight merge nodes
+        # form chains in the reconstruction forest, so strict `parent > gate`
+        # naturally selects only the highest active node in each component.
+        roots = (self._merge_weights <= gate) & (self._parent_weights > gate)
+        # Component order is not a scientific output contract; do not sort the
+        # returned sizes. The recommendation function computes its own unique
+        # ordered values, and the histogram consumes an unordered sample.
+        return np.ascontiguousarray(self._subtree_sizes[roots], dtype=np.int64)
 
 
 def _branch_sizes_from_candidate_graph(peak_catalog, candidate_graph, theta_gate: float):
@@ -391,6 +520,10 @@ def recommend_min_branch_events(
     ``min_multiplicative_gap`` and at least two components lie below it.
     The threshold is the geometric midpoint (natural on a log-size axis).
     When no clear gap exists, return 1, i.e. retain every branch.
+
+    Counts are accumulated once from ``np.unique``. The prior implementation
+    rescanned the full component-size array for every adjacent unique pair,
+    making this post-processing quadratic when many component sizes differ.
     """
     values = np.asarray(branch_sizes, dtype=np.float64).reshape(-1)
     if values.size == 0:
@@ -400,7 +533,7 @@ def recommend_min_branch_events(
             or not np.equal(values, np.rint(values)).all()):
         raise ValueError("Размеры ветвей должны быть конечными положительными целыми числами")
     values_int = values.astype(np.int64)
-    unique = np.unique(values_int)
+    unique, counts = np.unique(values_int, return_counts=True)
     gap_min = float(min_multiplicative_gap)
     if not np.isfinite(gap_min) or gap_min <= 1.0:
         raise ValueError("min_multiplicative_gap должен быть конечным числом больше 1")
@@ -409,25 +542,31 @@ def recommend_min_branch_events(
                     "ratio": None, "lower_size": int(unique[0]),
                     "upper_size": None, "min_multiplicative_gap": gap_min}
 
-    # Candidate boundaries split *observed* sizes. Branches do not receive a
-    # model-derived probability; ties are resolved toward the larger gap.
-    candidates = []
-    for index in range(unique.size - 1):
-        lower = int(unique[index])
-        upper = int(unique[index + 1])
-        n_lower = int(np.count_nonzero(values_int <= lower))
-        n_upper = int(values_int.size - n_lower)
-        if n_lower < 2 or n_upper < 1:
-            continue
-        ratio = float(upper) / float(lower)
-        candidates.append((ratio, lower, upper, n_lower, n_upper))
-    if not candidates:
+    cumulative_counts = np.cumsum(counts, dtype=np.int64)
+    lower_counts = cumulative_counts[:-1]
+    upper_counts = values_int.size - lower_counts
+    eligible = (lower_counts >= 2) & (upper_counts >= 1)
+    candidate_indices = np.flatnonzero(eligible)
+    if candidate_indices.size == 0:
         return 1, {"method": "largest_multiplicative_gap_v1", "status": "insufficient_components",
                     "ratio": None, "lower_size": None, "upper_size": None,
                     "min_multiplicative_gap": gap_min}
-    ratio, lower, upper, n_lower, n_upper = max(
-        candidates, key=lambda item: (item[0], -item[1])
+
+    ratios = (
+        unique[1:].astype(np.float64, copy=False)
+        / unique[:-1].astype(np.float64, copy=False)
     )
+    # np.argmax returns the first equal maximum. Since `unique` is ascending,
+    # this exactly preserves the previous tie-breaker: prefer the smaller lower
+    # component size when multiplicative gaps are equal.
+    local_best = int(np.argmax(ratios[candidate_indices]))
+    index = int(candidate_indices[local_best])
+    lower = int(unique[index])
+    upper = int(unique[index + 1])
+    n_lower = int(lower_counts[index])
+    n_upper = int(upper_counts[index])
+    ratio = float(ratios[index])
+
     if ratio < gap_min:
         return 1, {"method": "largest_multiplicative_gap_v1", "status": "no_clear_gap",
                     "ratio": ratio, "lower_size": lower, "upper_size": upper,
@@ -465,17 +604,27 @@ def branch_analysis_mask(branch_catalog) -> np.ndarray:
 def calculate_branch_size_distribution(
     peak_catalog, theta_gate: float, *, candidate_graph=None,
 ) -> dict[str, Any]:
-    """Calculate exact global connected-component sizes for the supplied gate."""
-    sizes = _branch_sizes_from_candidate_graph(
-        peak_catalog, candidate_graph, theta_gate
-    )
+    """Calculate exact global connected-component sizes for the supplied gate.
+
+    Pass a :class:`BranchSizeCalculator` as ``candidate_graph`` to reuse its
+    pre-indexed, sorted edge arrays for repeated interactive gate changes.  In
+    this prepared mode the catalog itself is not needed after preparation.
+    """
+    if isinstance(candidate_graph, BranchSizeCalculator):
+        sizes = candidate_graph.sizes(theta_gate)
+        n_events = candidate_graph.n_events
+    else:
+        sizes = _branch_sizes_from_candidate_graph(
+            peak_catalog, candidate_graph, theta_gate
+        )
+        n_events = int(len(peak_catalog))
     recommended, diagnostics = recommend_min_branch_events(sizes)
     return {
         "sizes": sizes.astype(int).tolist(),
         "recommended_min": int(recommended),
         "diagnostics": diagnostics,
         "n_branches": int(sizes.size),
-        "n_events": int(len(peak_catalog)),
+        "n_events": n_events,
     }
 
 def summarize_peak_spacing(

@@ -11,6 +11,8 @@ import numpy as np
 from PyQt6 import QtCore, QtGui, QtWidgets
 
 from roc_mcs.gui.roi_explorer.theme import resolve_theme, theme_colors
+from roc_mcs.analysis.project import project_directory_for_scan
+from roc_mcs.gui.app_settings import resolve_analysis_projects_directory
 from roc_mcs.gui.components.floating_legend import FloatingLegendPanel, LegendEntry
 from roc_mcs.gui.roi_explorer.map_tools_widget import SmartDropdownButton
 from roc_mcs.gui.roi_explorer.theta_range_preview import THETA_RANGE_PREVIEW_INTERVAL_MS
@@ -21,9 +23,10 @@ from roc_mcs.gui.roi_explorer.plot_toolbar_style import (
 from .cursor_link import map_detector_cursor_to_volume
 from .scan_view_adapter import build_volume_payload
 from roc_mcs.roi.roi_types import normalize_rectangular_roi
-from .vtk_scene import TransferSettings, VTKVolumeScene
+from .vtk_scene import TransferSettings, VTKVolumeScene, _rebase_vtk_mouse_move
 from .vtk_tools_widget import VTKToolsWidget
 from .vtk_volume_display_widget import VTKVolumeDisplayWidget
+from .scan_view_state import load_view_state, save_view_state
 
 
 logger = logging.getLogger(__name__)
@@ -162,6 +165,18 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
         self._rois: list = []
         self._selected_roi_id: int | None = None
         self._source_scan_key: str | None = None
+        # Display-only state belongs to a scan/project, not to the application
+        # preferences or the immutable scientific workflow manifest.
+        self._view_state_identity: str | None = None
+        self._view_state_path: Path | None = None
+        self._pending_view_state: dict | None = None
+        self._pending_view_camera_state: dict | None = None
+        self._default_view_controls: dict | None = None
+        self._view_state_interaction_observer_id = None
+        self._view_state_timer = QtCore.QTimer(self)
+        self._view_state_timer.setSingleShot(True)
+        self._view_state_timer.setInterval(300)
+        self._view_state_timer.timeout.connect(self._save_scan_view_state)
         self._map_theta_mode = False
         self._map_theta_values = np.empty(0, dtype=np.float64)
         self._map_theta_index = 0
@@ -278,6 +293,7 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
         self.status.setWordWrap(True)
         root.addWidget(self.status, 0)
 
+        self.apply_global_icon_size()
         self._build_overlay_settings()
         self._connect_tools()
         self.source_combo.currentIndexChanged.connect(self._source_changed)
@@ -629,6 +645,8 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
         t.bounding_box_toggled.connect(lambda value: self._scene_call("set_bounding_box_visible", value))
         t.axis_ticks_toggled.connect(lambda value: self._scene_call("set_axis_ticks_visible", value))
         t.grid_toggled.connect(lambda value: self._scene_call("set_grid_visible", value))
+        for signal in (t.axes_toggled, t.bounding_box_toggled, t.axis_ticks_toggled, t.grid_toggled):
+            signal.connect(self._schedule_view_state_save)
         t.perspective_view_requested.connect(self._perspective_view)
         t.camera_axis_direction_requested.connect(self._camera_axis)
         t.axis_scales_apply_requested.connect(self._set_axis_scales)
@@ -661,6 +679,34 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
         self._pending_theta_range = None
         scan_key = str(scan_label)
         source_identity = f"{Path(source_path).expanduser().resolve() if source_path else ''}|{scan_key}"
+        analysis_root = resolve_analysis_projects_directory() if source_path and scan_key else None
+        # Include the configured root in the storage identity. If the user changes
+        # the global projects path while a viewer remains open, the next dataset
+        # selection must switch sidecars rather than silently writing to the old root.
+        view_storage_identity = f"{source_identity}|{analysis_root or ''}"
+        if self._view_state_identity != view_storage_identity:
+            self._save_scan_view_state(flush=True)
+            if self._default_view_controls is None:
+                self._default_view_controls = self._capture_scan_view_controls()
+            self._view_state_identity = view_storage_identity
+            self._view_state_path = None
+            self._pending_view_state = None
+            self._pending_view_camera_state = None
+            if source_path and scan_key and analysis_root is not None:
+                try:
+                    project_dir = project_directory_for_scan(
+                        source_path, scan_key, analysis_root
+                    )
+                    self._view_state_path = project_dir / "view_state.json"
+                    self._pending_view_state = load_view_state(self._view_state_path)
+                except (OSError, ValueError, TypeError) as exc:
+                    logger.warning(
+                        "Не удалось загрузить сохранённый вид скана %s: %s",
+                        scan_key, exc,
+                    )
+            if self._pending_view_state is None and self._default_view_controls is not None:
+                self._apply_scan_view_controls(self._default_view_controls, restore_camera=False)
+            self._first_payload = True
         if self._source_scan_key != source_identity:
             # ID ROI могут повторяться в разных сканах: чужую геометрию не переносим.
             self.source_combo.blockSignals(True)
@@ -701,6 +747,125 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
             self._submit_payload(self._dataset_request)
         else:
             self._schedule_vtk_init()
+
+    def apply_global_icon_size(self) -> None:
+        """Refresh embedded 3D source/toolbar geometry after global icon changes."""
+        size = VTKToolsWidget._icon_size()
+        self.source_button.setFixedSize(size + 10, size + 6)
+        self.source_button.setIconSize(QtCore.QSize(size, size))
+        self.tools._set_icon_sizes()
+
+    def _capture_scan_view_controls(self) -> dict:
+        """Capture Qt-owned display controls without touching scientific data."""
+        return {
+            "axis_scales": list(self.tools.axis_scales),
+            "transfer": {
+                "low_percent": float(self.low_threshold.value()),
+                "high_percent": float(self.high_threshold.value()),
+                "opacity": float(self.opacity.value()),
+                "gamma": float(self.gamma.value()),
+                "sample_factor": float(self.sample_factor.value()),
+                "unit_distance": float(self.unit_distance.value()),
+                "palette": str(self.palette.currentData() or "magma"),
+                "projection_enabled": bool(self.tools.projection_button.isChecked()),
+                "projection_opacity": float(self.projection_opacity.value()),
+                "projection_palette": self.projection_palette.currentData(),
+            },
+            "scene": {
+                "axes_visible": bool(self.tools.axes_button.isChecked()),
+                "bounding_box_visible": bool(self.tools.bounding_box_button.isChecked()),
+                "axis_ticks_visible": bool(self.tools.axis_ticks_action.isChecked()),
+                "grid_visible": bool(self.tools.grid_action.isChecked()),
+            },
+        }
+
+    def _capture_scan_view_state(self) -> dict:
+        state = self._capture_scan_view_controls()
+        if self._scene is not None:
+            camera = self._scene.capture_camera_state()
+            if camera is not None:
+                state["camera"] = camera
+            state["scene"] = {
+                "axes_visible": bool(self._scene.axes_visible),
+                "bounding_box_visible": bool(self._scene.bounding_box_visible),
+                "axis_ticks_visible": bool(self._scene.axis_ticks_visible),
+                "grid_visible": bool(self._scene.grid_visible),
+            }
+        return state
+
+    def _apply_scan_view_controls(self, state: dict, *, restore_camera: bool = True) -> None:
+        """Apply a validated sidecar to controls before the next payload build."""
+        controls = [
+            self.low_threshold, self.high_threshold, self.opacity, self.gamma,
+            self.sample_factor, self.unit_distance, self.palette,
+            self.projection_opacity, self.projection_palette,
+            self.tools.projection_button, self.tools.axes_button,
+            self.tools.bounding_box_button, self.tools.axis_ticks_button,
+        ]
+        blockers = [QtCore.QSignalBlocker(widget) for widget in controls]
+        try:
+            transfer = state.get("transfer", {}) if isinstance(state, dict) else {}
+            for key, widget in (
+                ("low_percent", self.low_threshold), ("high_percent", self.high_threshold),
+                ("opacity", self.opacity), ("gamma", self.gamma),
+                ("sample_factor", self.sample_factor), ("unit_distance", self.unit_distance),
+                ("projection_opacity", self.projection_opacity),
+            ):
+                if key in transfer:
+                    widget.setValue(float(transfer[key]))
+            palette_index = self.palette.findData(transfer.get("palette"))
+            if palette_index >= 0:
+                self.palette.setCurrentIndex(palette_index)
+            projection_palette_index = self.projection_palette.findData(
+                transfer.get("projection_palette")
+            )
+            if projection_palette_index >= 0:
+                self.projection_palette.setCurrentIndex(projection_palette_index)
+            if isinstance(transfer.get("projection_enabled"), bool):
+                self.tools.projection_button.setChecked(transfer["projection_enabled"])
+            axis_scales = state.get("axis_scales") if isinstance(state, dict) else None
+            if axis_scales is not None:
+                self.tools.set_axis_scales(*axis_scales)
+            scene_state = state.get("scene", {}) if isinstance(state, dict) else {}
+            for key, method in (
+                ("axes_visible", self.tools.set_axes_visible),
+                ("bounding_box_visible", self.tools.set_bounding_box_visible),
+                ("axis_ticks_visible", self.tools.set_axis_ticks_visible),
+                ("grid_visible", self.tools.set_grid_visible),
+            ):
+                if key in scene_state:
+                    method(scene_state[key])
+        finally:
+            del blockers
+        self._pending_view_camera_state = (
+            state.get("camera") if restore_camera and isinstance(state, dict) else None
+        )
+
+    def _schedule_view_state_save(self, *_args) -> None:
+        if (
+            self._view_state_path is not None and self._payload is not None
+            and self._scene is not None and not self._closed
+        ):
+            self._view_state_timer.start()
+
+    def _save_scan_view_state(self, *, flush: bool = False) -> None:
+        if flush and self._view_state_timer.isActive():
+            self._view_state_timer.stop()
+        if (
+            self._view_state_path is None or self._payload is None
+            or self._scene is None or self._closed
+        ):
+            return
+        try:
+            save_view_state(self._view_state_path, self._capture_scan_view_state())
+        except (OSError, ValueError, TypeError) as exc:
+            logger.warning(
+                "Не удалось сохранить состояние 3D-вида (%s): %s",
+                self._view_state_path, exc,
+            )
+
+    def _on_vtk_interaction_finished(self, *_args) -> None:
+        self._schedule_view_state_save()
 
     def update_saved_rois(self, saved_rois) -> None:
         """Refresh the source menu without rebuilding an unchanged volume.
@@ -840,11 +1005,25 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
             self._payload = payload
             return
         self._hide_peak_tooltip()
+        pending_view_state, self._pending_view_state = self._pending_view_state, None
+        if pending_view_state is not None:
+            self._apply_scan_view_controls(pending_view_state)
         # Excluded-component visibility is a per-dataset inspection choice;
         # never carry it silently into another scan/preview.
         self._show_excluded_branches = False
         settings = self._transfer_settings()
         info = self._scene.set_payload(payload, settings, axis_scales=self.tools.axis_scales)
+        if pending_view_state is not None:
+            scene_state = pending_view_state.get("scene", {})
+            if "axes_visible" in scene_state:
+                self._scene.set_axes_visible(scene_state["axes_visible"])
+            for key, method in (
+                ("bounding_box_visible", self._scene.set_bounding_box_visible),
+                ("axis_ticks_visible", self._scene.set_axis_ticks_visible),
+                ("grid_visible", self._scene.set_grid_visible),
+            ):
+                if key in scene_state:
+                    method(scene_state[key], render=False)
         request = self._dataset_request or {}
         marker_error = None
         branch_error = None
@@ -994,11 +1173,17 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
         self._refresh_theta_link_control()
         if self._first_payload:
             self._scene.reset_camera_fit_preserve_direction()
+            if self._pending_view_camera_state is not None:
+                self._scene.restore_camera_state(
+                    self._pending_view_camera_state, render=False
+                )
+                self._pending_view_camera_state = None
             self._first_payload = False
         self._apply_cursor_position()
         if self._roi_preview is not None:
             self._update_roi_preview()
         self._render()
+        self._schedule_view_state_save()
         marker_status = ""
         if marker_count:
             marker_state = "показаны" if bool(self._scene._peak_marker_actor.GetVisibility()) else "скрыты"
@@ -1103,6 +1288,58 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
             def __init__(self, parent=None):
                 super().__init__(parent)
                 self._roc_finalized = False
+                self._roc_mouse_move_dispatch = False
+                self._roc_drag_previous_vtk_position = None
+
+            def _setEventInformation(self, x, y, ctrl, shift, key, repeat=0, keysum=None):
+                # Preserve QVTK's own device-pixel-ratio and Y-flip conversion,
+                # then correct LastEventPosition before mouseMoveEvent dispatches
+                # the event to vtkInteractorStyleTrackballCamera.
+                super()._setEventInformation(x, y, ctrl, shift, key, repeat, keysum)
+                if self._roc_mouse_move_dispatch:
+                    self._roc_drag_previous_vtk_position = _rebase_vtk_mouse_move(
+                        self._Iren, self._roc_drag_previous_vtk_position
+                    )
+
+            def mousePressEvent(self, event):
+                # Recover if a release was lost while a native toolbar/menu was
+                # active. The normal VTK release path still owns ordinary drags.
+                self._roc_drag_previous_vtk_position = None
+                style = None
+                try:
+                    style = self._Iren.GetInteractorStyle()
+                    if style is not None and int(style.GetState()) != 0:
+                        style.StopState()
+                        style.ReleaseFocus()
+                except Exception:
+                    logger.debug("Could not recover a stale QVTK mouse gesture", exc_info=True)
+                super().mousePressEvent(event)
+                try:
+                    if style is not None and int(style.GetState()) != 0:
+                        self._roc_drag_previous_vtk_position = tuple(
+                            map(int, self._Iren.GetEventPosition())
+                        )
+                except Exception:
+                    self._roc_drag_previous_vtk_position = None
+                    logger.debug("Could not capture the QVTK drag start", exc_info=True)
+
+            def mouseMoveEvent(self, event):
+                # VTK's GrabFocus() sends drag events exclusively to the style,
+                # so an interactor MouseMoveEvent observer cannot rebase them.
+                # Interpose inside QVTK's standard adapter after its coordinate
+                # conversion and before it invokes the event; keep every other
+                # platform-specific conversion and event path unchanged.
+                self._roc_mouse_move_dispatch = True
+                try:
+                    super().mouseMoveEvent(event)
+                finally:
+                    self._roc_mouse_move_dispatch = False
+
+            def mouseReleaseEvent(self, event):
+                try:
+                    super().mouseReleaseEvent(event)
+                finally:
+                    self._roc_drag_previous_vtk_position = None
 
             def closeEvent(self, event):
                 if not self._roc_finalized:
@@ -1238,6 +1475,12 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
             # render synchronously, allowing nested paints during Qt events.
             self._scene = VTKVolumeScene(render_window, interactor, render_callback=widget.update)
             self._scene.set_theme(self._theme)
+            try:
+                self._view_state_interaction_observer_id = interactor.AddObserver(
+                    "EndInteractionEvent", self._on_vtk_interaction_finished
+                )
+            except Exception:
+                self._view_state_interaction_observer_id = None
             if self._peak_hover_observer_id is None:
                 self._peak_hover_observer_id = interactor.AddObserver(
                     "MouseMoveEvent", self._on_peak_hover, 0.10
@@ -1362,6 +1605,7 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
                 reference=info.get("threshold_reference"),
             )
             self._render()
+            self._schedule_view_state_save()
         except Exception as exc:
             self.status.setText(f"Не удалось обновить контраст объёма: {exc}")
 
@@ -1381,6 +1625,7 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
             self.display.set_colormap(self._transfer.palette)
             self.display.set_thresholds(self.low_threshold.value(), self.high_threshold.value(), absolute_low=info.get("threshold_min"), absolute_high=info.get("threshold_max"), reference=info.get("threshold_reference"))
             self._render()
+            self._schedule_view_state_save()
         except Exception as exc:
             self.status.setText(f"Настройки отображения не применены: {exc}")
 
@@ -2020,6 +2265,7 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
     def _toggle_projection(self, enabled):
         self._transfer = replace(self._transfer, show_projection=bool(enabled))
         self._queue_transfer_settings()
+        self._schedule_view_state_save()
 
     def _toggle_overlay(self, key, enabled):
         if key == "peaks":
@@ -2196,23 +2442,27 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
             self._scene.reset_camera_axis(str(axis), polarity=int(polarity))
             self.tools.set_perspective_enabled(self._scene.perspective_enabled)
             self._render()
+            self._schedule_view_state_save()
 
     def _perspective_view(self):
         if self._scene is not None:
             self._scene.set_perspective_view()
             self.tools.set_perspective_enabled(self._scene.perspective_enabled)
             self._render()
+            self._schedule_view_state_save()
 
     def _reset_camera(self):
         if self._scene is not None:
             self._scene.reset_camera_fit_preserve_direction()
             self._render()
+            self._schedule_view_state_save()
 
     def _set_axis_scales(self, x, y, theta):
         if self._scene is not None:
             self._scene.set_axis_scales(float(x), float(y), float(theta), render=False)
             self.tools.set_axis_scales(float(x), float(y), float(theta))
             self._render()
+            self._schedule_view_state_save()
 
     def _set_theta_range(self, low, high):
         """Queue the newest range for a bounded-rate VTK scene update."""
@@ -2389,6 +2639,8 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
             return
 
         self._release_in_progress = True
+        self._save_scan_view_state(flush=True)
+        self._view_state_timer.stop()
         self._closed = True
         try:
             self._roi_preview_timer.stop()
@@ -2423,6 +2675,12 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
                 except Exception:
                     logger.debug("Не удалось снять peak-hover observer", exc_info=True)
             self._peak_hover_observer_id = None
+            if self._interactor is not None and self._view_state_interaction_observer_id is not None:
+                try:
+                    self._interactor.RemoveObserver(self._view_state_interaction_observer_id)
+                except Exception:
+                    logger.debug("Не удалось снять observer состояния 3D-вида", exc_info=True)
+            self._view_state_interaction_observer_id = None
             scene, self._scene = self._scene, None
             widget, self._qvtk = self._qvtk, None
             self._render_window = None

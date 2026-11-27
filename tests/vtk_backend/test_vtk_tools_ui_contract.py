@@ -63,6 +63,45 @@ class VTKToolsSourceContractTests(unittest.TestCase):
                            "setIconSize(QSize(15, 15))", "setIconSize(QSize(14, 14))"):
             self.assertNotIn(fixed_size, source)
 
+    def test_toolbar_geometry_and_icons_follow_global_scale_together(self):
+        source = TOOLS.read_text(encoding="utf-8")
+        start = source.index("    def _set_icon_sizes(self) -> None:")
+        end = source.index("\n    def _color_swatch_icon", start)
+        method = source[start:end]
+        self.assertIn("button_width = max(22, min(30, icon + 10))", method)
+        self.assertIn("button_height = max(18, min(26, icon + 6))", method)
+        self.assertIn("self.setFixedHeight(button_height + 4)", method)
+        self.assertIn('button.setProperty("toolbarControl", True)', method)
+        self.assertIn("button.setFixedSize(button_width, button_height)", method)
+        self.assertIn("compact_size = QSize(max(10, icon - 2), max(10, icon - 2))", method)
+        self.assertNotIn("self.setFixedHeight(34)", source)
+
+    def test_embedded_viewer_reapplies_toolbar_policy_after_global_icon_propagation(self):
+        explorer = (GUI / "roi_explorer" / "explorer_window.py").read_text(encoding="utf-8")
+        embedded = (GUI / "roi_explorer" / "vtk_backend" / "embedded_widget.py").read_text(encoding="utf-8")
+        self.assertIn('widget.objectName() == "EmbeddedVTKVolumeWidget"', explorer)
+        self.assertIn("if callable(apply_icon_size):", explorer)
+        self.assertIn("self.tools._set_icon_sizes()", embedded)
+
+    def test_trs_host_applies_page_specific_icon_policy_after_global_baseline(self):
+        host = (GUI / "trs_apps" / "app_host.py").read_text(encoding="utf-8")
+        method_start = host.index("    def _apply_global_settings_to_pages")
+        method_end = host.index("\n    def open_resource_monitor", method_start)
+        method = host[method_start:method_end]
+        self.assertLess(
+            method.index("button.setIconSize"),
+            method.index("method = getattr(page, \"apply_global_settings\", None)"),
+        )
+
+    def test_per_scan_view_state_is_separate_from_workflow_and_restored_after_payload(self):
+        embedded = (GUI / "roi_explorer" / "vtk_backend" / "embedded_widget.py").read_text(encoding="utf-8")
+        state_module = GUI / "roi_explorer" / "vtk_backend" / "scan_view_state.py"
+        self.assertTrue(state_module.is_file())
+        self.assertIn('project_dir / "view_state.json"', embedded)
+        self.assertIn('"EndInteractionEvent"', embedded)
+        self.assertIn("self._scene.restore_camera_state", embedded)
+        self.assertIn("save_view_state(self._view_state_path", embedded)
+
     def test_volume_source_selector_uses_existing_roi_geometry_in_dialog(self):
         toolbar = TOOLS.read_text(encoding="utf-8")
         desktop = DESKTOP.read_text(encoding="utf-8")

@@ -66,6 +66,10 @@ class _VolumeContrastRangeSlider(QRangeSlider):
         """
         apply_widget_palette(self, theme)
         palette = QPalette(self.palette())
+        # Keep the selected-range segment identical to the shared 2D slider
+        # highlight; do not let the native blue style override the app theme.
+        colors = theme_colors(theme)
+        palette.setColor(QPalette.ColorRole.Highlight, QColor(colors["highlight"]))
         if surface_color is not None:
             palette.setColor(QPalette.ColorRole.Window, QColor(surface_color))
         self.setPalette(palette)

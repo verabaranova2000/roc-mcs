@@ -1,12 +1,16 @@
 """Compact, exact sensitivity plot for diffraction-branch ``theta_gate``."""
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import numpy as np
 from PyQt6.QtCore import Qt, QSize, QPoint, pyqtSignal
 from PyQt6.QtGui import QColor, QBrush, QFont, QPainter, QPainterPath, QPen, QPolygon
 from PyQt6.QtWidgets import QSizePolicy, QWidget
+
+
+_logger = logging.getLogger(__name__)
 
 
 class ThetaGateSensitivityPlot(QWidget):
@@ -28,6 +32,15 @@ class ThetaGateSensitivityPlot(QWidget):
         self._dragging = False
         self._level_gates = np.empty(0, dtype=np.float64)
         self._level_counts = np.empty(0, dtype=np.int64)
+        self._levels: tuple[dict[str, Any], ...] = ()
+        self._initial_count = 0
+        # Keep the actual data extrema as persistent scan state.  The painter
+        # uses them for axis labels; deriving the plot range alone is not enough.
+        self._y_min = 0
+        self._y_max = 1
+        self._y_low = 0.0
+        self._y_high = 1.0
+        self._paint_error_reported = False
         self._curve_path: QPainterPath | None = None
         self._curve_path_size = QSize()
         self.setObjectName("thetaGateSensitivityPlot")
@@ -38,9 +51,10 @@ class ThetaGateSensitivityPlot(QWidget):
         self.setToolTip(
             "Ступенчатая кривая показывает точное число компонент связности при каждом θ-gate. "
             "Полоса отмечает точный интервал неизменного разбиения вокруг опорного значения; "
-            "пунктир — оценка по Q90 и внутрипиксельным зазорам (либо рабочее значение 60″, "
-            "если правило не выделило разделяющий интервал Q90 < G_min), сплошной указатель — "
-            "текущее редактируемое значение. "
+            "тонкая пунктирная линия без маркера — справочная оценка по Q90 и "
+            "внутрипиксельным зазорам (либо рабочее значение 60″, если правило не "
+            "выделило разделяющий интервал Q90 < G_min); сплошная линия со стрелкой — "
+            "текущее редактируемое значение. Справочная линия не является следом drag. "
             "Перетащите сплошной указатель, чтобы изменить θ-gate."
         )
 
@@ -53,17 +67,33 @@ class ThetaGateSensitivityPlot(QWidget):
 
     def set_scan(self, scan: dict[str, Any] | None) -> None:
         self._scan = dict(scan) if isinstance(scan, dict) else None
-        levels = list((self._scan or {}).get("levels", ()))
-        self._level_gates = np.asarray(
-            [float(item.get("gate", np.inf)) for item in levels], dtype=np.float64
+        # Normalize the (potentially large) filtration once when the scan
+        # changes. Drag repaint then touches only compact cached arrays/path.
+        self._levels = tuple(
+            {"gate": float(item.get("gate", np.inf)),
+             "branch_count": int(item.get("branch_count", 0))}
+            for item in (self._scan or {}).get("levels", ())
         )
-        initial = int((self._scan or {}).get(
+        self._level_gates = np.asarray(
+            [item["gate"] for item in self._levels], dtype=np.float64
+        )
+        self._initial_count = int((self._scan or {}).get(
             "initial_branch_count", (self._scan or {}).get("n_events", 0)
         ))
         self._level_counts = np.asarray(
-            [initial] + [int(item.get("branch_count", initial)) for item in levels],
+            [self._initial_count] + [item["branch_count"] for item in self._levels],
             dtype=np.int64,
         )
+        self._y_min = int(self._level_counts.min()) if self._level_counts.size else 0
+        self._y_max = int(self._level_counts.max()) if self._level_counts.size else 1
+        if self._y_max <= self._y_min:
+            self._y_low = float(max(0, self._y_min - 1))
+            self._y_high = float(self._y_max + 1)
+        else:
+            pad = max(0.5, (self._y_max - self._y_min) * 0.06)
+            self._y_low = max(0.0, self._y_min - pad)
+            self._y_high = self._y_max + pad
+        self._paint_error_reported = False
         self._curve_path = None
         self.update()
 
@@ -87,10 +117,12 @@ class ThetaGateSensitivityPlot(QWidget):
             return
         if not np.isfinite(gate) or gate <= 0.0:
             return
-        changed = not np.isclose(gate, self._gate, rtol=1e-12, atol=1e-12)
+        changed = gate != self._gate
+        if not changed:
+            return
         self._gate = gate
         self.update()
-        if emit and changed:
+        if emit:
             self.gate_changed.emit(gate)
 
     def _plot_rect(self) -> tuple[float, float, float, float]:
@@ -163,7 +195,44 @@ class ThetaGateSensitivityPlot(QWidget):
         return path
 
     def paintEvent(self, _event) -> None:  # noqa: N802 - Qt API
+        """Paint without allowing a Python exception to escape into Qt.
+
+        An exception raised by a PyQt virtual callback can terminate the GUI
+        process.  Keep the QPainter lifetime exception-safe and report an
+        unexpected rendering failure once per scan instead of crashing TRS Apps.
+        """
         painter = QPainter(self)
+        if not painter.isActive():
+            return
+        try:
+            self._paint_contents(painter)
+        except Exception:
+            if not self._paint_error_reported:
+                _logger.exception(
+                    "Failed to render theta-gate sensitivity plot; keeping the "
+                    "processing workbench alive"
+                )
+                self._paint_error_reported = True
+            # Best-effort compact fallback.  Keep it inside the same active
+            # painter; never trigger a synchronous repaint from paintEvent.
+            try:
+                painter.save()
+                painter.resetTransform()
+                painter.setPen(self.palette().color(self.palette().ColorRole.PlaceholderText))
+                painter.drawText(
+                    self.rect(), Qt.AlignmentFlag.AlignCenter,
+                    "График θ-gate временно недоступен",
+                )
+                painter.restore()
+            except Exception:
+                # The painter may already be in an unrecoverable Qt state.
+                pass
+        finally:
+            if painter.isActive():
+                painter.end()
+
+    def _paint_contents(self, painter: QPainter) -> None:
+        """Render the plot using scan state prepared by :meth:`set_scan`."""
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         palette = self.palette()
         text = palette.color(palette.ColorRole.Text)
@@ -210,20 +279,12 @@ class ThetaGateSensitivityPlot(QWidget):
                 int(left), int((top + bottom) / 2), int(right - left), 16,
                 Qt.AlignmentFlag.AlignCenter, "Расчёт скана θ-gate…",
             )
-            painter.end()
             return
 
         x_min, x_max = self._domain()
-        initial = int(scan.get("initial_branch_count", scan.get("n_events", 0)))
-        levels = list(scan.get("levels", ()))
-        y_values = [initial] + [int(item.get("branch_count", initial)) for item in levels]
-        y_min = min(y_values, default=0)
-        y_max = max(y_values, default=1)
-        if y_max <= y_min:
-            y_low, y_high = max(0, y_min - 1), y_max + 1
-        else:
-            pad = max(0.5, (y_max - y_min) * 0.06)
-            y_low, y_high = max(0.0, y_min - pad), y_max + pad
+        initial = self._initial_count
+        levels = self._levels
+        y_low, y_high = self._y_low, self._y_high
 
         # Shade only the exact plateau containing the independent spacing
         # reference value (estimate or documented fallback).  The scan does
@@ -288,24 +349,27 @@ class ThetaGateSensitivityPlot(QWidget):
                 Qt.AlignmentFlag.AlignHCenter, f"{value:g}",
             )
 
-        # The recommendation is a non-interactive dashed guide.  The solid
-        # marker remains the only draggable control and is linked to the form.
+        # The reference estimate is deliberately a quiet, non-interactive
+        # guide: no arrowhead (the draggable current gate owns that glyph), a
+        # fine dotted stroke and a short label make its semantics unambiguous.
         if self._recommended_gate is not None and not np.isclose(
             self._recommended_gate, self._gate, rtol=1e-10, atol=1e-12
         ):
             x_recommended = self._x_for_gate(self._recommended_gate, left, right)
-            recommended_pen = QColor(palette.color(palette.ColorRole.Link))
-            painter.setPen(QPen(recommended_pen, 1.0, Qt.PenStyle.DashLine))
+            recommended_color = QColor(palette.color(palette.ColorRole.PlaceholderText))
+            recommended_color.setAlpha(170)
+            painter.setPen(QPen(recommended_color, 0.9, Qt.PenStyle.DotLine))
             painter.drawLine(
-                int(x_recommended), int(top + 2), int(x_recommended), int(bottom)
+                int(x_recommended), int(top + 3), int(x_recommended), int(bottom)
             )
-            painter.setBrush(QBrush(recommended_pen))
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.drawPolygon(QPolygon([
-                QPoint(int(x_recommended), int(top + 1)),
-                QPoint(int(x_recommended - 3), int(top + 5)),
-                QPoint(int(x_recommended + 3), int(top + 5)),
-            ]))
+            label = "оценка"
+            label_width = painter.fontMetrics().horizontalAdvance(label)
+            label_x = int(x_recommended + 4)
+            if label_x + label_width > int(right):
+                label_x = int(x_recommended - label_width - 4)
+            if label_x >= int(left):
+                painter.setPen(QPen(recommended_color, 1.0))
+                painter.drawText(label_x, int(top + 11), label)
 
         # Selected gate is the only draggable control; it is linked to the form.
         x_gate = self._x_for_gate(self._gate, left, right)
@@ -336,6 +400,7 @@ class ThetaGateSensitivityPlot(QWidget):
         # the smaller tick font, while the axis caption keeps supporting size.
         painter.setFont(tick_font)
         painter.setPen(QPen(muted, 1.0))
+        y_min, y_max = self._y_min, self._y_max
         y_span = max(1e-12, y_high - y_low)
         y_for_data_max = bottom - ((float(y_max) - y_low) / y_span) * (bottom - top)
         if y_min == y_max:
@@ -358,8 +423,6 @@ class ThetaGateSensitivityPlot(QWidget):
             int(max(left, (left + right) / 2 - 48)), int(self.height() - 12),
             96, 10, Qt.AlignmentFlag.AlignHCenter, "θ-gate, ″ · лог. шкала",
         )
-
-        painter.end()
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
