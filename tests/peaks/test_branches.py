@@ -7,9 +7,11 @@ import pytest
 from roc_mcs.analysis.artifacts import ArtifactBundle
 from roc_mcs.analysis.operations import default_registry
 from roc_mcs.peaks.branches import (
+    build_peak_branch_candidate_graph,
     build_peak_branch_graph,
     fitted_peak_positions,
     label_peak_branches,
+    scan_theta_gate_stability,
     summarize_peak_spacing,
 )
 
@@ -309,3 +311,135 @@ def test_branch_inclusion_flags_roundtrip_in_immutable_artifact(tmp_path):
     assert restored_catalog["branch_id"].nunique() == 2
     assert restored_catalog.groupby("branch_id")["analysis_included"].nunique().max() == 1
     assert restored.metadata["branch_selection"]["preserves_all_catalog_rows"] is True
+
+
+def test_theta_gate_scan_is_exact_component_filtration_and_recommends_stable_gap():
+    # A four-edge chain with distinct |Δθ| levels: 1, 2, 20, 100 arcsec.
+    catalog = pd.DataFrame([
+        {"peak_id": 0, "x": 0, "y": 0, "theta": 0.0},
+        {"peak_id": 1, "x": 1, "y": 0, "theta": 1.0},
+        {"peak_id": 2, "x": 2, "y": 0, "theta": 3.0},
+        {"peak_id": 3, "x": 3, "y": 0, "theta": 23.0},
+        {"peak_id": 4, "x": 4, "y": 0, "theta": 123.0},
+    ])
+    candidate_graph = build_peak_branch_candidate_graph(catalog)
+    scan = scan_theta_gate_stability(catalog, candidate_graph=candidate_graph)
+
+    assert scan["status"] == "stable_window_found"
+    assert [level["gate"] for level in scan["levels"]] == [1.0, 2.0, 20.0, 100.0]
+    assert [level["branch_count"] for level in scan["levels"]] == [4, 3, 2, 1]
+    window = scan["stability_window"]
+    assert window["lower_gate"] == pytest.approx(2.0)
+    assert window["upper_gate"] == pytest.approx(20.0)
+    assert window["multiplicative_gap"] == pytest.approx(10.0)
+    assert scan["recommended_gate"] == pytest.approx(np.sqrt(40.0))
+
+    from roc_mcs.peaks.branches import calculate_branch_size_distribution
+    uncached_sizes = calculate_branch_size_distribution(catalog, scan["recommended_gate"])
+    cached_sizes = calculate_branch_size_distribution(
+        catalog, scan["recommended_gate"], candidate_graph=candidate_graph
+    )
+    assert sorted(uncached_sizes["sizes"]) == sorted(cached_sizes["sizes"])
+
+    # The sweep's component count must equal the production graph at every
+    # representative threshold, including exact inclusive boundaries.
+    for gate in (0.001, 1.0, 1.5, 2.0, 19.99, 20.0, 100.0):
+        edges, _ = build_peak_branch_graph(catalog, theta_gate=gate)
+        expected, _labels = label_peak_branches(catalog, edges)
+        observed = scan["initial_branch_count"]
+        for level in scan["levels"]:
+            if level["gate"] <= gate:
+                observed = level["branch_count"]
+        assert observed == expected
+
+
+def test_theta_gate_scan_does_not_invent_an_elbow_when_no_wide_window_exists():
+    catalog = pd.DataFrame([
+        {"peak_id": 0, "x": 0, "y": 0, "theta": 0.0},
+        {"peak_id": 1, "x": 1, "y": 0, "theta": 1.0},
+        {"peak_id": 2, "x": 2, "y": 0, "theta": 3.0},
+        {"peak_id": 3, "x": 3, "y": 0, "theta": 6.0},
+        {"peak_id": 4, "x": 4, "y": 0, "theta": 10.0},
+    ])
+    scan = scan_theta_gate_stability(catalog)
+    assert scan["status"] == "no_robust_stability_window"
+    assert scan["recommended_gate"] is None
+
+
+def test_theta_gate_scan_handles_zero_weight_edges_and_empty_neighbour_graph():
+    same_theta = pd.DataFrame([
+        {"peak_id": 0, "x": 0, "y": 0, "theta": 5.0},
+        {"peak_id": 1, "x": 1, "y": 0, "theta": 5.0},
+        {"peak_id": 2, "x": 3, "y": 0, "theta": 100.0},
+    ])
+    scan = scan_theta_gate_stability(same_theta)
+    assert scan["initial_branch_count"] == 2
+    assert scan["n_candidate_edges"] == 1
+    assert scan["n_merge_levels"] == 0
+    assert scan["status"] == "partition_constant"
+    assert scan["recommended_gate"] is None
+
+    isolated = pd.DataFrame([
+        {"peak_id": 10, "x": 0, "y": 0, "theta": 5.0},
+        {"peak_id": 11, "x": 4, "y": 4, "theta": 100.0},
+    ])
+    no_edges = scan_theta_gate_stability(isolated)
+    assert no_edges["status"] == "no_candidate_edges"
+    assert no_edges["initial_branch_count"] == 2
+
+
+def test_theta_gate_scan_can_recommend_initial_stable_plateau_after_small_local_merges():
+    # Two local links are already active at the UI's minimum gate.  A much
+    # larger third link would merge their components, leaving a broad initial
+    # interval with a stable two-component partition.
+    catalog = pd.DataFrame([
+        {"peak_id": 0, "x": 0, "y": 0, "theta": 0.0},
+        {"peak_id": 1, "x": 1, "y": 0, "theta": 0.0001},
+        {"peak_id": 2, "x": 2, "y": 0, "theta": 0.0003},
+        {"peak_id": 3, "x": 3, "y": 0, "theta": 1.0003},
+    ])
+    scan = scan_theta_gate_stability(catalog)
+
+    assert scan["status"] == "stable_window_found"
+    window = scan["stability_window"]
+    assert window["lower_gate"] == pytest.approx(0.001)
+    assert window["upper_gate"] == pytest.approx(1.0)
+    assert window["branch_count"] == 2
+    assert window["merges_before"] == 2
+    assert window["merges_after"] == 1
+    assert scan["recommended_gate"] == pytest.approx(np.sqrt(0.001))
+
+
+def test_theta_gate_filtration_matches_production_graph_on_small_random_catalogs():
+    rng = np.random.default_rng(814_2026)
+    for _case in range(12):
+        rows = []
+        peak_id = 0
+        for y in range(3):
+            for x in range(4):
+                if rng.random() < 0.78:
+                    for _ in range(int(rng.integers(1, 4))):
+                        rows.append({
+                            "peak_id": peak_id,
+                            "x": x,
+                            "y": y,
+                            "theta": float(rng.normal(250.0, 80.0)),
+                        })
+                        peak_id += 1
+        if not rows:
+            continue
+        catalog = pd.DataFrame(rows)
+        candidate_graph = build_peak_branch_candidate_graph(catalog)
+        scan = scan_theta_gate_stability(catalog, candidate_graph=candidate_graph)
+        probes = {0.001}
+        for weight in np.unique(candidate_graph[1]):
+            probes.add(float(weight))
+            probes.add(float(np.nextafter(weight, np.inf)))
+        for gate in sorted(probes):
+            edges, _ = build_peak_branch_graph(catalog, theta_gate=gate)
+            expected_count, _labels = label_peak_branches(catalog, edges)
+            observed_count = int(scan["initial_branch_count"])
+            for level in scan["levels"]:
+                if float(level["gate"]) <= gate:
+                    observed_count = int(level["branch_count"])
+            assert observed_count == expected_count

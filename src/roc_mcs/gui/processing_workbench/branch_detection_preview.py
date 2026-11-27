@@ -34,8 +34,8 @@ class BranchDetectionPreview(QWidget):
         }
         self._message = "Выберите родительский результат с каталогом пиков."
         self.setObjectName("branchDetectionPreview")
-        self.setMinimumSize(320, 126)
-        self.setMaximumSize(560, 148)
+        self.setMinimumSize(300, 94)
+        self.setMaximumSize(500, 112)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.setAccessibleName(
             "Трёхмерная иллюстрация сопоставления пиков в пространственно-угловых ветвях"
@@ -51,7 +51,7 @@ class BranchDetectionPreview(QWidget):
         )
 
     def sizeHint(self) -> QSize:
-        return QSize(470, 140)
+        return QSize(440, 108)
 
     def set_catalog(self, catalog: Any | None, info: dict[str, Any] | None = None) -> None:
         """Replace the compact real-data patch selected by the stats worker."""
@@ -167,25 +167,23 @@ class BranchDetectionPreview(QWidget):
         info = self._patch_info
         patch_width = int(info.get("width", 4))
         patch_height = int(info.get("height", 3))
-        source_label = str(info.get("position_label", "пики"))
         accepted_count = len(accepted_edges)
         component_count = int(self._graph.get("n_branches", 0))
 
-        # One compact, non-overlapping header: the right-hand gate value gets
-        # a reserved area; the descriptive part is safely elided if needed.
+        # A restrained one-line header.  The numeric gate has reserved space;
+        # the data summary is elided rather than forcing the preview wider.
         heading_font = QFont(self.font())
-        heading_font.setPointSizeF(max(7.5, self.font().pointSizeF() - 0.35))
+        heading_font.setPointSizeF(max(7.0, self.font().pointSizeF() - 0.8))
         heading_font.setWeight(QFont.Weight.DemiBold)
         painter.setFont(heading_font)
         painter.setPen(QPen(text, 1.0))
         gate_text = f"θ-gate {self._theta_gate:.4g}″"
         gate_width = painter.fontMetrics().horizontalAdvance(gate_text)
         heading = (
-            f"{source_label}  ·  {patch_width}×{patch_height} px  ·  "
-            f"{len(events)} пиков  ·  {accepted_count}/{len(candidate_edges)} связей  ·  "
-            f"{component_count} компонент"
+            f"{patch_width}×{patch_height} px  ·  {len(events)} событий  ·  "
+            f"{accepted_count}/{len(candidate_edges)} связей  ·  {component_count} компонент"
         )
-        heading_rect = card.adjusted(11, 5, -(gate_width + 23), -card.height() + 23)
+        heading_rect = card.adjusted(10, 3, -(gate_width + 19), -card.height() + 19)
         heading = painter.fontMetrics().elidedText(
             heading, Qt.TextElideMode.ElideRight, max(20, heading_rect.width())
         )
@@ -196,12 +194,12 @@ class BranchDetectionPreview(QWidget):
         )
         painter.setPen(QPen(muted, 1.0))
         painter.drawText(
-            card.adjusted(0, 5, -11, -card.height() + 23),
+            card.adjusted(0, 3, -9, -card.height() + 19),
             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
             gate_text,
         )
 
-        plot = card.adjusted(12, 27, -12, -25)
+        plot = card.adjusted(10, 21, -10, -19)
         x_values = [int(event["x"]) for event in events.values()]
         y_values = [int(event["y"]) for event in events.values()]
         theta_values = [float(event["theta"]) for event in events.values()]
@@ -215,15 +213,15 @@ class BranchDetectionPreview(QWidget):
         # Isometric projection: X/Y form a detector-pixel floor grid; θ is the
         # vertical coordinate.  The same fixed projection is retained while
         # the user changes θ-gate, so only the real graph topology changes.
-        available_width = max(180.0, float(plot.width()) - 36.0)
-        step_x = min(33.0, available_width / (x_span + 0.58 * y_span + 0.6))
+        available_width = max(150.0, float(plot.width()) - 31.0)
+        step_x = min(27.0, available_width / (x_span + 0.58 * y_span + 0.6))
         step_y = step_x * 0.58
         projected_width = x_span * step_x + y_span * step_y
         origin_x = float(plot.left()) + (float(plot.width()) - projected_width) / 2.0
         baseline_y = float(plot.bottom()) - 12.0
         depth_x = step_x * 0.18
         depth_y = step_y * 0.78
-        height_theta = min(70.0, max(34.0, float(plot.height()) * 0.72))
+        height_theta = min(46.0, max(24.0, float(plot.height()) * 0.68))
 
         def project(event: dict[str, Any]) -> QPointF:
             xr = float(event["x"] - x_min)
@@ -260,10 +258,13 @@ class BranchDetectionPreview(QWidget):
         self._draw_arrow(painter, axis_origin, axis_x, axis_color)
         self._draw_arrow(painter, axis_origin, axis_y, axis_color)
         self._draw_arrow(painter, axis_origin, axis_theta, axis_color)
+        axis_font = QFont(painter.font())
+        axis_font.setPointSizeF(max(6.5, axis_font.pointSizeF() * 0.78))
+        painter.setFont(axis_font)
         painter.setPen(QPen(text, 1.0))
-        painter.drawText(QPointF(axis_x.x() + 3, axis_x.y() + 1), "X")
-        painter.drawText(QPointF(axis_y.x() + 3, axis_y.y() + 1), "Y")
-        painter.drawText(QPointF(axis_theta.x() + 3, axis_theta.y() - 2), "θ, ″")
+        painter.drawText(QPointF(axis_x.x() + 2, axis_x.y() + 1), "X")
+        painter.drawText(QPointF(axis_y.x() + 2, axis_y.y() + 1), "Y")
+        painter.drawText(QPointF(axis_theta.x() + 2, axis_theta.y() - 2), "θ")
 
         # Accepted links are drawn as fine, flat centrelines. The previous broad
         # ribbons and translucent cells made the diagnostic look illustrative
@@ -298,7 +299,7 @@ class BranchDetectionPreview(QWidget):
             color = self._component_color(component)
             painter.setPen(QPen(QColor(25, 30, 38, 225), 0.8))
             painter.setBrush(QBrush(color))
-            painter.drawEllipse(point, 3.0, 3.0)
+            painter.drawEllipse(point, 2.45, 2.45)
 
         # One-line restrained key; font scale follows the actual compact card.
         legend_y = float(card.bottom()) - 7.0
@@ -308,19 +309,19 @@ class BranchDetectionPreview(QWidget):
         painter.setFont(small_font)
         painter.setPen(QPen(QColor(25, 30, 38, 225), 0.8))
         painter.setBrush(QBrush(self._component_color(0)))
-        painter.drawEllipse(QPointF(x_cursor + 2.5, legend_y - 2.0), 2.5, 2.5)
+        painter.drawEllipse(QPointF(x_cursor + 2.0, legend_y - 2.0), 2.0, 2.0)
         painter.setPen(QPen(muted, 1.0))
-        painter.drawText(QPointF(x_cursor + 9.0, legend_y + 1.0), "peak-event")
-        x_cursor += 72.0
+        painter.drawText(QPointF(x_cursor + 7.0, legend_y + 1.0), "событие")
+        x_cursor += 57.0
         accepted_color = self._component_color(0, alpha=220)
         painter.setPen(QPen(accepted_color, 1.3, Qt.PenStyle.SolidLine))
         painter.drawLine(QPointF(x_cursor, legend_y - 2.0), QPointF(x_cursor + 13.0, legend_y - 2.0))
         painter.setPen(QPen(muted, 1.0))
-        painter.drawText(QPointF(x_cursor + 18.0, legend_y + 1.0), "связь в графе")
-        x_cursor += 92.0
+        painter.drawText(QPointF(x_cursor + 18.0, legend_y + 1.0), "принято")
+        x_cursor += 73.0
         rejected = QColor("#C98753")
         painter.setPen(QPen(rejected, 1.2, Qt.PenStyle.DashLine))
         painter.drawLine(QPointF(x_cursor, legend_y - 2.0), QPointF(x_cursor + 13.0, legend_y - 2.0))
         painter.setPen(QPen(muted, 1.0))
-        painter.drawText(QPointF(x_cursor + 18.0, legend_y + 1.0), "отклонённое назначение")
+        painter.drawText(QPointF(x_cursor + 18.0, legend_y + 1.0), "отвергнуто")
         painter.end()

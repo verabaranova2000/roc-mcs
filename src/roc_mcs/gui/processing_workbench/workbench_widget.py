@@ -36,6 +36,7 @@ from .graph_canvas import ProcessingGraphView
 from .peak_detection_preview import PeakDetectionPreview
 from .branch_detection_preview import BranchDetectionPreview
 from .branch_size_histogram import BranchSizeHistogram
+from .theta_gate_sensitivity import ThetaGateSensitivityPlot
 from roc_mcs.visualization.peak_count_map import integrated_intensity_map, peak_count_rgba
 from roc_mcs.gui.components.icon_provider import svg_icon
 from roc_mcs.gui.roi_explorer.plot_toolbar_style import ICON_DIR
@@ -277,11 +278,11 @@ def _read_branch_position_catalog(artifact_store: ArtifactStore, artifact_id: st
 
 
 class _BranchStatsTask(QRunnable):
-    """Compute gate diagnostics and exact branch sizes outside the GUI thread."""
+    """Compute the exact θ-gate filtration and branch diagnostics off the GUI thread."""
 
     def __init__(
         self, parent_id: str, parent_operation: str, artifact_id: str,
-        artifact_directory: str, theta_gate: float,
+        artifact_directory: str, theta_gate: float, *, prefer_recommendation: bool = False,
     ):
         super().__init__()
         self.parent_id = str(parent_id)
@@ -289,12 +290,16 @@ class _BranchStatsTask(QRunnable):
         self.artifact_id = str(artifact_id)
         self.artifact_directory = str(artifact_directory)
         self.theta_gate = float(theta_gate)
+        self.prefer_recommendation = bool(prefer_recommendation)
         self.signals = _WorkerSignals()
 
     def run(self) -> None:
         try:
             from roc_mcs.peaks.branches import (
-                summarize_peak_spacing, calculate_branch_size_distribution,
+                build_peak_branch_candidate_graph,
+                scan_theta_gate_stability,
+                summarize_peak_spacing,
+                calculate_branch_size_distribution,
             )
             from .branch_preview_data import select_preview_patch
 
@@ -302,8 +307,25 @@ class _BranchStatsTask(QRunnable):
             catalog, position_label = _read_branch_position_catalog(
                 store, self.artifact_id, self.parent_operation
             )
-            stats = summarize_peak_spacing(catalog, reference_theta_gate=60.0)
-            size_distribution = calculate_branch_size_distribution(catalog, self.theta_gate)
+            # Hungarian assignments do not depend on θ-gate. Build the weighted
+            # candidate graph once and reuse it for the complete gate scan,
+            # spacing diagnostics and the initial exact size distribution.
+            candidate_graph = build_peak_branch_candidate_graph(catalog)
+            gate_scan = scan_theta_gate_stability(
+                catalog, candidate_graph=candidate_graph
+            )
+            effective_gate = self.theta_gate
+            recommended_gate = gate_scan.get("recommended_gate")
+            if self.prefer_recommendation and recommended_gate is not None:
+                # The linked QDoubleSpinBox stores four decimal places; use
+                # that exact displayed value for the first size histogram too.
+                effective_gate = round(float(recommended_gate), 4)
+            stats = summarize_peak_spacing(
+                catalog, reference_theta_gate=60.0, candidate_graph=candidate_graph
+            )
+            size_distribution = calculate_branch_size_distribution(
+                catalog, effective_gate, candidate_graph=candidate_graph
+            )
             preview_catalog, preview_info = select_preview_patch(catalog)
             preview_rows = [
                 (int(row.peak_id), int(row.x), int(row.y), float(row.theta))
@@ -311,8 +333,9 @@ class _BranchStatsTask(QRunnable):
             ]
             self.signals.succeeded.emit(self.parent_id, {
                 "stats": stats,
+                "theta_gate_scan": gate_scan,
                 "branch_size": size_distribution,
-                "theta_gate": self.theta_gate,
+                "theta_gate": effective_gate,
                 "preview_rows": preview_rows,
                 "preview_info": preview_info,
                 "position_label": position_label,
@@ -1388,39 +1411,61 @@ class ProcessingWorkbenchWidget(QWidget):
 
     def _build_branch_form(self) -> None:
         layout = self._add_form_page("peaks.branches", "Определение дифракционных ветвей")
-        # Keep the parameter row compact, but let all explanatory content span
-        # the full form width. This avoids the old narrow label column and text
-        # clipping in the stage popup.
         layout.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         layout.setFormAlignment(Qt.AlignmentFlag.AlignTop)
         layout.setRowWrapPolicy(QFormLayout.RowWrapPolicy.DontWrapRows)
 
-        theta_gate = self._float_spin(0.001, 1_000_000.0, 60.0, 2)
+        # 1. First inspect how the exact component partition changes with θ.
+        # The chart is intentionally above the parameter it recommends.
+        gate_sensitivity = ThetaGateSensitivityPlot()
+        layout.addRow(gate_sensitivity)
+
+        # 2. One source of truth for the selected gate: the numeric field and
+        # the draggable plot marker update each other bidirectionally.
+        theta_gate = self._float_spin(0.001, 1_000_000.0, 60.0, 4)
         theta_gate.setSuffix(" ″")
         theta_gate.setSingleStep(1.0)
         theta_gate.setToolTip(
             "Максимальное |Δθ| для сопоставления пиков в 4-связных соседних пикселях. "
             "Единицы совпадают с единицами оси θ; для текущих исходных данных это угловые секунды."
         )
-        layout.addRow("θ-gate:", theta_gate)
+        gate_row = QWidget()
+        gate_row_layout = QHBoxLayout(gate_row)
+        gate_row_layout.setContentsMargins(0, 0, 0, 0)
+        gate_row_layout.setSpacing(8)
+        gate_row_layout.addWidget(theta_gate, 0)
+        gate_status = QLabel("Ожидается анализ устойчивого интервала…")
+        gate_status.setWordWrap(False)
+        gate_status.setMinimumWidth(0)
+        gate_status.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        gate_status.setToolTip(
+            "Рекомендация появляется только при обнаружении достаточно широкого диапазона θ-gate, "
+            "внутри которого разбиение candidate-графа на компоненты полностью неизменно. "
+            "Это оценка устойчивости параметра, а не физическая константа."
+        )
+        gate_row_layout.addWidget(gate_status, 1)
+        layout.addRow("θ-gate:", gate_row)
+        theta_gate.valueChanged.connect(gate_sensitivity.set_gate)
+        gate_sensitivity.gate_changed.connect(theta_gate.setValue)
 
+        # 3. The local real-data topology illustration follows the selected gate.
         preview = BranchDetectionPreview()
         preview.set_theta_gate(float(theta_gate.value()))
         theta_gate.valueChanged.connect(preview.set_theta_gate)
-        layout.addRow(preview)
+        preview_row = QWidget()
+        preview_row_layout = QHBoxLayout(preview_row)
+        preview_row_layout.setContentsMargins(0, 0, 0, 0)
+        preview_row_layout.setSpacing(0)
+        preview_row_layout.addWidget(preview, 0, Qt.AlignmentFlag.AlignLeft)
+        preview_row_layout.addStretch(1)
+        layout.addRow(preview_row)
 
         diagnostics = QLabel(
-            "Точки — реальные пики выбранного участка скана; X/Y — соседство пикселей, "
-            "высота — θ. Цветные ленты показывают принятые связи, а оранжевый пунктир — "
-            "минимальные взаимно-однозначные назначения, которые порог отверг. "
-            "При увеличении θ-gate часть пунктирных связей станет сплошной, а отдельные "
-            "компоненты могут объединиться. Цвет показывает локальную компоненту, "
-            "а площадка появляется только для подтверждённой ячейки 2×2. Пересечение "
-            "проекций линий не означает общий пик. Данные не прореживаются."
+            "Фрагмент реальных событий: сплошные линии — принятые связи, пунктир — "
+            "отвергнутые назначения; компоненты локальны для миниатюры."
         )
         diagnostics.setWordWrap(True)
-        diagnostics.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        diagnostics.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        diagnostics.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         diagnostics.setToolTip(
             "Миниатюра вычисляется на реальных peak-events небольшого непрерывного "
             "фрагмента выбранного результата. Для каждой пары соседних пикселей "
@@ -1430,6 +1475,8 @@ class ProcessingWorkbenchWidget(QWidget):
         )
         layout.addRow(diagnostics)
 
+        # 4. Secondary spacing diagnostics remain available, but are no longer
+        # described as the primary θ-gate recommendation.
         stats_label = QLabel("Статистика выбранного скана загружается при открытии формы…")
         stats_label.setWordWrap(True)
         stats_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -1511,18 +1558,9 @@ class ProcessingWorkbenchWidget(QWidget):
         min_events.valueChanged.connect(self._on_branch_threshold_manual_changed)
         auto_button.clicked.connect(self._set_branch_threshold_auto)
         theta_gate.valueChanged.connect(self._on_branch_theta_gate_changed)
-
-        hint = QLabel(
-            "4-связность по X/Y · one-to-one assignment по минимуму |Δθ| · "
-            "каждый пик остаётся отдельным узлом графа · несвязанные события образуют "
-            "одиночные ветви. Диагностические Q90 и внутренние интервалы — ориентиры "
-            "для sensitivity analysis, а не физические константы."
-        )
-        hint.setWordWrap(True)
-        hint.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        layout.addRow(hint)
         self._forms["peaks.branches"].update(
-            theta_gate=theta_gate, preview=preview,
+            theta_gate=theta_gate, gate_sensitivity=gate_sensitivity,
+            gate_status=gate_status, preview=preview,
             stats_label=stats_label, stats_table=table,
             size_histogram=size_histogram, min_branch_events=min_events,
             branch_threshold_auto=auto_button, branch_selection_status=selection_status,
@@ -1792,6 +1830,12 @@ class ProcessingWorkbenchWidget(QWidget):
         preview = form.get("preview")
         if preview is not None:
             preview.clear_catalog("Загрузка реального фрагмента каталога пиков…")
+        gate_sensitivity = form.get("gate_sensitivity")
+        if gate_sensitivity is not None:
+            gate_sensitivity.set_scan(None)
+        gate_status = form.get("gate_status")
+        if gate_status is not None:
+            gate_status.setText("Вычисляется скан θ-gate…")
         if table is not None:
             table.setRowCount(0)
         # Invalidate any size calculation started for the previously selected
@@ -1826,14 +1870,20 @@ class ProcessingWorkbenchWidget(QWidget):
         self._active_branch_artifact = (str(parent_id), str(node.operation_id), str(artifact_id))
         gate_control = form.get("theta_gate")
         saved_gate = self._branch_gate_values.get(str(parent_id))
-        if gate_control is not None and saved_gate is not None:
+        if gate_control is not None:
+            initial_gate = 60.0 if saved_gate is None else float(saved_gate)
             blocker = QSignalBlocker(gate_control)
-            gate_control.setValue(min(gate_control.maximum(), max(gate_control.minimum(), float(saved_gate))))
+            gate_control.setValue(min(
+                gate_control.maximum(), max(gate_control.minimum(), initial_gate)
+            ))
             del blocker
+            if gate_sensitivity is not None:
+                gate_sensitivity.set_gate(float(gate_control.value()))
         theta_gate = float(gate_control.value()) if gate_control is not None else 60.0
         task = _BranchStatsTask(
             parent_id, node.operation_id, artifact_id,
             str(self.project.artifact_store.directory), theta_gate,
+            prefer_recommendation=saved_gate is None,
         )
         task.signals.succeeded.connect(
             lambda pid, stats, source_task=task:
@@ -1855,6 +1905,9 @@ class ProcessingWorkbenchWidget(QWidget):
         preview = self._forms.get("peaks.branches", {}).get("preview")
         if preview is not None:
             preview.set_theta_gate(float(value))
+        gate_sensitivity = self._forms.get("peaks.branches", {}).get("gate_sensitivity")
+        if gate_sensitivity is not None:
+            gate_sensitivity.set_gate(float(value))
         if self._active_branch_artifact and self._active_branch_artifact[0] == str(parent_id):
             self._branch_size_update_timer.start()
 
@@ -2049,10 +2102,88 @@ class ProcessingWorkbenchWidget(QWidget):
         if label is None or table is None:
             return
         result = stats if isinstance(stats, dict) else {}
+        gate_scan = result.get("theta_gate_scan")
+        scan_widget = form.get("gate_sensitivity")
+        gate_status = form.get("gate_status")
+        if scan_widget is not None:
+            scan_widget.set_scan(gate_scan if isinstance(gate_scan, dict) else None)
+
+        # On the first visit to a parent, adopt the graph-stability suggestion
+        # computed in the worker.  A user-edited or previously saved value takes
+        # precedence, including edits made while this task was still running.
+        spin = form.get("theta_gate")
+        if spin is not None:
+            saved_gate = self._branch_gate_values.get(str(parent_id))
+            if saved_gate is None:
+                try:
+                    selected_gate = float(result.get("theta_gate", spin.value()))
+                except (TypeError, ValueError, OverflowError):
+                    selected_gate = float(spin.value())
+                selected_gate = min(spin.maximum(), max(spin.minimum(), selected_gate))
+                blocker = QSignalBlocker(spin)
+                spin.setValue(selected_gate)
+                del blocker
+                self._branch_gate_values[str(parent_id)] = float(spin.value())
+            else:
+                selected_gate = min(spin.maximum(), max(spin.minimum(), float(saved_gate)))
+                if not np.isclose(float(spin.value()), selected_gate, rtol=1e-10, atol=1e-9):
+                    blocker = QSignalBlocker(spin)
+                    spin.setValue(selected_gate)
+                    del blocker
+            selected_gate = float(spin.value())
+            if scan_widget is not None:
+                scan_widget.set_gate(selected_gate)
+            preview_widget = form.get("preview")
+            if preview_widget is not None:
+                preview_widget.set_theta_gate(selected_gate)
+
+        if gate_status is not None:
+            stability = gate_scan.get("stability_window") if isinstance(gate_scan, dict) else None
+            if isinstance(stability, dict) and gate_scan.get("status") == "stable_window_found":
+                lower = float(stability["lower_gate"])
+                upper = float(stability["upper_gate"])
+                ratio = float(stability["multiplicative_gap"])
+                components = int(stability["branch_count"])
+                gate_status.setText(
+                    f"Окно [{lower:.4g}; {upper:.4g})″ · ×{ratio:.1f} · {components:,} ветвей"
+                )
+                gate_status.setToolTip(
+                    "Для θ-gate от нижней границы включительно до верхней границы не включительно "
+                    "разбиение полного candidate-графа на компоненты неизменно. На верхней "
+                    "границе появляется следующее объединение. "
+                    "Рекомендован геометрический центр интервала. Это устойчивый диапазон "
+                    "параметра, а не утверждение о физической природе ветвей."
+                )
+            else:
+                scan_status = gate_scan.get("status") if isinstance(gate_scan, dict) else None
+                if scan_status == "no_candidate_edges":
+                    gate_status.setText("Нет соседних связей · B(θ) постоянно")
+                    gate_status.setToolTip(
+                        "В каталоге нет пар занятых 4-связных соседних пикселей. "
+                        "Изменение θ-gate не может изменить разбиение на компоненты."
+                    )
+                elif scan_status == "empty":
+                    gate_status.setText("Нет peak-events для скана θ-gate")
+                    gate_status.setToolTip("Каталог событий пиков пуст.")
+                elif scan_status == "partition_constant":
+                    gate_status.setText("B(θ) постоянно · порог не меняет разбиение")
+                    gate_status.setToolTip(
+                        "В пределах всего проверенного диапазона θ-gate ни одно новое ребро "
+                        "не объединяет разные компоненты. Текущее разбиение инвариантно к "
+                        "изменению порога; автоматическая рекомендация не требуется."
+                    )
+                else:
+                    gate_status.setText("Широкое устойчивое окно не найдено")
+                    gate_status.setToolTip(
+                        "В скане нет интервала с неизменным разбиением и отношением верхней "
+                        "границы к нижней не менее 4. Автоматическое значение не подменяется "
+                        "произвольным локтем; используйте текущий θ-gate и ручную проверку графа."
+                    )
+
         if "branch_size" in result:
             try:
                 computed_gate = float(result.get("theta_gate"))
-                current_gate = float(form["theta_gate"].value())
+                current_gate = float(spin.value()) if spin is not None else float("nan")
             except (TypeError, ValueError, KeyError):
                 computed_gate = current_gate = float("nan")
             if np.isfinite(computed_gate) and np.isclose(
@@ -2084,16 +2215,20 @@ class ProcessingWorkbenchWidget(QWidget):
             stats = result["stats"]
         q90 = stats.get("q90_neighbor_delta")
         minimum = stats.get("min_internal_gap")
-        suggested = float(stats.get("recommended_theta_gate", 60.0))
         q90_text = "н/д" if q90 is None else f"{q90:.2f}″"
         min_text = "н/д" if minimum is None else f"{minimum:.2f}″"
         edge_count = int(stats.get("neighbor_edge_count_reference_gate", 0))
         reference_gate = float(stats.get("reference_theta_gate", 60.0))
         label.setText(
-            f"Q90 Δθ: {q90_text} ({edge_count:,} связей при {reference_gate:g}″)  ·  "
-            f"min internal: {min_text}  ·  старт: {suggested:.2f}″"
+            f"Контроль разнесения: Q90 соседних Δθ = {q90_text} "
+            f"({edge_count:,} связей при {reference_gate:g}″); "
+            f"минимальная медиана внутрипиксельного интервала = {min_text}."
         )
-        label.setToolTip(str(stats.get("recommendation_status", "")))
+        label.setToolTip(
+            "Вспомогательные характеристики распределения расстояний. Они не выбирают θ-gate: "
+            "основная рекомендация задаётся интервалом неизменного разбиения на графике выше.\n"
+            + str(stats.get("recommendation_status", ""))
+        )
         rows = list(stats.get("internal_gap_by_n", ()))
         table.setRowCount(len(rows))
         column_names = ("n_peaks", "pixel_count", "median_gap", "q25_gap", "q75_gap", "min_pixel_median_gap")
@@ -2110,16 +2245,6 @@ class ProcessingWorkbenchWidget(QWidget):
                 item.setToolTip(f"{value}; {unit_hint} {table.horizontalHeaderItem(column).toolTip()}")
                 table.setItem(row_index, column, item)
         table.resizeColumnsToContents()
-        # Keep a separate working gate for each parent branch. A suggestion for
-        # scan B must not inherit the manually tuned value from scan A.
-        spin = form.get("theta_gate")
-        if spin is not None:
-            saved = self._branch_gate_values.get(str(parent_id))
-            if saved is None:
-                current = float(spin.value())
-                saved = suggested if abs(current - 60.0) < 1e-9 else current
-                self._branch_gate_values[str(parent_id)] = float(saved)
-            spin.setValue(min(spin.maximum(), max(spin.minimum(), float(saved))))
 
     def _on_branch_stats_failed(
         self, parent_id: str, error: str, source_task: _BranchStatsTask | None = None

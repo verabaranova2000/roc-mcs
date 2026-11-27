@@ -89,8 +89,29 @@ def _pixel_peak_lookup(peak_catalog):
 
 
 def build_peak_branch_graph(peak_catalog, theta_gate=60.0):
-    """Build edges between one-to-one matched peaks in right/down neighbours."""
+    """Build accepted edges between one-to-one matches in right/down neighbours.
+
+    The one-to-one assignment is independent of ``theta_gate``: the gate only
+    filters the already assigned candidate edges.  Keeping that distinction
+    explicit is what makes an exact, inexpensive gate-sensitivity scan possible.
+    """
     gate = _validate_theta_gate(theta_gate)
+    candidate_edges, candidate_deltas = build_peak_branch_candidate_graph(peak_catalog)
+    accepted = candidate_deltas <= gate
+    return (
+        [edge for edge, keep in zip(candidate_edges, accepted) if bool(keep)],
+        candidate_deltas[accepted],
+    )
+
+
+def build_peak_branch_candidate_graph(peak_catalog):
+    """Build all one-to-one candidate edges and their exact ``|Δθ|`` weights.
+
+    For each 4-connected detector-pixel pair the Hungarian assignment is
+    calculated once, without applying a finite gate.  The returned graph is
+    the complete weighted graph from which every finite-gate branch graph is
+    obtained by the exact sublevel condition ``edge_delta <= theta_gate``.
+    """
     lookup = _pixel_peak_lookup(peak_catalog)
     edges: list[tuple[int, int]] = []
     deltas: list[float] = []
@@ -99,11 +120,250 @@ def build_peak_branch_graph(peak_catalog, theta_gate=60.0):
             peaks_next = lookup.get(neighbour)
             if not peaks_next:
                 continue
-            matches, _, _ = match_neighbor_peaks(peaks_here, peaks_next, theta_gate=gate)
+            matches, _, _ = match_neighbor_peaks(
+                peaks_here, peaks_next, theta_gate=float("inf")
+            )
             for peak_a, peak_b, delta in matches:
                 edges.append((peak_a, peak_b))
                 deltas.append(delta)
     return edges, np.asarray(deltas, dtype=np.float64)
+
+
+def _candidate_graph_or_build(peak_catalog, candidate_graph=None):
+    if candidate_graph is None:
+        return build_peak_branch_candidate_graph(peak_catalog)
+    edges, deltas = candidate_graph
+    edges = [(int(edge[0]), int(edge[1])) for edge in edges]
+    deltas = np.asarray(deltas, dtype=np.float64).reshape(-1)
+    if len(edges) != deltas.size:
+        raise ValueError("Число candidate-рёбер не совпадает с числом весов |Δθ|")
+    if not np.isfinite(deltas).all() or np.any(deltas < 0.0):
+        raise ValueError("Веса candidate-рёбер должны быть конечными и неотрицательными")
+    return edges, deltas
+
+
+def _branch_sizes_from_candidate_graph(peak_catalog, candidate_graph, theta_gate: float):
+    gate = _validate_theta_gate(theta_gate)
+    edges, deltas = _candidate_graph_or_build(peak_catalog, candidate_graph)
+    selected_edges = [edge for edge, delta in zip(edges, deltas) if delta <= gate]
+    count, labels = label_peak_branches(peak_catalog, selected_edges)
+    sizes = (
+        np.bincount(labels.astype(np.int64), minlength=count).astype(np.int64)
+        if count > 0 else np.empty(0, dtype=np.int64)
+    )
+    return sizes
+
+
+def scan_theta_gate_stability(
+    peak_catalog,
+    *,
+    candidate_graph=None,
+    minimum_gate: float = 0.001,
+    minimum_multiplicative_gap: float = 4.0,
+    minimum_merges_before: int = 2,
+) -> dict[str, Any]:
+    """Scan the exact connected-component filtration induced by ``theta_gate``.
+
+    Each Hungarian one-to-one neighbour assignment is fixed before the gate is
+    applied.  Increasing the gate therefore only adds weighted edges in order
+    of ``|Δθ|``.  A union-find sweep visits all distinct component-merger levels
+    exactly, without repeatedly rebuilding the graph for a parameter grid.
+
+    A recommendation is emitted only for a broad *stability window*: either
+    the initial interval from the UI's minimum gate to the first later merge,
+    or an interval between consecutive merge-causing edge weights.  In each
+    case the full connected-component partition is unchanged.  The selected
+    point is the geometric midpoint of the widest qualifying multiplicative
+    interval.
+    This is deliberately not presented as a universal elbow or physical law.
+    """
+    gate_min = _validate_theta_gate(minimum_gate)
+    gap_min = float(minimum_multiplicative_gap)
+    if not np.isfinite(gap_min) or gap_min <= 1.0:
+        raise ValueError("minimum_multiplicative_gap должен быть конечным числом больше 1")
+    min_merges = max(1, int(minimum_merges_before))
+
+    ids, _, _, _ = _validate_catalog(peak_catalog)
+    n_events = int(ids.size)
+    if n_events == 0:
+        return {
+            "method": "weighted_candidate_graph_component_filtration_v1",
+            "status": "empty",
+            "n_events": 0,
+            "n_candidate_edges": 0,
+            "n_merge_levels": 0,
+            "minimum_gate": gate_min,
+            "maximum_gate": max(gate_min * 10.0, 0.01),
+            "initial_branch_count": 0,
+            "final_branch_count": 0,
+            "levels": [],
+            "stability_window": None,
+            "recommended_gate": None,
+        }
+
+    edges, deltas = _candidate_graph_or_build(peak_catalog, candidate_graph)
+    if not edges:
+        return {
+            "method": "weighted_candidate_graph_component_filtration_v1",
+            "status": "no_candidate_edges",
+            "n_events": n_events,
+            "n_candidate_edges": 0,
+            "n_merge_levels": 0,
+            "minimum_gate": gate_min,
+            "maximum_gate": max(gate_min * 10.0, 0.01),
+            "initial_branch_count": n_events,
+            "final_branch_count": n_events,
+            "levels": [],
+            "stability_window": None,
+            "recommended_gate": None,
+        }
+
+    id_to_row = {int(peak_id): row for row, peak_id in enumerate(ids)}
+    edge_rows = np.empty((len(edges), 2), dtype=np.int64)
+    for index, (peak_a, peak_b) in enumerate(edges):
+        try:
+            edge_rows[index, 0] = id_to_row[int(peak_a)]
+            edge_rows[index, 1] = id_to_row[int(peak_b)]
+        except KeyError as exc:
+            raise ValueError(f"Candidate-ребро ссылается на неизвестный peak_id: {exc.args[0]}") from exc
+
+    order = np.argsort(deltas, kind="mergesort")
+    parent = np.arange(n_events, dtype=np.int64)
+    component_size = np.ones(n_events, dtype=np.int64)
+
+    def find_root(value: int) -> int:
+        root = int(value)
+        while parent[root] != root:
+            parent[root] = parent[int(parent[root])]
+            root = int(parent[root])
+        return root
+
+    components = n_events
+    accepted_edges_at_minimum = 0
+    initial_branch_count = n_events
+    levels: list[dict[str, Any]] = []
+    cumulative_merges = 0
+    index = 0
+    while index < order.size:
+        delta = float(deltas[order[index]])
+        end = index + 1
+        while end < order.size and float(deltas[order[end]]) == delta:
+            end += 1
+        before = components
+        for ordered_index in order[index:end]:
+            row_a, row_b = edge_rows[int(ordered_index)]
+            root_a = find_root(int(row_a))
+            root_b = find_root(int(row_b))
+            if root_a == root_b:
+                continue
+            if component_size[root_a] < component_size[root_b]:
+                root_a, root_b = root_b, root_a
+            parent[root_b] = root_a
+            component_size[root_a] += component_size[root_b]
+            components -= 1
+
+        merges = before - components
+        # Count merges from the beginning of the filtration, including edges
+        # already accepted at the minimum UI gate.  They establish that the
+        # initial plateau contains actual spatially linked components rather
+        # than a collection of isolated peak-events.
+        cumulative_merges += merges
+        if delta <= gate_min:
+            accepted_edges_at_minimum = end
+            initial_branch_count = components
+        elif merges:
+            levels.append({
+                "gate": delta,
+                "branch_count": int(components),
+                "merges_at_level": int(merges),
+                "cumulative_merges": int(cumulative_merges),
+            })
+        index = end
+
+    max_delta = float(np.max(deltas)) if deltas.size else gate_min
+    maximum_gate = max(gate_min * 10.0, max_delta * 1.25, gate_min + 1e-9)
+    stability_window = None
+    candidates: list[dict[str, Any]] = []
+
+    # Include the initial plateau beginning at the smallest gate supported by
+    # the UI.  It can be the strongest stability interval when many local
+    # links have very small |Δθ| and the first cross-component merger is much
+    # farther away.
+    if levels:
+        merges_before = int(n_events - initial_branch_count)
+        merges_after = int(cumulative_merges - merges_before)
+        lower = float(gate_min)
+        upper = float(levels[0]["gate"])
+        ratio = upper / lower if lower > 0.0 else float("inf")
+        if merges_before >= min_merges and merges_after >= 1:
+            candidates.append({
+                "lower_gate": lower,
+                "upper_gate": upper,
+                "recommended_gate": float(np.sqrt(lower * upper)),
+                "branch_count": int(initial_branch_count),
+                "multiplicative_gap": float(ratio),
+                "merges_before": merges_before,
+                "merges_after": merges_after,
+            })
+
+    for level_index in range(len(levels) - 1):
+        left = levels[level_index]
+        right = levels[level_index + 1]
+        merges_before = int(left["cumulative_merges"])
+        merges_after = int(cumulative_merges - merges_before)
+        lower = float(left["gate"])
+        upper = float(right["gate"])
+        ratio = upper / lower if lower > 0.0 else float("inf")
+        if merges_before < min_merges or merges_after < 1:
+            continue
+        recommendation = float(np.sqrt(lower * upper)) if lower > 0.0 else float(upper)
+        candidates.append({
+            "lower_gate": lower,
+            "upper_gate": upper,
+            "recommended_gate": recommendation,
+            "branch_count": int(left["branch_count"]),
+            "multiplicative_gap": float(ratio),
+            "merges_before": merges_before,
+            "merges_after": merges_after,
+        })
+
+    qualifying = [item for item in candidates if item["multiplicative_gap"] >= gap_min]
+    if qualifying:
+        stability_window = max(
+            qualifying,
+            key=lambda item: (item["multiplicative_gap"], item["merges_before"], -item["lower_gate"]),
+        )
+        status = "stable_window_found"
+        recommended_gate = float(stability_window["recommended_gate"])
+    else:
+        status = (
+            "partition_constant" if not levels
+            else "no_robust_stability_window"
+        )
+        recommended_gate = None
+        if candidates:
+            stability_window = max(
+                candidates,
+                key=lambda item: (item["multiplicative_gap"], item["merges_before"], -item["lower_gate"]),
+            )
+
+    return {
+        "method": "weighted_candidate_graph_component_filtration_v1",
+        "status": status,
+        "n_events": n_events,
+        "n_candidate_edges": int(len(edges)),
+        "n_merge_levels": int(len(levels)),
+        "accepted_edges_at_minimum": int(accepted_edges_at_minimum),
+        "minimum_gate": gate_min,
+        "maximum_gate": float(maximum_gate),
+        "initial_branch_count": int(initial_branch_count),
+        "final_branch_count": int(components),
+        "levels": levels,
+        "stability_window": stability_window,
+        "recommended_gate": recommended_gate,
+        "minimum_multiplicative_gap": gap_min,
+        "minimum_merges_before": min_merges,
+    }
 
 
 def label_peak_branches(peak_catalog, edges):
@@ -223,25 +483,24 @@ def branch_analysis_mask(branch_catalog) -> np.ndarray:
     return result
 
 
-def calculate_branch_size_distribution(peak_catalog, theta_gate: float) -> dict[str, Any]:
+def calculate_branch_size_distribution(
+    peak_catalog, theta_gate: float, *, candidate_graph=None,
+) -> dict[str, Any]:
     """Calculate exact global connected-component sizes for the supplied gate."""
-    edges, _ = build_peak_branch_graph(peak_catalog, theta_gate=theta_gate)
-    count, labels = label_peak_branches(peak_catalog, edges)
-    if count <= 0:
-        sizes = np.empty(0, dtype=np.int64)
-    else:
-        sizes = np.bincount(labels.astype(np.int64), minlength=count).astype(np.int64)
+    sizes = _branch_sizes_from_candidate_graph(
+        peak_catalog, candidate_graph, theta_gate
+    )
     recommended, diagnostics = recommend_min_branch_events(sizes)
     return {
         "sizes": sizes.astype(int).tolist(),
         "recommended_min": int(recommended),
         "diagnostics": diagnostics,
-        "n_branches": int(count),
+        "n_branches": int(sizes.size),
         "n_events": int(len(peak_catalog)),
     }
 
 def summarize_peak_spacing(
-    peak_catalog, *, reference_theta_gate: float = 60.0
+    peak_catalog, *, reference_theta_gate: float = 60.0, candidate_graph=None,
 ) -> dict[str, Any]:
     """Per-scan diagnostics for selecting a theta gate.
 
@@ -281,16 +540,10 @@ def summarize_peak_spacing(
             "min_pixel_median_gap": float(np.min(values)),
         })
 
-    neighbour_deltas: list[float] = []
-    for (x, y), peaks_here in lookup.items():
-        for neighbour in ((x + 1, y), (x, y + 1)):
-            peaks_next = lookup.get(neighbour)
-            if not peaks_next:
-                continue
-            matches, _, _ = match_neighbor_peaks(
-                peaks_here, peaks_next, theta_gate=reference_gate
-            )
-            neighbour_deltas.extend(delta for _, _, delta in matches)
+    _candidate_edges, candidate_deltas = _candidate_graph_or_build(
+        peak_catalog, candidate_graph
+    )
+    neighbour_deltas = candidate_deltas[candidate_deltas <= reference_gate].tolist()
     q90 = float(np.percentile(neighbour_deltas, 90)) if neighbour_deltas else None
     min_internal = float(np.min(all_internal)) if all_internal else None
     suggestion = 60.0
