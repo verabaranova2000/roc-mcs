@@ -38,6 +38,31 @@ class VTKToolsSourceContractTests(unittest.TestCase):
         for icon in ("vtk_camera_axis_x.svg", "vtk_camera_axis_y.svg", "vtk_camera_axis_z.svg", "zoom_out_map.svg"):
             self.assertTrue((ICONS / icon).is_file(), icon)
 
+    def test_all_3d_tool_icons_follow_the_application_icon_size(self):
+        source = TOOLS.read_text(encoding="utf-8")
+        start = source.index("    def _set_icon_sizes(self) -> None:")
+        end = source.index("\n    def _color_swatch_icon", start)
+        method = source[start:end]
+        self.assertIn("size = QSize(self._icon_size(), self._icon_size())", method)
+        for control in (
+            "self.volume_source_btn", "self.orientation_btn", "self.camera_btn",
+            "self.overlays_btn", "self.theta_range_btn", "self.theme_btn",
+            "self.perspective_button", "self.camera_axis_buttons.values()",
+            "self.axes_button", "self.bounding_box_button", "self.axis_ticks_button",
+            "self.axis_scale_btn", "self.theta_range_swap_button",
+            "self.theta_range_link_button", "self.axis_scale_reset_btn",
+            "self._overlay_buttons.values()",
+        ):
+            self.assertIn(control, method)
+        # Color swatches intentionally retain their rectangular preview geometry.
+        self.assertNotIn("cursor_color_btn", method)
+        self.assertNotIn("roi_preview_color_btn", method)
+        # Creation-time defaults must not reintroduce fixed-size exceptions:
+        # even compact nested controls follow the shared setting.
+        for fixed_size in ("setIconSize(QSize(18, 18))", "setIconSize(QSize(17, 17))",
+                           "setIconSize(QSize(15, 15))", "setIconSize(QSize(14, 14))"):
+            self.assertNotIn(fixed_size, source)
+
     def test_volume_source_selector_uses_existing_roi_geometry_in_dialog(self):
         toolbar = TOOLS.read_text(encoding="utf-8")
         desktop = DESKTOP.read_text(encoding="utf-8")

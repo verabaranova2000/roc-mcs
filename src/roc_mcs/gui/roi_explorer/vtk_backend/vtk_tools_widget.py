@@ -386,7 +386,7 @@ class VTKToolsWidget(QWidget):
         self.volume_source_btn.setAutoRaise(True)
         self.volume_source_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         self.volume_source_btn.setFixedSize(27, 27)
-        self.volume_source_btn.setIconSize(QSize(18, 18))
+        self.volume_source_btn.setIconSize(QSize(self._icon_size(), self._icon_size()))
         self.volume_source_btn.setToolTip("Источник объёма: прямоугольная ROI")
         self.volume_source_btn.setAccessibleName("Выбор источника объёма")
         self.volume_source_menu = QMenu(self.volume_source_btn)
@@ -415,7 +415,7 @@ class VTKToolsWidget(QWidget):
         self.orientation_btn.setAutoRaise(True)
         self.orientation_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         self.orientation_btn.setFixedSize(27, 27)
-        self.orientation_btn.setIconSize(QSize(18, 18))
+        self.orientation_btn.setIconSize(QSize(self._icon_size(), self._icon_size()))
         self.orientation_btn.setToolTip("Стандартные ракурсы 3D-сцены")
         self.orientation_btn.setAccessibleName("Стандартные ракурсы 3D-сцены")
         self.orientation_menu = QMenu(self.orientation_btn)
@@ -433,7 +433,7 @@ class VTKToolsWidget(QWidget):
         self.camera_btn.setAutoRaise(True)
         self.camera_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         self.camera_btn.setFixedSize(27, 27)
-        self.camera_btn.setIconSize(QSize(18, 18))
+        self.camera_btn.setIconSize(QSize(self._icon_size(), self._icon_size()))
         self.camera_btn.setToolTip("Камера и координатные оси")
         self.camera_btn.setAccessibleName("Камера и координатные оси")
         self.camera_menu = QMenu(self.camera_btn)
@@ -468,7 +468,7 @@ class VTKToolsWidget(QWidget):
         self.theta_range_btn.setAutoRaise(True)
         self.theta_range_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         self.theta_range_btn.setFixedSize(27, 27)
-        self.theta_range_btn.setIconSize(QSize(18, 18))
+        self.theta_range_btn.setIconSize(QSize(self._icon_size(), self._icon_size()))
         self.theta_range_btn.setToolTip(
             "Предпросмотр диапазона θ в 3D · данные и XY-проекция не изменяются"
         )
@@ -825,7 +825,7 @@ class VTKToolsWidget(QWidget):
         self.theta_range_swap_button.setObjectName("VTKThetaRangeComplementButton")
         self.theta_range_swap_button.setAutoRaise(True)
         self.theta_range_swap_button.setFixedSize(22, 22)
-        self.theta_range_swap_button.setIconSize(QSize(15, 15))
+        self.theta_range_swap_button.setIconSize(QSize(self._icon_size(), self._icon_size()))
         self.theta_range_swap_button.setToolTip(
             "Показать противоположный участок θ, оставив общую граничную точку"
         )
@@ -890,7 +890,7 @@ class VTKToolsWidget(QWidget):
         self.theta_range_link_button.setAutoRaise(True)
         self.theta_range_link_button.setCheckable(True)
         self.theta_range_link_button.setFixedSize(20, 20)
-        self.theta_range_link_button.setIconSize(QSize(14, 14))
+        self.theta_range_link_button.setIconSize(QSize(self._icon_size(), self._icon_size()))
         self.theta_range_link_button.setIcon(svg_icon(
             ICON_DIR / "vtk_theta_link_1.svg",
             widget=self.theta_range_link_button, monochrome=True,
@@ -1205,7 +1205,7 @@ class VTKToolsWidget(QWidget):
         self.perspective_button.setAutoRaise(True)
         self.perspective_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
         self.perspective_button.setFixedSize(27, 27)
-        self.perspective_button.setIconSize(QSize(17, 17))
+        self.perspective_button.setIconSize(QSize(self._icon_size(), self._icon_size()))
         self.perspective_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.perspective_button.setToolTip(
             "Стандартный перспективный изометрический ракурс"
@@ -1222,7 +1222,7 @@ class VTKToolsWidget(QWidget):
             button.setAutoRaise(True)
             button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
             button.setFixedSize(27, 27)
-            button.setIconSize(QSize(17, 17))
+            button.setIconSize(QSize(self._icon_size(), self._icon_size()))
             button.setCursor(Qt.CursorShape.PointingHandCursor)
             button.setToolTip(
                 f"Вид вдоль оси {axis.upper()} · ЛКМ: +{axis.upper()}, ПКМ: −{axis.upper()}"
@@ -1251,7 +1251,7 @@ class VTKToolsWidget(QWidget):
             checkable=True,
         )
         self.axes_button.setFixedSize(27, 27)
-        self.axes_button.setIconSize(QSize(17, 17))
+        self.axes_button.setIconSize(QSize(self._icon_size(), self._icon_size()))
         self.axes_button.setChecked(True)
         self.axes_button.toggled.connect(self.axes_toggled.emit)
         strip.addWidget(self.axes_button)
@@ -1263,7 +1263,7 @@ class VTKToolsWidget(QWidget):
             checkable=True,
         )
         self.bounding_box_button.setFixedSize(27, 27)
-        self.bounding_box_button.setIconSize(QSize(17, 17))
+        self.bounding_box_button.setIconSize(QSize(self._icon_size(), self._icon_size()))
         self.bounding_box_button.setChecked(True)
         self.bounding_box_button.toggled.connect(self.bounding_box_toggled.emit)
         strip.addWidget(self.bounding_box_button)
@@ -1272,7 +1272,7 @@ class VTKToolsWidget(QWidget):
         self.axis_ticks_button.setAutoRaise(True)
         self.axis_ticks_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
         self.axis_ticks_button.setFixedSize(27, 27)
-        self.axis_ticks_button.setIconSize(QSize(17, 17))
+        self.axis_ticks_button.setIconSize(QSize(self._icon_size(), self._icon_size()))
         self.axis_ticks_button.setToolTip("Настройки делений и координатной сетки")
         self.axis_ticks_button.setAccessibleName("Настройки делений и координатной сетки")
         self.axis_ticks_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
@@ -1292,7 +1292,7 @@ class VTKToolsWidget(QWidget):
         self.axis_scale_btn = SmartDropdownButton(self._camera_panel)
         self.axis_scale_btn.setAutoRaise(True)
         self.axis_scale_btn.setFixedSize(27, 27)
-        self.axis_scale_btn.setIconSize(QSize(18, 18))
+        self.axis_scale_btn.setIconSize(QSize(self._icon_size(), self._icon_size()))
         self.axis_scale_btn.setToolTip("Масштаб геометрии по X, Y и θ")
         self.axis_scale_btn.setAccessibleName("Масштаб координатных осей")
         self.axis_scale_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
@@ -1427,7 +1427,7 @@ class VTKToolsWidget(QWidget):
         self.axis_scale_reset_btn = QToolButton(panel)
         self.axis_scale_reset_btn.setObjectName("VTKAxisScaleResetButton")
         self.axis_scale_reset_btn.setFixedSize(24, 23)
-        self.axis_scale_reset_btn.setIconSize(QSize(15, 15))
+        self.axis_scale_reset_btn.setIconSize(QSize(self._icon_size(), self._icon_size()))
         self.axis_scale_reset_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.axis_scale_reset_btn.setToolTip(
             "Сбросить коэффициенты к 1,00× (только черновик; нажмите «Применить» для фиксации)"
@@ -1647,12 +1647,14 @@ class VTKToolsWidget(QWidget):
         if not str(icon_name).lower().endswith(".svg"):
             raise ValueError("Для overlay-инструмента требуется имя SVG-иконки.")
 
+        # ``icon_size`` remains in the registration signature for compatibility;
+        # the shared application preference is authoritative for display.
         button = _OverlayToolButton(self._overlays_panel)
         button.setObjectName(f"vtkOverlay_{tool_key}")
         button.setAutoRaise(True)
         button.setCheckable(bool(checkable))
         button.setFixedSize(27, 27)
-        button.setIconSize(QSize(int(icon_size), int(icon_size)))
+        button.setIconSize(QSize(self._icon_size(), self._icon_size()))
         button.setToolTip(str(tooltip))
         button.setAccessibleName(str(tooltip).split("·", 1)[0].strip())
         button.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1978,14 +1980,35 @@ class VTKToolsWidget(QWidget):
             return 16
 
     def _set_icon_sizes(self) -> None:
-        size = self._icon_size()
-        self.reset_btn.setIconSize(QSize(size, size))
-        self.volume_source_btn.setIconSize(QSize(18, 18))
-        self.camera_btn.setIconSize(QSize(18, 18))
-        self.orientation_btn.setIconSize(QSize(18, 18))
-        self.overlays_btn.setIconSize(QSize(18, 18))
-        self.theta_range_btn.setIconSize(QSize(18, 18))
-        self.theme_btn.setIconSize(QSize(17, 17))
+        """Apply the application-wide icon size to every 3D tool icon.
+
+        Colour swatches are intentionally excluded: their rectangular preview
+        geometry is part of the colour-control affordance, not an icon-size
+        preference.  Text-only popup controls are excluded as well.
+        """
+        size = QSize(self._icon_size(), self._icon_size())
+        icon_buttons = (
+            self.reset_btn,
+            self.volume_source_btn,
+            self.orientation_btn,
+            self.camera_btn,
+            self.overlays_btn,
+            self.theta_range_btn,
+            self.theme_btn,
+            self.perspective_button,
+            *self.camera_axis_buttons.values(),
+            self.axes_button,
+            self.bounding_box_button,
+            self.axis_ticks_button,
+            self.axis_scale_btn,
+            self.theta_range_swap_button,
+            self.theta_range_link_button,
+            self.axis_scale_reset_btn,
+            *self._overlay_buttons.values(),
+        )
+        for button in icon_buttons:
+            if button is not None and not button.icon().isNull():
+                button.setIconSize(size)
 
     def _color_swatch_icon(self, color: str) -> QIcon:
         pixmap = QPixmap(22, 16)

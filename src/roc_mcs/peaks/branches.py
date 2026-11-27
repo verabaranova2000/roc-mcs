@@ -159,63 +159,107 @@ def scan_theta_gate_stability(
     *,
     candidate_graph=None,
     minimum_gate: float = 0.001,
-    minimum_multiplicative_gap: float = 4.0,
-    minimum_merges_before: int = 2,
+    reference_gate: float | None = None,
 ) -> dict[str, Any]:
-    """Scan the exact connected-component filtration induced by ``theta_gate``.
+    """Return the exact component-count filtration for the weighted peak graph.
 
-    Each Hungarian one-to-one neighbour assignment is fixed before the gate is
-    applied.  Increasing the gate therefore only adds weighted edges in order
-    of ``|Δθ|``.  A union-find sweep visits all distinct component-merger levels
-    exactly, without repeatedly rebuilding the graph for a parameter grid.
+    The Hungarian one-to-one assignment for each pair of 4-connected detector
+    pixels is calculated once, independently of the finite gate.  Increasing
+    ``theta_gate`` therefore only adds candidate edges in nondecreasing
+    ``|Δθ|`` order.  A union-find sweep visits every distinct edge-weight level
+    in ``O((V + E) α(V) + E log E)`` time, without rebuilding a sparse graph
+    for a grid of trial thresholds.
 
-    A recommendation is emitted only for a broad *stability window*: either
-    the initial interval from the UI's minimum gate to the first later merge,
-    or an interval between consecutive merge-causing edge weights.  In each
-    case the full connected-component partition is unchanged.  The selected
-    point is the geometric midpoint of the widest qualifying multiplicative
-    interval.
-    This is deliberately not presented as a universal elbow or physical law.
+    This function is deliberately descriptive: it does *not* choose a gate
+    from the widest plateau, an elbow, a prescribed number of domains, or a
+    component-size heuristic.  When ``reference_gate`` is supplied, the result
+    includes the exact half-open interval ``[lower_gate, upper_gate)`` over
+    which the component partition containing that reference value is
+    unchanged.  ``upper_gate=None`` means that no higher-weight edge can merge
+    components, so the interval is unbounded above.
+
+    The gate recommendation is produced separately by
+    :func:`summarize_peak_spacing`; the filtration only explains the topology
+    at that recommended value and how it changes nearby.
     """
     gate_min = _validate_theta_gate(minimum_gate)
-    gap_min = float(minimum_multiplicative_gap)
-    if not np.isfinite(gap_min) or gap_min <= 1.0:
-        raise ValueError("minimum_multiplicative_gap должен быть конечным числом больше 1")
-    min_merges = max(1, int(minimum_merges_before))
+    reference = None
+    if reference_gate is not None:
+        reference = _validate_theta_gate(reference_gate)
+        if reference < gate_min:
+            raise ValueError("reference_gate должен быть не меньше minimum_gate")
 
     ids, _, _, _ = _validate_catalog(peak_catalog)
     n_events = int(ids.size)
+
+    def maximum_scan_gate(max_delta: float | None = None) -> float:
+        candidates = [gate_min * 10.0, gate_min + 1e-9, 0.01]
+        if max_delta is not None and np.isfinite(max_delta):
+            candidates.append(float(max_delta) * 1.25)
+        if reference is not None:
+            # Keep the independent reference/fallback inside the visible x-domain
+            # even when the candidate graph has no edges or all weights are lower.
+            candidates.append(float(reference) * 1.25)
+        return float(max(candidates))
+
+    def make_reference_window(
+        *, initial_count: int, levels: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        if reference is None or n_events == 0:
+            return None
+        lower = float(gate_min)
+        upper: float | None = None
+        branch_count = int(initial_count)
+        for item in levels:
+            level_gate = float(item["gate"])
+            if level_gate <= reference:
+                lower = level_gate
+                branch_count = int(item["branch_count"])
+            else:
+                upper = level_gate
+                break
+        return {
+            "reference_gate": float(reference),
+            "lower_gate": lower,
+            "upper_gate": upper,
+            "branch_count": branch_count,
+            "upper_unbounded": upper is None,
+        }
+
     if n_events == 0:
         return {
-            "method": "weighted_candidate_graph_component_filtration_v1",
+            "method": "weighted_candidate_graph_component_filtration_v2",
             "status": "empty",
             "n_events": 0,
             "n_candidate_edges": 0,
             "n_merge_levels": 0,
             "minimum_gate": gate_min,
-            "maximum_gate": max(gate_min * 10.0, 0.01),
+            "maximum_gate": maximum_scan_gate(),
             "initial_branch_count": 0,
             "final_branch_count": 0,
             "levels": [],
-            "stability_window": None,
-            "recommended_gate": None,
+            "reference_window": None,
+            "reference_gate": reference,
         }
 
     edges, deltas = _candidate_graph_or_build(peak_catalog, candidate_graph)
     if not edges:
+        reference_window = make_reference_window(
+            initial_count=n_events, levels=[]
+        )
         return {
-            "method": "weighted_candidate_graph_component_filtration_v1",
+            "method": "weighted_candidate_graph_component_filtration_v2",
             "status": "no_candidate_edges",
             "n_events": n_events,
             "n_candidate_edges": 0,
             "n_merge_levels": 0,
             "minimum_gate": gate_min,
-            "maximum_gate": max(gate_min * 10.0, 0.01),
+            "maximum_gate": maximum_scan_gate(),
             "initial_branch_count": n_events,
             "final_branch_count": n_events,
             "levels": [],
-            "stability_window": None,
-            "recommended_gate": None,
+            "reference_window": reference_window,
+            "reference_gate": reference,
         }
 
     id_to_row = {int(peak_id): row for row, peak_id in enumerate(ids)}
@@ -225,7 +269,9 @@ def scan_theta_gate_stability(
             edge_rows[index, 0] = id_to_row[int(peak_a)]
             edge_rows[index, 1] = id_to_row[int(peak_b)]
         except KeyError as exc:
-            raise ValueError(f"Candidate-ребро ссылается на неизвестный peak_id: {exc.args[0]}") from exc
+            raise ValueError(
+                f"Candidate-ребро ссылается на неизвестный peak_id: {exc.args[0]}"
+            ) from exc
 
     order = np.argsort(deltas, kind="mergesort")
     parent = np.arange(n_events, dtype=np.int64)
@@ -242,7 +288,6 @@ def scan_theta_gate_stability(
     accepted_edges_at_minimum = 0
     initial_branch_count = n_events
     levels: list[dict[str, Any]] = []
-    cumulative_merges = 0
     index = 0
     while index < order.size:
         delta = float(deltas[order[index]])
@@ -263,92 +308,28 @@ def scan_theta_gate_stability(
             components -= 1
 
         merges = before - components
-        # Count merges from the beginning of the filtration, including edges
-        # already accepted at the minimum UI gate.  They establish that the
-        # initial plateau contains actual spatially linked components rather
-        # than a collection of isolated peak-events.
-        cumulative_merges += merges
         if delta <= gate_min:
             accepted_edges_at_minimum = end
             initial_branch_count = components
         elif merges:
+            # Equal edge weights are handled as one level.  The reported count
+            # is therefore the partition after *all* edges at this exact gate
+            # have been admitted, matching the inclusive production rule.
             levels.append({
                 "gate": delta,
                 "branch_count": int(components),
                 "merges_at_level": int(merges),
-                "cumulative_merges": int(cumulative_merges),
             })
         index = end
 
     max_delta = float(np.max(deltas)) if deltas.size else gate_min
-    maximum_gate = max(gate_min * 10.0, max_delta * 1.25, gate_min + 1e-9)
-    stability_window = None
-    candidates: list[dict[str, Any]] = []
-
-    # Include the initial plateau beginning at the smallest gate supported by
-    # the UI.  It can be the strongest stability interval when many local
-    # links have very small |Δθ| and the first cross-component merger is much
-    # farther away.
-    if levels:
-        merges_before = int(n_events - initial_branch_count)
-        merges_after = int(cumulative_merges - merges_before)
-        lower = float(gate_min)
-        upper = float(levels[0]["gate"])
-        ratio = upper / lower if lower > 0.0 else float("inf")
-        if merges_before >= min_merges and merges_after >= 1:
-            candidates.append({
-                "lower_gate": lower,
-                "upper_gate": upper,
-                "recommended_gate": float(np.sqrt(lower * upper)),
-                "branch_count": int(initial_branch_count),
-                "multiplicative_gap": float(ratio),
-                "merges_before": merges_before,
-                "merges_after": merges_after,
-            })
-
-    for level_index in range(len(levels) - 1):
-        left = levels[level_index]
-        right = levels[level_index + 1]
-        merges_before = int(left["cumulative_merges"])
-        merges_after = int(cumulative_merges - merges_before)
-        lower = float(left["gate"])
-        upper = float(right["gate"])
-        ratio = upper / lower if lower > 0.0 else float("inf")
-        if merges_before < min_merges or merges_after < 1:
-            continue
-        recommendation = float(np.sqrt(lower * upper)) if lower > 0.0 else float(upper)
-        candidates.append({
-            "lower_gate": lower,
-            "upper_gate": upper,
-            "recommended_gate": recommendation,
-            "branch_count": int(left["branch_count"]),
-            "multiplicative_gap": float(ratio),
-            "merges_before": merges_before,
-            "merges_after": merges_after,
-        })
-
-    qualifying = [item for item in candidates if item["multiplicative_gap"] >= gap_min]
-    if qualifying:
-        stability_window = max(
-            qualifying,
-            key=lambda item: (item["multiplicative_gap"], item["merges_before"], -item["lower_gate"]),
-        )
-        status = "stable_window_found"
-        recommended_gate = float(stability_window["recommended_gate"])
-    else:
-        status = (
-            "partition_constant" if not levels
-            else "no_robust_stability_window"
-        )
-        recommended_gate = None
-        if candidates:
-            stability_window = max(
-                candidates,
-                key=lambda item: (item["multiplicative_gap"], item["merges_before"], -item["lower_gate"]),
-            )
-
+    maximum_gate = maximum_scan_gate(max_delta)
+    reference_window = make_reference_window(
+        initial_count=initial_branch_count, levels=levels
+    )
+    status = "partition_constant" if not levels else "scan_complete"
     return {
-        "method": "weighted_candidate_graph_component_filtration_v1",
+        "method": "weighted_candidate_graph_component_filtration_v2",
         "status": status,
         "n_events": n_events,
         "n_candidate_edges": int(len(edges)),
@@ -359,10 +340,8 @@ def scan_theta_gate_stability(
         "initial_branch_count": int(initial_branch_count),
         "final_branch_count": int(components),
         "levels": levels,
-        "stability_window": stability_window,
-        "recommended_gate": recommended_gate,
-        "minimum_multiplicative_gap": gap_min,
-        "minimum_merges_before": min_merges,
+        "reference_window": reference_window,
+        "reference_gate": reference,
     }
 
 
@@ -547,23 +526,28 @@ def summarize_peak_spacing(
     q90 = float(np.percentile(neighbour_deltas, 90)) if neighbour_deltas else None
     min_internal = float(np.min(all_internal)) if all_internal else None
     suggestion = 60.0
+    recommendation_is_data_derived = False
     status = (
-        "Недостаточно данных для автоматической оценки; начальное значение 60″ "
-        "задано как рабочая настройка."
+        "Недостаточно данных для разделяющей оценки Q90 < минимальный "
+        "внутрипиксельный зазор; сохранено рабочее значение 60″."
     )
     if q90 is not None and min_internal is not None and q90 < min_internal:
+        # Preserve the established notebook rule exactly.  The graph scan is
+        # a topological cross-check, not a second estimator that may override it.
         suggestion = float(q90 + 0.25 * (min_internal - q90))
+        recommendation_is_data_derived = True
         status = (
-            f"Q90 рассчитан по принятым one-to-one связям при опорном gate "
-            f"{reference_gate:g}″. Рекомендация находится между этим Q90 и "
-            "минимальной пиксельной медианой внутреннего промежутка; это старт "
-            "для sensitivity analysis, не физический закон."
+            f"Q90 рассчитан по one-to-one связям, принятым при опорном gate "
+            f"{reference_gate:g}″. Порог расположен на 25% интервала от Q90 "
+            "соседних связей к минимальной медиане внутрипиксельных зазоров "
+            "(для пикселей с 2–5 пиками); это эмпирическое стартовое правило, "
+            "не физический закон."
         )
     elif q90 is not None and min_internal is not None:
         status = (
-            f"При опорном gate {reference_gate:g}″ интервал Q90 соседних связей "
-            "< min internal gap не разделён; исходное значение оставлено как старт, "
-            "требуется анализ чувствительности."
+            f"При опорном gate {reference_gate:g}″ не выполняется Q90 < "
+            "минимальный внутрипиксельный зазор; сохранено рабочее значение 60″. "
+            "Граф чувствительности остаётся доступен для ручной проверки."
         )
     return {
         "n_events": int(ids.size),
@@ -573,6 +557,8 @@ def summarize_peak_spacing(
         "q90_neighbor_delta": q90,
         "min_internal_gap": min_internal,
         "recommended_theta_gate": suggestion,
+        "recommendation_method": "q90_to_min_internal_gap_v1",
+        "recommendation_is_data_derived": bool(recommendation_is_data_derived),
         "recommendation_status": status,
         "internal_gap_by_n": rows,
         "theta_unit": "arcsec",

@@ -24,6 +24,7 @@ class ThetaGateSensitivityPlot(QWidget):
         super().__init__(parent)
         self._scan: dict[str, Any] | None = None
         self._gate = 60.0
+        self._recommended_gate: float | None = None
         self._dragging = False
         self._level_gates = np.empty(0, dtype=np.float64)
         self._level_counts = np.empty(0, dtype=np.int64)
@@ -36,8 +37,11 @@ class ThetaGateSensitivityPlot(QWidget):
         self.setAccessibleName("Зависимость числа дифракционных ветвей от θ-gate")
         self.setToolTip(
             "Ступенчатая кривая показывает точное число компонент связности при каждом θ-gate. "
-            "Выделенная полоса — диапазон, внутри которого разбиение на ветви не меняется. "
-            "Перетащите вертикальный указатель, чтобы изменить θ-gate."
+            "Полоса отмечает точный интервал неизменного разбиения вокруг опорного значения; "
+            "пунктир — оценка по Q90 и внутрипиксельным зазорам (либо рабочее значение 60″, "
+            "если правило не выделило разделяющий интервал Q90 < G_min), сплошной указатель — "
+            "текущее редактируемое значение. "
+            "Перетащите сплошной указатель, чтобы изменить θ-gate."
         )
 
     def sizeHint(self) -> QSize:
@@ -61,6 +65,19 @@ class ThetaGateSensitivityPlot(QWidget):
             dtype=np.int64,
         )
         self._curve_path = None
+        self.update()
+
+    def set_recommended_gate(self, value: float | None) -> None:
+        """Set the independent spacing-estimate / fallback reference marker."""
+        if value is None:
+            self._recommended_gate = None
+        else:
+            try:
+                gate = float(value)
+            except (TypeError, ValueError, OverflowError):
+                self._recommended_gate = None
+            else:
+                self._recommended_gate = gate if np.isfinite(gate) and gate > 0.0 else None
         self.update()
 
     def set_gate(self, value: float, *, emit: bool = False) -> None:
@@ -163,6 +180,8 @@ class ThetaGateSensitivityPlot(QWidget):
         detail_font = QFont(painter.font())
         detail_font.setPointSizeF(max(6.5, detail_font.pointSizeF() * 0.88))
         detail_font.setWeight(QFont.Weight.Normal)
+        tick_font = QFont(detail_font)
+        tick_font.setPointSizeF(max(5.5, detail_font.pointSizeF() * 0.76))
         painter.setFont(detail_font)
         gate_count = self._branch_count_at_gate(self._gate)
         current_text = f"θ={self._gate:.4g}″"
@@ -206,11 +225,17 @@ class ThetaGateSensitivityPlot(QWidget):
             pad = max(0.5, (y_max - y_min) * 0.06)
             y_low, y_high = max(0.0, y_min - pad), y_max + pad
 
-        # A stability band marks an interval where no component merger occurs.
-        stability = scan.get("stability_window")
-        if isinstance(stability, dict) and scan.get("status") == "stable_window_found":
-            band_left = self._x_for_gate(float(stability["lower_gate"]), left, right)
-            band_right = self._x_for_gate(float(stability["upper_gate"]), left, right)
+        # Shade only the exact plateau containing the independent spacing
+        # reference value (estimate or documented fallback).  The scan does
+        # not rank plateaus or select a gate.
+        reference_window = scan.get("reference_window")
+        if isinstance(reference_window, dict):
+            band_left = self._x_for_gate(float(reference_window["lower_gate"]), left, right)
+            upper_gate = reference_window.get("upper_gate")
+            band_right = (
+                right if upper_gate is None
+                else self._x_for_gate(float(upper_gate), left, right)
+            )
             band = QColor(accent)
             band.setAlpha(34)
             painter.setPen(Qt.PenStyle.NoPen)
@@ -242,8 +267,10 @@ class ThetaGateSensitivityPlot(QWidget):
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawPath(self._curve_path)
 
-        # Sparse logarithmic decade ticks preserve legibility on compact widths.
-        painter.setFont(detail_font)
+        # Compact tick labels are intentionally smaller than the chart's
+        # supporting text; the logarithmic decade grid remains legible at the
+        # narrow embedded-form width.
+        painter.setFont(tick_font)
         painter.setPen(QPen(muted, 1.0))
         log_min, log_max = np.log10(x_min), np.log10(x_max)
         first_power = int(np.ceil(log_min))
@@ -260,6 +287,25 @@ class ThetaGateSensitivityPlot(QWidget):
                 int(x - 20), int(bottom + 11), 40, 10,
                 Qt.AlignmentFlag.AlignHCenter, f"{value:g}",
             )
+
+        # The recommendation is a non-interactive dashed guide.  The solid
+        # marker remains the only draggable control and is linked to the form.
+        if self._recommended_gate is not None and not np.isclose(
+            self._recommended_gate, self._gate, rtol=1e-10, atol=1e-12
+        ):
+            x_recommended = self._x_for_gate(self._recommended_gate, left, right)
+            recommended_pen = QColor(palette.color(palette.ColorRole.Link))
+            painter.setPen(QPen(recommended_pen, 1.0, Qt.PenStyle.DashLine))
+            painter.drawLine(
+                int(x_recommended), int(top + 2), int(x_recommended), int(bottom)
+            )
+            painter.setBrush(QBrush(recommended_pen))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawPolygon(QPolygon([
+                QPoint(int(x_recommended), int(top + 1)),
+                QPoint(int(x_recommended - 3), int(top + 5)),
+                QPoint(int(x_recommended + 3), int(top + 5)),
+            ]))
 
         # Selected gate is the only draggable control; it is linked to the form.
         x_gate = self._x_for_gate(self._gate, left, right)
@@ -286,7 +332,9 @@ class ThetaGateSensitivityPlot(QWidget):
                 QPoint(edge_x - direction * 7, int(top - 5)),
             ]))
 
-        # Compact axis labels; units are stated once.
+        # Compact axis labels; units are stated once.  Numeric tick labels use
+        # the smaller tick font, while the axis caption keeps supporting size.
+        painter.setFont(tick_font)
         painter.setPen(QPen(muted, 1.0))
         y_span = max(1e-12, y_high - y_low)
         y_for_data_max = bottom - ((float(y_max) - y_low) / y_span) * (bottom - top)
@@ -305,6 +353,7 @@ class ThetaGateSensitivityPlot(QWidget):
                 1, int(y_for_data_min - 5), 38, 10, Qt.AlignmentFlag.AlignRight,
                 f"{y_min:,}",
             )
+        painter.setFont(detail_font)
         painter.drawText(
             int(max(left, (left + right) / 2 - 48)), int(self.height() - 12),
             96, 10, Qt.AlignmentFlag.AlignHCenter, "θ-gate, ″ · лог. шкала",

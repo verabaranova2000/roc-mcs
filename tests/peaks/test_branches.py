@@ -77,6 +77,8 @@ def test_spacing_diagnostics_use_pixel_medians_and_recommend_gate_between_limits
     assert row["min_pixel_median_gap"] == pytest.approx(300.0)
     assert stats["q90_neighbor_delta"] == pytest.approx(5.0)
     assert stats["recommended_theta_gate"] == pytest.approx(78.75)
+    assert stats["recommendation_method"] == "q90_to_min_internal_gap_v1"
+    assert stats["recommendation_is_data_derived"] is True
     assert stats["theta_unit"] == "arcsec"
 
 
@@ -111,6 +113,21 @@ def test_notebook_reference_example_recommends_sixty_arcseconds():
     assert stats["q90_neighbor_delta"] == pytest.approx(45.0)
     assert stats["min_internal_gap"] == pytest.approx(105.0)
     assert stats["recommended_theta_gate"] == pytest.approx(60.0)
+    assert stats["recommendation_is_data_derived"] is True
+
+
+def test_spacing_estimate_uses_documented_fallback_when_q90_is_not_below_internal_gap():
+    catalog = pd.DataFrame([
+        {"peak_id": 0, "x": 0, "y": 0, "theta": 100.0},
+        {"peak_id": 1, "x": 0, "y": 0, "theta": 105.0},
+        {"peak_id": 2, "x": 1, "y": 0, "theta": 110.0},
+    ])
+
+    stats = summarize_peak_spacing(catalog, reference_theta_gate=60.0)
+    assert stats["q90_neighbor_delta"] >= stats["min_internal_gap"]
+    assert stats["recommended_theta_gate"] == pytest.approx(60.0)
+    assert stats["recommendation_is_data_derived"] is False
+    assert "не выполняется Q90 <" in stats["recommendation_status"]
 
 
 def test_zero_internal_gap_is_not_discarded_from_diagnostics():
@@ -313,7 +330,7 @@ def test_branch_inclusion_flags_roundtrip_in_immutable_artifact(tmp_path):
     assert restored.metadata["branch_selection"]["preserves_all_catalog_rows"] is True
 
 
-def test_theta_gate_scan_is_exact_component_filtration_and_recommends_stable_gap():
+def test_theta_gate_scan_is_exact_filtration_and_reports_reference_plateau():
     # A four-edge chain with distinct |Δθ| levels: 1, 2, 20, 100 arcsec.
     catalog = pd.DataFrame([
         {"peak_id": 0, "x": 0, "y": 0, "theta": 0.0},
@@ -323,21 +340,28 @@ def test_theta_gate_scan_is_exact_component_filtration_and_recommends_stable_gap
         {"peak_id": 4, "x": 4, "y": 0, "theta": 123.0},
     ])
     candidate_graph = build_peak_branch_candidate_graph(catalog)
-    scan = scan_theta_gate_stability(catalog, candidate_graph=candidate_graph)
+    reference_gate = float(np.sqrt(40.0))
+    scan = scan_theta_gate_stability(
+        catalog, candidate_graph=candidate_graph, reference_gate=reference_gate
+    )
 
-    assert scan["status"] == "stable_window_found"
+    assert scan["method"] == "weighted_candidate_graph_component_filtration_v2"
+    assert scan["status"] == "scan_complete"
     assert [level["gate"] for level in scan["levels"]] == [1.0, 2.0, 20.0, 100.0]
     assert [level["branch_count"] for level in scan["levels"]] == [4, 3, 2, 1]
-    window = scan["stability_window"]
+    window = scan["reference_window"]
     assert window["lower_gate"] == pytest.approx(2.0)
     assert window["upper_gate"] == pytest.approx(20.0)
-    assert window["multiplicative_gap"] == pytest.approx(10.0)
-    assert scan["recommended_gate"] == pytest.approx(np.sqrt(40.0))
+    assert window["branch_count"] == 3
+    assert window["upper_unbounded"] is False
+    # The filtration is diagnostic: it deliberately has no recommendation.
+    assert "recommended_gate" not in scan
+    assert "stability_window" not in scan
 
     from roc_mcs.peaks.branches import calculate_branch_size_distribution
-    uncached_sizes = calculate_branch_size_distribution(catalog, scan["recommended_gate"])
+    uncached_sizes = calculate_branch_size_distribution(catalog, reference_gate)
     cached_sizes = calculate_branch_size_distribution(
-        catalog, scan["recommended_gate"], candidate_graph=candidate_graph
+        catalog, reference_gate, candidate_graph=candidate_graph
     )
     assert sorted(uncached_sizes["sizes"]) == sorted(cached_sizes["sizes"])
 
@@ -346,14 +370,35 @@ def test_theta_gate_scan_is_exact_component_filtration_and_recommends_stable_gap
     for gate in (0.001, 1.0, 1.5, 2.0, 19.99, 20.0, 100.0):
         edges, _ = build_peak_branch_graph(catalog, theta_gate=gate)
         expected, _labels = label_peak_branches(catalog, edges)
-        observed = scan["initial_branch_count"]
+        observed = int(scan["initial_branch_count"])
         for level in scan["levels"]:
             if level["gate"] <= gate:
-                observed = level["branch_count"]
+                observed = int(level["branch_count"])
         assert observed == expected
 
 
-def test_theta_gate_scan_does_not_invent_an_elbow_when_no_wide_window_exists():
+def test_branch_size_distribution_reuses_cached_candidate_graph(monkeypatch):
+    import roc_mcs.peaks.branches as branches
+
+    catalog = pd.DataFrame([
+        {"peak_id": 0, "x": 0, "y": 0, "theta": 0.0},
+        {"peak_id": 1, "x": 1, "y": 0, "theta": 2.0},
+        {"peak_id": 2, "x": 2, "y": 0, "theta": 4.0},
+    ])
+    candidate_graph = build_peak_branch_candidate_graph(catalog)
+
+    def unexpected_rebuild(_catalog):
+        raise AssertionError("cached graph path must not repeat Hungarian assignments")
+
+    monkeypatch.setattr(branches, "build_peak_branch_candidate_graph", unexpected_rebuild)
+    cached = branches.calculate_branch_size_distribution(
+        catalog, theta_gate=2.0, candidate_graph=candidate_graph
+    )
+    assert cached["sizes"] == [3]
+    assert cached["n_branches"] == 1
+
+
+def test_theta_gate_scan_reports_local_plateau_without_ranking_other_plateaus():
     catalog = pd.DataFrame([
         {"peak_id": 0, "x": 0, "y": 0, "theta": 0.0},
         {"peak_id": 1, "x": 1, "y": 0, "theta": 1.0},
@@ -361,9 +406,13 @@ def test_theta_gate_scan_does_not_invent_an_elbow_when_no_wide_window_exists():
         {"peak_id": 3, "x": 3, "y": 0, "theta": 6.0},
         {"peak_id": 4, "x": 4, "y": 0, "theta": 10.0},
     ])
-    scan = scan_theta_gate_stability(catalog)
-    assert scan["status"] == "no_robust_stability_window"
-    assert scan["recommended_gate"] is None
+    scan = scan_theta_gate_stability(catalog, reference_gate=2.5)
+    window = scan["reference_window"]
+    assert scan["status"] == "scan_complete"
+    assert window["lower_gate"] == pytest.approx(2.0)
+    assert window["upper_gate"] == pytest.approx(3.0)
+    assert window["branch_count"] == 3
+    assert "recommended_gate" not in scan
 
 
 def test_theta_gate_scan_handles_zero_weight_edges_and_empty_neighbour_graph():
@@ -372,42 +421,67 @@ def test_theta_gate_scan_handles_zero_weight_edges_and_empty_neighbour_graph():
         {"peak_id": 1, "x": 1, "y": 0, "theta": 5.0},
         {"peak_id": 2, "x": 3, "y": 0, "theta": 100.0},
     ])
-    scan = scan_theta_gate_stability(same_theta)
+    scan = scan_theta_gate_stability(same_theta, reference_gate=0.001)
     assert scan["initial_branch_count"] == 2
     assert scan["n_candidate_edges"] == 1
     assert scan["n_merge_levels"] == 0
     assert scan["status"] == "partition_constant"
-    assert scan["recommended_gate"] is None
+    assert scan["reference_window"]["lower_gate"] == pytest.approx(0.001)
+    assert scan["reference_window"]["upper_gate"] is None
+    assert scan["reference_window"]["branch_count"] == 2
 
     isolated = pd.DataFrame([
         {"peak_id": 10, "x": 0, "y": 0, "theta": 5.0},
         {"peak_id": 11, "x": 4, "y": 4, "theta": 100.0},
     ])
-    no_edges = scan_theta_gate_stability(isolated)
+    no_edges = scan_theta_gate_stability(isolated, reference_gate=0.01)
     assert no_edges["status"] == "no_candidate_edges"
     assert no_edges["initial_branch_count"] == 2
+    assert no_edges["reference_window"]["upper_gate"] is None
+
+    # The visible scan domain must still include the reference value even when
+    # there are no candidate edges to define a natural upper bound.
+    no_edges_at_fallback = scan_theta_gate_stability(isolated, reference_gate=60.0)
+    assert no_edges_at_fallback["maximum_gate"] > 60.0
+    empty = pd.DataFrame(columns=("peak_id", "x", "y", "theta"))
+    empty_scan = scan_theta_gate_stability(empty, reference_gate=60.0)
+    assert empty_scan["status"] == "empty"
+    assert empty_scan["maximum_gate"] > 60.0
 
 
-def test_theta_gate_scan_can_recommend_initial_stable_plateau_after_small_local_merges():
-    # Two local links are already active at the UI's minimum gate.  A much
-    # larger third link would merge their components, leaving a broad initial
-    # interval with a stable two-component partition.
+def test_theta_gate_scan_includes_all_equal_weight_merges_at_reference_gate():
+    catalog = pd.DataFrame([
+        {"peak_id": 0, "x": 0, "y": 0, "theta": 0.0},
+        {"peak_id": 1, "x": 1, "y": 0, "theta": 1.0},
+        {"peak_id": 2, "x": 3, "y": 0, "theta": 0.0},
+        {"peak_id": 3, "x": 4, "y": 0, "theta": 1.0},
+    ])
+    scan = scan_theta_gate_stability(catalog, reference_gate=1.0)
+    assert scan["reference_window"]["lower_gate"] == pytest.approx(1.0)
+    assert scan["reference_window"]["upper_gate"] is None
+    # The two candidate edges at the same exact weight are both included by
+    # the production <= gate condition; both components have merged.
+    assert scan["reference_window"]["branch_count"] == 2
+    assert scan["levels"][0]["branch_count"] == 2
+
+
+def test_theta_gate_scan_reports_initial_plateau_after_small_local_merges():
+    # Two local links are already active at the UI's minimum gate.  The scan
+    # reports the exact partition containing the supplied reference value;
+    # it does not rank this plateau or invent a gate from its width.
     catalog = pd.DataFrame([
         {"peak_id": 0, "x": 0, "y": 0, "theta": 0.0},
         {"peak_id": 1, "x": 1, "y": 0, "theta": 0.0001},
         {"peak_id": 2, "x": 2, "y": 0, "theta": 0.0003},
         {"peak_id": 3, "x": 3, "y": 0, "theta": 1.0003},
     ])
-    scan = scan_theta_gate_stability(catalog)
-
-    assert scan["status"] == "stable_window_found"
-    window = scan["stability_window"]
+    scan = scan_theta_gate_stability(catalog, reference_gate=0.5)
+    window = scan["reference_window"]
+    assert scan["status"] == "scan_complete"
     assert window["lower_gate"] == pytest.approx(0.001)
     assert window["upper_gate"] == pytest.approx(1.0)
     assert window["branch_count"] == 2
-    assert window["merges_before"] == 2
-    assert window["merges_after"] == 1
-    assert scan["recommended_gate"] == pytest.approx(np.sqrt(0.001))
+    assert "recommended_gate" not in scan
 
 
 def test_theta_gate_filtration_matches_production_graph_on_small_random_catalogs():
