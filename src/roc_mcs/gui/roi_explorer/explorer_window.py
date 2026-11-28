@@ -308,11 +308,13 @@ class RockingCurveExplorerWindow(QMainWindow):
         size = QSize(self._global_icon_size(), self._global_icon_size())
         for button in self.findChildren(QAbstractButton):
             if not button.icon().isNull(): button.setIconSize(size)
-        # Generic icon propagation above also visits VTK popup buttons. Re-run
-        # the 3D toolbar's geometry policy afterwards so its compact subcontrols
-        # and main-row button proportions remain consistent with 2D/ROC.
+        # Embedded tools that own icon-to-control geometry reapply that policy
+        # after this generic icon-size pass. Keep the explicit VTK object-name
+        # check as a guard for the native toolbar's geometry contract.
         for widget in self.findChildren(QWidget):
-            if widget.objectName() == "EmbeddedVTKVolumeWidget":
+            is_vtk_widget = widget.objectName() == "EmbeddedVTKVolumeWidget"
+            is_workbench_widget = widget.objectName() == "processingWorkbenchWidget"
+            if is_vtk_widget or is_workbench_widget:
                 apply_icon_size = getattr(widget, "apply_global_icon_size", None)
                 if callable(apply_icon_size):
                     apply_icon_size()

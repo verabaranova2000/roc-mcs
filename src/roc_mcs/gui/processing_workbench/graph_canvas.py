@@ -265,6 +265,7 @@ class ProcessingGraphView(QGraphicsView):
         self._history: WorkflowHistory | None = None
         self._selected_id: str | None = None
         self._show_rejected = False
+        self.setObjectName("processingGraphView")
         self._vertical_scroll_enabled = True
         self.setRenderHints(
             QPainter.RenderHint.Antialiasing
@@ -540,9 +541,44 @@ class ProcessingGraphView(QGraphicsView):
 
     def wheelEvent(self, event) -> None:
         if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
-            factor = 1.15 if event.angleDelta().y() > 0 else (1.0 / 1.15)
-            self.scale(factor, factor)
-            self.view_transform_changed.emit()
+            delta = event.angleDelta().y() or event.pixelDelta().y()
+            if delta:
+                factor = 1.15 if delta > 0 else (1.0 / 1.15)
+                self.scale(factor, factor)
+                self.view_transform_changed.emit()
             event.accept()
             return
-        super().wheelEvent(event)
+
+        # In the compact sidebar the graph is nested inside the outer
+        # leftSidebarScroll. QWidget's default wheelEvent ignores an event at
+        # the scrollbar limit, which then bubbles to the outer area and moves
+        # the whole sidebar away from the graph. Own the complete wheel gesture
+        # whenever the inner DAG really has a vertical range, including at both
+        # limits. If it has no range (full-height mode), deliberately ignore the
+        # event so the outer sidebar can scroll instead.
+        if self._vertical_scroll_enabled:
+            bar = self.verticalScrollBar()
+            has_internal_range = bar.maximum() > bar.minimum()
+            if has_internal_range:
+                pixel_delta = int(event.pixelDelta().y())
+                angle_delta = int(event.angleDelta().y())
+                if pixel_delta:
+                    scroll_delta = pixel_delta
+                elif angle_delta:
+                    # One wheel notch follows the familiar three-line rhythm;
+                    # use at least 20 logical pixels even if the style reports
+                    # a one-pixel singleStep for a graphics view.
+                    line_step = max(20, int(bar.singleStep()))
+                    scroll_delta = int(round((angle_delta / 120.0) * line_step * 3))
+                else:
+                    scroll_delta = 0
+
+                if scroll_delta:
+                    bar.setValue(int(bar.value()) - scroll_delta)
+                # Also consume zero-delta begin/end events from high-resolution
+                # touchpads, otherwise their gesture may leak to the parent.
+                if scroll_delta or event.phase() != Qt.ScrollPhase.NoScrollPhase:
+                    event.accept()
+                    return
+
+        event.ignore()

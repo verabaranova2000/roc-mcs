@@ -14,8 +14,8 @@ from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QSplitter, QFormLayout, QComboBox,
     QSpinBox, QDoubleSpinBox, QAbstractSpinBox, QCheckBox, QLineEdit, QPushButton, QLabel,
     QPlainTextEdit, QTabWidget, QStackedWidget, QProgressBar, QMessageBox,
-    QSizePolicy, QFrame, QMenu, QScrollArea, QToolButton, QWidgetAction,
-    QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
+    QSizePolicy, QFrame, QMenu, QScrollArea, QToolButton, QWidgetAction, QGridLayout,
+    QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView, QStyle,
 )
 
 from matplotlib.figure import Figure
@@ -478,6 +478,7 @@ class ProcessingWorkbenchWidget(QWidget):
 
     def __init__(self, project: WorkflowProject, parent: QWidget | None = None, *, embedded: bool = False):
         super().__init__(parent)
+        self.setObjectName("processingWorkbenchWidget")
         self.project = project
         self.embedded = bool(embedded)
         self._last_busy_state = False
@@ -997,9 +998,7 @@ class ProcessingWorkbenchWidget(QWidget):
             self.graph_scroll_button.setIcon(
                 svg_icon(ICON_DIR / icon_name, color=colors["text"], widget=self.graph_scroll_button)
             )
-            icon_size = max(18, self._global_icon_size())
-            self.graph_scroll_button.setIconSize(QSize(icon_size, icon_size))
-            self.graph_scroll_button.setFixedSize(max(27, icon_size + 9), max(27, icon_size + 9))
+            self._apply_graph_header_button_metrics(self.graph_scroll_button)
             self.graph_scroll_button.setToolTip(tooltip)
             self.graph_scroll_button.setAccessibleName(accessible)
             self.graph_scroll_button.setEnabled(bool(enabled and not self.is_busy))
@@ -1014,6 +1013,23 @@ class ProcessingWorkbenchWidget(QWidget):
             return max(12, min(20, int(raw)))
         except (TypeError, ValueError, OverflowError):
             return 16
+
+    def _apply_graph_header_button_metrics(self, button: QToolButton) -> None:
+        """Match pipeline-header controls to TRS Apps' global toolbar metrics."""
+        icon = self._global_icon_size()
+        button_width = max(22, min(30, icon + 10))
+        button_height = max(18, min(26, icon + 6))
+        button.setIconSize(QSize(icon, icon))
+        button.setFixedSize(button_width, button_height)
+
+    def apply_global_icon_size(self) -> None:
+        """Reapply toolbar geometry after the host changes the global icon size."""
+        for button in (
+            getattr(self, "fit_graph_button", None),
+            getattr(self, "graph_scroll_button", None),
+        ):
+            if button is not None:
+                self._apply_graph_header_button_metrics(button)
 
     def _toggle_theme(self) -> None:
         self._apply_theme("dark" if self._theme == "light" else "light")
@@ -1037,15 +1053,12 @@ class ProcessingWorkbenchWidget(QWidget):
             target = "тёмную" if self._theme == "light" else "светлую"
             self.theme_button.setToolTip(f"Переключить Workbench на {target} тему")
             self.theme_button.setAccessibleName(f"Переключить Workbench на {target} тему")
-            icon_size = max(18, self._global_icon_size())
-            button_size = max(27, icon_size + 9)
             for button, name in (
                 (self.fit_graph_button, "zoom_out_map.svg"),
                 (self.graph_scroll_button, "workflow_expand_vertical.svg" if self.embedded else "vertical_scroll.svg"),
             ):
                 button.setIcon(svg_icon(ICON_DIR / name, color=colors["text"], widget=button))
-                button.setIconSize(QSize(icon_size, icon_size))
-                button.setFixedSize(button_size, button_size)
+                self._apply_graph_header_button_metrics(button)
             self.graph.setBackgroundBrush(self.graph.palette().color(QPalette.ColorRole.Base))
             self._style_matplotlib_figure(self.figure)
             self._style_matplotlib_figure(self.diagnostic_figure)
@@ -1163,42 +1176,70 @@ class ProcessingWorkbenchWidget(QWidget):
         self._forms["preprocess.detector_bad_pixels"].update(pixels=pixels)
 
     def _build_pool_form(self) -> None:
+        """Build the compact stage form while keeping one canonical parameter set."""
         layout = self._add_form_page("preprocess.pool", "Pooling")
+        layout.setContentsMargins(2, 2, 2, 2)
+        layout.setHorizontalSpacing(0)
+        layout.setVerticalSpacing(0)
+
         size = self._int_spin(1, 101, 5, 2)
         stride = self._int_spin(1, 101, 1, 1)
-        layout.addRow("Размер окна (px):", size)
-        layout.addRow("Stride (px):", stride)
-        hint = QLabel("Сумма counts по X/Y; ось θ сохраняется. Окно: нечётный размер.")
-        hint.setWordWrap(True)
-        hint.setToolTip(
-            "В каждом пространственном окне counts суммируются по X/Y. "
-            "Отсчёты θ не усредняются и не прореживаются. Окна с частичным "
-            "покрытием отображаются для QC, но исключаются из научного анализа."
-        )
+        for control in (size, stride):
+            control.setFixedSize(48, 21)
+            control.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+            control.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            control.setKeyboardTracking(False)
+        size.setToolTip("Размер пространственного окна в пикселях; для симметричного окна используйте нечётное значение.")
+        stride.setToolTip("Шаг смещения соседних пространственных окон в пикселях.")
+
         preview = QLabel()
-        preview.setFixedSize(88, 66)
+        preview.setFixedSize(82, 62)
         preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
         preview.setAccessibleName("Геометрия окна pooling и шага")
         preview.setToolTip(
             "Схема двух окон: сетка — исходные пиксели, смещение — stride, "
-            "перекрытие — общие пиксели соседних окон."
+            "перекрытие — общие пиксели соседних окон. Частично покрытые окна "
+            "остаются доступными для контроля качества, но не входят в научный анализ."
         )
         preview.setPixmap(pooling_preview_pixmap(size.value(), stride.value(), self.palette()))
-        detail = QWidget()
-        detail_row = QHBoxLayout(detail)
-        detail_row.setContentsMargins(0, 0, 0, 0)
-        detail_row.setSpacing(7)
-        detail_text = QLabel("Геометрия окна\nи шага смещения")
-        detail_text.setWordWrap(True)
-        detail_row.addWidget(detail_text, 1)
-        detail_row.addWidget(preview)
-        layout.addRow("Схема:", detail)
+
+        content = QWidget()
+        content.setObjectName("compactSpatialPoolingForm")
+        row = QHBoxLayout(content)
+        row.setContentsMargins(2, 1, 2, 1)
+        row.setSpacing(9)
+        fields = QGridLayout()
+        fields.setContentsMargins(0, 0, 0, 0)
+        fields.setHorizontalSpacing(6)
+        fields.setVerticalSpacing(4)
+        window_label = QLabel("Окно")
+        stride_label = QLabel("Шаг")
+        for label in (window_label, stride_label):
+            label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        fields.addWidget(window_label, 0, 0)
+        fields.addWidget(size, 0, 1)
+        fields.addWidget(stride_label, 1, 0)
+        fields.addWidget(stride, 1, 1)
+        note = QLabel("Σ counts · θ без агрегации")
+        note.setObjectName("poolingCompactNote")
+        note.setToolTip(
+            "Counts суммируются только по пространственным X/Y. Ось θ сохраняется "
+            "без усреднения и прореживания. Частично покрытые окна исключаются "
+            "из научного анализа."
+        )
+        fields.addWidget(note, 2, 0, 1, 2)
+        row.addLayout(fields, 1)
+        row.addWidget(preview, 0, Qt.AlignmentFlag.AlignVCenter)
+        layout.addRow(content)
+
         refresh_preview = lambda *_: preview.setPixmap(
             pooling_preview_pixmap(size.value(), stride.value(), self.palette())
         )
         size.valueChanged.connect(refresh_preview)
         stride.valueChanged.connect(refresh_preview)
-        self._forms["preprocess.pool"].update(size=size, stride=stride, preview=preview)
+        self._forms["preprocess.pool"].update(
+            size=size, stride=stride, preview=preview, compact_content=content
+        )
 
     def _build_spike_form(self) -> None:
         layout = self._add_form_page("preprocess.spikes", "Spikes")
@@ -1895,28 +1936,29 @@ class ProcessingWorkbenchWidget(QWidget):
                 "Для каталога других кристаллов установите xraylib; для Darwin widths "
                 "дополнительно требуется crystalpy."
             )
-        dependency_hint = QLabel(dependency_message)
-        dependency_hint.setWordWrap(True)
-        dependency_hint.setObjectName("hklDependencyHint")
-        layout.addRow(dependency_hint)
-
-        explanation = QLabel(
+        explanation = (
             "Измеренное |Δθ| восстанавливается из исходных θ по точным peak_id в "
             "branch_catalog; остатки после совмещения не используются. Теоретические "
             "Δθ ранжируются по абсолютному отклонению от медианы измерений. Ранг — "
             "геометрическое совпадение, не вероятность и не оценка интенсивности."
         )
-        explanation.setWordWrap(True)
-        explanation.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        explanation.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        explanation.setObjectName("hklFormExplanation")
-        layout.addRow(explanation)
+        information_text = (
+            "ДОСТУПНОСТЬ РАСЧЁТНЫХ БИБЛИОТЕК\n\n"
+            + dependency_message
+            + "\n\nМЕТОДИКА И ИНТЕРПРЕТАЦИЯ РАНГА\n\n"
+            + explanation
+            + "\n\nЧТЕНИЕ ГРАФИКА И ТАБЛИЦЫ\n\n"
+            + "Интервал на графике соответствует Q10–Q90 измерений; круг отмечает "
+            "медиану, ромб — лучшее теоретическое Δθ. Ранг на графике рефлексов "
+            "соответствует первому столбцу таблицы. Ранжирование описывает "
+            "геометрическое совпадение, а не вероятность и не интенсивность."
+        )
         self._forms["theory.identify_hkl"].update(
             crystal_model_id=crystal_selector, lattice_a_A=lattice,
             lambda_ka1_A=lambda_1, lambda_ka2_A=lambda_2,
             max_miller_index=max_index,
             include_crystalpy=include_crystalpy, crystal_thickness_m=thickness,
-            unit_cell_stack=unit_cell_stack,
+            unit_cell_stack=unit_cell_stack, information_text=information_text,
         )
 
     def _request_branch_stats(self, parent_id: str) -> None:
@@ -2837,6 +2879,8 @@ class ProcessingWorkbenchWidget(QWidget):
 
         spec = self.registry.get(operation_id)
         page = form_info["page"]
+        is_hkl_stage = operation_id == "theory.identify_hkl"
+        is_pooling_stage = operation_id == "preprocess.pool"
         popup = _StageConfigurationPopup(self)
         popup.setObjectName("processingStagePopup")
         root = QVBoxLayout(popup)
@@ -2859,16 +2903,38 @@ class ProcessingWorkbenchWidget(QWidget):
                 "  ·  просмотр сохранённого результата"
             )
         title.setWordWrap(False)
-        title.setToolTip("Перетащите за эту строку, чтобы переместить окно")
+        # The title can contain a long parent label.  It must yield horizontal
+        # space to the fixed Info/Close controls instead of pushing them out of
+        # the popup viewport.  The complete text remains available as a tooltip.
+        title.setMinimumWidth(0)
+        title.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        title.setToolTip(
+            f"{spec.label} · вход: {parent.label}\n"
+            "Перетащите за эту строку, чтобы переместить окно"
+        )
         header.addWidget(title, 1)
+        if is_hkl_stage:
+            info_button = QToolButton(popup)
+            info_button.setObjectName("processingStageInfoButton")
+            info_button.setAutoRaise(False)
+            info_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+            info_button.setFixedSize(24, 24)
+            info_button.setIconSize(QSize(16, 16))
+            info_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            info_button.setToolTip("Методика HKL, смысл ранжирования и доступность библиотек")
+            info_button.setAccessibleName("Справка по теоретической идентификации HKL")
+            header.addWidget(info_button, 0, Qt.AlignmentFlag.AlignVCenter)
+
         close_button = QToolButton(popup)
         close_button.setObjectName("processingStageCloseButton")
-        close_button.setText("×")
-        close_button.setFixedSize(20, 20)
+        close_button.setAutoRaise(True)
+        close_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+        close_button.setFixedSize(22, 22)
         close_button.setToolTip("Закрыть окно параметров")
+        close_button.setAccessibleName("Закрыть окно параметров")
         close_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         close_button.clicked.connect(popup.close)
-        header.addWidget(close_button, 0, Qt.AlignmentFlag.AlignTop)
+        header.addWidget(close_button, 0, Qt.AlignmentFlag.AlignVCenter)
         root.addLayout(header)
 
         scroll = QScrollArea(popup)
@@ -2889,7 +2955,6 @@ class ProcessingWorkbenchWidget(QWidget):
         # activation to make the Qt visibility transition deterministic.
         page.setMinimumWidth(0)
         page.setEnabled(existing_node_id is None)
-        is_hkl_stage = operation_id == "theory.identify_hkl"
         original_control_metrics = []
         original_layout_metrics = None
         if is_hkl_stage:
@@ -2903,6 +2968,7 @@ class ProcessingWorkbenchWidget(QWidget):
                         control, control.minimumHeight(), control.maximumHeight(),
                         control.minimumWidth(), symbols,
                     ))
+        if is_hkl_stage or is_pooling_stage:
             original_layout = form_info.get("layout")
             if original_layout is not None:
                 margins = original_layout.contentsMargins()
@@ -2940,6 +3006,11 @@ class ProcessingWorkbenchWidget(QWidget):
 
         for widget_type in (QSpinBox, QDoubleSpinBox, QComboBox, QLineEdit):
             for field in page.findChildren(widget_type):
+                if is_pooling_stage:
+                    # Pooling controls have deliberate fixed dimensions in the
+                    # compact shared form; do not overwrite them with generic
+                    # stage-editor metrics.
+                    continue
                 compact_peak_control = (
                     operation_id == "peaks.detect"
                     and isinstance(field, QAbstractSpinBox)
@@ -2954,7 +3025,7 @@ class ProcessingWorkbenchWidget(QWidget):
                     field.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
                 if isinstance(field, QDoubleSpinBox):
                     field.setMinimumWidth(82 if is_hkl_stage else 78)
-                elif isinstance(field, QSpinBox):
+                elif isinstance(field, QSpinBox) and not is_pooling_stage:
                     field.setMinimumWidth(68)
                 elif isinstance(field, QComboBox):
                     field.setMinimumWidth(112 if is_hkl_stage else 112)
@@ -2962,10 +3033,11 @@ class ProcessingWorkbenchWidget(QWidget):
         if page_layout is not None:
             compact_peak_form = operation_id == "peaks.detect"
             compact_hkl_form = is_hkl_stage
-            margin = 2 if (compact_peak_form or compact_hkl_form) else 4
+            compact_pool_form = is_pooling_stage
+            margin = 2 if (compact_peak_form or compact_hkl_form or compact_pool_form) else 4
             page_layout.setContentsMargins(margin, margin, margin, margin)
-            page_layout.setVerticalSpacing(2 if compact_hkl_form else (3 if compact_peak_form else 5))
-            page_layout.setHorizontalSpacing(6 if compact_hkl_form else (7 if compact_peak_form else 8))
+            page_layout.setVerticalSpacing(0 if compact_pool_form else (2 if compact_hkl_form else (3 if compact_peak_form else 5)))
+            page_layout.setHorizontalSpacing(0 if compact_pool_form else (6 if compact_hkl_form else (7 if compact_peak_form else 8)))
         root.addWidget(scroll, 1)
 
         footer = QHBoxLayout()
@@ -2986,19 +3058,28 @@ class ProcessingWorkbenchWidget(QWidget):
             reset_button.clicked.connect(form_info["reset_parameters"])
             footer.addWidget(reset_button)
         cancel_button = QPushButton("Отмена", popup)
-        run_button = QPushButton("Создать и запустить", popup)
+        if is_pooling_stage:
+            run_button = QToolButton(popup)
+            run_button.setObjectName("processingStageRunButton")
+            run_button.setAutoRaise(True)
+            run_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+            run_button.setFixedSize(26, 26)
+            run_button.setToolTip("Создать и запустить пространственный pooling")
+            run_button.setAccessibleName("Создать и запустить пространственный pooling")
+        else:
+            run_button = QPushButton("Создать и запустить", popup)
+            run_button.setMinimumHeight(24)
+            run_button.setDefault(True)
         popup._stage_run_button = run_button
         popup._stage_cancel_button = cancel_button
-        run_button.setDefault(True)
-        for button in (cancel_button, run_button):
-            button.setMinimumHeight(24)
+        cancel_button.setMinimumHeight(24)
         footer.addWidget(cancel_button)
         footer.addWidget(run_button)
         root.addLayout(footer)
 
         apply_popup_theme(popup, self._theme)
         apply_widget_palette(popup, self._theme)
-        compact_form = operation_id in {"peaks.detect", "theory.identify_hkl"}
+        compact_form = operation_id in {"peaks.detect", "theory.identify_hkl", "preprocess.pool"}
         spin_min_height = 18 if compact_form else 21
         spin_max_height = 21 if compact_form else 25
         popup_colors = theme_colors(self._theme)
@@ -3018,8 +3099,75 @@ class ProcessingWorkbenchWidget(QWidget):
             "background:palette(button); color:palette(button-text); border:1px solid palette(mid); border-radius:3px; }"
             "QFrame#processingStagePopup QPushButton:hover, QFrame#processingStagePopup QToolButton:hover { "
             "background:palette(midlight); }"
-            "QToolButton#processingStageCloseButton { border:0; font-size:17px; padding:0; }"
+            "QToolButton#processingStageCloseButton, QToolButton#processingStageRunButton { "
+            "min-width:22px; max-width:30px; min-height:22px; max-height:30px; "
+            "padding:0; margin:0; border:1px solid transparent; border-radius:3px; "
+            "background:transparent; }"
+            "QToolButton#processingStageInfoButton { min-width:24px; max-width:24px; "
+            "min-height:24px; max-height:24px; padding:0; margin:0; "
+            "border:1px solid palette(mid); border-radius:3px; background:palette(button); }"
+            "QToolButton#processingStageCloseButton:hover, QToolButton#processingStageInfoButton:hover, "
+            "QToolButton#processingStageRunButton:hover { background:palette(midlight); border-color:palette(mid); }"
+            "QWidget#compactSpatialPoolingForm QLabel { font-size:9px; }"
+            "QLabel#poolingCompactNote { color:palette(placeholderText); font-size:8px; }"
         )
+        if is_hkl_stage:
+            # The supplied project already contains info_circle_icon.svg.  Use
+            # its theme-recoloured form and retain a Qt-native fallback so an
+            # optional/missing SVG can never prevent the stage dialog opening.
+            try:
+                info_icon = svg_icon(
+                    ICON_DIR / "info_circle_icon.svg",
+                    widget=info_button,
+                    size=16,
+                    color=info_button.palette().color(QPalette.ColorRole.WindowText),
+                )
+            except (OSError, ValueError):
+                info_icon = info_button.style().standardIcon(
+                    QStyle.StandardPixmap.SP_MessageBoxInformation
+                )
+            if info_icon.isNull():
+                info_button.setText("i")
+                info_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+            else:
+                info_button.setIcon(info_icon)
+            info_button.setIconSize(QSize(16, 16))
+
+            def show_hkl_help(_checked: bool = False) -> None:
+                help_dialog = QMessageBox(popup)
+                help_dialog.setWindowTitle("Справка · теоретическая идентификация HKL")
+                help_dialog.setIcon(QMessageBox.Icon.Information)
+                help_dialog.setTextFormat(Qt.TextFormat.PlainText)
+                help_dialog.setText(
+                    str(form_info.get("information_text", "")).strip()
+                    or "Справочная информация для этапа HKL не задана."
+                )
+                help_dialog.setTextInteractionFlags(
+                    Qt.TextInteractionFlag.TextSelectableByMouse
+                )
+                help_dialog.setStandardButtons(QMessageBox.StandardButton.Ok)
+                apply_popup_theme(help_dialog, self._theme)
+                apply_widget_palette(help_dialog, self._theme)
+                help_dialog.exec()
+
+            info_button.clicked.connect(show_hkl_help)
+
+        # A standard Qt title-bar close glyph is independent of optional SVG
+        # files and is centered by QToolButton using the active platform style.
+        # This removes the missing-close_icon.svg crash for every stage type.
+        close_icon = close_button.style().standardIcon(
+            QStyle.StandardPixmap.SP_TitleBarCloseButton
+        )
+        if close_icon.isNull():
+            close_button.setText("×")
+            close_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        else:
+            close_button.setIcon(close_icon)
+            close_button.setIconSize(QSize(13, 13))
+        if is_pooling_stage:
+            run_icon_size = self._global_icon_size()
+            run_button.setIcon(svg_icon(ICON_DIR / "run_icon.svg", widget=run_button, size=run_icon_size))
+            self._apply_graph_header_button_metrics(run_button)
 
         # A bounded, adaptive height keeps all controls reachable on smaller
         # displays. The form itself scrolls vertically rather than being clipped.
@@ -3028,18 +3176,31 @@ class ProcessingWorkbenchWidget(QWidget):
         available = screen.availableGeometry() if screen is not None else self.frameGeometry()
         if is_hkl_stage:
             popup_width = min(640, max(320, available.width() - 16))
+        elif is_pooling_stage:
+            popup_width = min(310, max(240, available.width() - 16))
         else:
             popup_width = max(340, min(440, available.width() - 16))
         popup.setFixedWidth(popup_width)
-        content_height = max(140, (stage_content.sizeHint().height() if stage_content is not None else page.sizeHint().height()) + 8)
+        if is_pooling_stage:
+            # This form is a single compact parameter strip; do not reserve a
+            # generic dialog-sized viewport around it.
+            content_height = max(66, int(page.sizeHint().height()) + 6)
+        else:
+            content_height = max(140, (stage_content.sizeHint().height() if stage_content is not None else page.sizeHint().height()) + 8)
         max_popup_height = max(190, int(available.height() * (0.89 if is_hkl_stage else 0.82)))
-        desired_height = min(content_height + 78, max_popup_height)
+        desired_height = min(content_height + (62 if is_pooling_stage else 78), max_popup_height)
         if is_hkl_stage:
             # Keep the existing 640 px width cap intact; only give the result
             # panel a materially taller vertical viewport.
             desired_height = max(min(390, max_popup_height), desired_height)
         popup.setMaximumHeight(max_popup_height)
-        scroll.setMinimumHeight(min(max(115, content_height), max(115, desired_height - 82)))
+        minimum_scroll_height = content_height if is_pooling_stage else 115
+        scroll.setMinimumHeight(
+            min(max(minimum_scroll_height, content_height), max(minimum_scroll_height, desired_height - 82))
+        )
+        if is_pooling_stage:
+            scroll.setMaximumHeight(content_height)
+            scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         popup.resize(popup_width, desired_height)
         popup.adjustSize()
         x = min(max(cursor_pos.x(), available.left() + 4), available.right() - popup.width() + 1)
@@ -3073,23 +3234,23 @@ class ProcessingWorkbenchWidget(QWidget):
                 scroll.takeWidget()
             page.setParent(self.form_stack)
             page.setEnabled(True)
+            page.setMinimumWidth(original_page_minimum_width)
             if is_hkl_stage:
                 temporary_model_index = getattr(popup, "_stage_temporary_model_item_index", None)
                 if temporary_model_index is not None:
                     form_info["crystal_model_id"].removeItem(temporary_model_index)
                     popup._stage_temporary_model_item_index = None
-                page.setMinimumWidth(original_page_minimum_width)
                 for control, minimum_height, maximum_height, minimum_width, symbols in original_control_metrics:
                     control.setMinimumHeight(minimum_height)
                     control.setMaximumHeight(maximum_height)
                     control.setMinimumWidth(minimum_width)
                     if symbols is not None:
                         control.setButtonSymbols(symbols)
-                if page_layout is not None and original_layout_metrics is not None:
-                    left, top, right, bottom, vertical, horizontal = original_layout_metrics
-                    page_layout.setContentsMargins(left, top, right, bottom)
-                    page_layout.setVerticalSpacing(vertical)
-                    page_layout.setHorizontalSpacing(horizontal)
+            if (is_hkl_stage or is_pooling_stage) and page_layout is not None and original_layout_metrics is not None:
+                left, top, right, bottom, vertical, horizontal = original_layout_metrics
+                page_layout.setContentsMargins(left, top, right, bottom)
+                page_layout.setVerticalSpacing(vertical)
+                page_layout.setHorizontalSpacing(horizontal)
             if stage_content is not None:
                 stage_content.deleteLater()
             if self.form_stack.indexOf(page) < 0:

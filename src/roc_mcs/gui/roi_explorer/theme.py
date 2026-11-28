@@ -7,6 +7,82 @@ from PyQt6.QtWidgets import QApplication, QAbstractScrollArea, QDialog, QMenu, Q
 
 from roc_mcs.gui.components.icon_provider import set_icon_theme
 
+
+# One switch controls only the two workflow navigation areas.
+# Available variants: "instrument" (default), "minimal", "classic", "native".
+SCROLLBAR_STYLE = "instrument"
+_SCROLLBAR_VARIANTS = {
+    "instrument": {
+        "extent": 7, "radius": 3, "minimum": 30, "margin": 3,
+        "idle": "border", "hover": "muted", "pressed": "highlight",
+        "track": "transparent",
+    },
+    "minimal": {
+        "extent": 5, "radius": 2, "minimum": 24, "margin": 4,
+        "idle": "border", "hover": "highlight", "pressed": "highlight",
+        "track": "transparent",
+    },
+    "classic": {
+        "extent": 10, "radius": 2, "minimum": 32, "margin": 0,
+        "idle": "border", "hover": "muted", "pressed": "highlight",
+        "track": "alternate",
+    },
+}
+
+
+def _workflow_scrollbar_stylesheet(colors: dict[str, str]) -> str:
+    """Return a theme-aware scrollbar style scoped to the sidebar and DAG only."""
+    variant_name = str(SCROLLBAR_STYLE).strip().lower()
+    if variant_name == "native":
+        return ""
+    variant = _SCROLLBAR_VARIANTS.get(variant_name, _SCROLLBAR_VARIANTS["instrument"])
+    extent = int(variant["extent"])
+    radius = int(variant["radius"])
+    minimum = int(variant["minimum"])
+    margin = int(variant["margin"])
+    idle = colors[str(variant["idle"])] if variant["idle"] != "transparent" else "transparent"
+    hover = colors[str(variant["hover"])]
+    pressed = colors[str(variant["pressed"])]
+    track = colors[str(variant["track"])] if variant["track"] != "transparent" else "transparent"
+    return f"""
+        QScrollArea#leftSidebarScroll QScrollBar:vertical,
+        QGraphicsView#processingGraphView QScrollBar:vertical {{
+            background:{track}; border:0; width:{extent}px; margin:{margin}px 1px;
+        }}
+        QScrollArea#leftSidebarScroll QScrollBar:horizontal,
+        QGraphicsView#processingGraphView QScrollBar:horizontal {{
+            background:{track}; border:0; height:{extent}px; margin:1px {margin}px;
+        }}
+        QScrollArea#leftSidebarScroll QScrollBar::handle:vertical,
+        QGraphicsView#processingGraphView QScrollBar::handle:vertical {{
+            background:{idle}; border:0; border-radius:{radius}px; min-height:{minimum}px; min-width:{extent}px;
+        }}
+        QScrollArea#leftSidebarScroll QScrollBar::handle:horizontal,
+        QGraphicsView#processingGraphView QScrollBar::handle:horizontal {{
+            background:{idle}; border:0; border-radius:{radius}px; min-width:{minimum}px; min-height:{extent}px;
+        }}
+        QScrollArea#leftSidebarScroll QScrollBar::handle:hover,
+        QGraphicsView#processingGraphView QScrollBar::handle:hover {{ background:{hover}; }}
+        QScrollArea#leftSidebarScroll QScrollBar::handle:pressed,
+        QGraphicsView#processingGraphView QScrollBar::handle:pressed {{ background:{pressed}; }}
+        QScrollArea#leftSidebarScroll QScrollBar::add-line:vertical,
+        QScrollArea#leftSidebarScroll QScrollBar::sub-line:vertical,
+        QGraphicsView#processingGraphView QScrollBar::add-line:vertical,
+        QGraphicsView#processingGraphView QScrollBar::sub-line:vertical {{
+            width:0; height:0; border:0; background:transparent;
+        }}
+        QScrollArea#leftSidebarScroll QScrollBar::add-line:horizontal,
+        QScrollArea#leftSidebarScroll QScrollBar::sub-line:horizontal,
+        QGraphicsView#processingGraphView QScrollBar::add-line:horizontal,
+        QGraphicsView#processingGraphView QScrollBar::sub-line:horizontal {{
+            width:0; height:0; border:0; background:transparent;
+        }}
+        QScrollArea#leftSidebarScroll QScrollBar::add-page,
+        QScrollArea#leftSidebarScroll QScrollBar::sub-page,
+        QGraphicsView#processingGraphView QScrollBar::add-page,
+        QGraphicsView#processingGraphView QScrollBar::sub-page {{ background:transparent; border:0; }}
+    """
+
 _PALETTES = {
     "dark": {"window": "#11151b", "text": "#d8e0ec", "base": "#151c27", "alternate": "#1b2430", "button": "#202a38", "button_text": "#d8e0ec", "border": "#384454", "hover": "#2a3646", "highlight": "#3e77a8", "highlight_text": "#ffffff", "muted": "#9eafc3", "grid": "#344255", "canvas": "#11151b", "axes": "#151c27", "roi": "#ffd54a", "roi_hover": "#7ad7ff"},
     "light": {"window": "#f5f7fa", "text": "#263445", "base": "#ffffff", "alternate": "#f3f6fa", "button": "#edf1f5", "button_text": "#263445", "border": "#cbd5e1", "hover": "#e3eaf2", "highlight": "#cfe5fa", "highlight_text": "#163c5e", "muted": "#64748b", "grid": "#9aa4b2", "canvas": "#f5f7fa", "axes": "#ffffff", "roi": "#174a78", "roi_hover": "#087e8b"},
@@ -185,9 +261,7 @@ def apply_theme(widget: QWidget, theme: str | None = None) -> str:
         QToolButton#collapsibleSectionHeader:hover {{ background:{c['hover']}; }}
         QToolTip {{ background:{c['base']}; color:{c['text']}; border:1px solid {c['border']}; padding:3px; }}
         QSplitter::handle {{ background:{c['border']}; }} QSplitter::handle:hover {{ background:{c['highlight']}; }}
-        QScrollBar:horizontal, QScrollBar:vertical {{ background:{c['window']}; border:0; width:10px; height:10px; }}
-        QScrollBar::handle {{ background:{c['border']}; border-radius:4px; min-width:24px; min-height:24px; }}
-        QScrollBar::add-line, QScrollBar::sub-line {{ width:0; height:0; }}
+        {_workflow_scrollbar_stylesheet(c)}
         QLabel#MapCoordLabel {{ color:{c['muted']}; }}
     """)
     # Локальные QSS-стили с palette(...) используют правильную палитру;

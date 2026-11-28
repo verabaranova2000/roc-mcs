@@ -234,17 +234,6 @@ class HklResultsPanel(QWidget):
         all_layout.addWidget(self.pair_table)
         self.tabs.addTab(self.all_pairs_tab, "Сравнение пар")
 
-        self.method_note = QLabel(
-            "Интервал — Q10–Q90 измерений; круг — медиана; ромб — лучшее теоретическое Δθ. "
-            "Ранг в графике рефлексов соответствует первому столбцу таблицы. "
-            "Ранжирование — геометрическое совпадение, не вероятность и не оценка интенсивности.",
-            self,
-        )
-        self.method_note.setWordWrap(True)
-        self.method_note.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.method_note.setObjectName("hklMethodNote")
-        root.addWidget(self.method_note)
-
         self.apply_theme(self._theme)
         self.set_result(None)
 
@@ -337,7 +326,7 @@ class HklResultsPanel(QWidget):
         colors = theme_colors(self._theme)
         self.setStyleSheet(
             f"QLabel#hklSummary {{ color:{colors['text']}; font-size:9px; font-weight:600; }}"
-            f"QLabel#hklControlLabel, QLabel#hklMethodNote {{ color:{colors['muted']}; font-size:8px; }}"
+            f"QLabel#hklControlLabel {{ color:{colors['muted']}; font-size:8px; }}"
             f"QLabel#hklPairStatistics {{ color:{colors['text']}; font-size:8px; }}"
             f"QComboBox#hklPairSelector, "
             f"QDoubleSpinBox#hklHistogramBinWidth {{ color:{colors['text']}; background:{colors['base']}; "
