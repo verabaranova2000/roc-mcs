@@ -55,6 +55,10 @@ class WorkflowPreviewState:
     branch_edges: Any | None = None
     branch_correlation_preview: Any | None = None
     hkl_identification_preview: Any | None = None
+    # Stable connected-component branch identity from peaks.branches.  This is
+    # separate from peak_points because the latter can also exist before a
+    # branch assignment has been computed.
+    branch_catalog: Any | None = None
 
     def map_layer(self, key: str | None = None) -> PreviewMapLayer:
         selected = str(key or self.default_map_key)
@@ -241,98 +245,10 @@ def _residual_summary_maps(residual: Any, valid_mask: np.ndarray | None, shape_y
     ]
 
 
-def _component_parameter_maps(fit: Any, shape_yx: tuple[int, int]) -> list[PreviewMapLayer]:
-    frame = _table(fit, "fitted_peak_catalog")
-    if frame is None or getattr(frame, "empty", True):
-        return []
-    required = {"x", "y", "component_id"}
-    if not required.issubset(frame.columns):
-        return []
-    metadata = getattr(fit, "metadata", {}) or {}
-    names = list(metadata.get("component_param_names", ()) or ())
-    if not names:
-        names = [name for name in frame.columns if name not in required and not str(name).endswith("_error")]
-    try:
-        component_ids = sorted({int(v) for v in frame["component_id"].dropna().tolist() if float(v).is_integer()})
-    except (TypeError, ValueError, OverflowError):
-        component_ids = []
-    if not component_ids:
-        return []
-    ny, nx = shape_yx
-    layers: list[PreviewMapLayer] = []
-    model_id = str(metadata.get("model_id", ""))
-    try:
-        from roc_mcs.fitting.registry import DERIVED_SPECS
-        derived = DERIVED_SPECS.get(model_id, {})
-    except Exception:
-        derived = {}
-
-    component_names = {
-        "S": "Площадь", "theta0": "Положение центра θ₀", "H": "Высота",
-        "eta": "Параметр смешения η", "sigma": "Ширина σ", "gamma": "Ширина γ",
-        "Delta": "Амплитуда углового сдвига Δθₚ",
-        "beta_Gl": "Gaussian-ширина слева β_Gl", "beta_Cl": "Lorentz-ширина слева β_Cl",
-        "beta_Gr": "Gaussian-ширина справа β_Gr", "beta_Cr": "Lorentz-ширина справа β_Cr",
-        "lam": "Параметр экспоненциального хвоста λ",
-    }
-    for name in names:
-        if name not in frame.columns:
-            continue
-        for component_id in component_ids:
-            result = np.full((ny, nx), np.nan, dtype=np.float64)
-            subset = frame.loc[frame["component_id"] == component_id, ["x", "y", name]]
-            for x_value, y_value, value in subset.itertuples(index=False, name=None):
-                try:
-                    x, y, scalar = int(x_value), int(y_value), float(value)
-                except (TypeError, ValueError, OverflowError):
-                    continue
-                if 0 <= x < nx and 0 <= y < ny and np.isfinite(scalar):
-                    result[y, x] = scalar
-            if np.isfinite(result).any():
-                friendly = component_names.get(str(name), str(name))
-                if name == "S":
-                    unit = "counts·θ"
-                elif name in {"theta0", "H", "sigma", "gamma", "Delta", "beta_Gl", "beta_Cl", "beta_Gr", "beta_Cr"}:
-                    unit = "θ"
-                elif name == "lam":
-                    unit = "θ⁻¹"
-                elif name == "eta":
-                    unit = "—"
-                else:
-                    unit = ""
-                layers.append(PreviewMapLayer(
-                    key=f"fit.parameter.{name}.component{component_id}",
-                    label=f"{friendly} · компонента {component_id + 1}",
-                    data_yx=result, group="Параметры модели", unit=unit,
-                    description=f"Параметр {name} модели {model_id}, компонент {component_id + 1}; значение взято из fitted_peak_catalog.",
-                ))
-
-    # FWHM is a registered derived quantity only for models whose expression
-    # does not require a separately sampled curve (split-Voigt is excluded).
-    fwhm_spec = derived.get("FWHM") if isinstance(derived, dict) else None
-    if fwhm_spec is not None and not bool(getattr(fwhm_spec, "needs_curve", True)):
-        if names and all(p in frame.columns for p in names):
-            for component_id in component_ids:
-                result = np.full((ny, nx), np.nan, dtype=np.float64)
-                subset = frame.loc[frame["component_id"] == component_id, ["x", "y", *names]]
-                for row in subset.itertuples(index=False, name=None):
-                    x_value, y_value, *parameter_values = row
-                    try:
-                        x, y = int(x_value), int(y_value)
-                        parameters = {p: float(v) for p, v in zip(names, parameter_values)}
-                        width = float(fwhm_spec.value_func(parameters))
-                    except Exception:
-                        continue
-                    if 0 <= x < nx and 0 <= y < ny and np.isfinite(width):
-                        result[y, x] = width
-                if np.isfinite(result).any():
-                    layers.append(PreviewMapLayer(
-                        key=f"fit.derived.FWHM.component{component_id}",
-                        label=f"FWHM · компонента {component_id + 1}",
-                        data_yx=result, group="Derived-параметры", unit="θ",
-                        description=f"FWHM рассчитана зарегистрированным выражением модели {model_id} из параметров fit; не является отдельным параметром подгонки.",
-                    ))
-    return layers
+# Per-pixel ``component_id`` maps are intentionally not generated here.
+# component_id is a local fit ordering, not a spatially connected branch
+# identity. Branch-specific parameter maps are created on demand by the
+# Branch Manager from ``branch_catalog`` and the stable ``branch_id``.
 
 
 def _fit_valid_mask(fit: Any, shape: tuple[int, int, int]) -> np.ndarray | None:
@@ -633,17 +549,11 @@ def build_workflow_preview_state(
         if "n_fitted_map" in fit_arrays:
             _add_map(layers, key="fit.n_fitted_map", label="Число fitted-компонент (карта)", value=fit_arrays.get("n_fitted_map"),
                      shape_yx=(ny, nx), group="Fit · число компонент", unit="компонент")
-        layers.extend(_component_parameter_maps(fit, (ny, nx)))
-        fitted_catalog = fit_tables.get("fitted_peak_catalog") if isinstance(fit_tables, dict) else None
-        if fitted_catalog is not None and not getattr(fitted_catalog, "empty", True) and "delta_theta" in fitted_catalog.columns:
-            component_ids = sorted({int(v) for v in fitted_catalog["component_id"].dropna().tolist() if float(v).is_integer()}) if "component_id" in fitted_catalog else []
-            for component_id in component_ids:
-                subset = fitted_catalog.loc[fitted_catalog["component_id"] == component_id]
-                values = _peak_catalog_map(subset, "delta_theta", (ny, nx), aggregate="mean")
-                _add_map(layers, key=f"fit.derived.delta_theta.component{component_id}",
-                         label=f"Смещение центра Δθ · компонента {component_id + 1}",
-                         value=values, shape_yx=(ny, nx), group="Derived-параметры", unit="θ",
-                         description="Разность θ_fit − θ_detected из fitted_peak_catalog; показывает сдвиг центра после подгонки.")
+        # Do not publish parameter maps indexed by component_id.  That index is
+        # only a local ordering inside one detector pixel; it is not a track
+        # identity across the detector.  Once peaks.branches has assigned a
+        # connected branch_id, branch-specific parameter maps are generated
+        # lazily by the Branch Manager for exactly one selected branch.
         residual_mask = _fit_valid_mask(fit, shape)
         layers.extend(_residual_summary_maps(fit_arrays.get("residual_cube"), residual_mask, (ny, nx)))
 
@@ -885,4 +795,5 @@ def build_workflow_preview_state(
         branch_edges=branch_edges,
         branch_correlation_preview=branch_correlation_preview,
         hkl_identification_preview=hkl_identification_preview,
+        branch_catalog=branch_catalog,
     )

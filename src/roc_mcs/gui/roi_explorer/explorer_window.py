@@ -72,7 +72,17 @@ from roc_mcs.roi.spatial_pooling import PoolSpec, pooled_shape
 from roc_mcs.gui.roi_explorer.roi_manager_widget import _pane_toggle_icon
 from roc_mcs.gui.components.collapsible_section import CollapsibleSection
 from roc_mcs.gui.components.icon_provider import resource_svg_icon, set_icon_theme
-from roc_mcs.gui.app_settings import load_settings, save_settings, resolve_initial_database, remember_hdf5_database, settings_path
+from roc_mcs.gui.app_settings import (
+    load_settings, save_settings, resolve_initial_database, remember_hdf5_database,
+    settings_path, resolve_analysis_projects_directory,
+)
+from roc_mcs.analysis.project import project_directory_for_scan
+from roc_mcs.analysis.branch_display import (
+    available_branch_parameters, branch_catalog_fingerprint,
+    branch_footprint_layers, build_branch_parameter_map,
+    load_branch_display_colors, normalize_branch_colors,
+    save_branch_display_colors, summarize_branch_catalog,
+)
 from roc_mcs.gui.roi_explorer.theme import apply_theme as apply_roi_theme, apply_popup_theme, resolve_theme, theme_colors
 from roc_mcs.gui.roi_explorer.plot_workspace_widget import PlotWorkspaceWidget
 from roc_mcs.gui.roi_explorer.plot_display_settings import PlotDisplaySettingsDialog, load_plot_display_settings, save_plot_display_settings
@@ -144,6 +154,12 @@ class RockingCurveExplorerWindow(QMainWindow):
         self._analysis_layer_cmap_preferences = {}
         self._analysis_quantitative_contrast = False
         self._analysis_contrast_snapshot: tuple[float, float] | None = None
+        self._branch_catalog = None
+        self._branch_fingerprint: str | None = None
+        self._branch_display_colors: dict[int, str] = {}
+        self._branch_display_state_path: Path | None = None
+        self._branch_parameter_layer = None
+        self._branch_parameter_branch_id: int | None = None
 
         self._theta_render_timer = QTimer(self); self._theta_render_timer.setSingleShot(True); self._theta_render_timer.setInterval(35); self._theta_render_timer.timeout.connect(self.refresh_map)
         self._theta_range_preview_timer = QTimer(self)
@@ -246,6 +262,7 @@ class RockingCurveExplorerWindow(QMainWindow):
         self.map_widget = self.plot_workspace.map_widget
         self.curve_widget = self.plot_workspace.curve_widget
         self.volume_widget = self.plot_workspace.volume_widget
+        self.branch_manager = self.plot_workspace.branch_manager
 
         
         self.preview_curve_line = None
@@ -447,7 +464,14 @@ class RockingCurveExplorerWindow(QMainWindow):
         self.roi_manager.delete_requested.connect(self._on_roi_manager_delete_requested)
         self.roi_manager.export_requested.connect(self._save_roi_curve)
         self.roi_manager.copy_requested.connect(self._copy_roi_content)
-        self.roi_manager.expanded_changed.connect(self._on_roi_manager_expanded)
+        # PlotWorkspaceWidget owns the two adjacent object-manager rails and
+        # their splitter geometry. The legacy 3-pane callback is intentionally
+        # not connected because the workspace now has four conceptual regions.
+        self.branch_manager.selection_changed.connect(self._on_branch_selection_changed)
+        self.branch_manager.color_changed.connect(self._on_branch_color_changed)
+        self.branch_manager.footprints_toggled.connect(self._on_branch_footprints_toggled)
+        self.branch_manager.focus_3d_toggled.connect(self._on_branch_focus_3d_toggled)
+        self.branch_manager.parameter_map_requested.connect(self._on_branch_parameter_map_requested)
 
         # --- Сигналы тулбара над картой ---
         self.map_widget.low_pct.valueChanged.connect(self.refresh_map)
@@ -488,6 +512,7 @@ class RockingCurveExplorerWindow(QMainWindow):
         # Drop it before swapping repositories; its saved PoolSpec must not be
         # applied to the newly opened source.
         self._analysis_view = None
+        self._clear_branch_context()
         self._restore_analysis_source_colormap()
         self._analysis_previous_pool = None
         self._analysis_curve_cache.clear()
@@ -1475,10 +1500,14 @@ class RockingCurveExplorerWindow(QMainWindow):
         self.map_widget.current_cmap = cmap_name
         self.map_widget.tools.set_current_cmap(cmap_name)
 
-    @staticmethod
-    def _analysis_menu_items(state, attribute: str):
-        items = getattr(state, attribute, ()) if state is not None else ()
-        return tuple(items or ())
+    def _analysis_menu_items(self, state, attribute: str):
+        items = tuple(getattr(state, attribute, ()) or ()) if state is not None else ()
+        if (
+            attribute == "map_layers" and state is self._analysis_view
+            and self._branch_parameter_layer is not None
+        ):
+            items = (*items, self._branch_parameter_layer)
+        return items
 
     def _build_analysis_result_menu(self, menu, items, selected_key, callback) -> None:
         previous_group = getattr(menu, "_analysis_result_action_group", None)
@@ -1593,7 +1622,8 @@ class RockingCurveExplorerWindow(QMainWindow):
         state = self._analysis_view
         if state is None or not hasattr(state, "map_layers"):
             return
-        if not any(layer.key == str(key) for layer in state.map_layers):
+        available_layers = self._analysis_menu_items(state, "map_layers")
+        if not any(layer.key == str(key) for layer in available_layers):
             return
         self._remember_analysis_display_preferences()
         self._analysis_map_key = str(key)
@@ -1682,6 +1712,7 @@ class RockingCurveExplorerWindow(QMainWindow):
         self.map_widget.set_pool_enabled(False)
         self._analysis_view = state
         self._analysis_display_identity = identity
+        self._install_branch_context(state)
         saved = self._analysis_display_preferences.get(identity, (None, None))
         map_keys = {layer.key for layer in getattr(state, "map_layers", ())}
         curve_keys = {source.key for source in getattr(state, "curve_sources", ())}
@@ -1706,10 +1737,229 @@ class RockingCurveExplorerWindow(QMainWindow):
         else:
             self.status.showMessage(f"Workflow preview: {state.label}")
 
+    def _branch_display_path(self) -> Path | None:
+        if self.current_file is None or self.selected_scan is None:
+            return None
+        try:
+            root = resolve_analysis_projects_directory()
+            project_dir = project_directory_for_scan(self.current_file, self.selected_scan, root)
+            return project_dir / "branch_display_state.json"
+        except (OSError, ValueError, TypeError):
+            return None
+
+    def _clear_branch_context(self) -> None:
+        """Clear transient branch selections and overlays when leaving a preview."""
+        self._branch_catalog = None
+        self._branch_fingerprint = None
+        self._branch_display_colors = {}
+        self._branch_display_state_path = None
+        self._branch_parameter_layer = None
+        self._branch_parameter_branch_id = None
+        manager = getattr(self, "branch_manager", None)
+        workspace = getattr(self, "plot_workspace", None)
+        if manager is not None:
+            manager.set_branches((), {}, ())
+        if workspace is not None:
+            workspace.set_branch_manager_visible(False)
+        map_widget = getattr(self, "map_widget", None)
+        if map_widget is not None:
+            map_widget.clear_branch_footprints(draw=False)
+        volume = getattr(self, "volume_widget", None)
+        if volume is not None:
+            volume.set_branch_display_state({}, (), focus_selected=False)
+
+    def _install_branch_context(self, state) -> None:
+        """Install the branch catalogue from the active immutable workflow node."""
+        catalog = getattr(state, "branch_catalog", None)
+        required = {"branch_id", "x", "y"}
+        if catalog is None or getattr(catalog, "empty", True) or not required.issubset(getattr(catalog, "columns", ())):
+            self._clear_branch_context()
+            return
+        try:
+            summaries = summarize_branch_catalog(catalog)
+            fingerprint = branch_catalog_fingerprint(catalog)
+            branch_ids = [int(item["branch_id"]) for item in summaries]
+            sidecar_path = self._branch_display_path()
+            saved_colors = (
+                load_branch_display_colors(sidecar_path, fingerprint)
+                if sidecar_path is not None else {}
+            )
+            colors = normalize_branch_colors(branch_ids, saved_colors)
+            parameter_fields = available_branch_parameters(catalog)
+        except (ValueError, TypeError, KeyError) as exc:
+            _logger.exception("Не удалось подготовить менеджер ветвей")
+            self._clear_branch_context()
+            self.status.showMessage(f"Менеджер ветвей недоступен: {exc}", 10000)
+            return
+        self._branch_catalog = catalog
+        self._branch_fingerprint = fingerprint
+        self._branch_display_colors = colors
+        self._branch_display_state_path = sidecar_path
+        self._branch_parameter_layer = None
+        self._branch_parameter_branch_id = None
+        self.branch_manager.set_branches(summaries, colors, parameter_fields)
+        self.plot_workspace.set_branch_manager_visible(bool(summaries))
+        self.volume_widget.set_branch_display_state(colors, (), focus_selected=False)
+        self._sync_analysis_result_menus(state)
+
+    def _sync_branch_display_to_volume(self) -> None:
+        manager = getattr(self, "branch_manager", None)
+        self.volume_widget.set_branch_display_state(
+            self._branch_display_colors,
+            manager.selected_branch_ids if manager is not None else (),
+            focus_selected=bool(manager is not None and manager.focus_3d_enabled),
+        )
+
+    def _on_branch_selection_changed(self, branch_ids) -> None:
+        selected = tuple(sorted({int(value) for value in (branch_ids or ())}))
+        parameter_branch_id = self._branch_parameter_branch_id
+        if (
+            self._branch_parameter_layer is not None
+            and (len(selected) != 1 or parameter_branch_id is None
+                 or selected[0] != int(parameter_branch_id))
+        ):
+            was_active = self._analysis_map_key == self._branch_parameter_layer.key
+            self._branch_parameter_layer = None
+            self._branch_parameter_branch_id = None
+            if was_active:
+                fallback = getattr(self._analysis_view, "default_map_key", None)
+                if fallback is not None:
+                    self._analysis_map_key = str(fallback)
+                self._set_analysis_contrast_mode(self._analysis_map_key)
+            self._sync_analysis_result_menus(self._analysis_view)
+            if was_active and not self.branch_manager.footprints_enabled:
+                self.refresh_map()
+        self._sync_branch_display_to_volume()
+        # BranchManagerWidget emits footprints_toggled(True) after a selection
+        # change when the overlay is enabled. That signal owns the one redraw;
+        # doing it here as well would render the same detector map twice.
+
+    def _on_branch_color_changed(self, branch_id: int, color: str) -> None:
+        try:
+            branch_id = int(branch_id)
+            parsed = QColor(str(color))
+            if not parsed.isValid() or branch_id not in self._branch_display_colors:
+                return
+            normalized = parsed.name(QColor.NameFormat.HexRgb).upper()
+            conflicting_branch = next(
+                (
+                    other_id for other_id, other_color in self._branch_display_colors.items()
+                    if int(other_id) != branch_id
+                    and QColor(str(other_color)).name(QColor.NameFormat.HexRgb).upper() == normalized
+                ),
+                None,
+            )
+            if conflicting_branch is not None:
+                self.status.showMessage(
+                    f"Цвет {normalized} уже назначен ветви {conflicting_branch}. "
+                    "Выберите другой цвет.",
+                    8000,
+                )
+                return
+            if not self.branch_manager.set_branch_color(branch_id, normalized):
+                self.status.showMessage(
+                    f"Цвет {normalized} уже используется другой ветвью.", 8000,
+                )
+                return
+            self._branch_display_colors[branch_id] = normalized
+            if self._branch_display_state_path is not None and self._branch_fingerprint:
+                save_branch_display_colors(
+                    self._branch_display_state_path, self._branch_fingerprint,
+                    self._branch_display_colors,
+                )
+        except (OSError, ValueError, TypeError) as exc:
+            self.status.showMessage(f"Не удалось сохранить цвет ветви: {exc}", 10000)
+        self._sync_branch_display_to_volume()
+        if self.branch_manager.footprints_enabled:
+            self.refresh_map()
+
+    def _on_branch_footprints_toggled(self, enabled: bool) -> None:
+        if enabled and not self.branch_manager.selected_branch_ids:
+            return
+        if self._analysis_view is None:
+            self.map_widget.clear_branch_footprints(draw=True)
+            return
+        self.refresh_map()
+
+    def _on_branch_focus_3d_toggled(self, enabled: bool) -> None:
+        self._sync_branch_display_to_volume()
+        if enabled and not self.plot_workspace.mdi_area.is_panel_visible("volume"):
+            self.plot_workspace.mdi_area.show_panel("volume", True)
+            self._request_volume_refresh()
+
+    def _on_branch_parameter_map_requested(self, branch_id: int, parameter: str) -> None:
+        state = self._analysis_view
+        catalog = self._branch_catalog
+        if state is None or catalog is None:
+            return
+        selected = self.branch_manager.selected_branch_ids
+        if len(selected) != 1 or int(selected[0]) != int(branch_id):
+            self.status.showMessage("Карта параметра требует ровно одну выбранную ветвь", 8000)
+            return
+        try:
+            shape_yx = tuple(map(int, np.shape(state.data_yxt)[:2]))
+            image = build_branch_parameter_map(catalog, int(branch_id), str(parameter), shape_yx)
+            field = next(
+                (item for item in available_branch_parameters(catalog) if item["key"] == str(parameter)),
+                {"label": str(parameter), "unit": ""},
+            )
+            from roc_mcs.analysis.workflow_preview import PreviewMapLayer
+            layer = PreviewMapLayer(
+                key=f"branch.parameter.{int(branch_id)}.{str(parameter)}",
+                label=f"Ветвь {int(branch_id)} · {field['label']}",
+                data_yx=image,
+                group=f"Параметры ветви {int(branch_id)}",
+                unit=str(field.get("unit", "")),
+                description=(
+                    f"Значение {parameter} для событий ветви {int(branch_id)}; "
+                    "при нескольких событиях одной ветви в одном пикселе отображается их среднее. "
+                    "Вне детекторных пикселей выбранной ветви значения отсутствуют."
+                ),
+            )
+        except (ValueError, TypeError, KeyError, IndexError) as exc:
+            self.status.showMessage(f"Не удалось построить карту параметра ветви: {exc}", 10000)
+            return
+        if not np.isfinite(image).any():
+            self.status.showMessage("У выбранной ветви нет конечных значений этого параметра", 8000)
+            return
+        self._branch_parameter_layer = layer
+        self._branch_parameter_branch_id = int(branch_id)
+        self._analysis_map_key = layer.key
+        self._apply_analysis_layer_colormap(
+            self._analysis_display_identity, self._analysis_map_key, default_hkl=False,
+        )
+        self._set_analysis_contrast_mode(self._analysis_map_key)
+        self._sync_analysis_result_menus(state)
+        self._set_result_menu_checked(self.map_widget.tools.results_menu, self._analysis_map_key)
+        self.refresh_map()
+        self._update_inspector()
+
+    def _draw_branch_footprints_overlay(self) -> None:
+        if (
+            self._analysis_view is None or self._branch_catalog is None
+            or not self.branch_manager.footprints_enabled
+        ):
+            self.map_widget.clear_branch_footprints(draw=False)
+            return
+        selected = self.branch_manager.selected_branch_ids
+        if not selected:
+            self.map_widget.clear_branch_footprints(draw=False)
+            return
+        shape_yx = tuple(map(int, np.shape(self._analysis_view.data_yxt)[:2]))
+        layers = branch_footprint_layers(
+            self._branch_catalog, selected, shape_yx, smooth_sigma=1.2,
+        )
+        count = self.map_widget.draw_branch_footprints(
+            layers, self._branch_display_colors, alpha=0.45, contour_level=0.35,
+        )
+        if count == 0:
+            self.status.showMessage("Для выбранных ветвей не найдено валидных XY-координат", 8000)
+
     def restore_analysis_preview(self) -> None:
         """Возвращает исходный HDF5-view, палитру и прежний spatial pooling."""
         self._remember_analysis_display_preferences()
         self._analysis_view = None
+        self._clear_branch_context()
         self._restore_analysis_source_colormap()
         self._set_analysis_contrast_mode(None)
         self._analysis_map_key = None
@@ -1863,13 +2113,25 @@ class RockingCurveExplorerWindow(QMainWindow):
             self.status.showMessage(f"Preview update failed: {exc}")
             return
 
-        self.preview_th = th
-        self.preview_curve = curve
-        self.preview_count = count
+        theta_values = np.asarray(th, dtype=float)
         curve_values = np.asarray(curve, dtype=float)
-        fit_view = self._preview_fit_pending and curve_values.size > 0 and np.isfinite(curve_values).any()
+        self.preview_th = theta_values if theta_values.ndim == 1 else None
+        self.preview_curve = curve_values if curve_values.ndim == 1 else np.array([], dtype=float)
+        self.preview_count = int(count)
+        aligned_preview = (
+            theta_values.ndim == 1 and curve_values.ndim == 1
+            and theta_values.size > 0 and theta_values.shape == curve_values.shape
+        )
+        has_finite_preview = bool(
+            aligned_preview
+            and (np.isfinite(theta_values) & np.isfinite(curve_values)).any()
+        )
+        fit_view = self._preview_fit_pending and has_finite_preview
         self._preview_fit_pending = False
-        self.refresh_curves(fit_curve_view=fit_view, fit_curve_y=bool(curve_values.size and np.isfinite(curve_values).any()), update_volume=False)
+        self.refresh_curves(
+            fit_curve_view=fit_view, fit_curve_y=has_finite_preview,
+            update_volume=False,
+        )
         self._update_inspector()
 
     def pin_preview_roi(self, *args) -> None:
@@ -2160,14 +2422,22 @@ class RockingCurveExplorerWindow(QMainWindow):
                 title = f"{state.label} · θ={state.theta[idx]:.6g}"
                 self.map_widget.tools.results_btn.setEnabled(False)
             else:
-                if hasattr(state, "map_layer"):
+                if (
+                    self._branch_parameter_layer is not None
+                    and self._analysis_map_key == self._branch_parameter_layer.key
+                ):
+                    layer = self._branch_parameter_layer
+                    img = layer.data_yx
+                    title = f"{state.label} · {layer.label}"
+                elif hasattr(state, "map_layer"):
                     layer = state.map_layer(self._analysis_map_key)
                     img = layer.data_yx
                     title = f"{state.label} · {layer.label}"
                 else:
+                    layer = None
                     img = state.map_data
                     title = f"{state.label} · {state.map_title}"
-                self.map_widget.tools.results_btn.setEnabled(bool(getattr(state, "map_layers", ())))
+                self.map_widget.tools.results_btn.setEnabled(bool(self._analysis_menu_items(state, "map_layers")))
             if not self._theta_slice_mode and self._analysis_map_key == "peaks.count":
                 # Match the display intensity to the signal actually consumed
                 # by peaks.detect: measured counts or upstream interpolation.
@@ -2201,15 +2471,21 @@ class RockingCurveExplorerWindow(QMainWindow):
                     y_coords=state.y_coords,
                     valid_mask_yx=valid_yx,
                 )
+                self._draw_branch_footprints_overlay()
                 self._draw_pinned_rois(); self.map_widget.canvas.draw_idle()
                 return
 
-            try:
-                img, title = self._apply_theta_projection_range(img, title)
-            except (ValueError, TypeError, IndexError) as exc:
-                self.status.showMessage(
-                    f"Предпросмотр диапазона θ не применён: {exc}", 8000
-                )
+            branch_parameter_active = bool(
+                self._branch_parameter_layer is not None
+                and self._analysis_map_key == self._branch_parameter_layer.key
+            )
+            if not branch_parameter_active:
+                try:
+                    img, title = self._apply_theta_projection_range(img, title)
+                except (ValueError, TypeError, IndexError) as exc:
+                    self.status.showMessage(
+                        f"Предпросмотр диапазона θ не применён: {exc}", 8000
+                    )
 
             quantitative = self._is_quantitative_analysis_map(self._analysis_map_key)
             p_lo = float(self.map_widget.low_pct.value())
@@ -2249,12 +2525,16 @@ class RockingCurveExplorerWindow(QMainWindow):
                 colorbar_mode="quantitative" if quantitative else "continuous",
             )
             if self.map_widget.cbar is not None:
-                colorbar_unit = (
-                    "Δθ, ″"
-                    if str(self._analysis_map_key or "").startswith("hkl.delta_theta.")
-                    else ""
-                )
+                if branch_parameter_active and self._branch_parameter_layer is not None:
+                    colorbar_unit = str(self._branch_parameter_layer.unit or "")
+                else:
+                    colorbar_unit = (
+                        "Δθ, ″"
+                        if str(self._analysis_map_key or "").startswith("hkl.delta_theta.")
+                        else ""
+                    )
                 self.map_widget.cbar.set_label(colorbar_unit, labelpad=3)
+            self._draw_branch_footprints_overlay()
             self._draw_pinned_rois(); self.map_widget.canvas.draw_idle()
             return
         if self.repo is None or self.selected_scan is None or (self.selected_map is None and not self._theta_slice_mode):
@@ -2342,10 +2622,18 @@ class RockingCurveExplorerWindow(QMainWindow):
                     th, curve, count = self._analysis_curve(state, roi)
                 except Exception:
                     continue
-                if np.asarray(curve).size == 0:
+                try:
+                    theta_values = np.asarray(th, dtype=float)
+                    curve_values = np.asarray(curve, dtype=float)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if (
+                    theta_values.ndim != 1 or curve_values.ndim != 1
+                    or theta_values.size == 0 or theta_values.shape != curve_values.shape
+                ):
                     continue
                 curves_data.append({
-                    "id": pinned.id, "th": th, "curve": curve,
+                    "id": pinned.id, "th": theta_values, "curve": curve_values,
                     "color": roi.color or self._color_for_roi(pinned.id),
                     "is_selected": pinned.id == self.selected_roi_id,
                     "label": roi.label or f"ROI {pinned.id}",
@@ -2354,8 +2642,14 @@ class RockingCurveExplorerWindow(QMainWindow):
             if self.preview_roi is not None and self.preview_roi.is_valid:
                 try:
                     pth, pcurve, _ = self._analysis_curve(state, self.preview_roi)
-                    preview_data = {"th": pth, "curve": pcurve}
-                    self.preview_th, self.preview_curve = np.asarray(pth), np.asarray(pcurve)
+                    pth = np.asarray(pth, dtype=float)
+                    pcurve = np.asarray(pcurve, dtype=float)
+                    self.preview_th, self.preview_curve = pth, pcurve
+                    if (
+                        pth.ndim == 1 and pcurve.ndim == 1
+                        and pth.size > 0 and pth.shape == pcurve.shape
+                    ):
+                        preview_data = {"th": pth, "curve": pcurve}
                 except Exception:
                     preview_data = None
             pixel_data = None
@@ -2393,12 +2687,15 @@ class RockingCurveExplorerWindow(QMainWindow):
                     count = 0
                 pinned.curve = curve
                 pinned.count = int(count)
-            curve = pinned.curve
-            if curve is None or curve.size == 0:
+            curve = np.asarray(pinned.curve, dtype=float) if pinned.curve is not None else np.array([])
+            if curve.ndim != 1 or curve.size == 0:
                 continue
-                
-            # --- Формируем пакет данных для Панели ---
-            current_th = th if th is not None else np.arange(curve.size)
+
+            # A cached ROI profile may outlive a scan/theta-axis change. Never
+            # hand Matplotlib an x/y pair with different lengths.
+            current_th = np.asarray(th, dtype=float) if th is not None else np.arange(curve.size)
+            if current_th.ndim != 1 or current_th.shape != curve.shape:
+                continue
             color = roi.color or self._color_for_roi(pinned.id)
             curves_data.append({
                 'id': pinned.id,
@@ -2411,11 +2708,17 @@ class RockingCurveExplorerWindow(QMainWindow):
 
         # Данные для предпросмотра
         preview_data = None
-        if self.preview_curve is not None and self.preview_th is not None and self.preview_curve.size > 0:
-            preview_data = {
-                'th': self.preview_th,
-                'curve': self.preview_curve
-            }
+        if self.preview_curve is not None and self.preview_th is not None:
+            preview_th = np.asarray(self.preview_th, dtype=float)
+            preview_curve = np.asarray(self.preview_curve, dtype=float)
+            if (
+                preview_th.ndim == 1 and preview_curve.ndim == 1
+                and preview_th.size > 0 and preview_th.shape == preview_curve.shape
+            ):
+                preview_data = {
+                    'th': preview_th,
+                    'curve': preview_curve,
+                }
         pixel_data = None
         if self.repo is not None and self.selected_scan is not None and self.selected_pixel is not None:
             scan = self.repo.load_scan(self.selected_scan)

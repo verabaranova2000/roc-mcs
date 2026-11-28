@@ -785,6 +785,12 @@ class VTKVolumeScene:
         self._show_excluded_branches = False
         self._peak_branch_event_counts: dict[int, int] = {}
         self._peak_excluded_branch_event_counts: dict[int, int] = {}
+        # Shared branch-manager display state belongs to the scene from its
+        # first construction, not only after set_payload() happens to run.
+        self._branch_display_colors: dict[int, str] = {}
+        self._branch_display_selected_ids = np.empty(0, dtype=np.int64)
+        self._branch_display_focus_selected = False
+        self._branch_display_previous_visibility: tuple[bool, bool] | None = None
         self._peak_point_picker = vtk.vtkPointPicker()
         self._peak_point_picker.SetTolerance(0.012)
         self._peak_point_picker.PickFromListOn()
@@ -866,6 +872,9 @@ class VTKVolumeScene:
 
         self._branch_edge_positions_physical = np.empty((0, 2, 3), dtype=np.float64)
         self._branch_edge_colors = np.empty((0, 4), dtype=np.uint8)
+        self._branch_edge_base_colors = np.empty((0, 4), dtype=np.uint8)
+        self._branch_edge_branch_ids = np.empty(0, dtype=np.int64)
+        self._branch_edge_analysis_included = np.empty(0, dtype=bool)
         self._branch_edge_visible = False
         self._branch_edge_width = 2.0
         self._branch_edge_opacity = 0.92
@@ -2732,11 +2741,18 @@ class VTKVolumeScene:
         self._show_excluded_branches = False
         self._peak_branch_event_counts = {}
         self._peak_excluded_branch_event_counts = {}
+        self._branch_display_colors: dict[int, str] = {}
+        self._branch_display_selected_ids = np.empty(0, dtype=np.int64)
+        self._branch_display_focus_selected = False
+        self._branch_display_previous_visibility: tuple[bool, bool] | None = None
         self._peak_marker_visible = False
         self._branch_edge_actor.SetVisibility(0)
         self._branch_edge_polydata.Initialize()
         self._branch_edge_positions_physical = np.empty((0, 2, 3), dtype=np.float64)
         self._branch_edge_colors = np.empty((0, 4), dtype=np.uint8)
+        self._branch_edge_base_colors = np.empty((0, 4), dtype=np.uint8)
+        self._branch_edge_branch_ids = np.empty(0, dtype=np.int64)
+        self._branch_edge_analysis_included = np.empty(0, dtype=bool)
         self._branch_edge_visible = False
         self._branch_correlation_matched_actor.SetVisibility(0)
         self._branch_correlation_candidate_actor.SetVisibility(0)
@@ -3509,24 +3525,65 @@ class VTKVolumeScene:
         return "#{:02X}{:02X}{:02X}".format(int(rgba[0]), int(rgba[1]), int(rgba[2]))
 
     def branch_legend_data(self, *, limit: int = 40) -> dict[str, Any]:
-        """Return accepted branch rows plus one aggregate for excluded branches."""
+        """Return the active 3D branch palette without conflating exclusions.
+
+        In normal mode, counts and rows retain the established accepted-only
+        contract; excluded branches remain one separate aggregate. During an
+        explicit Branch Manager focus, the legend instead lists exactly the
+        selected objects, including an individually selected excluded branch.
+        """
         limit = max(1, min(200, int(limit)))
-        ordered = sorted(
-            self._peak_branch_event_counts.items(),
-            key=lambda item: (-int(item[1]), int(item[0])),
+        accepted = dict(getattr(self, "_peak_branch_event_counts", {}) or {})
+        excluded = dict(getattr(self, "_peak_excluded_branch_event_counts", {}) or {})
+        color_map = getattr(self, "_branch_display_colors", {}) or {}
+        focus = bool(getattr(self, "_branch_display_focus_selected", False))
+        selected = np.asarray(
+            getattr(self, "_branch_display_selected_ids", np.empty(0)), dtype=np.int64
         )
-        excluded = self._peak_excluded_branch_event_counts
+        if focus and selected.size:
+            all_counts = {int(key): int(value) for key, value in accepted.items()}
+            all_counts.update({int(key): int(value) for key, value in excluded.items()})
+            selected_ids = sorted({int(value) for value in selected if int(value) >= 0})
+            ordered = sorted(
+                selected_ids,
+                key=lambda branch_id: (-int(all_counts.get(branch_id, 0)), branch_id),
+            )
+            entries = []
+            for branch_id in ordered[:limit]:
+                included = branch_id in accepted
+                color = str(color_map.get(branch_id, self._branch_hex_color(branch_id)))
+                entries.append({
+                    "branch_id": branch_id,
+                    "event_count": int(all_counts.get(branch_id, 0)),
+                    "color": color,
+                    "analysis_included": bool(included),
+                })
+            return {
+                "total_branches": int(len(accepted)),
+                "total_events": int(sum(int(value) for value in accepted.values())),
+                "excluded_branches": int(len(excluded)),
+                "excluded_events": int(sum(int(value) for value in excluded.values())),
+                "show_excluded": bool(getattr(self, "_show_excluded_branches", False)),
+                "focus_selected": True,
+                "selected_branches": int(len(selected_ids)),
+                "entries": entries,
+                "truncated": bool(len(ordered) > limit),
+            }
+
+        ordered = sorted(
+            accepted.items(), key=lambda item: (-int(item[1]), int(item[0]))
+        )
         return {
-            "total_branches": int(len(ordered)),
-            "total_events": int(sum(count for _, count in ordered)),
+            "total_branches": int(len(accepted)),
+            "total_events": int(sum(int(value) for value in accepted.values())),
             "excluded_branches": int(len(excluded)),
-            "excluded_events": int(sum(excluded.values())),
+            "excluded_events": int(sum(int(value) for value in excluded.values())),
             "show_excluded": bool(getattr(self, "_show_excluded_branches", False)),
             "entries": [
                 {
                     "branch_id": int(branch_id),
                     "event_count": int(count),
-                    "color": self._branch_hex_color(branch_id),
+                    "color": str(color_map.get(int(branch_id), self._branch_hex_color(branch_id))),
                 }
                 for branch_id, count in ordered[:limit]
             ],
@@ -3678,55 +3735,104 @@ class VTKVolumeScene:
             edge_b = np.asarray(branch_edges["peak_id_b"], dtype=object)
             valid_pairs = []
             branch_values = []
+            inclusion_values = []
             for left, right in zip(edge_a, edge_b):
                 key_a, key_b = self._stable_id_key(left), self._stable_id_key(right)
                 if key_a not in position_by_id or key_b not in position_by_id:
                     continue
-                if not inclusion_by_id.get(key_a, True) or not inclusion_by_id.get(key_b, True):
+                branch_a = branch_by_id.get(key_a, -1)
+                branch_b = branch_by_id.get(key_b, branch_a)
+                # branch_edges must connect events belonging to one connected
+                # component. Refuse malformed cross-branch links rather than
+                # colouring them ambiguously.
+                if branch_a >= 0 and branch_b >= 0 and branch_a != branch_b:
                     continue
                 valid_pairs.append((position_by_id[key_a], position_by_id[key_b]))
-                branch_values.append(branch_by_id.get(key_a))
+                branch_values.append(branch_a if branch_a >= 0 else branch_b)
+                inclusion_values.append(
+                    bool(inclusion_by_id.get(key_a, True) and inclusion_by_id.get(key_b, True))
+                )
                 if len(valid_pairs) >= 200_000:
                     break
             positions = (
                 np.asarray(valid_pairs, dtype=np.float64).reshape(-1, 2, 3)
                 if valid_pairs else np.empty((0, 2, 3), dtype=np.float64)
             )
+            branch_numeric = np.asarray(branch_values, dtype=np.int64) if branch_values else np.empty(0, dtype=np.int64)
+            edge_included = np.asarray(inclusion_values, dtype=bool)
             fallback = self._hex_rgba(uniform_color)
             colors = np.repeat(fallback[None, :], len(valid_pairs), axis=0)
             if color_by_branch and colors.size:
-                branch_numeric = np.asarray([
-                    np.nan if value is None else float(value) for value in branch_values
-                ], dtype=np.float64)
-                branch_valid = np.isfinite(branch_numeric)
+                branch_valid = branch_numeric >= 0
                 if np.any(branch_valid):
-                    colors[branch_valid] = self._branch_rgba(
-                        np.rint(branch_numeric[branch_valid]).astype(np.int64)
-                    )
+                    colors[branch_valid] = self._branch_rgba(branch_numeric[branch_valid])
         # Actor property opacity is applied globally; preserve per-cell alpha
         # in the direct RGBA array as fully opaque to avoid accidental squaring.
         if colors.size:
             colors[:, 3] = 255
         self._branch_edge_positions_physical = np.ascontiguousarray(positions, dtype=np.float64)
-        self._branch_edge_colors = np.ascontiguousarray(colors, dtype=np.uint8)
+        self._branch_edge_base_colors = np.ascontiguousarray(colors, dtype=np.uint8)
+        self._branch_edge_branch_ids = np.ascontiguousarray(
+            branch_numeric if "branch_numeric" in locals() else np.full(len(positions), -1, dtype=np.int64),
+            dtype=np.int64,
+        )
+        self._branch_edge_analysis_included = np.ascontiguousarray(
+            edge_included if "edge_included" in locals() else np.ones(len(positions), dtype=bool),
+            dtype=bool,
+        )
+        self._branch_edge_colors = self._branch_edge_base_colors.copy()
         self._update_branch_edge_polydata()
         self._branch_edge_visible = bool(visible and positions.shape[0] > 0)
         self._branch_edge_actor.SetVisibility(self._branch_edge_visible)
         if render:
             self._request_render()
-        return int(positions.shape[0])
+        return int(self._branch_edge_polydata.GetNumberOfLines())
 
     def _update_branch_edge_polydata(self) -> None:
-        """Rebuild VTK line cells using physical endpoints + display scaling."""
+        """Rebuild only the currently visible branch-edge subset."""
         vtk, numpy_to_vtk = _vtk()
-        edges = self._branch_edge_positions_physical
+        all_edges = self._branch_edge_positions_physical
+        all_ids = np.asarray(getattr(self, "_branch_edge_branch_ids", np.full(len(all_edges), -1)), dtype=np.int64)
+        all_included = np.asarray(
+            getattr(self, "_branch_edge_analysis_included", np.ones(len(all_edges), dtype=bool)),
+            dtype=bool,
+        )
+        if all_ids.size != len(all_edges):
+            all_ids = np.full(len(all_edges), -1, dtype=np.int64)
+        if all_included.size != len(all_edges):
+            all_included = np.ones(len(all_edges), dtype=bool)
+        focus = bool(getattr(self, "_branch_display_focus_selected", False))
+        selected = np.asarray(getattr(self, "_branch_display_selected_ids", np.empty(0)), dtype=np.int64)
+        visible_mask = (
+            np.isin(all_ids, selected, assume_unique=False)
+            if focus and selected.size else all_included
+        )
+        visible_indices = np.flatnonzero(visible_mask)
+        edges = all_edges[visible_indices]
+        base_colors = np.asarray(
+            getattr(self, "_branch_edge_base_colors", self._branch_edge_colors), dtype=np.uint8
+        )
+        if base_colors.shape != (len(all_edges), 4):
+            base_colors = np.repeat(self._hex_rgba("#53C6D8")[None, :], len(all_edges), axis=0)
+        colors = base_colors[visible_indices].copy()
+        color_map = getattr(self, "_branch_display_colors", {}) or {}
+        if colors.size and color_map:
+            edge_ids = all_ids[visible_indices]
+            for branch_id, color in color_map.items():
+                mask = edge_ids == int(branch_id)
+                if not np.any(mask):
+                    continue
+                try:
+                    rgba = self._hex_rgba(str(color))
+                except (TypeError, ValueError):
+                    continue
+                colors[mask, :3] = rgba[:3]
+        self._branch_edge_colors = np.ascontiguousarray(colors, dtype=np.uint8)
         count = int(edges.shape[0])
         if count == 0:
             self._branch_edge_polydata.Initialize()
             self._branch_edge_polydata.Modified()
-            # Correlation links are an independent layer and must still be
-            # remapped after display-axis changes when no ordinary branch-edge
-            # geometry exists in this payload.
+            self._branch_edge_actor.SetVisibility(False)
             if hasattr(self, "_branch_correlation_matched_polydata"):
                 self._update_branch_correspondence_polydata()
             return
@@ -3746,16 +3852,73 @@ class VTKVolumeScene:
         connectivity = numpy_to_vtkIdTypeArray(np.arange(count * 2, dtype=np.int64), deep=True)
         cells.SetData(offsets, connectivity)
         self._branch_edge_polydata.SetLines(cells)
-        rgba = numpy_to_vtk(np.ascontiguousarray(self._branch_edge_colors), deep=True)
+        rgba = numpy_to_vtk(np.ascontiguousarray(colors), deep=True)
         rgba.SetNumberOfComponents(4)
         rgba.SetName("BranchEdgeRGBA")
         self._branch_edge_polydata.GetCellData().SetScalars(rgba)
         self._branch_edge_polydata.Modified()
+        self._branch_edge_actor.SetVisibility(bool(self._branch_edge_visible))
         if hasattr(self, "_branch_correlation_matched_polydata"):
             self._update_branch_correspondence_polydata()
 
+    def set_branch_display_style(
+        self,
+        branch_colors: dict[int, str] | None = None,
+        selected_branch_ids=(),
+        *,
+        focus_selected: bool = False,
+        render: bool = True,
+    ) -> None:
+        """Apply one branch palette/selection to both 3D event and edge layers.
+
+        This is display state only: inclusion flags, branch IDs and scientific
+        artifact tables are not edited. When focus is enabled it temporarily
+        reveals the selected branch overlays and restores their previous layer
+        visibility when focus is disabled.
+        """
+        normalized: dict[int, str] = {}
+        for raw_id, raw_color in (branch_colors or {}).items():
+            try:
+                branch_id = int(raw_id)
+                color = str(raw_color).strip()
+                if branch_id < 0 or len(color) != 7 or not color.startswith("#"):
+                    continue
+                int(color[1:], 16)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            normalized[branch_id] = color.upper()
+        selected = sorted({int(value) for value in selected_branch_ids if int(value) >= 0})
+        previous_focus = bool(getattr(self, "_branch_display_focus_selected", False))
+        focus_selected = bool(focus_selected and selected)
+        if focus_selected and not previous_focus:
+            self._branch_display_previous_visibility = (
+                bool(self._peak_marker_visible), bool(self._branch_edge_visible)
+            )
+            self._peak_marker_visible = True
+            self._branch_edge_visible = True
+        elif previous_focus and not focus_selected:
+            previous = self._branch_display_previous_visibility
+            if previous is not None:
+                self._peak_marker_visible, self._branch_edge_visible = previous
+            self._branch_display_previous_visibility = None
+        self._branch_display_colors = normalized
+        self._branch_display_selected_ids = np.asarray(selected, dtype=np.int64)
+        self._branch_display_focus_selected = focus_selected
+        self._apply_branch_correlation_peak_emphasis(update_polydata=False)
+        self._update_peak_marker_polydata()
+        self._peak_marker_actor.SetVisibility(
+            bool(self._peak_marker_visible and self._peak_marker_rendered_indices.size)
+        )
+        self._update_branch_edge_polydata()
+        self._branch_edge_actor.SetVisibility(
+            bool(self._branch_edge_visible and self._branch_edge_polydata.GetNumberOfLines())
+        )
+        if render:
+            self._request_render()
+
     def set_branch_edges_visible(self, visible: bool, *, render: bool = True) -> None:
-        self._branch_edge_visible = bool(visible and self._branch_edge_positions_physical.size)
+        has_visible_lines = bool(self._branch_edge_polydata.GetNumberOfLines() > 0)
+        self._branch_edge_visible = bool(visible and has_visible_lines)
         self._branch_edge_actor.SetVisibility(self._branch_edge_visible)
         if render:
             self._request_render()
@@ -3896,6 +4059,26 @@ class VTKVolumeScene:
         )
         if included.size == colors.shape[0] and np.any(~included):
             colors[~included] = np.asarray([132, 139, 149, 255], dtype=np.uint8)
+        # User-defined display colours are applied after branch-correlation
+        # emphasis. Only RGB changes; alpha still communicates the emphasis.
+        color_map = getattr(self, "_branch_display_colors", {}) or {}
+        focus = bool(getattr(self, "_branch_display_focus_selected", False))
+        selected_ids = np.asarray(getattr(self, "_branch_display_selected_ids", np.empty(0)), dtype=np.int64)
+        if colors.size and branch_ids.size == colors.shape[0] and color_map:
+            for branch_id, color in color_map.items():
+                mask = branch_ids == int(branch_id)
+                if included.size == colors.shape[0]:
+                    if focus and selected_ids.size and int(branch_id) in selected_ids:
+                        pass
+                    else:
+                        mask &= included
+                if not np.any(mask):
+                    continue
+                try:
+                    rgba = self._hex_rgba(str(color))
+                except (TypeError, ValueError):
+                    continue
+                colors[mask, :3] = rgba[:3]
         self._peak_marker_colors = np.ascontiguousarray(colors, dtype=np.uint8)
         if update_polydata and getattr(self, "_peak_marker_positions_physical", np.empty((0, 3))).size:
             self._update_peak_marker_polydata()
@@ -4250,7 +4433,15 @@ class VTKVolumeScene:
         if included.size != len(physical):
             included = np.ones(len(physical), dtype=bool)
         show_excluded = bool(getattr(self, "_show_excluded_branches", False))
-        visible_mask = included | (show_excluded & ~included)
+        focus = bool(getattr(self, "_branch_display_focus_selected", False))
+        selected = np.asarray(getattr(self, "_branch_display_selected_ids", np.empty(0)), dtype=np.int64)
+        branch_ids = np.asarray(getattr(self, "_peak_marker_branch_ids", np.full(len(physical), -1)), dtype=np.int64)
+        if focus and selected.size and branch_ids.size == len(physical):
+            # Explicit branch-manager focus may inspect an otherwise excluded
+            # branch, but does not change its scientific inclusion flag.
+            visible_mask = np.isin(branch_ids, selected, assume_unique=False)
+        else:
+            visible_mask = included | (show_excluded & ~included)
         visible_indices = np.flatnonzero(visible_mask).astype(np.int64, copy=False)
         self._peak_marker_rendered_indices = np.ascontiguousarray(visible_indices, dtype=np.int64)
         if visible_indices.size == 0:
@@ -5222,6 +5413,9 @@ class VTKVolumeScene:
             self._branch_edge_polydata.Initialize()
         self._branch_edge_positions_physical = np.empty((0, 2, 3), dtype=np.float64)
         self._branch_edge_colors = np.empty((0, 4), dtype=np.uint8)
+        self._branch_edge_base_colors = np.empty((0, 4), dtype=np.uint8)
+        self._branch_edge_branch_ids = np.empty(0, dtype=np.int64)
+        self._branch_edge_analysis_included = np.empty(0, dtype=bool)
         self._branch_edge_visible = False
         self._branch_correlation_matched_actor.SetVisibility(0)
         self._branch_correlation_candidate_actor.SetVisibility(0)

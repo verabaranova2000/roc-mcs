@@ -1,4 +1,5 @@
 from math import ceil, cos, pi, sin, sqrt
+from typing import Iterable
 from PyQt6.QtCore import QPoint, QPointF, QSize, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QLinearGradient, QPainter, QPen, QPolygon, QPalette
 from PyQt6.QtWidgets import (QColorDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QToolButton,
@@ -37,6 +38,7 @@ class _HexSwatchCanvas(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent); self._radius = 9.0; self._cells = []; self._hover = -1
+        self._disabled_colors: set[str] = set()
         self.setFixedSize(ceil(8 * sqrt(3) * self._radius) + 1, ceil(8 * self._radius) + 1); self.setMouseTracking(True); self.setCursor(Qt.CursorShape.PointingHandCursor)
         self._build_cells()
 
@@ -50,9 +52,21 @@ class _HexSwatchCanvas(QWidget):
                 points = [QPoint(round(cx + r * cos(pi / 2 + k * pi / 3)), round(cy + r * sin(pi / 2 + k * pi / 3))) for k in range(6)]
                 self._cells.append((QPolygon(points), self.COLORS[index])); index += 1
 
+    def set_disabled_colors(self, colors: Iterable[str]) -> None:
+        normalized = set()
+        for value in colors:
+            parsed = QColor(str(value))
+            if parsed.isValid():
+                normalized.add(parsed.name(QColor.NameFormat.HexRgb).upper())
+        self._disabled_colors = normalized
+        self.update()
+
     def _index_at(self, point):
-        for index, (polygon, _) in enumerate(self._cells):
-            if polygon.containsPoint(point, Qt.FillRule.OddEvenFill): return index
+        for index, (polygon, value) in enumerate(self._cells):
+            if polygon.containsPoint(point, Qt.FillRule.OddEvenFill):
+                parsed = QColor(value)
+                key = parsed.name(QColor.NameFormat.HexRgb).upper()
+                return -1 if key in self._disabled_colors else index
         return -1
 
     def mousePressEvent(self, event):
@@ -63,8 +77,19 @@ class _HexSwatchCanvas(QWidget):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
-        index = self._index_at(event.position().toPoint())
+        point = event.position().toPoint()
+        index = self._index_at(point)
         if index != self._hover: self._hover = index; self.update()
+        hovered_disabled = any(
+            polygon.containsPoint(point, Qt.FillRule.OddEvenFill)
+            and QColor(value).name(QColor.NameFormat.HexRgb).upper() in self._disabled_colors
+            for polygon, value in self._cells
+        )
+        self.setCursor(
+            Qt.CursorShape.ForbiddenCursor if hovered_disabled
+            else Qt.CursorShape.PointingHandCursor
+        )
+        self.setToolTip("Цвет уже назначен другой ветви" if hovered_disabled else "")
         super().mouseMoveEvent(event)
 
     def leaveEvent(self, event):
@@ -73,8 +98,20 @@ class _HexSwatchCanvas(QWidget):
     def paintEvent(self, event):
         p = QPainter(self); p.setRenderHint(QPainter.RenderHint.Antialiasing)
         for index, (polygon, value) in enumerate(self._cells):
-            color = QColor(value); p.setBrush(color); p.setPen(QPen(color, 1.4)); p.drawPolygon(polygon)
-            if index == self._hover:
+            key = QColor(value).name(QColor.NameFormat.HexRgb).upper()
+            color = QColor(value)
+            disabled = key in self._disabled_colors
+            if disabled:
+                hue, saturation, brightness, _ = color.getHsv()
+                color = QColor.fromHsv(max(0, hue), round(saturation * 0.16), round(brightness * 0.72))
+                p.setOpacity(0.58)
+            p.setBrush(color); p.setPen(QPen(color.darker(125), 1.0 if disabled else 1.4)); p.drawPolygon(polygon)
+            if disabled:
+                bounds = polygon.boundingRect()
+                p.setPen(QPen(self.palette().color(QPalette.ColorRole.Mid), 1.0))
+                p.drawLine(bounds.topLeft(), bounds.bottomRight())
+                p.setOpacity(1.0)
+            if index == self._hover and not disabled:
                 p.setBrush(Qt.BrushStyle.NoBrush); p.setPen(QPen(self.palette().color(QPalette.ColorRole.Highlight), 1.5)); p.drawPolygon(polygon)
         p.end()
 
@@ -124,7 +161,10 @@ class CompactColorPicker(QFrame):
     """
     color_selected = pyqtSignal(str)
 
-    def __init__(self, color: str = "#1f77b4", parent=None, *, popup: bool = False):
+    def __init__(
+        self, color: str = "#1f77b4", parent=None, *, popup: bool = False,
+        unavailable_colors: Iterable[str] = (),
+    ):
         # Standalone callers retain the existing Tool-window behavior.  When
         # embedded into a QMenu hierarchy, Qt.Popup keeps the picker in the
         # same nested popup chain so palette clicks do not dismiss its parents.
@@ -134,6 +174,11 @@ class CompactColorPicker(QFrame):
         super().__init__(parent, flags)
         self.setObjectName("compactColorPicker"); apply_widget_palette(self, resolve_theme(parent))
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True); self._color = QColor(color if QColor(color).isValid() else "#1f77b4")
+        self._unavailable_colors: set[str] = set()
+        for unavailable in unavailable_colors:
+            parsed_unavailable = QColor(str(unavailable))
+            if parsed_unavailable.isValid():
+                self._unavailable_colors.add(parsed_unavailable.name(QColor.NameFormat.HexRgb).upper())
         self.setStyleSheet("""
             QFrame#compactColorPicker { background: palette(window); color: palette(window-text); border: 1px solid palette(mid); border-radius: 5px; }
             QToolButton { border: 1px solid transparent; border-radius: 3px; padding: 0; font-size: 10px; }
@@ -157,6 +202,7 @@ class CompactColorPicker(QFrame):
         header.addWidget(self.close_button)
         root.addLayout(header)
         self.swatches = _HexSwatchCanvas(self)
+        self.swatches.set_disabled_colors(self._unavailable_colors)
         self.swatches.color_clicked.connect(self._set_color)
         root.addWidget(self.swatches, 0, Qt.AlignmentFlag.AlignHCenter)
         plane_row = QHBoxLayout()
@@ -168,6 +214,11 @@ class CompactColorPicker(QFrame):
         plane_row.addWidget(self.plane)
         plane_row.addWidget(self.hue_strip)
         root.addLayout(plane_row)
+        self.validation_label = QLabel("", self)
+        self.validation_label.setWordWrap(True)
+        self.validation_label.setStyleSheet("QLabel { color: #c44747; font-size: 9px; }")
+        self.validation_label.hide()
+        root.addWidget(self.validation_label)
         footer = QHBoxLayout()
         footer.setContentsMargins(0, 0, 0, 0)
         footer.setSpacing(3)
@@ -213,33 +264,79 @@ class CompactColorPicker(QFrame):
         apply_popup_theme(self, theme)
         self.color_preview.setStyleSheet(f"QFrame {{ background: {self._color.name()}; border: 1px solid palette(mid); border-radius: 2px; }}")
 
+    def _show_validation_error(self, message: str) -> None:
+        self.validation_label.setText(str(message))
+        self.validation_label.show()
+        self.apply_button.setEnabled(False)
+        self.hex_edit.setStyleSheet("QLineEdit { border: 1px solid #c33; }")
+
     def _refresh_controls(self):
         self.color_preview.setStyleSheet(f"QFrame {{ background: {self._color.name()}; border: 1px solid palette(mid); border-radius: 2px; }}")
         self.hex_edit.blockSignals(True); self.hex_edit.setText(self._color.name().upper()); self.hex_edit.blockSignals(False); self.hex_edit.setStyleSheet("")
+        self.validation_label.clear()
+        self.validation_label.hide()
+        self.apply_button.setEnabled(True)
+
+    def _restore_color_controls(self) -> None:
+        h, s, v, _ = self._color.getHsv()
+        h = max(0, h)
+        self.hue_strip.hue = h
+        self.hue_strip.update()
+        self.plane.set_hsv(h, max(0, s) / 255, max(0, v) / 255)
 
     def _set_color(self, color):
         q = QColor(color)
-        if not q.isValid(): return
-        self._color = q; h, s, v, _ = q.getHsv(); h = max(0, h); self.hue_strip.hue = h; self.hue_strip.update(); self.plane.set_hsv(h, max(0, s) / 255, max(0, v) / 255); self._refresh_controls()
+        if not q.isValid():
+            return False
+        key = q.name(QColor.NameFormat.HexRgb).upper()
+        if key in self._unavailable_colors:
+            self._show_validation_error("Этот цвет уже назначен другой ветви. Выберите другой цвет.")
+            return False
+        self._color = q
+        h, s, v, _ = q.getHsv()
+        h = max(0, h)
+        self.hue_strip.hue = h
+        self.hue_strip.update()
+        self.plane.set_hsv(h, max(0, s) / 255, max(0, v) / 255)
+        self._refresh_controls()
+        return True
 
     def _on_plane_changed(self, saturation: float, value: float):
-        self._color = QColor.fromHsv(self.hue_strip.hue, round(saturation * 255), round(value * 255)); self._refresh_controls()
+        candidate = QColor.fromHsv(
+            self.hue_strip.hue, round(saturation * 255), round(value * 255)
+        )
+        if not self._set_color(candidate):
+            self._restore_color_controls()
 
     def _on_hue_changed(self, hue: int):
-        _, saturation, value, _ = self._color.getHsv(); self.plane.set_hsv(hue, max(0, saturation) / 255, max(0, value) / 255); self._color = QColor.fromHsv(hue, max(0, saturation), max(0, value)); self._refresh_controls()
+        _, saturation, value, _ = self._color.getHsv()
+        candidate = QColor.fromHsv(hue, max(0, saturation), max(0, value))
+        if not self._set_color(candidate):
+            self._restore_color_controls()
 
     def _on_hex_edited(self):
         candidate = QColor(self.hex_edit.text().strip())
-        if candidate.isValid(): self._set_color(candidate)
-        else: self.hex_edit.setStyleSheet("QLineEdit { border: 1px solid #c33; }")
+        if not candidate.isValid():
+            self._show_validation_error("Введите корректный HEX-цвет в формате #RRGGBB.")
+        elif not self._set_color(candidate):
+            # Keep the typed value visible so the user can see why it cannot be applied.
+            self.hex_edit.setText(candidate.name().upper())
 
     def _open_advanced(self):
         dialog = QColorDialog(self._color, self); dialog.setWindowTitle("More colors"); dialog.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True); dialog.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, False)
         dialog.setStyleSheet("QColorDialog { font-size: 10px; background: palette(window); color: palette(window-text); } QLabel { margin: 1px; color: palette(window-text); } QPushButton { padding: 2px 7px; min-height: 20px; background: palette(button); color: palette(button-text); border: 1px solid palette(mid); border-radius: 3px; } QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox { background: palette(base); color: palette(text); border: 1px solid palette(mid); }")
         apply_popup_theme(dialog, resolve_theme(self))
-        if dialog.exec() == QDialog.DialogCode.Accepted: self._set_color(dialog.selectedColor().name())
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self._set_color(dialog.selectedColor().name())
 
     def _apply(self):
         candidate = QColor(self.hex_edit.text().strip())
-        if not candidate.isValid(): self.hex_edit.setStyleSheet("QLineEdit { border: 1px solid #c33; }"); self.hex_edit.setFocus(); return
-        self._set_color(candidate.name()); self.color_selected.emit(self._color.name()); self.close()
+        if not candidate.isValid():
+            self._show_validation_error("Введите корректный HEX-цвет в формате #RRGGBB.")
+            self.hex_edit.setFocus()
+            return
+        if not self._set_color(candidate):
+            self.hex_edit.setFocus()
+            return
+        self.color_selected.emit(self._color.name(QColor.NameFormat.HexRgb).upper())
+        self.close()

@@ -5,6 +5,7 @@ from PyQt6.QtCore import QEvent,QLineF,QRect,QSize,Qt,QTimer,pyqtSignal,QRectF
 from PyQt6.QtWidgets import QHBoxLayout,QMdiArea,QMdiSubWindow,QSizePolicy,QSplitter,QToolButton,QVBoxLayout,QWidget,QMenu,QWidgetAction
 from PyQt6.QtGui import QPainter,QPen,QColor,QPainterPath
 from roc_mcs.gui.roi_explorer.roi_manager_widget import RoiManagerWidget
+from roc_mcs.gui.roi_explorer.branch_manager_widget import BranchManagerWidget
 from roc_mcs.gui.roi_explorer.map_plot_widget import MapPlotWidget
 from roc_mcs.gui.roi_explorer.curve_plot_widget import CurvePlotWidget
 from roc_mcs.gui.roi_explorer.vtk_backend.embedded_widget import EmbeddedVTKVolumeWidget
@@ -19,6 +20,8 @@ FOCUS_LEFT_RATIO = 0.50  # Доля ширины карты в стартово�
 FOCUS_TOP_RATIO = 0.50  # Доля высоты верхнего окна ROC справа.
 ROI_RAIL_COMPACT_WIDTH = 22
 ROI_RAIL_EXPANDED_WIDTH = 282
+BRANCH_RAIL_COMPACT_WIDTH = 22
+BRANCH_RAIL_EXPANDED_WIDTH = BranchManagerWidget.EXPANDED_WIDTH
 
 class _PlotSubWindow(QMdiSubWindow):
     """Закрытие скрывает MDI-экран; финальный backend teardown принадлежит владельцу."""
@@ -531,7 +534,25 @@ class _LayoutPreviewButton(QToolButton):
 class PlotWorkspaceWidget(QSplitter):
     """Слева менеджер ROI; справа три независимых MDI-экрана."""
     def __init__(self,parent=None):
-        super().__init__(Qt.Orientation.Horizontal,parent);self.setObjectName("PlotWorkspaceWidget");self.roi_manager=RoiManagerWidget();self.roi_table=self.roi_manager.table;self.map_widget=MapPlotWidget();self.curve_widget=CurvePlotWidget();self.volume_widget=EmbeddedVTKVolumeWidget();self._map_ratio=.53
+        super().__init__(Qt.Orientation.Horizontal,parent)
+        self.setObjectName("PlotWorkspaceWidget")
+        self.roi_manager=RoiManagerWidget()
+        self.roi_table=self.roi_manager.table
+        self.branch_manager=BranchManagerWidget()
+        self._branch_manager_enabled = False
+        self.branch_manager.hide()
+        self.branch_manager.setFixedWidth(0)
+        self.map_widget=MapPlotWidget()
+        self.curve_widget=CurvePlotWidget()
+        self.volume_widget=EmbeddedVTKVolumeWidget()
+        self._map_ratio=.53
+        self._manager_layout_guard=False
+        self.roi_manager.expanded_changed.connect(
+            lambda expanded: self._on_manager_expanded("roi", expanded)
+        )
+        self.branch_manager.expanded_changed.connect(
+            lambda expanded: self._on_manager_expanded("branch", expanded)
+        )
         self.plot_area=QWidget(self);self.plot_area.setObjectName("PlotScreensArea");self.plot_area.setMinimumSize(340,300);layout=QVBoxLayout(self.plot_area);layout.setContentsMargins(0,0,0,0);layout.setSpacing(2)
         controls=QWidget(self.plot_area);controls.setObjectName("PlotScreensToolbar");row=QHBoxLayout(controls);row.setContentsMargins(2,0,2,0);row.setSpacing(4);self._buttons={}
         for key,text,tip in (("map","Карта","Показать или скрыть окно карты"),("curve","ROC-кривые","Показать или скрыть окно ROC-кривых"),("volume","3D","Показать или скрыть 3D-объём")):
@@ -547,7 +568,18 @@ class PlotWorkspaceWidget(QSplitter):
         for mode,label in (("focus","Карта слева · ROC и 3D справа"),("row","Три окна в ряд"),("column","Три окна вертикально"),("map3d-top","Карта и 3D сверху · ROC снизу")):
             preview=_LayoutPreviewButton(mode,label,self.layout_menu);action=QWidgetAction(self.layout_menu);action.setDefaultWidget(preview);self.layout_menu.addAction(action);preview.clicked.connect(lambda _=False,m=mode:self._choose_layout(m));self._layout_preview_buttons[mode]=preview
         self.arrange_btn.clicked.connect(lambda:self.mdi_area.set_layout_choice(self.mdi_area._layout_choice));self.mdi_area.panel_visibility_changed.connect(self._sync_panel_buttons)
-        self.addWidget(self.roi_manager);self.addWidget(self.plot_area);self.setStretchFactor(0,0);self.setStretchFactor(1,1);self.setCollapsible(0,True);self.setCollapsible(1,False);self.setHandleWidth(8);self.roi_manager.setFixedWidth(22);self.setSizes([22,900]);self.setMinimumSize(400,340);self._style_toolbar();QTimer.singleShot(0,self._force_compact_rail)
+        self.addWidget(self.roi_manager)
+        self.addWidget(self.branch_manager)
+        self.addWidget(self.plot_area)
+        self.setStretchFactor(0,0);self.setStretchFactor(1,0);self.setStretchFactor(2,1)
+        self.setCollapsible(0,True);self.setCollapsible(1,True);self.setCollapsible(2,False)
+        self.setHandleWidth(4)
+        self.roi_manager.setFixedWidth(ROI_RAIL_COMPACT_WIDTH)
+        self.branch_manager.setFixedWidth(BRANCH_RAIL_COMPACT_WIDTH)
+        self.setSizes([ROI_RAIL_COMPACT_WIDTH, 0, 900])
+        self.setMinimumSize(400,340)
+        self._style_toolbar()
+        QTimer.singleShot(0,self._force_compact_rail)
     def _choose_layout(self,mode):
         self.mdi_area.set_layout_choice(mode)
         for key,button in self._layout_preview_buttons.items():button.set_selected(key==mode)
@@ -559,17 +591,82 @@ class PlotWorkspaceWidget(QSplitter):
         c=theme_colors(resolve_theme(self));self.plot_area.setStyleSheet(f"QWidget#PlotScreensArea{{background:{c['window']};}} QWidget#PlotScreensToolbar QToolButton{{color:{c['text']};background:transparent;border:1px solid transparent;border-radius:3px;padding:2px 7px;font-size:10px;}} QWidget#PlotScreensToolbar QToolButton:hover{{background:{c['hover']};border-color:{c['border']};}} QWidget#PlotScreensToolbar QToolButton:checked{{background:{c['button']};border-color:{c['border']};}}")
     def apply_theme(self,theme=None):
         apply_widget_palette(self,theme);self._style_toolbar();c=theme_colors(theme or resolve_theme(self))
+        self.branch_manager.apply_theme(theme)
         for win in (self.map_subwindow,self.curve_subwindow,self.volume_subwindow):win.setPalette(self.palette());win.setStyleSheet(f"QMdiSubWindow{{background:{c['window']};border:2px solid {c['border']};border-radius:2px;}} QMdiSubWindow:hover{{border-color:{c['highlight']};}}")
         self.mdi_area.setBackground(self.palette().window())
         for key,button in self._layout_preview_buttons.items():button.set_selected(key==self.mdi_area._layout_choice)
+    def set_branch_manager_visible(self, visible: bool) -> None:
+        visible = bool(visible)
+        self._branch_manager_enabled = visible
+        if not visible and self.branch_manager.is_expanded:
+            self._manager_layout_guard = True
+            try:
+                self.branch_manager._toggle_expanded()
+            finally:
+                self._manager_layout_guard = False
+        self.branch_manager.setVisible(visible)
+        self.branch_manager.setFixedWidth(
+            (BRANCH_RAIL_EXPANDED_WIDTH if self.branch_manager.is_expanded
+             else BRANCH_RAIL_COMPACT_WIDTH) if visible else 0
+        )
+        self._apply_manager_sizes()
+
+    def _on_manager_expanded(self, which: str, expanded: bool) -> None:
+        if self._manager_layout_guard:
+            return
+        self._manager_layout_guard = True
+        try:
+            if expanded:
+                sibling = self.branch_manager if which == "roi" else self.roi_manager
+                if getattr(sibling, "_expanded", False):
+                    sibling._toggle_expanded()
+            self._apply_manager_sizes()
+        finally:
+            self._manager_layout_guard = False
+
+    def _apply_manager_sizes(self, requested_plot_width: int | None = None) -> None:
+        total = max(
+            int(self.width()),
+            int(sum(self.sizes())),
+            int(requested_plot_width or 0),
+            400,
+        )
+        roi_width = (
+            ROI_RAIL_EXPANDED_WIDTH if self.roi_manager._expanded
+            else ROI_RAIL_COMPACT_WIDTH
+        )
+        branch_enabled = bool(getattr(self, "_branch_manager_enabled", False))
+        if branch_enabled:
+            branch_width = (
+                BRANCH_RAIL_EXPANDED_WIDTH if self.branch_manager.is_expanded
+                else BRANCH_RAIL_COMPACT_WIDTH
+            )
+        else:
+            branch_width = 0
+        plot_width = max(1, total - roi_width - branch_width - 8)
+        self.roi_manager.setFixedWidth(roi_width)
+        self.branch_manager.setFixedWidth(branch_width)
+        super().setSizes([roi_width, branch_width, plot_width])
+
     def setSizes(self,sizes):
         values=[max(0,int(v)) for v in (sizes or [])]
-        if not values:return
-        if len(values)>=3:
-            right_total=max(1,sum(values[1:]));self._map_ratio=max(.25,min(.75,values[1]/right_total))
-        total=max(sum(values),self.width() if self.width()>0 else 0);rail=ROI_RAIL_EXPANDED_WIDTH if self.roi_manager._expanded else ROI_RAIL_COMPACT_WIDTH
-        super().setSizes([rail,max(1,total-rail)])
+        if not values:
+            return
+        if len(values) >= 3 and sum(values) > 0:
+            # First two panes are object-manager rails; the remaining width is
+            # the plot workspace. Keep caller-selected plot width where possible.
+            plot_width = values[2]
+        elif len(values) == 2:
+            plot_width = values[1]
+        else:
+            plot_width = values[-1]
+        self._apply_manager_sizes(requested_plot_width=plot_width)
+
     def _force_compact_rail(self):
         if not self.roi_manager._expanded:
-            self.roi_manager.table.hide();self.roi_manager.setFixedWidth(ROI_RAIL_COMPACT_WIDTH);self.roi_manager.rail.setFixedWidth(ROI_RAIL_COMPACT_WIDTH-2)
-            super().setSizes([ROI_RAIL_COMPACT_WIDTH,max(1,self.width()-ROI_RAIL_COMPACT_WIDTH-8)])
+            self.roi_manager.table.hide()
+            self.roi_manager.setFixedWidth(ROI_RAIL_COMPACT_WIDTH)
+            self.roi_manager.rail.setFixedWidth(ROI_RAIL_COMPACT_WIDTH-2)
+        if self._branch_manager_enabled and not self.branch_manager.is_expanded:
+            self.branch_manager.setFixedWidth(BRANCH_RAIL_COMPACT_WIDTH)
+        self._apply_manager_sizes()

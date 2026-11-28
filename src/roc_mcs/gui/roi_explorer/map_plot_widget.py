@@ -261,6 +261,11 @@ class MapPlotWidget(QWidget):
         self._theme = "light"
         self.cbar = None
         self.map_image = None
+        self._branch_footprint_images = []
+        self._branch_footprint_contours = []
+        self._branch_footprint_legend = None
+        self._branch_footprint_note = None
+        self._branch_footprint_provenance_note = None
         # Scalar source for hover readout; peak-count rendering itself is RGBA.
         self._cursor_intensity_map = None
         self.roi_right_click_callback = None
@@ -879,6 +884,7 @@ class MapPlotWidget(QWidget):
         the movable 2D legend: the two visual channels are coupled, not one
         ordinary scalar map.
         """
+        self.clear_branch_footprints(draw=False)
         counts = np.asarray(peak_count_map, dtype=float)
         intensity = np.asarray(intensity_map, dtype=float)
         if counts.ndim != 2 or intensity.shape != counts.shape:
@@ -954,6 +960,7 @@ class MapPlotWidget(QWidget):
         x_coords=None, y_coords=None, colorbar_mode: str = "continuous",
     ) -> None:
         """Обновляет карту detector-grid без наследования старой нормировки."""
+        self.clear_branch_footprints(draw=False)
         self._peak_map_active = False
         mode = str(colorbar_mode).lower()
         if mode not in {"continuous", "quantitative"}:
@@ -1080,6 +1087,225 @@ class MapPlotWidget(QWidget):
 
 
 
+
+    def clear_branch_footprints(self, *, draw: bool = False) -> None:
+        """Remove display-only branch occupancy overlays from the detector map."""
+        changed = False
+        for artist in self._branch_footprint_images:
+            try:
+                artist.remove()
+                changed = True
+            except (ValueError, AttributeError, RuntimeError):
+                pass
+        self._branch_footprint_images.clear()
+        for contour in self._branch_footprint_contours:
+            try:
+                contour.remove()
+                changed = True
+            except (ValueError, AttributeError, RuntimeError):
+                # Older Matplotlib versions may not expose QuadContourSet.remove.
+                for collection in getattr(contour, "collections", ()):
+                    try:
+                        collection.remove()
+                        changed = True
+                    except (ValueError, AttributeError, RuntimeError):
+                        pass
+        self._branch_footprint_contours.clear()
+        if self._branch_footprint_legend is not None:
+            try:
+                self._branch_footprint_legend.remove()
+                changed = True
+            except (ValueError, AttributeError, RuntimeError):
+                pass
+            self._branch_footprint_legend = None
+        if self._branch_footprint_note is not None:
+            try:
+                self._branch_footprint_note.remove()
+                changed = True
+            except (ValueError, AttributeError, RuntimeError):
+                pass
+            self._branch_footprint_note = None
+        if self._branch_footprint_provenance_note is not None:
+            try:
+                self._branch_footprint_provenance_note.remove()
+                changed = True
+            except (ValueError, AttributeError, RuntimeError):
+                pass
+            self._branch_footprint_provenance_note = None
+        if draw and changed:
+            self.canvas.draw_idle()
+
+    def draw_branch_footprints(
+        self,
+        footprint_layers,
+        branch_colors,
+        *,
+        alpha: float = 0.45,
+        contour_level: float = 0.35,
+        max_legend_entries: int = 8,
+    ) -> int:
+        """Render normalized branch-occupancy masks as one efficient XY overlay.
+
+        Only one detector-sized RGBA canvas and one contour LineCollection are
+        retained, regardless of selected branch count. Per-branch masks are
+        consumed one at a time in ascending median-theta painter order. The
+        source branch catalogue and quantitative map are never modified.
+        """
+        self.clear_branch_footprints(draw=False)
+        if self.map_image is None or self._cursor_intensity_map is None:
+            return 0
+        try:
+            opacity = float(alpha)
+            level = float(contour_level)
+        except (TypeError, ValueError, OverflowError):
+            return 0
+        if not np.isfinite(opacity) or not 0.0 <= opacity <= 1.0:
+            return 0
+        if not np.isfinite(level) or not 0.0 < level < 1.0:
+            return 0
+
+        height, width = np.asarray(self._cursor_intensity_map).shape
+        x_centers, x_edges = self._axis_centers(self._x_coords, width, "x_coords")
+        y_centers, y_edges = self._axis_centers(self._y_coords, height, "y_coords")
+        extent = (x_edges[0], x_edges[1], y_edges[0], y_edges[1])
+        rgba_canvas = np.zeros((height, width, 4), dtype=np.float32)
+        colors = dict(branch_colors or {})
+        rendered: list[tuple[int, str]] = []
+        contour_segments: list[np.ndarray] = []
+        contour_colors: list[str] = []
+
+        from matplotlib.colors import to_hex
+        from matplotlib.lines import Line2D
+        from matplotlib.collections import LineCollection
+        import contourpy
+        from roc_mcs.analysis.branch_display import composite_footprint_rgba_inplace
+
+        for branch_id, mask, _median_theta in footprint_layers:
+            try:
+                branch_id = int(branch_id)
+                color = to_hex(str(colors.get(branch_id, "#4C9FD6")))
+                data = np.asarray(mask, dtype=np.float32)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if data.shape != (height, width) or not np.isfinite(data).any():
+                continue
+            data = np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
+            data = np.clip(data, 0.0, 1.0, out=data)
+            if float(np.max(data)) <= 0.0:
+                continue
+            try:
+                composited = composite_footprint_rgba_inplace(
+                    rgba_canvas, data, color, opacity=opacity,
+                )
+            except ValueError:
+                continue
+            if not composited:
+                continue
+            rendered.append((branch_id, color))
+
+            if float(np.max(data)) >= level and height >= 2 and width >= 2:
+                # contourpy is Matplotlib's contour engine. It returns data-space
+                # line segments without attaching transient artists to Axes or
+                # modifying its data limits/autoscaling state.
+                try:
+                    generator = contourpy.contour_generator(
+                        x=np.asarray(x_centers, dtype=np.float64),
+                        y=np.asarray(y_centers, dtype=np.float64),
+                        z=data,
+                        line_type="Separate",
+                    )
+                    for segment in generator.lines(level):
+                        points = np.asarray(segment, dtype=np.float64)
+                        if points.ndim == 2 and points.shape[0] >= 2 and np.isfinite(points).all():
+                            contour_segments.append(points)
+                            contour_colors.append(color)
+                except (ValueError, RuntimeError):
+                    # A contour can be absent for a sparse/single-pixel mask;
+                    # its soft occupancy layer is still useful and remains valid.
+                    pass
+
+        if not rendered:
+            return 0
+
+        # Footprints are display-only: adding them must not reset the detector
+        # map's physical aspect ratio, visible extent, or autoscale policy.
+        axes_state = {
+            "xlim": self.ax.get_xlim(),
+            "ylim": self.ax.get_ylim(),
+            "aspect": self.ax.get_aspect(),
+            "adjustable": self.ax.get_adjustable(),
+            "anchor": self.ax.get_anchor(),
+            "autoscalex": self.ax.get_autoscalex_on(),
+            "autoscaley": self.ax.get_autoscaley_on(),
+        }
+        image = self.ax.imshow(
+            rgba_canvas, origin="lower", extent=extent,
+            interpolation="bilinear", zorder=4, aspect=axes_state["aspect"],
+        )
+        self.ax.set_aspect(
+            axes_state["aspect"], adjustable=axes_state["adjustable"],
+            anchor=axes_state["anchor"],
+        )
+        self.ax.set_xlim(axes_state["xlim"])
+        self.ax.set_ylim(axes_state["ylim"])
+        self.ax.set_autoscalex_on(axes_state["autoscalex"])
+        self.ax.set_autoscaley_on(axes_state["autoscaley"])
+        self._branch_footprint_images.append(image)
+        if contour_segments:
+            contours = LineCollection(
+                contour_segments, colors=contour_colors,
+                linewidths=1.15, alpha=0.88, zorder=5,
+                capstyle="round", joinstyle="round",
+            )
+            self.ax.add_collection(contours, autolim=False)
+            self._branch_footprint_contours.append(contours)
+
+        theme = theme_colors(self._theme)
+        limit = max(1, int(max_legend_entries))
+        if len(rendered) <= limit:
+            handles = [
+                Line2D(
+                    [], [], linestyle="None", marker="o", markersize=5.5,
+                    markerfacecolor=color, markeredgecolor=color,
+                    label=f"Ветвь {branch_id}",
+                )
+                for branch_id, color in rendered
+            ]
+            legend = self.ax.legend(
+                handles=handles,
+                title="XY-проекции · занятые пиксели",
+                loc="upper right", fontsize=7.5, title_fontsize=8,
+                frameon=True, framealpha=0.90, borderpad=0.55,
+                labelspacing=0.35, handletextpad=0.45,
+            )
+            legend.get_frame().set_facecolor(theme["base"])
+            legend.get_frame().set_edgecolor(theme["border"])
+            for text in legend.get_texts():
+                text.set_color(theme["text"])
+            legend.get_title().set_color(theme["text"])
+            self._branch_footprint_legend = legend
+        else:
+            note = self.ax.text(
+                0.99, 0.99,
+                f"XY-проекции · {len(rendered)} ветвей",
+                transform=self.ax.transAxes, ha="right", va="top",
+                fontsize=8, color=theme["text"], zorder=15,
+                bbox={"boxstyle": "round,pad=0.3", "facecolor": theme["base"],
+                      "edgecolor": theme["border"], "alpha": 0.90},
+            )
+            self._branch_footprint_note = note
+
+        note = self.ax.text(
+            0.01, 0.012,
+            "XY-проекция занятых пикселей · сглаживание только для отображения",
+            transform=self.ax.transAxes, ha="left", va="bottom",
+            fontsize=6.8, color=theme["text"], alpha=0.82, zorder=15,
+            bbox={"boxstyle": "round,pad=0.22", "facecolor": theme["base"],
+                  "edgecolor": theme["border"], "alpha": 0.78},
+        )
+        self._branch_footprint_provenance_note = note
+        self.canvas.draw_idle()
+        return len(rendered)
 
     def draw_rois(self, roi_data_list: list) -> dict:
         """Отрисовывает квадратики, линии и точки ROI поверх карты."""

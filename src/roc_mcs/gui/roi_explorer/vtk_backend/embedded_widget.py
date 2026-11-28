@@ -138,6 +138,9 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
         self._peak_catalog = None
         self._peak_position_kind = "detected"
         self._branch_edges = None
+        self._branch_display_colors: dict[int, str] = {}
+        self._branch_display_selected_ids: tuple[int, ...] = ()
+        self._branch_display_focus_selected = False
         self._show_excluded_branches = False
         # Immutable, renderer-neutral view model built from the stored
         # correlation artifact. It is deliberately excluded from the volume
@@ -661,6 +664,38 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
         t.roi_preview_color_changed.connect(self._set_roi_color)
         t.peak_marker_color_changed.connect(self._set_peak_marker_color)
 
+    def set_branch_display_state(
+        self,
+        branch_colors: dict[int, str] | None = None,
+        selected_branch_ids=(),
+        *,
+        focus_selected: bool = False,
+    ) -> None:
+        """Apply shared branch-manager state to the current/future 3D payload."""
+        colors: dict[int, str] = {}
+        for raw_id, raw_color in (branch_colors or {}).items():
+            try:
+                branch_id = int(raw_id)
+                color = str(raw_color).strip().upper()
+                if branch_id < 0 or len(color) != 7 or not color.startswith("#"):
+                    continue
+                int(color[1:], 16)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            colors[branch_id] = color
+        selected = tuple(sorted({int(value) for value in selected_branch_ids if int(value) >= 0}))
+        self._branch_display_colors = colors
+        self._branch_display_selected_ids = selected
+        self._branch_display_focus_selected = bool(focus_selected and selected)
+        if self._scene is not None:
+            self._scene.set_branch_display_style(
+                self._branch_display_colors,
+                self._branch_display_selected_ids,
+                focus_selected=self._branch_display_focus_selected,
+                render=True,
+            )
+        self._update_branch_legend()
+
     def _scene_call(self, method, *args):
         scene = self._scene
         if scene is not None:
@@ -1138,6 +1173,12 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
         self.tools.set_overlay_tool_checked("branches", branches_visible)
         self._scene.set_peak_markers_visible(peak_visible, render=False)
         self._scene.set_branch_edges_visible(branches_visible, render=False)
+        self._scene.set_branch_display_style(
+            self._branch_display_colors,
+            self._branch_display_selected_ids,
+            focus_selected=self._branch_display_focus_selected,
+            render=False,
+        )
         # The correlation actor is independent of both volume and the ordinary
         # adjacent-pixel branch-edge layer. Its visibility was established
         # above from the stored correlation artifact.
@@ -2014,33 +2055,43 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
             QtWidgets.QToolTip.showText(QtGui.QCursor.pos(), html, self._qvtk)
 
     def _update_branch_legend(self) -> None:
-        """Show accepted branches individually and excluded branches as one toggle."""
+        """Show palette entries for the ordinary overlay or focused selection."""
         panel = getattr(self, "branch_legend", None)
         scene = self._scene
         if panel is None:
             return
-        if scene is None or not self.tools.is_overlay_tool_checked("peaks"):
+        if scene is None:
             panel.hide_on_canvas()
             return
         data = scene.branch_legend_data(limit=48)
+        focus_selected = bool(data.get("focus_selected", False))
+        peaks_visible = self.tools.is_overlay_tool_checked("peaks")
+        if not peaks_visible and not focus_selected:
+            panel.hide_on_canvas()
+            return
         entries = data.get("entries", ())
         excluded_count = int(data.get("excluded_branches", 0))
         color_by_branch = bool(self.peak_color_by_branch.isChecked())
-        if (not color_by_branch or not entries) and excluded_count <= 0:
+        # Explicit Branch Manager focus has its own branch palette contract;
+        # it remains visible even if the global uniform-marker preference is
+        # active, because the manager action is an explicit object selection.
+        show_palette = color_by_branch or focus_selected
+        if (not show_palette or not entries) and excluded_count <= 0:
             panel.hide_on_canvas()
             return
-        # Individual color keys are meaningful only in branch-colour mode.
-        # The aggregate excluded-branch switch remains reachable in uniform
-        # marker-colour mode so hidden components are still explicitly inspectable.
+
         legend_entries = [
             LegendEntry(
                 label=f"branch_id {int(item['branch_id'])}",
                 color=str(item["color"]),
-                detail=f"{int(item['event_count']):,} пиков",
+                detail=(
+                    f"{int(item['event_count']):,} пиков"
+                    + (" · исключена из анализа" if not item.get("analysis_included", True) else "")
+                ),
             )
-            for item in (entries if color_by_branch else ())
+            for item in (entries if show_palette else ())
         ]
-        if excluded_count:
+        if excluded_count and not focus_selected:
             legend_entries.append(LegendEntry(
                 label=(
                     f"Исключённые · {excluded_count:,} ветвей · "
@@ -2051,9 +2102,11 @@ class EmbeddedVTKVolumeWidget(QtWidgets.QWidget):
                 action_key="show_excluded",
                 checked=bool(data.get("show_excluded", False)),
             ))
-        if color_by_branch:
+        if focus_selected:
+            panel.set_title(f"ВЫБРАННЫЕ ВЕТВИ · {len(entries)}")
+        elif color_by_branch:
             suffix = f" · TOP {len(entries)} / {data['total_branches']}" if data.get("truncated") else ""
-            panel.set_title(f"ВЕТВИ · {data['total_branches']} ПРИНЯТЫХ{suffix}")
+            panel.set_title(f"ВЕТВИ · {len(entries)} ПРИНЯТЫХ{suffix}")
         else:
             panel.set_title("ВЕТВИ · ФИЛЬТР ОТОБРАЖЕНИЯ")
         panel.set_entries(legend_entries)

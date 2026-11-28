@@ -5,6 +5,8 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
 from matplotlib.ticker import MaxNLocator, ScalarFormatter
 
+import numpy as np
+
 from roc_mcs.gui.roi_explorer.curve_tools_widget import CurveToolsWidget
 from roc_mcs.gui.roi_explorer.theme import apply_widget_palette, theme_colors
 from roc_mcs.gui.roi_explorer.plot_display_settings import load_plot_display_settings
@@ -172,9 +174,36 @@ class CurvePlotWidget(QWidget):
         if self.header_label.text() != title:
             self.header_label.setText(title)
 
+        def aligned_xy(data: dict | None):
+            if not isinstance(data, dict):
+                return None
+            try:
+                x_values = np.asarray(data.get("th"), dtype=float)
+                y_values = np.asarray(data.get("curve"), dtype=float)
+            except (TypeError, ValueError, OverflowError):
+                return None
+            if (
+                x_values.ndim != 1 or y_values.ndim != 1
+                or x_values.size == 0 or x_values.shape != y_values.shape
+                or not (np.isfinite(x_values) & np.isfinite(y_values)).any()
+            ):
+                return None
+            return x_values, y_values
+
+        # Validate all inputs before changing artists: Matplotlib's relim()
+        # assumes every Line2D already has broadcast-compatible x/y arrays.
+        valid_curves = []
+        for curve in curves_data or ():
+            aligned = aligned_xy(curve)
+            if not isinstance(curve, dict) or aligned is None:
+                continue
+            valid_curves.append((curve, *aligned))
+        valid_preview = preview_data if aligned_xy(preview_data) is not None else None
+        valid_pixel = pixel_data if aligned_xy(pixel_data) is not None else None
+
         curve_lines = {}
         active_ids = set()
-        for curve in curves_data:
+        for curve, x_values, y_values in valid_curves:
             roi_id = curve["id"]
             active_ids.add(roi_id)
             line = self._curve_artists.get(roi_id)
@@ -182,7 +211,7 @@ class CurvePlotWidget(QWidget):
                 line, = self.ax.plot([], [], picker=self._left_click_picker)
                 line.set_pickradius(5)
                 self._curve_artists[roi_id] = line
-            line.set_data(curve["th"], curve["curve"])
+            line.set_data(x_values, y_values)
             line.set_color(curve["color"])
             line.set_linewidth(2.4 if curve["is_selected"] else 1.5)
             line.set_alpha(1.0 if curve["is_selected"] else 0.88)
@@ -199,28 +228,28 @@ class CurvePlotWidget(QWidget):
                 except ValueError: pass
 
         c = theme_colors(self._theme)
-        if preview_data:
+        if valid_preview is not None:
             if self._preview_artist is None or self._preview_artist.axes is not self.ax:
                 self._preview_artist, = self.ax.plot([], [], linestyle="--", linewidth=1.8, alpha=0.95, label="ROI preview", zorder=4)
-            self._preview_artist.set_data(preview_data["th"], preview_data["curve"])
+            self._preview_artist.set_data(*aligned_xy(valid_preview))
             self._preview_artist.set_color(c["text"])
             self._preview_artist.set_visible(True)
         elif self._preview_artist is not None:
             self._preview_artist.set_visible(False)
             self._preview_artist.set_data([], [])
 
-        if pixel_data:
+        if valid_pixel is not None:
             if self._pixel_artist is None or self._pixel_artist.axes is not self.ax:
                 self._pixel_artist, = self.ax.plot([], [], linestyle="-.", linewidth=1.7, alpha=0.95, zorder=3)
-            self._pixel_artist.set_data(pixel_data["th"], pixel_data["curve"])
+            self._pixel_artist.set_data(*aligned_xy(valid_pixel))
             self._pixel_artist.set_color(c["muted"])
-            self._pixel_artist.set_label(pixel_data["label"])
+            self._pixel_artist.set_label(str(valid_pixel.get("label", "Selected pixel")))
             self._pixel_artist.set_visible(True)
         elif self._pixel_artist is not None:
             self._pixel_artist.set_visible(False)
             self._pixel_artist.set_data([], [])
 
-        has_data = bool(curves_data or preview_data or pixel_data)
+        has_data = bool(valid_curves or valid_preview is not None or valid_pixel is not None)
         if not has_data:
             if self._empty_artist is None or self._empty_artist.axes is not self.ax:
                 self._empty_artist = self.ax.text(0.5, 0.5, "No saved ROIs or selected pixel", ha="center", va="center",
@@ -240,7 +269,7 @@ class CurvePlotWidget(QWidget):
             live_ylim=self.ax.get_ylim()
             if previous_xlim is not None and previous_ylim is not None and not fit_view:
                 self.ax.set_xlim(previous_xlim)
-                self.ax.set_ylim(live_ylim if (fit_y and preview_data) else previous_ylim)
+                self.ax.set_ylim(live_ylim if (fit_y and valid_preview is not None) else previous_ylim)
             self._view_initialized = True
         guide_visible=self._theta_guide_value is not None and has_data and self._has_visible_curve_data()
         if guide_visible:self._theta_guide_artist.set_xdata([self._theta_guide_value,self._theta_guide_value])
