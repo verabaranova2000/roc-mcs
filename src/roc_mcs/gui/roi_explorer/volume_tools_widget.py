@@ -3,9 +3,12 @@ from __future__ import annotations
 from PyQt6.QtCore import QSize, Qt, QPoint, pyqtSignal
 from PyQt6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap, QPalette, QActionGroup
 from PyQt6.QtWidgets import QApplication, QGridLayout, QMenu, QToolButton, QWidget, QWidgetAction, QHBoxLayout, QDialog, QDoubleSpinBox, QSpinBox, QCheckBox, QComboBox, QFormLayout, QLabel, QPushButton
+from roc_mcs.gui.roi_explorer.theme import (
+    top_level_window_owner, point_sized_font,
+    apply_popup_theme, apply_widget_palette, theme_colors,
+)
 from roc_mcs.gui.components.icon_provider import svg_icon
 from roc_mcs.gui.roi_explorer.plot_toolbar_style import ICON_DIR, COMPACT_PLOT_TOOLBAR_STYLE
-from roc_mcs.gui.roi_explorer.theme import apply_popup_theme, apply_widget_palette, theme_colors
 from roc_mcs.gui.roi_explorer.colormap_catalog import NAPARI_STYLE_COLORMAPS, colormap_icon
 from roc_mcs.gui.roi_explorer.map_tools_widget import SmartDropdownButton
 from roc_mcs.gui.roi_explorer.hex_color_picker import CompactColorPicker, _place_popup
@@ -29,7 +32,7 @@ class VolumeToolsWidget(QWidget):
     peak_display_changed = pyqtSignal(object)
 
     def __init__(self, parent=None):
-        super().__init__(parent); self.setObjectName("VolumeToolBar"); self.setFixedHeight(max(30, self._icon_size()+10)); self._theme = "light"; self._source_key = "full"; self._choices = []; self._rotation_lock = False; self._show_roi_on_full_detector = False
+        super().__init__(parent); self.setFont(point_sized_font(parent, fallback=9.0)); self.setObjectName("VolumeToolBar"); self.setFixedHeight(max(30, self._icon_size()+10)); self._theme = "light"; self._source_key = "full"; self._choices = []; self._rotation_lock = False; self._show_roi_on_full_detector = False
         self.setStyleSheet(COMPACT_PLOT_TOOLBAR_STYLE + "\nQWidget#VolumeToolBar QToolButton { max-height:26px; min-height:20px; border:1px solid transparent; border-radius:2px; background:transparent; padding:0 2px; } QWidget#VolumeToolBar QToolButton:hover { background:palette(midlight); border-color:palette(mid); } QWidget#VolumeToolBar QToolButton:checked { background:palette(highlight); color:palette(highlighted-text); }\nQWidget#VolumeToolBar SmartDropdownButton::menu-indicator { image:none; }")
         row = QHBoxLayout(self); row.setContentsMargins(4, 2, 4, 2); row.setSpacing(4)
         self.roi_btn = SmartDropdownButton(self); self.roi_btn.setToolTip("Источник объёма: весь детектор или выбранная ROI"); self.roi_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup); self.roi_menu = QMenu(self.roi_btn); self.roi_btn.setMenu(self.roi_menu); row.addWidget(self.roi_btn)
@@ -79,7 +82,7 @@ class VolumeToolsWidget(QWidget):
         self.soft_opacity_action.toggled.connect(self.opacity_mode_changed.emit)
         self.color_menu.addSeparator()
         self.contrast_action=self.color_menu.addAction("Контраст…"); self.contrast_action.triggered.connect(self._open_contrast_dialog)
-        self._contrast_dialog=QDialog(self,Qt.WindowType.Tool); self._contrast_dialog.setWindowTitle("Контраст 3D"); grid=QGridLayout(self._contrast_dialog); grid.setContentsMargins(9,8,9,8); grid.setSpacing(5)
+        self._contrast_dialog=QDialog(top_level_window_owner(self),Qt.WindowType.Tool); self._contrast_dialog.setFont(point_sized_font(self, fallback=9.0)); self._contrast_dialog.setWindowTitle("Контраст 3D"); self.destroyed.connect(self._contrast_dialog.deleteLater); grid=QGridLayout(self._contrast_dialog); grid.setContentsMargins(9,8,9,8); grid.setSpacing(5)
         self._contrast_low=QDoubleSpinBox(self._contrast_dialog); self._contrast_high=QDoubleSpinBox(self._contrast_dialog)
         for spin,value in ((self._contrast_low,16.0),(self._contrast_high,95.0)):
             spin.setRange(0.0,100.0); spin.setDecimals(1); spin.setSuffix(" %"); spin.setKeyboardTracking(False); spin.setButtonSymbols(QDoubleSpinBox.ButtonSymbols.NoButtons); spin.setFixedWidth(76)
@@ -92,7 +95,9 @@ class VolumeToolsWidget(QWidget):
         self.set_roi_choices([]); self.apply_theme("light")
 
     def _build_peak_display_dialog(self):
-        dialog = QDialog(self, Qt.WindowType.Tool)
+        dialog = QDialog(top_level_window_owner(self), Qt.WindowType.Tool)
+        dialog.setFont(point_sized_font(self, fallback=9.0))
+        self.destroyed.connect(dialog.deleteLater)
         dialog.setWindowTitle("Центры пиков в 3D")
         dialog.setMinimumWidth(250)
         form = QFormLayout(dialog)

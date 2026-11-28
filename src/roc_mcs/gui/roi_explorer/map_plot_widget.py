@@ -263,7 +263,14 @@ class MapPlotWidget(QWidget):
         self.map_image = None
         self._branch_footprint_images = []
         self._branch_footprint_contours = []
-        self._branch_footprint_legend = None
+        # Footprint labels use the same canvas-attached interaction model as
+        # the peak-count legend (move, resize, collapse, scroll, font scale).
+        self._branch_footprint_legend_panel = FloatingLegendPanel(
+            self.canvas, "ВЕТВИ · XY-FOOTPRINTS", default_size=QSize(250, 212), margin=10
+        )
+        self._branch_footprint_legend_panel.set_entries(())
+        self._branch_footprint_legend_panel.hide_on_canvas()
+        self._branch_footprint_legend = None  # retained as a compatibility alias; no Matplotlib legend is created
         self._branch_footprint_note = None
         self._branch_footprint_provenance_note = None
         # Scalar source for hover readout; peak-count rendering itself is RGBA.
@@ -610,6 +617,7 @@ class MapPlotWidget(QWidget):
         for label in self.header_widget.findChildren(QLabel, "MapHeaderSeparator"):
             label.setStyleSheet(f"font-size:11px; font-weight:normal; color:{c['muted']}; background:transparent;")
         self.peak_count_legend.set_panel_palette(self.canvas.palette())
+        self._branch_footprint_legend_panel.set_panel_palette(self.canvas.palette())
         self._apply_axes_theme(); self._update_scalebar(); self.tools.apply_theme(self._theme); self._update_pool_preview()
         self.coord_label.setStyleSheet(f"QLabel#MapCoordLabel {{ font-family:monospace; font-size:10px; font-weight:600; color:{c['muted']}; padding:1px 4px; background:transparent; }}")
         self.theta_row.setStyleSheet(f"QWidget#thetaSliceRow{{background:transparent;}} QLabel#thetaSliceValue{{color:{c['text']};font-family:Segoe UI,Arial,sans-serif;font-size:9px;font-weight:600;background:transparent;padding:0 1px;}}")
@@ -1111,13 +1119,10 @@ class MapPlotWidget(QWidget):
                     except (ValueError, AttributeError, RuntimeError):
                         pass
         self._branch_footprint_contours.clear()
-        if self._branch_footprint_legend is not None:
-            try:
-                self._branch_footprint_legend.remove()
-                changed = True
-            except (ValueError, AttributeError, RuntimeError):
-                pass
-            self._branch_footprint_legend = None
+        if not self._branch_footprint_legend_panel.isHidden():
+            self._branch_footprint_legend_panel.hide_on_canvas()
+            changed = True
+        self._branch_footprint_legend = None
         if self._branch_footprint_note is not None:
             try:
                 self._branch_footprint_note.remove()
@@ -1260,48 +1265,29 @@ class MapPlotWidget(QWidget):
             self.ax.add_collection(contours, autolim=False)
             self._branch_footprint_contours.append(contours)
 
-        theme = theme_colors(self._theme)
-        limit = max(1, int(max_legend_entries))
-        if len(rendered) <= limit:
-            handles = [
-                Line2D(
-                    [], [], linestyle="None", marker="o", markersize=5.5,
-                    markerfacecolor=color, markeredgecolor=color,
-                    label=f"Ветвь {branch_id}",
-                )
-                for branch_id, color in rendered
-            ]
-            legend = self.ax.legend(
-                handles=handles,
-                title="XY-проекции · занятые пиксели",
-                loc="upper right", fontsize=7.5, title_fontsize=8,
-                frameon=True, framealpha=0.90, borderpad=0.55,
-                labelspacing=0.35, handletextpad=0.45,
-            )
-            legend.get_frame().set_facecolor(theme["base"])
-            legend.get_frame().set_edgecolor(theme["border"])
-            for text in legend.get_texts():
-                text.set_color(theme["text"])
-            legend.get_title().set_color(theme["text"])
-            self._branch_footprint_legend = legend
-        else:
-            note = self.ax.text(
-                0.99, 0.99,
-                f"XY-проекции · {len(rendered)} ветвей",
-                transform=self.ax.transAxes, ha="right", va="top",
-                fontsize=8, color=theme["text"], zorder=15,
-                bbox={"boxstyle": "round,pad=0.3", "facecolor": theme["base"],
-                      "edgecolor": theme["border"], "alpha": 0.90},
-            )
-            self._branch_footprint_note = note
+        # Keep every selected branch individually identifiable.  The shared
+        # FloatingLegendPanel provides a scrollable list when many branches are
+        # selected, and remains movable/resizable/collapsible like the
+        # peak-count legend.  Starting at the upper-left avoids the latter's
+        # default upper-right placement when both overlays are visible.
+        self._branch_footprint_legend_panel.set_entries([
+            LegendEntry(f"Ветвь {branch_id}", color)
+            for branch_id, color in rendered
+        ])
+        self._branch_footprint_legend_panel.set_panel_palette(self.canvas.palette())
+        self._branch_footprint_legend_panel.show_on_canvas(position=QPoint(10, 10))
 
+        # Resolve colours from the widget's active theme at draw time.  The
+        # map widget owns the theme state; no module/global ``theme`` variable
+        # exists, and the same palette is used for both dark and light mode.
+        annotation_theme = theme_colors(self._theme)
         note = self.ax.text(
             0.01, 0.012,
             "XY-проекция занятых пикселей · сглаживание только для отображения",
             transform=self.ax.transAxes, ha="left", va="bottom",
-            fontsize=6.8, color=theme["text"], alpha=0.82, zorder=15,
-            bbox={"boxstyle": "round,pad=0.22", "facecolor": theme["base"],
-                  "edgecolor": theme["border"], "alpha": 0.78},
+            fontsize=6.8, color=annotation_theme["text"], alpha=0.82, zorder=15,
+            bbox={"boxstyle": "round,pad=0.22", "facecolor": annotation_theme["base"],
+                  "edgecolor": annotation_theme["border"], "alpha": 0.78},
         )
         self._branch_footprint_provenance_note = note
         self.canvas.draw_idle()

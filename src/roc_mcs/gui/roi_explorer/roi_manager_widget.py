@@ -6,7 +6,10 @@ from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QFrame, QHBoxLayou
 from roc_mcs.gui.roi_explorer.hex_color_picker import CompactColorPicker, _DragTitle
 from roc_mcs.gui.roi_explorer.plot_toolbar_style import ICON_DIR
 from roc_mcs.gui.components.icon_provider import svg_icon
-from roc_mcs.gui.roi_explorer.theme import apply_widget_palette, apply_popup_theme, resolve_theme
+from roc_mcs.gui.roi_explorer.theme import (
+    apply_widget_palette, apply_popup_theme, resolve_theme,
+    top_level_window_owner, point_sized_font,
+)
 
 def _symbol_icon(kind: str, color: QColor, size: int = 16) -> QIcon:
     pix = QPixmap(size, size); pix.fill(Qt.GlobalColor.transparent)
@@ -82,8 +85,10 @@ class _RoiSwatchButton(QToolButton):
     context_requested = pyqtSignal()
     long_press = pyqtSignal()
 
-    def __init__(self, parent=None):
-        super().__init__(parent); self.setFixedSize(14, 14); self.setCursor(Qt.CursorShape.PointingHandCursor)
+    def __init__(self, parent=None, size: int = 14):
+        super().__init__(parent)
+        self.setFixedSize(int(size), int(size))
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
         self._right_down = False; self._long_fired = False
         self._timer = QTimer(self); self._timer.setSingleShot(True); self._timer.setInterval(750); self._timer.timeout.connect(self._on_long_press)
 
@@ -110,9 +115,15 @@ class _RoiEditorPopup(QFrame):
     FIELDS = (("Label", "label"), ("X", "cx"), ("Y", "cy"), ("W", "width"), ("H", "height"), ("Angle", "angle"))
 
     def __init__(self, saved_roi, color: str, parent=None):
-        super().__init__(parent, Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint)
+        theme_owner = parent
+        native_parent = top_level_window_owner(parent)
+        super().__init__(native_parent, Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint)
+        self._theme_owner = theme_owner if theme_owner is not None else native_parent
+        if theme_owner is not None:
+            theme_owner.destroyed.connect(self.close)
+        self.setFont(point_sized_font(theme_owner, fallback=9.0))
         self.roi_id = int(saved_roi.id); self._roi_type = str(saved_roi.roi.type); self._color = color; self._busy = False
-        self.setObjectName("roiEditorPopup"); apply_widget_palette(self, resolve_theme(parent))
+        self.setObjectName("roiEditorPopup"); apply_widget_palette(self, resolve_theme(self._theme_owner or self))
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True); self.setMinimumWidth(190); self.setMaximumWidth(360); self._drag_offset = None
         self.setStyleSheet("""
             QFrame#roiEditorPopup { background: palette(window); color: palette(window-text); border: 1px solid palette(mid); border-radius: 4px; }
@@ -153,7 +164,7 @@ class _RoiEditorPopup(QFrame):
         apply_popup_theme(self, resolve_theme(parent))
 
     def apply_theme(self, theme: str | None = None) -> None:
-        apply_popup_theme(self, theme)
+        apply_popup_theme(self, theme or resolve_theme(getattr(self, "_theme_owner", None) or self))
         if hasattr(self, "delete_button"):
             self.delete_button.setIcon(_symbol_icon("trash", self.palette().color(QPalette.ColorRole.WindowText), 14))
 
@@ -208,7 +219,9 @@ class _RoiEditorPopup(QFrame):
 
 
 def _place_popup(popup, pos: QPoint):
-    popup.adjustSize(); screen = QApplication.screenAt(pos) or QApplication.primaryScreen()
+    if not bool(getattr(popup, "_layout_size_finalized", False)):
+        popup.adjustSize()
+    screen = QApplication.screenAt(pos) or QApplication.primaryScreen()
     if screen is not None:
         area = screen.availableGeometry(); max_x = area.right() - popup.width() + 1; max_y = area.bottom() - popup.height() + 1
         x = min(max(pos.x(), area.left()), max_x); y = min(max(pos.y(), area.top()), max_y); pos = QPoint(x, y)
@@ -226,16 +239,36 @@ class RoiManagerWidget(QWidget):
     _FALLBACK_COLORS = ("#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf")
 
     def __init__(self, parent=None):
-        super().__init__(parent); self.table = RoiTableWidget(self); self._rois = []; self._row_by_id = {}; self._buttons = {}; self._selected_id = None; self._expanded = False; self._color_resolver = None; self._active_editor = None; self.setObjectName("compactRoiManager"); self.setFixedWidth(22); self.setMinimumHeight(60); self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
-        root = QHBoxLayout(self); root.setContentsMargins(0, 0, 0, 0); root.setSpacing(2)
-        self.rail = QWidget(self); self.rail.setObjectName("roiPaletteRail"); self.rail.setFixedWidth(20); self.rail.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+        super().__init__(parent); self.setFont(point_sized_font(parent, fallback=9.0)); self.table = RoiTableWidget(self); self._rois = []; self._row_by_id = {}; self._buttons = {}; self._selected_id = None; self._expanded = False; self._color_resolver = None; self._active_editor = None; self.setObjectName("compactRoiManager"); self.setFixedWidth(24); self.setMinimumHeight(60); self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+        root = QHBoxLayout(self); root.setContentsMargins(0, 0, 0, 0); root.setSpacing(0)
+        self.rail = QWidget(self); self.rail.setObjectName("roiPaletteRail"); self.rail.setFixedWidth(24); self.rail.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
         rail_layout = QVBoxLayout(self.rail); rail_layout.setContentsMargins(0, 0, 0, 0); rail_layout.setSpacing(1)
         self.expand_button = QToolButton(self.rail); self.expand_button.setObjectName("roiExpandButton"); self.expand_button.setIcon(_pane_toggle_icon(False, self.palette().color(QPalette.ColorRole.WindowText))); self.expand_button.setIconSize(QSize(14, 14)); self.expand_button.setToolTip("Expand ROI list"); self.expand_button.setAutoRaise(True); self.expand_button.setFixedSize(20, 20); self.expand_button.setCursor(Qt.CursorShape.PointingHandCursor); self.expand_button.setStyleSheet("QToolButton { background: transparent; border: none; border-radius: 5px; padding: 1px; } QToolButton:hover { background: palette(midlight); }")
         rail_layout.addWidget(self.expand_button, 0, Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
-        self.palette_scroll = QScrollArea(self.rail); self.palette_scroll.setObjectName("roiPaletteScroll"); self.palette_scroll.setWidgetResizable(True); self.palette_scroll.setFixedWidth(20); self.palette_scroll.setFrameShape(QFrame.Shape.NoFrame); self.palette_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff); self.palette_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff); self.palette_scroll.setStyleSheet("QScrollArea { border: none; background: palette(window); }")
+        self.palette_scroll = QScrollArea(self.rail); self.palette_scroll.setObjectName("roiPaletteScroll"); self.palette_scroll.setWidgetResizable(True); self.palette_scroll.setFixedWidth(24); self.palette_scroll.setFrameShape(QFrame.Shape.NoFrame); self.palette_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff); self.palette_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff); self.palette_scroll.setStyleSheet("QScrollArea { border: none; background: palette(window); }")
         self.palette_scroll.viewport().setObjectName("roiPaletteViewport")
         self.palette_body = QWidget(); self.palette_body.setObjectName("roiPaletteBody"); self.palette_layout = QVBoxLayout(self.palette_body); self.palette_layout.setContentsMargins(2, 2, 2, 2); self.palette_layout.setSpacing(2); self.palette_layout.setAlignment(Qt.AlignmentFlag.AlignTop); self.palette_scroll.setWidget(self.palette_body); rail_layout.addWidget(self.palette_scroll, 1)
         root.addWidget(self.rail); root.addWidget(self.table, 0); self.table.hide(); self.table.itemSelectionChanged.connect(self._sync_selection_from_table); self.expand_button.clicked.connect(self._toggle_expanded)
+
+    @staticmethod
+    def _global_icon_size() -> int:
+        app = QApplication.instance()
+        try:
+            return min(20, max(12, int(app.property("rocMcsIconSize") if app is not None else 16)))
+        except (TypeError, ValueError, OverflowError):
+            return 16
+
+    def apply_global_icon_size(self) -> None:
+        """Apply the host application's shared icon metric to ROI swatches."""
+        size = self._global_icon_size()
+        for button in self._buttons.values():
+            button.setFixedSize(size, size)
+        # A 24 px rail has room for the maximum supported 20 px swatch plus
+        # the palette body's two-pixel horizontal inset on each side.
+        self.rail.setFixedWidth(24)
+        self.palette_scroll.setFixedWidth(24)
+        self.palette_body.updateGeometry()
+        self.palette_scroll.viewport().update()
 
     def apply_theme(self, _theme: str | None = None) -> None:
         active_theme = apply_widget_palette(self, _theme)
@@ -247,9 +280,9 @@ class RoiManagerWidget(QWidget):
     def _toggle_expanded(self):
         self._expanded = not self._expanded; self.table.setVisible(self._expanded)
         if self._expanded:
-            self.setFixedWidth(282); self.expand_button.setIcon(_pane_toggle_icon(True, self.palette().color(QPalette.ColorRole.WindowText))); self.expand_button.setToolTip("Collapse ROI list")
+            self.setFixedWidth(284); self.expand_button.setIcon(_pane_toggle_icon(True, self.palette().color(QPalette.ColorRole.WindowText))); self.expand_button.setToolTip("Collapse ROI list")
         else:
-            self.setFixedWidth(22); self.expand_button.setIcon(_pane_toggle_icon(False, self.palette().color(QPalette.ColorRole.WindowText))); self.expand_button.setToolTip(f"Expand ROI list ({len(self._rois)})")
+            self.setFixedWidth(24); self.expand_button.setIcon(_pane_toggle_icon(False, self.palette().color(QPalette.ColorRole.WindowText))); self.expand_button.setToolTip(f"Expand ROI list ({len(self._rois)})")
         self.expanded_changed.emit(self._expanded)
 
     def _clear_palette(self):
@@ -278,7 +311,7 @@ class RoiManagerWidget(QWidget):
         for roi_id, label in row_data.items():
             saved = roi_by_id.get(roi_id)
             if saved is None: continue
-            color = self._color_for(saved); button = _RoiSwatchButton(self.palette_body); button.setObjectName("roiSwatch")
+            color = self._color_for(saved); button = _RoiSwatchButton(self.palette_body, self._global_icon_size()); button.setObjectName("roiSwatch")
             button.setToolTip(f"{label or f'ROI {roi_id}'}\nLeft click: select\nRight click: actions\nHold right button: edit")
             button.setStyleSheet(self._swatch_style(color, roi_id == self._selected_id))
             button.clicked.connect(lambda _=False, rid=roi_id: self._select_roi(rid))
@@ -343,7 +376,7 @@ class RoiManagerWidget(QWidget):
         popup = _RoiEditorPopup(saved, self._color_for(saved), self); self._active_editor = popup
         popup.save_requested.connect(self.edit_requested.emit); popup.delete_requested.connect(self.delete_requested.emit)
         if button is None: button = self._buttons.get(int(roi_id), self.expand_button)
-        popup.adjustSize(); anchor_pos = button.mapToGlobal(QPoint(0, 0)); screen = button.screen() or QApplication.primaryScreen()
+        anchor_pos = button.mapToGlobal(QPoint(0, 0)); screen = button.screen() or QApplication.primaryScreen()
         area = screen.availableGeometry() if screen is not None else popup.geometry()
         x = anchor_pos.x() - popup.width() - 6
         if x < area.left() + 4: x = min(anchor_pos.x() + button.width() + 6, area.right() - popup.width() + 1)

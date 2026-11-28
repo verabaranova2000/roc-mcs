@@ -6,6 +6,9 @@ from PyQt6.QtGui import QColor, QPalette
 from PyQt6.QtWidgets import QApplication, QAbstractScrollArea, QDialog, QMenu, QWidget
 
 from roc_mcs.gui.components.icon_provider import set_icon_theme
+from roc_mcs.gui.components.qt_window_utils import (
+    point_sized_font, top_level_window_owner,
+)
 
 
 # One switch controls only the two workflow navigation areas.
@@ -95,6 +98,8 @@ _SURFACE_NAMES = {"roiExplorerCentral", "leftSidebarSurface", "leftSidebarConten
 
 def theme_colors(theme: str | None) -> dict[str, str]:
     return _PALETTES["dark" if str(theme).lower() == "dark" else "light"].copy()
+
+
 
 
 def resolve_theme(widget=None) -> str:

@@ -130,7 +130,6 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
             super().__init__(parent)
             self.paint_count = 0
             self.paint_stage = "pre-init"
-            self._preinit_refresh_requested = False
             self._finalized = False
 
         def closeEvent(self, event):
@@ -1720,27 +1719,12 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
                     raise RuntimeError(
                         "QVTK не создал vtkRenderWindowInteractor для render window."
                     )
-                # Ask Qt for one explicit pre-initialization repaint. The
-                # successful native diagnostic observed two completed paints
-                # before Initialize(); this request encourages the same stable
-                # backing-store/native-surface sequence without requiring a
-                # fixed event count (Qt is free to coalesce update requests).
-                if (not bool(self.interactor.GetInitialized())
-                        and not self.vtk_widget._preinit_refresh_requested
-                        and self.vtk_widget.paint_count < 2):
-                    self.vtk_widget._preinit_refresh_requested = True
-                    before_paints = int(self.vtk_widget.paint_count)
-                    # Match the successful native diagnostic: force one
-                    # synchronous pre-init paint while the child is visible.
-                    # This is only a best-effort surface warm-up, never a
-                    # readiness gate; if Qt coalesces/skips it, Initialize still
-                    # proceeds using the actual native-widget checks below.
-                    self.vtk_widget.repaint()
-                    _trace(
-                        "QVTK_PREINIT_REPAINT_DONE",
-                        paint_count_before=before_paints,
-                        paint_count_after=int(self.vtk_widget.paint_count),
-                    )
+                # QVTK uses WA_PaintOnScreen and owns its native OpenGL paint
+                # lifecycle.  A synchronous QWidget.repaint() is unsafe here:
+                # it can re-enter paintEvent while the native surface is not
+                # initialized, producing recursive repaint and inactive
+                # QPainter warnings.  A pre-init paint is not a readiness
+                # condition; native surface creation/size were verified above.
                 _trace_resources("before-qvtk-initialize")
                 _trace(
                     "QVTK_INITIALIZE_BEGIN",
@@ -1779,6 +1763,10 @@ def _create_window_class(QtCore, QtWidgets, QVTKRenderWindowInteractor):
                     render_callback=self.vtk_widget.update,
                 )
                 self.scene.set_theme(self._theme)
+                # Queue the first normal QVTK paint only after the interactor
+                # and scene are initialized. Qt may coalesce this with other
+                # pending updates; no nested paint or manual Render is needed.
+                QtCore.QTimer.singleShot(0, self.vtk_widget.update)
                 self.tools_widget.set_scene_available(True)
                 self.tools_widget.apply_theme(self._theme)
                 self.tools_widget.set_axes_visible(self.scene.axes_visible)

@@ -222,38 +222,316 @@ def branch_catalog_fingerprint(catalog: pd.DataFrame | None) -> str:
     return digest.hexdigest()
 
 
+def _model_registry():
+    """Load the fitting registry lazily so display-only imports stay lightweight."""
+    try:
+        from roc_mcs.fitting.registry import DERIVED_SPECS, MODEL_SPECS
+    except (ImportError, ModuleNotFoundError):
+        return {}, {}
+    return MODEL_SPECS, DERIVED_SPECS
+
+
+def _models_in_catalog(catalog: pd.DataFrame) -> list[str]:
+    if "model" not in catalog.columns:
+        return []
+    values = catalog["model"].dropna().astype(str).str.strip()
+    return list(dict.fromkeys(value for value in values if value))
+
+
+class BranchParameterChoices:
+    """Small per-branch parameter preference cache scoped to one preview.
+
+    Only parameter identifiers are retained. The potentially large 2D map
+    arrays are always rebuilt for the active branch and are never cached.
+    """
+
+    def __init__(self) -> None:
+        self._context_signature = None
+        self._by_branch: dict[int, str] = {}
+        self._last_parameter: str | None = None
+
+    def reset(self) -> None:
+        self._context_signature = None
+        self._by_branch.clear()
+        self._last_parameter = None
+
+    def bind_context(self, signature: Any) -> None:
+        """Start a clean cache when the active immutable preview changes."""
+        if signature != self._context_signature:
+            self._by_branch.clear()
+            self._last_parameter = None
+            self._context_signature = signature
+
+    def remember(self, branch_id: int, parameter: str) -> None:
+        branch_id = int(branch_id)
+        parameter = str(parameter)
+        if branch_id < 0 or not parameter:
+            return
+        self._by_branch[branch_id] = parameter
+        self._last_parameter = parameter
+
+    def preferred(
+        self, branch_id: int, available: Iterable[str], *, fallback: str | None = None,
+    ) -> str | None:
+        """Return this branch's valid choice, then last valid choice, then fallback."""
+        allowed = {str(value) for value in available if str(value)}
+        saved = self._by_branch.get(int(branch_id))
+        if saved in allowed:
+            return saved
+        if saved is not None:
+            self._by_branch.pop(int(branch_id), None)
+        if self._last_parameter in allowed:
+            return self._last_parameter
+        return str(fallback) if fallback is not None and str(fallback) in allowed else None
+
+
+def fitted_branch_parameter_columns() -> tuple[str, ...]:
+    """Columns required to retain fitted event values in a branch preview.
+
+    This is derived from the same model registry used by fitting and map
+    rendering; adding a model to ``MODEL_SPECS`` automatically extends the
+    preview subset without a second hand-maintained model-parameter list.
+    """
+    model_specs, _derived_specs = _model_registry()
+    model_columns = tuple(
+        name for spec in model_specs.values() for name in spec.param_names
+    )
+    return tuple(dict.fromkeys((
+        "x", "y", "component_id", "peak_id", "pixel_id", "n_components",
+        "model", "fit_success", "prominence", "height",
+        "theta0", "theta_fit", "center_theta", "theta", "theta_detected",
+        *model_columns,
+    )))
+
+
+def _crossing_x(x0: float, y0: float, x1: float, y1: float, level: float) -> float:
+    denominator = y1 - y0
+    if not np.isfinite(denominator) or abs(denominator) <= np.finfo(float).eps:
+        return float((x0 + x1) * 0.5)
+    fraction = (level - y0) / denominator
+    return float(x0 + np.clip(fraction, 0.0, 1.0) * (x1 - x0))
+
+
+def _numerical_model_fwhm(model_name: str, params: Mapping[str, float], model_specs) -> float:
+    """Measure FWHM from the actual registered profile when no closed form exists.
+
+    This is used only for the selected branch's fitted events and only for
+    models whose registry does not provide an algebraic FWHM.  The bounded
+    grid avoids unbounded work on pathological fit values.
+    """
+    spec = model_specs.get(str(model_name))
+    if spec is None or not callable(getattr(spec, "func", None)):
+        return float("nan")
+    try:
+        center = float(params["theta0"])
+        positive_widths = [
+            abs(float(params[name]))
+            for name in ("sigma", "gamma", "H", "Delta", "beta_Gl", "beta_Cl", "beta_Gr", "beta_Cr")
+            if name in params and np.isfinite(float(params[name])) and abs(float(params[name])) > 1e-12
+        ]
+        tail_scale = 1.0 / abs(float(params["lam"])) if "lam" in params and abs(float(params["lam"])) > 1e-12 else 0.0
+        scales = positive_widths + ([tail_scale] if np.isfinite(tail_scale) and tail_scale > 0 else [])
+        if not scales or not np.isfinite(center):
+            return float("nan")
+        width_scale = max(scales)
+        fine_scale = min(scales)
+        extent = max(8.0 * width_scale, 6.0 * fine_scale)
+        # 801–4097 samples bound per-event compute and still provide
+        # sub-percent interpolation precision for ordinary fitted profiles.
+        requested = int(np.ceil((2.0 * extent / max(fine_scale / 24.0, 1e-12)))) + 1
+        count = int(np.clip(requested, 801, 4097))
+        x = np.linspace(center - extent, center + extent, count, dtype=np.float64)
+        y = np.asarray(spec.func(x, **dict(params)), dtype=np.float64)
+        if y.ndim != 1 or y.shape != x.shape:
+            return float("nan")
+        finite = np.isfinite(x) & np.isfinite(y)
+        if finite.sum() < 5:
+            return float("nan")
+        x = x[finite]
+        y = y[finite]
+        order = np.argsort(x, kind="mergesort")
+        x = x[order]
+        y = y[order]
+        peak_index = int(np.argmax(y))
+        peak_value = float(y[peak_index])
+        if not np.isfinite(peak_value) or peak_value <= 0.0:
+            return float("nan")
+        half = 0.5 * peak_value
+        left_candidates = np.flatnonzero(y[:peak_index] <= half)
+        right_candidates = np.flatnonzero(y[peak_index + 1:] <= half)
+        if left_candidates.size == 0 or right_candidates.size == 0:
+            return float("nan")
+        left_outer = int(left_candidates[-1])
+        right_outer = int(peak_index + 1 + right_candidates[0])
+        left = _crossing_x(x[left_outer], y[left_outer], x[left_outer + 1], y[left_outer + 1], half)
+        right = _crossing_x(x[right_outer - 1], y[right_outer - 1], x[right_outer], y[right_outer], half)
+        result = right - left
+        return float(result) if np.isfinite(result) and result > 0.0 else float("nan")
+    except (ArithmeticError, KeyError, TypeError, ValueError, OverflowError, FloatingPointError):
+        return float("nan")
+
+
+def _fwhm_values(catalog: pd.DataFrame) -> np.ndarray:
+    """Return event-aligned FWHM values; no catalog columns are mutated."""
+    if catalog is None or catalog.empty:
+        return np.empty(0, dtype=np.float64)
+    direct = (
+        _numeric(catalog["FWHM"])
+        if "FWHM" in catalog.columns else np.full(len(catalog), np.nan, dtype=np.float64)
+    )
+    if np.isfinite(direct).all():
+        return direct
+    if "model" not in catalog.columns:
+        return np.full(len(catalog), np.nan, dtype=np.float64)
+    model_specs, derived_specs = _model_registry()
+    if not model_specs:
+        return np.full(len(catalog), np.nan, dtype=np.float64)
+
+    model_values = catalog["model"].fillna("").astype(str).to_numpy()
+    needed_columns = {
+        name for model_name in set(model_values)
+        for name in getattr(model_specs.get(model_name), "param_names", ())
+    }
+    numeric_columns = {
+        name: _numeric(catalog[name]) if name in catalog.columns
+        else np.full(len(catalog), np.nan, dtype=np.float64)
+        for name in needed_columns
+    }
+    result = direct.copy()
+    for index, model_name in enumerate(model_values):
+        if np.isfinite(result[index]):
+            continue
+        model_spec = model_specs.get(model_name)
+        if model_spec is None:
+            continue
+        params: dict[str, float] = {}
+        valid = True
+        for name in model_spec.param_names:
+            value = numeric_columns.get(name)
+            if value is None or not np.isfinite(value[index]):
+                valid = False
+                break
+            params[name] = float(value[index])
+        if not valid:
+            continue
+        derived = derived_specs.get(model_name, {}).get("FWHM")
+        try:
+            if derived is not None and not bool(derived.needs_curve):
+                value = float(derived.value_func(params))
+            else:
+                value = _numerical_model_fwhm(model_name, params, model_specs)
+        except (ArithmeticError, KeyError, TypeError, ValueError, OverflowError, FloatingPointError):
+            value = float("nan")
+        if np.isfinite(value) and value > 0.0:
+            result[index] = float(value)
+    return result
+
+
+def _has_computable_fwhm(catalog: pd.DataFrame) -> bool:
+    if "FWHM" in catalog.columns and np.isfinite(_numeric(catalog["FWHM"])).any():
+        return True
+    if "model" not in catalog.columns:
+        return False
+    model_specs, _derived_specs = _model_registry()
+    if not model_specs:
+        return False
+    models = catalog["model"].fillna("").astype(str).to_numpy()
+    for model_name in dict.fromkeys(models.tolist()):
+        spec = model_specs.get(model_name)
+        if spec is None or any(name not in catalog.columns for name in spec.param_names):
+            continue
+        mask = models == model_name
+        valid = np.ones(int(mask.sum()), dtype=bool)
+        for name in spec.param_names:
+            values = _numeric(catalog.loc[mask, name])
+            valid &= np.isfinite(values)
+        if valid.any():
+            return True
+    return False
+
+
 def available_branch_parameters(
     catalog: pd.DataFrame | None,
     declared_parameters: Iterable[str] = (),
+    *,
+    branch_id: int | None = None,
 ) -> list[dict[str, str]]:
-    """Return physically meaningful numeric branch parameters; never component_id."""
+    """Return RCI quantities first, then native parameters for one branch.
+
+    When ``branch_id`` is supplied, availability is evaluated against that
+    branch's events only. The fitting registry is the canonical source of
+    model parameter order. Detection-only catalogs intentionally expose only
+    their actual detection measurements; Fit-only quantities are not invented.
+    """
     if catalog is None or catalog.empty:
         return []
-    candidates: list[str] = []
-    for name in (
-        "theta", "theta_detected", "theta0", "theta_fit", "center_theta",
-        "delta_theta", "S", "H", "height", "prominence", "width_theta",
-        "eta", "sigma", "gamma", "Delta", "beta_Gl", "beta_Cl",
-        "beta_Gr", "beta_Cr", "lam",
-    ):
-        if name in catalog.columns and name not in candidates:
-            candidates.append(name)
+    if branch_id is not None:
+        if "branch_id" not in catalog.columns:
+            return []
+        branch_values = _numeric(catalog["branch_id"])
+        branch_mask = np.isfinite(branch_values) & (branch_values == int(branch_id))
+        catalog = catalog.loc[branch_mask]
+        if catalog.empty:
+            return []
+    fields: list[dict[str, str]] = []
+    seen: set[str] = set()
+
+    def add(name: str, *, label: str | None = None, unit: str | None = None) -> None:
+        if name in seen or name in _FORBIDDEN_PARAMETER_COLUMNS or name.endswith("_error"):
+            return
+        if name not in catalog.columns and name != "FWHM":
+            return
+        if name == "FWHM":
+            if not _has_computable_fwhm(catalog):
+                return
+        else:
+            values = _numeric(catalog[name])
+            if not np.isfinite(values).any():
+                return
+        default_label, default_unit = _PARAMETER_INFO.get(name, (str(name), ""))
+        fields.append({
+            "key": name,
+            "label": str(label or default_label),
+            "unit": str(unit if unit is not None else default_unit),
+        })
+        seen.add(name)
+
+    # RCI standard quantities: fitted position, FWHM, integrated intensity.
+    position_name = next(
+        (name for name in ("theta0", "theta", "theta_fit", "center_theta", "theta_detected")
+         if name in catalog.columns and np.isfinite(_numeric(catalog[name])).any()),
+        None,
+    )
+    if position_name is not None:
+        if position_name == "theta0":
+            add(position_name, label="Положение пика θ₀", unit="″")
+        elif position_name == "theta":
+            add(position_name, label="Положение пика θ", unit="″")
+        else:
+            add(position_name)
+    add("FWHM", label="Ширина на полувысоте FWHM", unit="″")
+    add("S", label="Интегральная интенсивность S", unit="counts·″")
+
+    # Model-specific parameters follow the exact order declared by ModelSpec.
+    # S/theta0 are already represented above; PVoigt H is FWHM itself.
+    model_specs, _derived_specs = _model_registry()
+    for model_name in _models_in_catalog(catalog):
+        spec = model_specs.get(model_name)
+        if spec is None:
+            continue
+        for name in spec.param_names:
+            if name in {"S", "theta0", "H"}:
+                continue
+            add(name)
+
+    # Detection metrics and fit displacement remain available after the
+    # common RCI/model quantities, without duplicating alternate centre names.
+    for name in ("height", "prominence", "width_theta", "delta_theta"):
+        add(name)
     for name in declared_parameters:
         value = str(name)
-        if value in catalog.columns and value not in candidates:
-            candidates.append(value)
-    fields: list[dict[str, str]] = []
-    for name in candidates:
-        if name in _FORBIDDEN_PARAMETER_COLUMNS or name.endswith("_error"):
-            continue
-        try:
-            values = _numeric(catalog[name])
-        except (TypeError, ValueError):
-            continue
-        if not np.isfinite(values).any():
-            continue
-        label, unit = _PARAMETER_INFO.get(name, (str(name), ""))
-        fields.append({"key": name, "label": label, "unit": unit})
+        if value not in {"theta", "theta_detected", "theta_fit", "center_theta", "theta0", "H"}:
+            add(value)
     return fields
 
 
@@ -266,27 +544,36 @@ def build_branch_parameter_map(
     """Rasterize one branch parameter; repeated events in one pixel are averaged.
 
     ``component_id`` is intentionally not an input to this operation: it is a
-    per-pixel fit ordering, not a persistent track identity.
+    per-pixel fit ordering, not a persistent track identity. FWHM is derived
+    from the registered model for each fitted event before pixel aggregation.
     """
     if catalog is None or catalog.empty:
         raise ValueError("Каталог ветвей пуст")
-    if parameter in _FORBIDDEN_PARAMETER_COLUMNS or parameter not in catalog.columns:
+    if parameter in _FORBIDDEN_PARAMETER_COLUMNS or (parameter not in catalog.columns and parameter != "FWHM"):
         raise ValueError(f"Параметр {parameter!r} недоступен для карты ветви")
     ny, nx = map(int, shape_yx)
     if ny < 1 or nx < 1:
         raise ValueError("Размер карты должен быть положительным")
-    required = {"branch_id", "x", "y", parameter}
+    required = {"branch_id", "x", "y"}
     if not required.issubset(catalog.columns):
         raise ValueError(f"Каталог не содержит {sorted(required - set(catalog.columns))}")
 
     ids = _numeric(catalog["branch_id"])
+    branch_mask = np.isfinite(ids) & (ids == int(branch_id))
+    if parameter == "FWHM":
+        values = np.full(len(catalog), np.nan, dtype=np.float64)
+        # Compute widths only for events in the requested branch; this keeps
+        # map construction proportional to the active branch, not the entire
+        # fit catalogue.
+        values[branch_mask] = _fwhm_values(catalog.loc[branch_mask])
+    else:
+        values = _numeric(catalog[parameter])
     x_values = _numeric(catalog["x"])
     y_values = _numeric(catalog["y"])
-    values = _numeric(catalog[parameter])
     rounded_x = np.rint(np.where(np.isfinite(x_values), x_values, 0.0))
     rounded_y = np.rint(np.where(np.isfinite(y_values), y_values, 0.0))
     valid = (
-        np.isfinite(ids) & (ids == int(branch_id))
+        branch_mask
         & np.isfinite(x_values) & np.isfinite(y_values)
         & (np.abs(x_values - rounded_x) <= 1e-6)
         & (np.abs(y_values - rounded_y) <= 1e-6)
@@ -304,7 +591,6 @@ def build_branch_parameter_map(
     flat_result = result.reshape(-1)
     flat_result[occupied] = sums[occupied] / counts[occupied]
     return result
-
 
 def branch_footprint_layers(
     catalog: pd.DataFrame,

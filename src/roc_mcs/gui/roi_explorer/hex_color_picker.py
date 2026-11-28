@@ -4,7 +4,10 @@ from PyQt6.QtCore import QPoint, QPointF, QSize, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QLinearGradient, QPainter, QPen, QPolygon, QPalette
 from PyQt6.QtWidgets import (QColorDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QToolButton,
                              QVBoxLayout, QWidget, QDialog)
-from roc_mcs.gui.roi_explorer.theme import apply_widget_palette, apply_popup_theme, resolve_theme
+from roc_mcs.gui.roi_explorer.theme import (
+    apply_widget_palette, apply_popup_theme, resolve_theme,
+    top_level_window_owner, point_sized_font,
+)
 
 
 class _DragTitle(QLabel):
@@ -165,14 +168,25 @@ class CompactColorPicker(QFrame):
         self, color: str = "#1f77b4", parent=None, *, popup: bool = False,
         unavailable_colors: Iterable[str] = (),
     ):
-        # Standalone callers retain the existing Tool-window behavior.  When
-        # embedded into a QMenu hierarchy, Qt.Popup keeps the picker in the
-        # same nested popup chain so palette clicks do not dismiss its parents.
-        flags = Qt.WindowType.FramelessWindowHint | (
-            Qt.WindowType.Popup if popup else Qt.WindowType.Tool
-        )
-        super().__init__(parent, flags)
-        self.setObjectName("compactColorPicker"); apply_widget_palette(self, resolve_theme(parent))
+        # A Qt.Tool is a top-level window.  Its native transient parent must
+        # therefore be the actual top-level owner, never an embedded manager
+        # widget (QSplitter/QListView child).  Popup mode is intentionally
+        # different: it remains in the existing nested popup chain.
+        theme_owner = parent
+        if popup:
+            native_parent = parent
+            window_type = Qt.WindowType.Popup
+        else:
+            native_parent = top_level_window_owner(parent)
+            window_type = Qt.WindowType.Tool
+        flags = Qt.WindowType.FramelessWindowHint | window_type
+        super().__init__(native_parent, flags)
+        self._theme_owner = theme_owner if theme_owner is not None else native_parent
+        if theme_owner is not None:
+            theme_owner.destroyed.connect(self.close)
+        self.setFont(point_sized_font(theme_owner, fallback=9.0))
+        self.setObjectName("compactColorPicker")
+        apply_widget_palette(self, resolve_theme(self._theme_owner or self))
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True); self._color = QColor(color if QColor(color).isValid() else "#1f77b4")
         self._unavailable_colors: set[str] = set()
         for unavailable in unavailable_colors:
@@ -257,11 +271,23 @@ class CompactColorPicker(QFrame):
         self.hue_strip.hue = max(0, h)
         self.plane.set_hsv(max(0, h), max(0, s) / 255, max(0, v) / 255)
         self._refresh_controls()
+        apply_popup_theme(self, resolve_theme(self._theme_owner or self))
+        # Theme styles can increase minimum metrics (fonts/paddings).  Polish
+        # and activate the complete layout before the first native geometry is
+        # requested, so Windows never receives a size below minimumSizeHint().
+        self.ensurePolished()
+        if self.layout() is not None:
+            self.layout().activate()
         self.adjustSize()
-        apply_popup_theme(self, resolve_theme(parent))
+        self._layout_size_finalized = True
 
     def apply_theme(self, theme: str | None = None) -> None:
-        apply_popup_theme(self, theme)
+        apply_popup_theme(self, theme or resolve_theme(self._theme_owner or self))
+        # The complete layout was measured once in __init__.  Re-running
+        # adjustSize() on a visible Qt.Tool can issue a second native geometry
+        # request while Windows is applying its minimum tracking size.  A
+        # palette change does not alter this fixed control geometry.
+        self.updateGeometry()
         self.color_preview.setStyleSheet(f"QFrame {{ background: {self._color.name()}; border: 1px solid palette(mid); border-radius: 2px; }}")
 
     def _show_validation_error(self, message: str) -> None:

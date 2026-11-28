@@ -78,7 +78,7 @@ from roc_mcs.gui.app_settings import (
 )
 from roc_mcs.analysis.project import project_directory_for_scan
 from roc_mcs.analysis.branch_display import (
-    available_branch_parameters, branch_catalog_fingerprint,
+    BranchParameterChoices, available_branch_parameters, branch_catalog_fingerprint,
     branch_footprint_layers, build_branch_parameter_map,
     load_branch_display_colors, normalize_branch_colors,
     save_branch_display_colors, summarize_branch_catalog,
@@ -160,6 +160,13 @@ class RockingCurveExplorerWindow(QMainWindow):
         self._branch_display_state_path: Path | None = None
         self._branch_parameter_layer = None
         self._branch_parameter_branch_id: int | None = None
+        # Parameter-map display is a transient view mode. Keep only the
+        # selected parameter per branch (never raster arrays) so switching
+        # branches is deterministic without retaining large image caches.
+        self._branch_parameter_choices = BranchParameterChoices()
+        self._branch_parameter_view_enabled = False
+        self._branch_parameter_return_map_key: str | None = None
+        self._branch_parameter_current_parameter: str | None = None
 
         self._theta_render_timer = QTimer(self); self._theta_render_timer.setSingleShot(True); self._theta_render_timer.setInterval(35); self._theta_render_timer.timeout.connect(self.refresh_map)
         self._theta_range_preview_timer = QTimer(self)
@@ -325,6 +332,12 @@ class RockingCurveExplorerWindow(QMainWindow):
         size = QSize(self._global_icon_size(), self._global_icon_size())
         for button in self.findChildren(QAbstractButton):
             if not button.icon().isNull(): button.setIconSize(size)
+        # Branch and ROI rails use these same global icon metrics for their
+        # square swatches and circular branch markers (including row pitch).
+        for manager in (getattr(self, "roi_manager", None), getattr(self, "branch_manager", None)):
+            apply_icon_size = getattr(manager, "apply_global_icon_size", None)
+            if callable(apply_icon_size):
+                apply_icon_size()
         # Embedded tools that own icon-to-control geometry reapply that policy
         # after this generic icon-size pass. Keep the explicit VTK object-name
         # check as a guard for the native toolbar's geometry contract.
@@ -1475,14 +1488,30 @@ class RockingCurveExplorerWindow(QMainWindow):
             self.map_widget.tools.set_current_cmap(str(previous))
 
     def _remember_analysis_display_preferences(self) -> None:
-        if self._analysis_display_identity is not None:
-            self._analysis_display_preferences[self._analysis_display_identity] = (
-                self._analysis_map_key, self._analysis_curve_key,
+        """Persist stable workflow-map preferences, never a transient branch map.
+
+        ``branch.parameter.*`` layers are derived from the current branch
+        selection and must not become the remembered map for the workflow
+        node.  Otherwise switching to another preview can persist a stale
+        branch raster key and the next visit may show another branch's data.
+        """
+        identity = self._analysis_display_identity
+        if identity is None:
+            return
+        map_key = self._analysis_map_key
+        branch_layer = self._branch_parameter_layer
+        is_transient_branch_map = bool(
+            branch_layer is not None and map_key == str(branch_layer.key)
+        )
+        if is_transient_branch_map:
+            map_key = self._branch_parameter_return_map_key
+        self._analysis_display_preferences[identity] = (
+            map_key, self._analysis_curve_key,
+        )
+        if map_key and not is_transient_branch_map:
+            self._analysis_layer_cmap_preferences[(identity, str(map_key))] = str(
+                self.map_widget.current_cmap
             )
-            if self._analysis_map_key:
-                self._analysis_layer_cmap_preferences[(
-                    self._analysis_display_identity, self._analysis_map_key
-                )] = str(self.map_widget.current_cmap)
 
     def _apply_analysis_layer_colormap(self, identity, map_key: str | None, *, default_hkl: bool) -> None:
         if not map_key:
@@ -1622,17 +1651,42 @@ class RockingCurveExplorerWindow(QMainWindow):
         state = self._analysis_view
         if state is None or not hasattr(state, "map_layers"):
             return
+        key = str(key)
         available_layers = self._analysis_menu_items(state, "map_layers")
-        if not any(layer.key == str(key) for layer in available_layers):
+        if not any(layer.key == key for layer in available_layers):
             return
-        self._remember_analysis_display_preferences()
-        self._analysis_map_key = str(key)
+
+        is_current_branch_layer = bool(
+            self._branch_parameter_layer is not None
+            and key == str(self._branch_parameter_layer.key)
+        )
+        if is_current_branch_layer:
+            branch_id = self._branch_parameter_branch_id
+            parameter = self._branch_parameter_current_parameter
+            if branch_id is not None and parameter:
+                self._branch_parameter_view_enabled = True
+                self._branch_parameter_choices.remember(int(branch_id), str(parameter))
+        else:
+            # Explicitly choosing a normal workflow map leaves branch-map
+            # mode. Do not store the transient branch.parameter.* key as a
+            # normal per-node display preference.
+            if self._branch_parameter_layer is None:
+                self._remember_analysis_display_preferences()
+            self._branch_parameter_view_enabled = False
+            self._branch_parameter_return_map_key = None
+            self._branch_parameter_layer = None
+            self._branch_parameter_branch_id = None
+            self._branch_parameter_current_parameter = None
+
+        self._analysis_map_key = key
         self._apply_analysis_layer_colormap(
             self._analysis_display_identity, self._analysis_map_key, default_hkl=True,
         )
         self._set_analysis_contrast_mode(self._analysis_map_key)
-        self._remember_analysis_display_preferences()
+        if not is_current_branch_layer:
+            self._remember_analysis_display_preferences()
         self._set_result_menu_checked(self.map_widget.tools.results_menu, self._analysis_map_key)
+        self._sync_analysis_result_menus(state)
         self._sync_theta_range_context()
         self.refresh_map()
         self._update_inspector()
@@ -1755,6 +1809,10 @@ class RockingCurveExplorerWindow(QMainWindow):
         self._branch_display_state_path = None
         self._branch_parameter_layer = None
         self._branch_parameter_branch_id = None
+        self._branch_parameter_choices.reset()
+        self._branch_parameter_view_enabled = False
+        self._branch_parameter_return_map_key = None
+        self._branch_parameter_current_parameter = None
         manager = getattr(self, "branch_manager", None)
         workspace = getattr(self, "plot_workspace", None)
         if manager is not None:
@@ -1795,8 +1853,15 @@ class RockingCurveExplorerWindow(QMainWindow):
         self._branch_fingerprint = fingerprint
         self._branch_display_colors = colors
         self._branch_display_state_path = sidecar_path
+        context_signature = (self._analysis_display_identity, str(fingerprint))
+        self._branch_parameter_choices.bind_context(context_signature)
+        # Re-installing a workflow preview rebuilds the menu and branch model.
+        # Do not keep a stale PreviewMapLayer object tied to the old state.
         self._branch_parameter_layer = None
         self._branch_parameter_branch_id = None
+        self._branch_parameter_view_enabled = False
+        self._branch_parameter_return_map_key = None
+        self._branch_parameter_current_parameter = None
         self.branch_manager.set_branches(summaries, colors, parameter_fields)
         self.plot_workspace.set_branch_manager_visible(bool(summaries))
         self.volume_widget.set_branch_display_state(colors, (), focus_selected=False)
@@ -1812,23 +1877,64 @@ class RockingCurveExplorerWindow(QMainWindow):
 
     def _on_branch_selection_changed(self, branch_ids) -> None:
         selected = tuple(sorted({int(value) for value in (branch_ids or ())}))
-        parameter_branch_id = self._branch_parameter_branch_id
-        if (
-            self._branch_parameter_layer is not None
-            and (len(selected) != 1 or parameter_branch_id is None
-                 or selected[0] != int(parameter_branch_id))
-        ):
-            was_active = self._analysis_map_key == self._branch_parameter_layer.key
-            self._branch_parameter_layer = None
-            self._branch_parameter_branch_id = None
-            if was_active:
-                fallback = getattr(self._analysis_view, "default_map_key", None)
-                if fallback is not None:
-                    self._analysis_map_key = str(fallback)
-                self._set_analysis_contrast_mode(self._analysis_map_key)
-            self._sync_analysis_result_menus(self._analysis_view)
-            if was_active and not self.branch_manager.footprints_enabled:
-                self.refresh_map()
+        if len(selected) == 1 and self._branch_catalog is not None:
+            fields = available_branch_parameters(self._branch_catalog, branch_id=selected[0])
+            self.branch_manager.set_parameter_fields(fields)
+        else:
+            fields = []
+            self.branch_manager.set_parameter_fields(())
+
+        if self._branch_parameter_view_enabled:
+            if len(selected) == 1:
+                branch_id = selected[0]
+                available = [str(item.get("key", "")) for item in fields]
+                parameter = self._branch_parameter_choices.preferred(
+                    branch_id, available, fallback=available[0] if available else None,
+                )
+                if parameter:
+                    try:
+                        self._activate_branch_parameter_layer(
+                            branch_id, parameter, remember_return_map=False,
+                            refresh_map=not self.branch_manager.footprints_enabled,
+                        )
+                    except (ValueError, TypeError, KeyError, IndexError) as exc:
+                        # A model-specific value (for example eta) may not be
+                        # present for a branch fitted with another model. Fall
+                        # back once to the RCI position map, which is common to
+                        # every valid branch event, rather than leaving stale
+                        # pixels from the previously selected branch visible.
+                        position = next(
+                            (str(item["key"]) for item in fields
+                             if str(item["key"]) in {"theta0", "theta", "theta_fit", "center_theta", "theta_detected"}),
+                            None,
+                        )
+                        if position and position != parameter:
+                            try:
+                                self._activate_branch_parameter_layer(
+                                    branch_id, position, remember_return_map=False,
+                                    refresh_map=not self.branch_manager.footprints_enabled,
+                                )
+                            except (ValueError, TypeError, KeyError, IndexError):
+                                _logger.debug(
+                                    "Для ветви %s нет конечных значений параметров карты",
+                                    branch_id, exc_info=True,
+                                )
+                                self._leave_branch_parameter_layer(restore=True, keep_mode=True)
+                        else:
+                            _logger.debug(
+                                "Для ветви %s нет конечных значений параметров карты",
+                                branch_id, exc_info=True,
+                            )
+                            self._leave_branch_parameter_layer(restore=True, keep_mode=True)
+                else:
+                    self._leave_branch_parameter_layer(restore=True, keep_mode=True)
+            else:
+                # Multi-selection / cleared selection hides the quantitative
+                # branch map, but the per-branch choice remains remembered.
+                self._leave_branch_parameter_layer(restore=True, keep_mode=True)
+        elif self._branch_parameter_layer is not None:
+            self._leave_branch_parameter_layer(restore=True, keep_mode=False)
+
         self._sync_branch_display_to_volume()
         # BranchManagerWidget emits footprints_toggled(True) after a selection
         # change when the overlay is enabled. That signal owns the one redraw;
@@ -1887,6 +1993,100 @@ class RockingCurveExplorerWindow(QMainWindow):
             self.plot_workspace.mdi_area.show_panel("volume", True)
             self._request_volume_refresh()
 
+    def _build_branch_parameter_layer(self, branch_id: int, parameter: str):
+        state = self._analysis_view
+        catalog = self._branch_catalog
+        if state is None or catalog is None:
+            raise ValueError("Нет активного каталога ветвей")
+        shape_yx = tuple(map(int, np.shape(state.data_yxt)[:2]))
+        image = build_branch_parameter_map(catalog, int(branch_id), str(parameter), shape_yx)
+        field = next(
+            (item for item in available_branch_parameters(catalog, branch_id=int(branch_id))
+             if item["key"] == str(parameter)),
+            None,
+        )
+        if field is None:
+            raise ValueError(f"Параметр {parameter!r} больше не доступен в текущем Fit-каталоге")
+        if not np.isfinite(image).any():
+            raise ValueError("У выбранной ветви нет конечных значений этого параметра")
+        from roc_mcs.analysis.workflow_preview import PreviewMapLayer
+        layer = PreviewMapLayer(
+            key=f"branch.parameter.{int(branch_id)}.{str(parameter)}",
+            label=f"Ветвь {int(branch_id)} · {field['label']}",
+            data_yx=image,
+            group=f"Параметры ветви {int(branch_id)}",
+            unit=str(field.get("unit", "")),
+            description=(
+                f"Значение {parameter} для событий ветви {int(branch_id)}; "
+                "при нескольких событиях одной ветви в одном пикселе отображается их среднее. "
+                "Вне детекторных пикселей выбранной ветви значения отсутствуют."
+            ),
+        )
+        return layer
+
+    def _leave_branch_parameter_layer(
+        self, *, restore: bool, keep_mode: bool,
+    ) -> None:
+        """Remove the transient branch layer and optionally restore the prior map."""
+        old_layer = self._branch_parameter_layer
+        was_active = bool(
+            old_layer is not None and self._analysis_map_key == str(old_layer.key)
+        )
+        self._branch_parameter_layer = None
+        self._branch_parameter_branch_id = None
+        self._branch_parameter_current_parameter = None
+        self._branch_parameter_view_enabled = bool(keep_mode)
+        if restore and was_active:
+            state = self._analysis_view
+            map_keys = {str(item.key) for item in getattr(state, "map_layers", ())}
+            fallback = self._branch_parameter_return_map_key
+            if fallback not in map_keys:
+                fallback = getattr(state, "default_map_key", None)
+            self._analysis_map_key = str(fallback) if fallback is not None else None
+            self._apply_analysis_layer_colormap(
+                self._analysis_display_identity, self._analysis_map_key, default_hkl=True,
+            )
+            self._set_analysis_contrast_mode(self._analysis_map_key)
+            self._sync_theta_range_context()
+        if not keep_mode:
+            self._branch_parameter_return_map_key = None
+        self._sync_analysis_result_menus(self._analysis_view)
+        if restore and was_active:
+            self._set_result_menu_checked(
+                self.map_widget.tools.results_menu, self._analysis_map_key,
+            )
+            if not self.branch_manager.footprints_enabled:
+                self.refresh_map()
+            self._update_inspector()
+
+    def _activate_branch_parameter_layer(
+        self, branch_id: int, parameter: str, *, remember_return_map: bool,
+        refresh_map: bool = True,
+    ) -> bool:
+        """Activate one branch's map and remember its lightweight selection key."""
+        branch_id = int(branch_id)
+        parameter = str(parameter)
+        layer = self._build_branch_parameter_layer(branch_id, parameter)
+        if remember_return_map and not self._branch_parameter_view_enabled:
+            self._branch_parameter_return_map_key = str(self._analysis_map_key or "") or None
+        self._branch_parameter_view_enabled = True
+        self._branch_parameter_choices.remember(branch_id, parameter)
+        self._branch_parameter_current_parameter = parameter
+        self._branch_parameter_layer = layer
+        self._branch_parameter_branch_id = branch_id
+        self._analysis_map_key = layer.key
+        self._apply_analysis_layer_colormap(
+            self._analysis_display_identity, self._analysis_map_key, default_hkl=False,
+        )
+        self._set_analysis_contrast_mode(self._analysis_map_key)
+        self._sync_analysis_result_menus(self._analysis_view)
+        self._set_result_menu_checked(self.map_widget.tools.results_menu, self._analysis_map_key)
+        self._sync_theta_range_context()
+        if refresh_map:
+            self.refresh_map()
+        self._update_inspector()
+        return True
+
     def _on_branch_parameter_map_requested(self, branch_id: int, parameter: str) -> None:
         state = self._analysis_view
         catalog = self._branch_catalog
@@ -1897,42 +2097,11 @@ class RockingCurveExplorerWindow(QMainWindow):
             self.status.showMessage("Карта параметра требует ровно одну выбранную ветвь", 8000)
             return
         try:
-            shape_yx = tuple(map(int, np.shape(state.data_yxt)[:2]))
-            image = build_branch_parameter_map(catalog, int(branch_id), str(parameter), shape_yx)
-            field = next(
-                (item for item in available_branch_parameters(catalog) if item["key"] == str(parameter)),
-                {"label": str(parameter), "unit": ""},
-            )
-            from roc_mcs.analysis.workflow_preview import PreviewMapLayer
-            layer = PreviewMapLayer(
-                key=f"branch.parameter.{int(branch_id)}.{str(parameter)}",
-                label=f"Ветвь {int(branch_id)} · {field['label']}",
-                data_yx=image,
-                group=f"Параметры ветви {int(branch_id)}",
-                unit=str(field.get("unit", "")),
-                description=(
-                    f"Значение {parameter} для событий ветви {int(branch_id)}; "
-                    "при нескольких событиях одной ветви в одном пикселе отображается их среднее. "
-                    "Вне детекторных пикселей выбранной ветви значения отсутствуют."
-                ),
+            self._activate_branch_parameter_layer(
+                int(branch_id), str(parameter), remember_return_map=True,
             )
         except (ValueError, TypeError, KeyError, IndexError) as exc:
             self.status.showMessage(f"Не удалось построить карту параметра ветви: {exc}", 10000)
-            return
-        if not np.isfinite(image).any():
-            self.status.showMessage("У выбранной ветви нет конечных значений этого параметра", 8000)
-            return
-        self._branch_parameter_layer = layer
-        self._branch_parameter_branch_id = int(branch_id)
-        self._analysis_map_key = layer.key
-        self._apply_analysis_layer_colormap(
-            self._analysis_display_identity, self._analysis_map_key, default_hkl=False,
-        )
-        self._set_analysis_contrast_mode(self._analysis_map_key)
-        self._sync_analysis_result_menus(state)
-        self._set_result_menu_checked(self.map_widget.tools.results_menu, self._analysis_map_key)
-        self.refresh_map()
-        self._update_inspector()
 
     def _draw_branch_footprints_overlay(self) -> None:
         if (

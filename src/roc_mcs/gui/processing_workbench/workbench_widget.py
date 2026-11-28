@@ -21,6 +21,7 @@ from PyQt6.QtWidgets import (
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 
+from roc_mcs.gui.components.qt_window_utils import top_level_window_owner, point_sized_font
 from roc_mcs.analysis.artifacts import ArtifactBundle, ArtifactStore
 from roc_mcs.analysis.engine import (
     WorkflowExecutor, application_version, build_input_refs, make_operation_label,
@@ -135,7 +136,11 @@ class _StageConfigurationPopup(QFrame):
     about_to_close = pyqtSignal()
 
     def __init__(self, parent: QWidget):
-        super().__init__(parent, Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint)
+        native_parent = top_level_window_owner(parent)
+        super().__init__(native_parent, Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint)
+        if parent is not None and parent is not native_parent:
+            parent.destroyed.connect(self.close)
+        self.setFont(point_sized_font(parent, fallback=9.0))
         self.setObjectName("processingStagePopup")
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self.setWindowModality(Qt.WindowModality.NonModal)
@@ -287,15 +292,22 @@ def _read_branch_position_catalog(artifact_store: ArtifactStore, artifact_id: st
     from roc_mcs.peaks.branches import fitted_peak_positions
 
     if parent_operation == "fit.scan":
+        # Branching from a Fit node must preserve the fitted parameters, not
+        # just the fitted center.  The old preview reader selected only theta0
+        # and silently discarded S/width/model fields before the branch
+        # catalogue was built, making parameter maps impossible even though
+        # the accepted Fit artifact contained the complete fit.
+        from roc_mcs.analysis.branch_display import fitted_branch_parameter_columns
+
+        fitted_columns = fitted_branch_parameter_columns()
         bundle = artifact_store.read_subset(
             artifact_id,
             table_names=("peak_catalog", "fitted_peak_catalog"),
             column_names_by_table={
-                "peak_catalog": ("peak_id", "x", "y", "theta", "theta_index", "component_id"),
-                "fitted_peak_catalog": (
-                    "x", "y", "component_id", "theta0", "theta_fit", "center_theta", "theta",
-                    "peak_id",
+                "peak_catalog": (
+                    "peak_id", "x", "y", "theta", "theta_index", "component_id",
                 ),
+                "fitted_peak_catalog": fitted_columns,
             },
             missing_ok=True,
             missing_columns_ok=True,

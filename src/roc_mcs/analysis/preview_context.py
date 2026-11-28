@@ -14,6 +14,21 @@ from .workflow_history import NodeStatus
 _BRANCH_OPERATIONS = {"peaks.branches", "peaks.branch_correlation", "theory.identify_hkl"}
 
 
+def _branch_catalog_preview_columns() -> tuple[str, ...]:
+    """Return the bounded branch-catalog schema needed by interactive preview.
+
+    Model-specific columns are sourced from the fitting registry through the
+    branch-display helper; this prevents the preview reader and fitter from
+    maintaining two divergent parameter lists.
+    """
+    from roc_mcs.analysis.branch_display import fitted_branch_parameter_columns
+
+    return tuple(dict.fromkeys((
+        *fitted_branch_parameter_columns(),
+        "branch_id", "branch_position_kind", "analysis_included", "theta_index",
+    )))
+
+
 def _require_successful_ancestor(history: Any, node_id: str, output_name: str):
     node = history.find_ancestor_output(node_id, output_name)
     if node is None:
@@ -93,9 +108,9 @@ def _branch_preview_context(node: Any, history: Any, executor: Any) -> dict[str,
     scientific calculations. Required signal cubes remain full resolution;
     unrelated arrays and wide table columns are not decoded a second time.
     """
-    branch_catalog_columns = (
-        "peak_id", "branch_id", "x", "y", "theta", "theta_index", "analysis_included",
-    )
+    # Keep fitted per-event values when present; detection-only artifacts
+    # simply omit the optional columns through missing_columns_ok.
+    branch_catalog_columns = _branch_catalog_preview_columns()
     branch_bundle_selection = {
         "tables": ("branch_catalog", "branch_edges"),
         "columns": {"branch_catalog": branch_catalog_columns},

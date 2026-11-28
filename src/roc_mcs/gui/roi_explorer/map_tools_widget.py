@@ -1,6 +1,10 @@
 """Панель инструментов карты; вычислительная логика остаётся в MapPlotWidget."""
 from PyQt6.QtWidgets import (QApplication, QWidget, QHBoxLayout, QVBoxLayout, QGridLayout, QComboBox,
     QDoubleSpinBox, QPushButton, QLabel, QToolButton, QMenu, QWidgetAction, QSpinBox, QDialog, QSizePolicy)
+from roc_mcs.gui.roi_explorer.theme import (
+    top_level_window_owner, point_sized_font,
+    apply_widget_palette, apply_popup_theme, theme_colors,
+)
 from PyQt6.QtGui import QIcon, QPixmap, QPainter, QLinearGradient, QColor, QActionGroup, QPen, QPolygon, QPalette
 from PyQt6.QtCore import QEvent, QSize, Qt, QRectF, QLineF, pyqtSignal, QPointF, QPoint
 from bisect import bisect_left, bisect_right
@@ -9,7 +13,6 @@ import math
 
 from roc_mcs.gui.roi_explorer.plot_toolbar_style import (ICON_DIR, COMPACT_PLOT_TOOLBAR_STYLE, SMART_DROPDOWN_INDICATOR_RGBA, SMART_DROPDOWN_INDICATOR_SIZE)
 from roc_mcs.gui.components.icon_provider import svg_icon
-from roc_mcs.gui.roi_explorer.theme import apply_widget_palette, apply_popup_theme, theme_colors
 from roc_mcs.gui.roi_explorer.colormap_catalog import NAPARI_STYLE_COLORMAPS, colormap_icon
 from roc_mcs.gui.roi_explorer.theta_range_preview import complementary_theta_range
 
@@ -70,6 +73,7 @@ class MapToolsWidget(QWidget):
 
     def __init__(self, roi_tools_config: dict, current_roi_type: str, smart_dropdown_cls, range_slider_cls, parent=None):
         super().__init__(parent)
+        self.setFont(point_sized_font(parent, fallback=9.0))
         self.roi_tools_config = roi_tools_config
         self.current_roi_type = current_roi_type; self._theme = "light"
         self.smart_dropdown_cls = smart_dropdown_cls
@@ -113,7 +117,10 @@ class MapToolsWidget(QWidget):
         layout.addWidget(self.results_btn)
         layout.addStretch(1)
         # Контраст вынесен из узкой панели в отдельный немодальный диалог.
-        self.contrast_dialog = QDialog(self, Qt.WindowType.Tool); self.contrast_dialog.setObjectName("mapContrastDialog")
+        self.contrast_dialog = QDialog(top_level_window_owner(self), Qt.WindowType.Tool)
+        self.contrast_dialog.setFont(point_sized_font(self, fallback=9.0))
+        self.contrast_dialog.setObjectName("mapContrastDialog")
+        self.destroyed.connect(self.contrast_dialog.deleteLater)
         self.contrast_dialog.setWindowTitle("Контраст и цветовая карта"); self.contrast_dialog.setMinimumWidth(310); self.contrast_dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
         dialog_layout = QGridLayout(self.contrast_dialog); dialog_layout.setContentsMargins(10, 9, 10, 9); dialog_layout.setHorizontalSpacing(7); dialog_layout.setVerticalSpacing(6)
         self.low_pct = QDoubleSpinBox(self.contrast_dialog); self.high_pct = QDoubleSpinBox(self.contrast_dialog)

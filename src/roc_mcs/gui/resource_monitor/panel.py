@@ -4,6 +4,7 @@ from PyQt6 import QtCore, QtWidgets
 from .activity import ActivityStatus
 from .telemetry import GPUSnapshot, ResourceSnapshot, format_gib, format_pct
 from .service import ResourceMonitorService
+from roc_mcs.gui.components.qt_window_utils import top_level_window_owner, point_sized_font
 
 class _DragHeader(QtWidgets.QFrame):
     def __init__(self, panel):
@@ -23,7 +24,11 @@ class _DragHeader(QtWidgets.QFrame):
 
 class ResourceMonitorPanel(QtWidgets.QDialog):
     def __init__(self, service: ResourceMonitorService, parent=None):
-        super().__init__(parent); self._service = service; self._colors = None; self._user_moved = False
+        native_parent = top_level_window_owner(parent)
+        super().__init__(native_parent); self._service = service; self._colors = None; self._user_moved = False
+        if parent is not None and parent is not native_parent:
+            parent.destroyed.connect(self.close)
+        self.setFont(point_sized_font(parent, fallback=9.0))
         self.setObjectName("resourceMonitorPanel"); self.setWindowFlags(QtCore.Qt.WindowType.Tool | QtCore.Qt.WindowType.FramelessWindowHint)
         self.setModal(False); self.setWindowModality(QtCore.Qt.WindowModality.NonModal); self.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose, False); self.setAttribute(QtCore.Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
         self.setFixedWidth(370); self.setMinimumHeight(245)

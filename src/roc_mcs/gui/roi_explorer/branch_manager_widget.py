@@ -100,7 +100,7 @@ class _BranchItemDelegate(QStyledItemDelegate):
         self.owner = owner
 
     def sizeHint(self, option, index):
-        return QSize(22 if not self.owner.is_expanded else 240, 24)
+        return QSize(22 if not self.owner.is_expanded else 240, self.owner._branch_row_height())
 
     def paint(self, painter: QPainter, option, index):
         row = index.data(_BranchListModel.SummaryRole) or {}
@@ -122,8 +122,8 @@ class _BranchItemDelegate(QStyledItemDelegate):
         color = QColor(str(row.get("color", "#4C9FD6")))
         if not color.isValid():
             color = QColor("#4C9FD6")
-        center = rect.left() + (11 if not self.owner.is_expanded else 14)
-        radius = 5.2
+        center = rect.left() + 12
+        radius = max(4.0, self.owner._global_icon_size() * 0.5 - 1.5)
         included = bool(row.get("analysis_included", True))
         pen_color = palette.color(QPalette.ColorRole.Highlight) if selected else color.darker(125)
         pen = QPen(pen_color, 2.0 if selected else 1.15)
@@ -131,8 +131,11 @@ class _BranchItemDelegate(QStyledItemDelegate):
             pen.setStyle(Qt.PenStyle.DashLine)
         painter.setPen(pen)
         painter.setBrush(QBrush(color if included else color.lighter(145)))
+        # The ROI rail adds a two-pixel inner top inset around each square;
+        # the list row includes that same two-pixel pitch. Shift the circle's
+        # center by one pixel to align its centreline with the ROI swatches.
         painter.drawEllipse(
-            QPoint(round(center), round(rect.center().y())),
+            QPoint(round(center), round(rect.center().y() - 1.0)),
             round(radius), round(radius),
         )
 
@@ -142,8 +145,7 @@ class _BranchItemDelegate(QStyledItemDelegate):
                 if selected else palette.color(QPalette.ColorRole.Text)
             )
             painter.setPen(text_color)
-            font = QFont(option.font)
-            font.setPointSize(max(8, font.pointSize() - 1))
+            font = self.owner._derived_point_font(option.font, decrement=1.0, minimum=8.0)
             font.setWeight(QFont.Weight.DemiBold)
             painter.setFont(font)
             branch_text = f"Ветвь {int(row['branch_id'])}"
@@ -155,8 +157,7 @@ class _BranchItemDelegate(QStyledItemDelegate):
             detail_color = QColor(text_color)
             detail_color.setAlpha(190)
             painter.setPen(detail_color)
-            detail_font = QFont(option.font)
-            detail_font.setPointSize(max(7, detail_font.pointSize() - 2))
+            detail_font = self.owner._derived_point_font(option.font, decrement=2.0, minimum=7.0)
             painter.setFont(detail_font)
             theta = row.get("median_theta")
             detail = (
@@ -185,11 +186,16 @@ class BranchManagerWidget(QWidget):
     parameter_map_requested = pyqtSignal(int, str)
     expanded_changed = pyqtSignal(bool)
 
-    COMPACT_WIDTH = 22
+    COMPACT_WIDTH = 24
     EXPANDED_WIDTH = 270
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        inherited_font = QFont(QApplication.font())
+        inherited_points = float(inherited_font.pointSizeF())
+        if not (inherited_points > 0.0):
+            inherited_font.setPointSizeF(9.0)
+        self.setFont(inherited_font)
         self.setObjectName("branchManager")
         self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
         self.setFixedWidth(self.COMPACT_WIDTH)
@@ -202,7 +208,9 @@ class BranchManagerWidget(QWidget):
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(2)
+        # Header 20px + 3px gap aligns the first circle with the ROI rail's
+        # 20px header + 1px layout gap + 2px body inset.
+        root.setSpacing(3)
 
         header = QWidget(self)
         header.setObjectName("branchManagerHeader")
@@ -298,6 +306,34 @@ class BranchManagerWidget(QWidget):
         self._sync_enabled_actions()
         self.apply_theme()
 
+    @staticmethod
+    def _global_icon_size() -> int:
+        app = QApplication.instance()
+        try:
+            return min(20, max(12, int(app.property("rocMcsIconSize") if app is not None else 16)))
+        except (TypeError, ValueError, OverflowError):
+            return 16
+
+    def _branch_row_height(self) -> int:
+        # ROI swatches use an icon-sized square plus a two-pixel row gap.
+        return self._global_icon_size() + 2
+
+    @staticmethod
+    def _derived_point_font(source: QFont, *, decrement: float, minimum: float) -> QFont:
+        font = QFont(source)
+        point_size = float(font.pointSizeF())
+        if not (point_size > 0.0):
+            app = QApplication.instance()
+            fallback = float(QFont(app.font()).pointSizeF()) if app is not None else 9.0
+            point_size = fallback if fallback > 0.0 else 9.0
+        font.setPointSizeF(max(float(minimum), point_size - float(decrement)))
+        return font
+
+    def apply_global_icon_size(self) -> None:
+        """Keep branch circles in lockstep with the shared ROI swatch size."""
+        self.view.doItemsLayout()
+        self.view.viewport().update()
+
     @property
     def is_expanded(self) -> bool:
         return bool(self._expanded)
@@ -374,6 +410,17 @@ class BranchManagerWidget(QWidget):
             self.view.blockSignals(view_blocker)
         self._selected_ids = ()
         self._parameter_fields = [dict(item) for item in parameter_fields]
+        has_fit_values = any(
+            str(item.get("key", "")) in {"FWHM", "S", "sigma", "gamma", "H", "eta", "Delta",
+                                         "lam", "beta_Gl", "beta_Cl", "beta_Gr", "beta_Cr"}
+            for item in self._parameter_fields
+        )
+        self._parameter_help = (
+            "Доступны RCI-показатели и параметры подгонки каждого события."
+            if has_fit_values else
+            "Сейчас ветви построены по обнаруженным пикам. Для карт FWHM, S и параметров модели "
+            "создайте этап «Определение ветвей» непосредственно от принятого результата «Fit»."
+        )
         # Replacing the catalog is a new branch context. Reset only the local
         # action state without emitting user interaction signals downstream.
         self._footprints_enabled = False
@@ -387,6 +434,17 @@ class BranchManagerWidget(QWidget):
         self._sync_parameter_menu()
         self._sync_enabled_actions()
         self.view.viewport().update()
+
+    def set_parameter_fields(self, parameter_fields: Iterable[dict[str, str]]) -> None:
+        """Update the menu for the current single-branch selection.
+
+        The menu is intentionally branch-specific: a parameter from a
+        different model may exist elsewhere in the catalogue but is not a
+        meaningful map choice for this branch.
+        """
+        self._parameter_fields = [dict(item) for item in parameter_fields]
+        self._sync_parameter_menu()
+        self._sync_enabled_actions()
 
     def is_branch_color_available(self, branch_id: int, color: str) -> bool:
         """Return whether a valid color is unused by every other branch."""
@@ -475,7 +533,10 @@ class BranchManagerWidget(QWidget):
         elif count > 1:
             self.parameter_button.setToolTip("Карта параметра доступна только для одной ветви")
         else:
-            self.parameter_button.setToolTip("Построить карту выбранного параметра одной ветви")
+            self.parameter_button.setToolTip(
+                self._parameter_help if self._parameter_fields else
+                "Для этой ветви нет конечных значений доступных параметров"
+            )
 
     def _sync_parameter_menu(self) -> None:
         self.parameter_menu.clear()
@@ -602,7 +663,6 @@ class BranchManagerWidget(QWidget):
         rect = self.view.visualRect(index) if index is not None and index.isValid() else self.expand_button.rect()
         anchor = self.view.viewport() if index is not None and index.isValid() else self.expand_button
         position = anchor.mapToGlobal(QPoint(rect.right() + 4, rect.top()))
-        picker.adjustSize()
         screen = anchor.screen() or QApplication.primaryScreen()
         if screen is not None:
             area = screen.availableGeometry()
